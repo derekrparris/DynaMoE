@@ -726,7 +726,8 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         let url = directory(for: sessionId)
         ioQueue.async { [self] in
             var rescueFailed = false
-            for var record in load(sessionId: sessionId) where record.holdsWorktreeWork {
+            let decoded = load(sessionId: sessionId)
+            for var record in decoded where record.holdsWorktreeWork {
                 if !record.status.isTerminal {
                     record.status = .cancelled
                     record.completedAt = record.completedAt ?? Date()
@@ -762,8 +763,46 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
                 signatureLock.unlock()
             }
             guard !rescueFailed else { return }
+            // A record this build cannot decode is kept, not deleted with the
+            // conversation. `pruneStaleWorktrees` asks `hasRecordFile` before
+            // disposing of a UUID-named worktree precisely because that file
+            // may be a newer schema's record of unapplied work; removing its
+            // directory here would hand the tree to the 14-day clock. Move it
+            // to the unscoped bucket instead, where it still protects its tree.
+            let decodableIds = Set(decoded.map(\.id))
+            if let files = try? fileManager.contentsOfDirectory(
+                at: url,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) {
+                let destination = directory(for: nil)
+                for file in files where file.pathExtension == "json" {
+                    guard let runId = UUID(uuidString: file.deletingPathExtension().lastPathComponent),
+                          !decodableIds.contains(runId) else { continue }
+                    do {
+                        try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
+                        try fileManager.moveItem(
+                            at: file,
+                            to: destination.appendingPathComponent(file.lastPathComponent)
+                        )
+                    } catch {
+                        // Moving failed, so the file is still the only copy of
+                        // whatever it says. Leave the whole directory alone.
+                        rescueFailed = true
+                        break
+                    }
+                }
+            }
+            guard !rescueFailed else { return }
+            // Removal BEFORE the tombstone, like `deleteLocked`: a tombstone
+            // written first is never lifted, so a failed removal would leave a
+            // directory every later write refuses to touch. A session that had
+            // no directory is still tombstoned, so a save already in flight
+            // cannot recreate it.
+            if fileManager.fileExists(atPath: url.path) {
+                guard (try? fileManager.removeItem(at: url)) != nil else { return }
+            }
             noteDeletedSession(sessionId)
-            try? fileManager.removeItem(at: url)
             signatureLock.lock()
             for key in writtenSignatures.keys where key.hasPrefix(url.path) {
                 writtenSignatures[key] = nil

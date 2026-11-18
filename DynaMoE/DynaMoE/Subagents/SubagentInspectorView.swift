@@ -1158,6 +1158,10 @@ private struct SubagentRunDetailView: View {
                 if !outcome.keptIgnoredFiles.isEmpty {
                     applyNotice = "Applied the tracked patch, but kept the worktree: it also holds git-ignored files a patch cannot carry (\(outcome.keptIgnoredFiles.joined(separator: ", "))). Retrieve them manually before clearing the run."
                 }
+                if outcome.keptBranch {
+                    let branchNote = "Kept branch '\(outcome.branch)' because it holds commits a patch cannot carry. Merge or delete it manually when you are done."
+                    applyNotice = [applyNotice, branchNote].compactMap { $0 }.joined(separator: " ")
+                }
                 onRecordChanged()
             } catch {
                 applyError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription

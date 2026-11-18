@@ -73,6 +73,34 @@ nonisolated private final class Gate: @unchecked Sendable {
     }
 }
 
+/// Bills one request into the out-of-band ledger, then parks until the run is
+/// cancelled. That is the shape of a cloud turn a Stop interrupts: the
+/// provider was paid, but no turn comes back to carry the usage.
+nonisolated private final class BilledThenParkedBackend: AgentModelBackend, @unchecked Sendable {
+    let descriptor = AgentBackendDescriptor(
+        kind: .cloud,
+        providerId: "billed-test",
+        modelId: "billed-test-model",
+        displayName: "Billed test provider"
+    )
+    private let started: AsyncStream<Void>.Continuation
+
+    init(started: AsyncStream<Void>.Continuation) {
+        self.started = started
+    }
+
+    func runTurn(_ request: AgentBackendRequest) async throws -> AgentBackendTurn {
+        var usage = AgentUsage()
+        usage.backendRequests = 1
+        usage.costIsUnpriced = true
+        usage.costUnpricedReason = .providerOmittedUsage
+        request.usageLedger?.add(usage)
+        started.yield()
+        try await Task.sleep(nanoseconds: 60_000_000_000)
+        return AgentBackendTurn(text: "", finishReason: "stop")
+    }
+}
+
 @MainActor
 final class SubagentLoopTests: XCTestCase {
 
@@ -203,9 +231,12 @@ final class SubagentLoopTests: XCTestCase {
         XCTAssertEqual(outcome.status, .completed)
         // Billed: both steps' full prompts, summed.
         XCTAssertEqual(outcome.usage.promptTokens, 220)
-        // Context: the LAST request's size plus everything generated.
+        // Context: the LAST request's size plus the tokens THAT step generated.
+        // The earlier steps' output is already inside the last prompt, so
+        // adding the summed completions would count it twice.
         XCTAssertEqual(outcome.usage.latestPromptTokens, 120)
-        XCTAssertEqual(outcome.usage.contextTokens, 132)
+        XCTAssertEqual(outcome.usage.latestCompletionTokens, 7)
+        XCTAssertEqual(outcome.usage.contextTokens, 127)
     }
 
     func testStepBudgetIsEnforced() async throws {
@@ -1682,6 +1713,68 @@ final class SubagentLoopTests: XCTestCase {
             FileManager.default.fileExists(atPath: outside.path),
             "a declined escape must not be written"
         )
+    }
+
+    /// A Stop persists the cancelled record BEFORE the loop unwinds, so the
+    /// spend of the step it interrupted used to be lost: the provider billed
+    /// the attempt, the ledger held it, and the inspector reported $0. The
+    /// terminal write now folds the loop's usage back in.
+    func testACancelledRunsInFlightSpendReachesItsRecord() async throws {
+        let (started, sink) = AsyncStream<Void>.makeStream()
+        let runId = UUID()
+        let session = UUID()
+        let backend = BilledThenParkedBackend(started: sink)
+        let plan = AgentSpawnPlan(
+            role: "Implementer",
+            taskDescription: "Spend one billed request.",
+            contextSummary: nil,
+            preset: .implementer,
+            backendDescriptor: backend.descriptor,
+            schedulingClass: .cloud(providerId: "billed-test"),
+            backend: backend,
+            toolNames: ["complete"],
+            budget: AgentBudget(
+                maxSteps: 2,
+                maxCompletionTokens: 1_000,
+                maxWallClockSeconds: 60,
+                maxCostUSD: nil
+            ),
+            approvalPolicy: .auto,
+            isolation: .none,
+            thinking: false,
+            sampling: .default,
+            priority: .userRequested,
+            parentSessionId: session,
+            parentTurnId: nil,
+            workingDirectory: FileManager.default.temporaryDirectory
+        )
+        let subagent = SubagentManager.shared.spawnModelBacked(plan, id: runId)
+        defer {
+            SubagentManager.shared.clearCompleted(sessionId: session)
+            AgentRunStore.shared.delete(runId: runId, sessionId: session)
+        }
+
+        // The backend has billed a request and is parked inside it.
+        for await _ in started { break }
+        subagent.cancel()
+        _ = await subagent.waitForCompletion()
+
+        // Cancel's own persist lands first; the loop's usage write follows it.
+        let deadline = Date().addingTimeInterval(5)
+        var stored = AgentRunStore.shared.loadAny(runId: runId)
+        while Date() < deadline, (stored?.usage.backendRequests ?? 0) == 0 {
+            try await Task.sleep(nanoseconds: 20_000_000)
+            stored = AgentRunStore.shared.loadAny(runId: runId)
+        }
+
+        let record = try XCTUnwrap(stored)
+        XCTAssertEqual(record.status, .cancelled)
+        XCTAssertEqual(
+            record.usage.backendRequests, 1,
+            "the billed attempt that never produced a turn must reach the record"
+        )
+        XCTAssertTrue(record.usage.costIsUnpriced)
+        XCTAssertEqual(record.usage.costUnpricedReason, .providerOmittedUsage)
     }
 }
 

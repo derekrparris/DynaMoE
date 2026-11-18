@@ -153,6 +153,17 @@ nonisolated public enum AgentApprovalPolicy: String, Codable, Equatable, Sendabl
     }
 }
 
+nonisolated enum AgentUnpricedReason: String, Codable, Equatable, Sendable {
+    /// The model has no recorded price, so a token count can be named but not
+    /// converted to dollars.
+    case noPriceRecorded
+    /// The provider billed a request but reported no usage block (or an
+    /// incomplete one), so neither the tokens nor the dollars can be named.
+    /// This is NOT a missing price: sending the operator to record one would
+    /// fix nothing.
+    case providerOmittedUsage
+}
+
 nonisolated struct AgentUsage: Codable, Equatable, Sendable {
     var steps: Int = 0
     var promptTokens: Int = 0
@@ -165,6 +176,14 @@ nonisolated struct AgentUsage: Codable, Equatable, Sendable {
     /// the app cannot name — so the loop refuses to run with a ceiling it
     /// cannot enforce instead of reading this as "$0 spent".
     var costIsUnpriced: Bool = false
+    /// WHY the cost could not be priced, so the refusal names something the
+    /// operator can act on. See `AgentUnpricedReason`.
+    var costUnpricedReason: AgentUnpricedReason? = nil
+    /// The completion count of the LAST request, beside `latestPromptTokens`.
+    /// The context footprint is the last prompt (which already contains every
+    /// earlier completion) plus only this step's generation, not the sum of
+    /// every step's completions.
+    var latestCompletionTokens: Int = 0
     var wallClockSeconds: Double = 0
     var toolCalls: Int = 0
     var backendRequests: Int = 0
@@ -187,10 +206,12 @@ nonisolated struct AgentUsage: Codable, Equatable, Sendable {
         cachedTokens += other.cachedTokens
         costUSD += other.costUSD
         costIsUnpriced = costIsUnpriced || other.costIsUnpriced
+        if costUnpricedReason == nil { costUnpricedReason = other.costUnpricedReason }
         wallClockSeconds += other.wallClockSeconds
         toolCalls += other.toolCalls
         backendRequests += other.backendRequests
         latestPromptTokens = max(latestPromptTokens, other.latestPromptTokens)
+        latestCompletionTokens = max(latestCompletionTokens, other.latestCompletionTokens)
     }
 
     /// The billed token total: every step's full prompt plus everything
@@ -204,7 +225,14 @@ nonisolated struct AgentUsage: Codable, Equatable, Sendable {
     /// that predates `latestPromptTokens` falls back to its recorded sum, the
     /// only number it holds.
     var contextTokens: Int {
-        (latestPromptTokens > 0 ? latestPromptTokens : promptTokens) + completionTokens
+        guard latestPromptTokens > 0 else {
+            // A record that predates both fields holds only the sums.
+            return promptTokens + completionTokens
+        }
+        // The last prompt already CONTAINS every earlier step's generation,
+        // so adding the summed `completionTokens` counted them twice. Only
+        // this step's output is still part of the live context.
+        return latestPromptTokens + latestCompletionTokens
     }
 
     /// Defaults-tolerant on purpose: the store's decode-failure path is "the
@@ -218,10 +246,12 @@ nonisolated struct AgentUsage: Codable, Equatable, Sendable {
         cachedTokens = try container.decodeIfPresent(Int.self, forKey: .cachedTokens) ?? 0
         costUSD = try container.decodeIfPresent(Double.self, forKey: .costUSD) ?? 0
         costIsUnpriced = try container.decodeIfPresent(Bool.self, forKey: .costIsUnpriced) ?? false
+        costUnpricedReason = try container.decodeIfPresent(AgentUnpricedReason.self, forKey: .costUnpricedReason)
         wallClockSeconds = try container.decodeIfPresent(Double.self, forKey: .wallClockSeconds) ?? 0
         toolCalls = try container.decodeIfPresent(Int.self, forKey: .toolCalls) ?? 0
         backendRequests = try container.decodeIfPresent(Int.self, forKey: .backendRequests) ?? 0
         latestPromptTokens = try container.decodeIfPresent(Int.self, forKey: .latestPromptTokens) ?? 0
+        latestCompletionTokens = try container.decodeIfPresent(Int.self, forKey: .latestCompletionTokens) ?? 0
     }
 }
 

@@ -297,6 +297,25 @@ struct TimelineStepCardView: View {
         }
     }
 
+    /// What the approval card says about where the action lands. The generic
+    /// card has only the tool's arguments, and `apply_subagent_changes` passes
+    /// just an id: the branch, the destination tree and the changed files come
+    /// from the run's own record so the operator can decide.
+    private var approvalDestinationSummary: String? {
+        if call.name == "subq_decide" {
+            return SubQDecideTool.approvalDetail(
+                rawArguments: call.rawArguments,
+                endpointString: call.pinnedEndpoint
+            )
+        }
+        if call.name == "apply_subagent_changes",
+           let raw = call.arguments["subagent_id"] ?? call.arguments["run_id"],
+           let id = UUID(uuidString: raw) {
+            return SubagentApplyControl.approvalSummary(forRunId: id)
+        }
+        return nil
+    }
+
     /// The expanded arguments. Each value is chunked rather than drawn as one
     /// `Text`: a write payload is one argument and can be a whole file.
     private var argumentRows: some View {
@@ -420,12 +439,7 @@ struct TimelineStepCardView: View {
                         toolName: call.name,
                         arguments: call.arguments,
                         targetSummary: primarySummary,
-                        destinationSummary: call.name == "subq_decide"
-                            ? SubQDecideTool.approvalDetail(
-                                rawArguments: call.rawArguments,
-                                endpointString: call.pinnedEndpoint
-                            )
-                            : nil,
+                        destinationSummary: approvalDestinationSummary,
                         diffPreview: call.arguments["diff"] ?? call.arguments["content"],
                         commandPreview: call.arguments["command"]
                     ),

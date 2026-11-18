@@ -54,6 +54,21 @@ public final class GitController {
 
     private init() {}
 
+    /// The curated tool environment with every `GIT_*` variable removed.
+    ///
+    /// An inherited `GIT_DIR` / `GIT_WORK_TREE` redirects a "git in this
+    /// directory" call into another repository entirely. The worktree apply
+    /// path already strips them; the commit tool did not, so a cardless
+    /// `git_commit` inside a run's sandbox could stage and commit into the
+    /// operator's checkout. Every git child this controller spawns gets this.
+    static func gitEnvironment() -> [String: String] {
+        var environment = ControlledProcessRunner.toolEnvironment()
+        for key in environment.keys where key.hasPrefix("GIT_") {
+            environment.removeValue(forKey: key)
+        }
+        return environment
+    }
+
     // MARK: - Git Status
 
     public func status(workingDirectory: URL) async throws -> GitStatusResult {
@@ -61,7 +76,8 @@ public final class GitController {
             executableURL: gitURL,
             arguments: ["status", "--porcelain=v1", "-b"],
             currentDirectory: workingDirectory,
-            timeoutSeconds: 30
+            timeoutSeconds: 30,
+            environment: Self.gitEnvironment()
         )
 
         guard exitCode == 0 else {
@@ -198,7 +214,8 @@ public final class GitController {
             executableURL: gitURL,
             arguments: args,
             currentDirectory: workingDirectory,
-            timeoutSeconds: 30
+            timeoutSeconds: 30,
+            environment: Self.gitEnvironment()
         )
 
         guard exitCode == 0 else {
@@ -265,7 +282,8 @@ public final class GitController {
                 executableURL: gitURL,
                 arguments: addArgs,
                 currentDirectory: workingDirectory,
-                timeoutSeconds: 30
+                timeoutSeconds: 30,
+                environment: Self.gitEnvironment()
             )
             guard addCode == 0 else {
                 throw NSError(
@@ -279,7 +297,8 @@ public final class GitController {
                 executableURL: gitURL,
                 arguments: ["add", "-A"],
                 currentDirectory: workingDirectory,
-                timeoutSeconds: 30
+                timeoutSeconds: 30,
+                environment: Self.gitEnvironment()
             )
             guard addCode == 0 else {
                 throw NSError(
@@ -305,7 +324,8 @@ public final class GitController {
             executableURL: gitURL,
             arguments: ["commit", "-m", cleanMessage],
             currentDirectory: workingDirectory,
-            timeoutSeconds: 30
+            timeoutSeconds: 30,
+            environment: Self.gitEnvironment()
         )
 
         guard commitCode == 0 else {

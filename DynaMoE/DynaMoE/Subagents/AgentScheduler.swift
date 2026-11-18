@@ -53,6 +53,18 @@ nonisolated struct AgentSchedulerLimits: Equatable, Sendable {
 
     static let `default` = AgentSchedulerLimits()
 
+    /// The admission wait for one class. A LOCAL run holds the only local
+    /// ticket for its whole life — including any approval card it parks on —
+    /// against a default 600 s wall-clock budget, so a two-minute wait refused
+    /// a second local spawn while the holder was still legally working. Local
+    /// admission therefore covers the default budget plus a margin; the other
+    /// classes keep the configured wait, because their capacity is not held for
+    /// a run's lifetime.
+    func queueTimeout(for schedulingClass: AgentSchedulingClass) -> TimeInterval {
+        guard case .local = schedulingClass else { return queueTimeoutSeconds }
+        return max(queueTimeoutSeconds, 900)
+    }
+
     /// Debug/settings seams. Each falls back to the default when absent or not
     /// a positive number, because a capacity of zero would deadlock the queue.
     static func configured(defaults: UserDefaults = .standard) -> AgentSchedulerLimits {
@@ -86,6 +98,9 @@ nonisolated enum AgentSchedulerError: LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .queueTimeout(let schedulingClass, let seconds):
+            if case .local = schedulingClass {
+                return "The subagent run waited \(Int(seconds)) s for local model capacity and was refused. Local model runs are strictly serial: another run holds the engine for its whole life, including any approval card it is waiting on. Wait for it to finish, or send this run to a cloud backend."
+            }
             return "The subagent run waited \(Int(seconds)) s for \(schedulingClass.displayName) capacity and was refused."
         case .cancelled:
             return "The subagent run was cancelled while it waited for capacity."
@@ -180,7 +195,7 @@ actor AgentScheduler {
         timeout: TimeInterval? = nil
     ) async throws -> UUID {
         let ticket = UUID()
-        let budget = timeout ?? limits.queueTimeoutSeconds
+        let budget = timeout ?? limits.queueTimeout(for: schedulingClass)
         let deadline = Date().addingTimeInterval(budget)
         nextSequence &+= 1
         waiters[ticket] = Waiter(

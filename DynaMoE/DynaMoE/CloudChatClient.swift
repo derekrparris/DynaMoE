@@ -619,6 +619,13 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                                 code: http.statusCode,
                                 summary: MCPHTTPTransport.summarizeErrorBody(body)
                             )
+                            // A 429's Retry-After is the provider telling us
+                            // exactly how long its window needs. The receipt
+                            // carries it to the backend's retry, which used to
+                            // ignore the header and sleep a fixed 0.75 s.
+                            if let delay = CloudRetryAfter.seconds(from: http) {
+                                receipt?.record(retryAfterSeconds: delay)
+                            }
                             receipt?.record(failure: failure)
                             continuation.yield(.failed(failure))
                             continuation.finish()
@@ -856,6 +863,7 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
         }
         return rejected
     }
+
 
     nonisolated static func shouldRetryWithoutAffinity(status: Int, body: String) -> Bool {
         !rejectedAffinityHeaders(
@@ -1157,6 +1165,32 @@ nonisolated final class AnthropicCloudChatService: CloudChatServicing, @unchecke
 /// connection test): the underlying URLSession is shared per endpoint, so a
 /// multi-step agent run reuses connections, while a per-turn client means a
 /// rotated key is picked up without restarting anything.
+/// `Retry-After` in seconds, clamped to a minute.
+///
+/// The header comes in two spellings: delta-seconds, and an HTTP-date. A date
+/// is converted against the local clock, which is the best a client can do; a
+/// date already in the past is zero. The clamp keeps a provider that asks for
+/// an hour from parking the run that long — one retry is the whole budget this
+/// loop has.
+nonisolated enum CloudRetryAfter {
+    static func seconds(from response: HTTPURLResponse) -> Double? {
+        guard let raw = response.value(forHTTPHeaderField: "Retry-After")?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+        let seconds: Double?
+        if let delta = Double(raw) {
+            seconds = delta
+        } else {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.timeZone = TimeZone(secondsFromGMT: 0)
+            formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+            seconds = formatter.date(from: raw)?.timeIntervalSinceNow
+        }
+        guard let seconds, seconds.isFinite else { return nil }
+        return min(max(seconds, 0), 60)
+    }
+}
+
 public nonisolated final class CloudChatClient: @unchecked Sendable {
     /// Idle (between-bytes) timeout for a chat turn. Generous on purpose: a
     /// large prompt or a reasoning model can take longer than half a minute to

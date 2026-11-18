@@ -280,35 +280,61 @@ nonisolated public final class GrammarConstrainedSampler {
     /// the registry: `AgentHarness.syncGrammar` is reached from tool
     /// registration, Skills and MCP, and a reload landing mid-turn replaced a
     /// client's vocabulary with the app catalog for the rest of that step.
-    /// `scopedMaskDepth` is the flag it consults.
+    /// `scopedMaskStack` is the state it consults.
+    ///
+    /// Masks can OVERLAP rather than merely nest: a run's mask stays installed
+    /// until its engine task has actually unwound, and the engine frees its
+    /// slot the moment that task ends. A server turn claiming the slot in that
+    /// window installs its own mask while the run's is still live. Restoring
+    /// an unconditional snapshot on every exit therefore put the run's
+    /// vocabulary back after the server had restored the app catalog, leaving
+    /// the run's mask installed for every later turn. Each scope is tracked by
+    /// identity, and an exit rebuilds the registry from the base snapshot plus
+    /// every scope still live, in install order.
     nonisolated public static func withTurnToolMask<T>(
         _ schemas: [GrammarToolSchema],
         _ body: () async throws -> T
     ) async rethrows -> T {
         guard !schemas.isEmpty else { return try await body() }
-        let previous = shared.snapshotRegistry()
-        // Install and count under one lock, and restore and uncount under it
+        let token = UUID()
+        // Install and record under one lock, and remove and rebuild under it
         // too, so a `syncGrammar` racing the boundary cannot see "installed"
         // and still overwrite the registry, nor read "not installed" while it
         // is about to be.
         scopedMaskLock.lock()
-        scopedMaskDepth += 1
+        if scopedMaskStack.isEmpty {
+            scopedMaskBase = shared.snapshotRegistry()
+        }
+        scopedMaskStack.append(ScopedMask(token: token, schemas: schemas))
         shared.registerToolSchemas(schemas)
         scopedMaskLock.unlock()
         defer {
             scopedMaskLock.lock()
-            shared.restoreRegistry(previous)
-            scopedMaskDepth -= 1
+            scopedMaskStack.removeAll { $0.token == token }
+            scopedMaskRebuildLocked()
             scopedMaskLock.unlock()
         }
         return try await body()
+    }
+
+    /// Rebuilds the registry from the base snapshot plus every live scope, in
+    /// install order. Caller holds `scopedMaskLock`.
+    nonisolated private static func scopedMaskRebuildLocked() {
+        guard let base = scopedMaskBase else { return }
+        shared.restoreRegistry(base)
+        for entry in scopedMaskStack {
+            shared.registerToolSchemas(entry.schemas)
+        }
+        if scopedMaskStack.isEmpty {
+            scopedMaskBase = nil
+        }
     }
 
     /// True while a scoped mask owns the registry.
     nonisolated public static var isScopedMaskInstalled: Bool {
         scopedMaskLock.lock()
         defer { scopedMaskLock.unlock() }
-        return scopedMaskDepth > 0
+        return !scopedMaskStack.isEmpty
     }
 
     /// Installs the app's own tool catalog, unless a scoped mask owns the
@@ -323,13 +349,22 @@ nonisolated public final class GrammarConstrainedSampler {
     nonisolated public static func registerAppTools(_ tools: [ToolDefinition]) -> Bool {
         scopedMaskLock.lock()
         defer { scopedMaskLock.unlock() }
-        guard scopedMaskDepth == 0 else { return false }
+        guard scopedMaskStack.isEmpty else { return false }
         shared.registerTools(tools)
         return true
     }
 
+    private struct ScopedMask {
+        let token: UUID
+        let schemas: [GrammarToolSchema]
+    }
+
     nonisolated private static let scopedMaskLock = NSLock()
-    nonisolated(unsafe) private static var scopedMaskDepth = 0
+    nonisolated(unsafe) private static var scopedMaskStack: [ScopedMask] = []
+    /// The registry that was live before the first scope installed. Rebuilt
+    /// under every scope exit, so a scope that ends before a later one cannot
+    /// leave its own vocabulary behind.
+    nonisolated(unsafe) private static var scopedMaskBase: GrammarToolRegistry?
 
     private func applyRegistry(names: Set<String>, parameterKeys: [String: Set<String>], requiredKeys: [String: Set<String>]) {
         registrationLock.lock()

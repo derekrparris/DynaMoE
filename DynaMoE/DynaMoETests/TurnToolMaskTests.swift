@@ -113,6 +113,63 @@ final class TurnToolMaskTests: XCTestCase {
         )
     }
 
+    /// Two scopes can overlap rather than nest, and the one that ends FIRST
+    /// must not restore its own snapshot over the other. That ordering is what
+    /// the engine produces: a local run's mask outlives its generation task,
+    /// and a server turn can install its mask in the freed-slot window. The
+    /// old depth-count restore put the run's vocabulary back when the run
+    /// unwound and left it installed after the server had restored the app
+    /// catalog.
+    func testTheScopeThatEndsFirstDoesNotRestoreOverTheOneStillInstalled() async {
+        let sampler = GrammarConstrainedSampler.shared
+        sampler.registerToolSchemas([GrammarToolSchema(name: "app_tool")])
+
+        let (firstInstalled, firstInstalledSink) = AsyncStream<Void>.makeStream()
+        let (firstRelease, firstReleaseSink) = AsyncStream<Void>.makeStream()
+        let (secondInstalled, secondInstalledSink) = AsyncStream<Void>.makeStream()
+        let (secondRelease, secondReleaseSink) = AsyncStream<Void>.makeStream()
+
+        func scope(
+            _ name: String,
+            installed: AsyncStream<Void>.Continuation,
+            release: AsyncStream<Void>
+        ) async {
+            await GrammarConstrainedSampler.withTurnToolMask([GrammarToolSchema(name: name)]) {
+                installed.yield()
+                var iterator = release.makeAsyncIterator()
+                _ = await iterator.next()
+            }
+        }
+
+        let first = Task { await scope("first_only", installed: firstInstalledSink, release: firstRelease) }
+        for await _ in firstInstalled { break }
+        let second = Task { await scope("second_only", installed: secondInstalledSink, release: secondRelease) }
+        for await _ in secondInstalled { break }
+
+        // The FIRST scope ends while the second is still live.
+        firstReleaseSink.yield()
+        await first.value
+
+        XCTAssertTrue(GrammarConstrainedSampler.isScopedMaskInstalled)
+        sampler.reset()
+        XCTAssertEqual(
+            masked("<tool_call><function=", tokens: ["first_only>", "second_only>", "app_tool>"]),
+            [true, false, true],
+            "ending the first scope must leave the second scope's vocabulary installed"
+        )
+
+        secondReleaseSink.yield()
+        await second.value
+
+        XCTAssertFalse(GrammarConstrainedSampler.isScopedMaskInstalled)
+        sampler.reset()
+        XCTAssertEqual(
+            masked("<tool_call><function=", tokens: ["first_only>", "second_only>", "app_tool>"]),
+            [true, true, false],
+            "the app catalog must return once every scope has ended"
+        )
+    }
+
     func testSnapshotAndRestoreRoundTripsTheRegistry() {
         let sampler = GrammarConstrainedSampler.shared
         sampler.registerToolSchemas([GrammarToolSchema(name: "before")])

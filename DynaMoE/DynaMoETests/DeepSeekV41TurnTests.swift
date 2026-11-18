@@ -714,6 +714,75 @@ final class DeepSeekV41TurnLoopTests: XCTestCase {
         XCTAssertEqual(forward.forwardedPositions, [])
     }
 
+    /// `onCacheWillChange` is what invalidates app-wide state derived from the
+    /// KV cache (the prefix pin). It must fire ONLY after every gate that can
+    /// refuse the turn, and BEFORE the reset/resume: a refused turn overwrites
+    /// nothing, while dropping the pin for one costs the next turn a full
+    /// re-prefill.
+    func testTheCacheChangeCallbackFiresOnlyForATurnThatWillRun() throws {
+        var calls = 0
+        var sawResetBeforeCallback = false
+
+        // Empty prompt: refused before anything is touched.
+        let empty = ScriptedForward(positionLimit: 64, scripted: [5])
+        XCTAssertThrowsError(
+            try DeepSeekV41TurnRunner.run(
+                forward: empty,
+                promptTokenIds: [],
+                settings: settings(maxTokens: 1),
+                sample: { _, _ in 5 },
+                decode: { _ in "" },
+                onCacheWillChange: { calls += 1 }
+            )
+        )
+        XCTAssertEqual(calls, 0)
+
+        // Prompt past the position limit: still untouched.
+        let tooLong = ScriptedForward(positionLimit: 2, scripted: [5])
+        XCTAssertThrowsError(
+            try DeepSeekV41TurnRunner.run(
+                forward: tooLong,
+                promptTokenIds: [10, 11, 12],
+                settings: settings(maxTokens: 1),
+                sample: { _, _ in 5 },
+                decode: { _ in "" },
+                onCacheWillChange: { calls += 1 }
+            )
+        )
+        XCTAssertEqual(calls, 0)
+
+        // An image row outside the prompt: still untouched.
+        let stray = ScriptedForward(positionLimit: 64, scripted: [5])
+        XCTAssertThrowsError(
+            try DeepSeekV41TurnRunner.run(
+                forward: stray,
+                promptTokenIds: [10, 11],
+                imageEmbeddings: [2: [Float](repeating: 0, count: 8)],
+                settings: settings(maxTokens: 1),
+                sample: { _, _ in 5 },
+                decode: { _ in "" },
+                onCacheWillChange: { calls += 1 }
+            )
+        )
+        XCTAssertEqual(calls, 0)
+
+        // A valid turn: exactly once, before the reset.
+        let valid = ScriptedForward(positionLimit: 64, scripted: [2])
+        _ = try DeepSeekV41TurnRunner.run(
+            forward: valid,
+            promptTokenIds: [10, 11],
+            settings: settings(maxTokens: 1),
+            sample: { _, _ in 2 },
+            decode: { _ in "" },
+            onCacheWillChange: {
+                calls += 1
+                sawResetBeforeCallback = valid.resetCount > 0
+            }
+        )
+        XCTAssertEqual(calls, 1)
+        XCTAssertFalse(sawResetBeforeCallback, "the callback must precede the cache reset")
+    }
+
     /// An executor with no supplied-row entry refuses instead of falling back to the
     /// token embedding, which is what keeps a partial backend from answering about
     /// nothing.

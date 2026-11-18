@@ -327,6 +327,38 @@ final class LocalAgentBackendLogicTests: XCTestCase {
         XCTAssertNoThrow(
             try LocalAgentBackend.admission(hasLoadedModel: true, estimate: estimate, operatorOverride: true)
         )
+        // The override approves THE NUMBER THE CARD SHOWED. A pin or rate that
+        // moved while the card was open makes the current estimate different,
+        // and admitting it because the old card was clicked is consent the
+        // operator never gave.
+        let stale = LocalSubagentCostEstimate.make(
+            coordinatorPrefixTokens: 3_000,
+            runPromptTokens: 0,
+            tokensPerSecond: 5,
+            limitSeconds: 120
+        )
+        XCTAssertThrowsError(
+            try LocalAgentBackend.admission(
+                hasLoadedModel: true,
+                estimate: estimate,
+                operatorOverride: true,
+                approvedEstimate: stale
+            )
+        ) { error in
+            guard let backendError = error as? AgentBackendError,
+                  case .refused(let message) = backendError else {
+                return XCTFail("expected a refusal, got \(error)")
+            }
+            XCTAssertTrue(message.contains("changed after the card was shown"), message)
+        }
+        XCTAssertNoThrow(
+            try LocalAgentBackend.admission(
+                hasLoadedModel: true,
+                estimate: estimate,
+                operatorOverride: true,
+                approvedEstimate: estimate
+            )
+        )
     }
 
     // MARK: - The step's generation slot

@@ -259,6 +259,107 @@ final class WorkspaceIsolationTests: XCTestCase {
         )
     }
 
+    /// `safeURL` is the containment preflight for every path a patch touches.
+    /// It used to compare raw spellings only, so a symlinked directory inside
+    /// the tree could send a write outside it. The traversal and both symlink
+    /// forms are checked here; git refusing a symlinked write was the only
+    /// thing standing behind this before.
+    func testSafeURLRefusesTraversalAndSymlinksThatLeaveTheTree() throws {
+        let fileManager = FileManager.default
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dynamoe-safeurl-\(UUID().uuidString)", isDirectory: true)
+        let outside = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dynamoe-safeurl-outside-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: outside, withIntermediateDirectories: true)
+        defer {
+            try? fileManager.removeItem(at: root)
+            try? fileManager.removeItem(at: outside)
+        }
+        try "outside\n".write(to: outside.appendingPathComponent("target.txt"), atomically: true, encoding: .utf8)
+
+        XCTAssertEqual(
+            WorkspaceIsolation.safeURL(for: "src/new/file.txt", in: root)?.path,
+            root.appendingPathComponent("src/new/file.txt").path
+        )
+        XCTAssertNil(WorkspaceIsolation.safeURL(for: "../escape.txt", in: root))
+        XCTAssertNil(WorkspaceIsolation.safeURL(for: "/etc/passwd", in: root))
+
+        // A directory symlink escaping the tree.
+        try fileManager.createSymbolicLink(
+            at: root.appendingPathComponent("link"),
+            withDestinationURL: outside
+        )
+        XCTAssertNil(
+            WorkspaceIsolation.safeURL(for: "link/target.txt", in: root),
+            "a write through a symlinked directory must not leave the tree"
+        )
+        XCTAssertNil(
+            WorkspaceIsolation.safeURL(for: "link/new.txt", in: root),
+            "a file the patch would CREATE through the symlink must be refused too"
+        )
+
+        // A leaf symlink escaping the tree.
+        try fileManager.createSymbolicLink(
+            at: root.appendingPathComponent("leaf.txt"),
+            withDestinationURL: outside.appendingPathComponent("target.txt")
+        )
+        XCTAssertNil(
+            WorkspaceIsolation.safeURL(for: "leaf.txt", in: root),
+            "a write through a leaf symlink must not leave the tree"
+        )
+    }
+
+    /// The rollback exists for an apply that dies PARTWAY through, and the
+    /// helper test alone cannot prove the real `git apply` path reaches it.
+    /// This patch passes `git apply --check` and then fails while writing its
+    /// second file (the first file is in the way of the second's directory), so
+    /// it is the exact shape the snapshot is taken for: one file created, then
+    /// an error. The main tree must come back with nothing new in it.
+    func testAPartialGitApplyRollsTheTreeBack() async throws {
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: UUID(),
+            root: worktreeRoot
+        )
+        let changes = WorkspaceChangeSet(
+            changedFiles: ["partial-file", "partial-file/child"],
+            diff: """
+            diff --git a/partial-file b/partial-file
+            new file mode 100644
+            index 0000000..3e75765
+            --- /dev/null
+            +++ b/partial-file
+            @@ -0,0 +1 @@
+            +first
+            diff --git a/partial-file/child b/partial-file/child
+            new file mode 100644
+            index 0000000..3e75765
+            --- /dev/null
+            +++ b/partial-file/child
+            @@ -0,0 +1 @@
+            +second
+            """ + "\n",
+            diffWasTruncated: false
+        )
+
+        do {
+            _ = try await WorkspaceIsolation.apply(worktree, changeSet: changes)
+            XCTFail("the second file cannot be written under the first, so the apply must fail")
+        } catch let error as WorkspaceIsolationError {
+            guard case .applyFailed = error else {
+                return XCTFail("expected applyFailed, got \(error)")
+            }
+        }
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: repository.appendingPathComponent("partial-file").path),
+            "the file the failed apply had already created must be removed again"
+        )
+        let status = try await git(["status", "--porcelain"], in: repository)
+        XCTAssertEqual(status.1, "", "the main tree must be exactly as it was")
+    }
+
     func testSnapshotBoundsOnlyItsDisplayCopy() async throws {
         let worktree = try await WorkspaceIsolation.createWorktree(
             repositoryRoot: repository,
@@ -853,6 +954,17 @@ final class WorkspaceIsolationTests: XCTestCase {
             "the terminal record is what keeps the worktree from the launch sweep"
         )
 
+        // The commit's safeguard, asserted directly: the bulk Clear button
+        // must not dispose of an unapplied isolated run (its record is the
+        // worktree's only protection). The per-run discard below is the one
+        // path allowed to make that decision.
+        SubagentManager.shared.clearCompleted(sessionId: session)
+        XCTAssertNotNil(SubagentManager.shared.getSubagent(byId: runId))
+        XCTAssertNotNil(
+            AgentRunStore.shared.load(runId: runId, sessionId: session),
+            "clearCompleted must spare an unapplied isolated run"
+        )
+
         SubagentManager.shared.discard(runId: runId, sessionId: session)
 
         XCTAssertNil(SubagentManager.shared.getSubagent(byId: runId))
@@ -1307,6 +1419,30 @@ final class WorkspaceIsolationTests: XCTestCase {
         XCTAssertEqual(changes.changedFiles, ["README.md"])
     }
 
+    /// A carded `shell_run` can `git checkout` another branch inside the
+    /// sandbox. The `.git` pointer is intact, so the linkage check alone says
+    /// yes; the HEAD check is what stops a later cardless `git_commit` from
+    /// moving a branch the run never owned.
+    func testASnapshotRefusesAWorktreeWhoseHeadMoved() async throws {
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: UUID(),
+            root: worktreeRoot
+        )
+        _ = try await git(["checkout", "-b", "operator-other"], in: worktree.path)
+
+        do {
+            _ = try await WorkspaceIsolation.snapshot(worktree)
+            XCTFail("a worktree on another branch must refuse the snapshot")
+        } catch let error as WorkspaceIsolationError {
+            guard case .worktreeLinkageCompromised(let detail) = error else {
+                return XCTFail("expected worktreeLinkageCompromised, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("HEAD"), detail)
+            XCTAssertTrue(detail.contains("operator-other"), detail)
+        }
+    }
+
     /// When the repository's own records are gone too, nothing can repair the
     /// linkage, and the snapshot must REFUSE rather than run a single git
     /// command through it — keeping the worktree so the files survive.
@@ -1418,7 +1554,7 @@ final class WorkspaceIsolationTests: XCTestCase {
         ))
         XCTAssertEqual(result.record.status, .withheld, "the linkage refusal is a policy withholding")
         XCTAssertTrue(
-            result.record.error?.contains("git metadata") == true,
+            result.record.error?.contains("no longer the checkout") == true,
             result.record.error ?? ""
         )
         let status = try await git(["status", "--porcelain"], in: repository)
@@ -1691,6 +1827,133 @@ final class WorkspaceIsolationTests: XCTestCase {
         XCTAssertFalse(applied.alreadyApplied)
         XCTAssertEqual(applied.changedFiles, ["same_repo.txt"])
         XCTAssertTrue(FileManager.default.fileExists(atPath: repository.appendingPathComponent("same_repo.txt").path))
+        // A REAL apply must give both claims back, not only the refusal path.
+        XCTAssertFalse(SubagentApplyService.isRunInFlight(runId))
+        XCTAssertFalse(SubagentApplyService.hasAnyRepositoryInFlight)
+    }
+
+    /// The claims must be released on a FAILED apply, not only refused while
+    /// one is held by the debug seam. A conflict throws after both claims are
+    /// taken, and a leaked claim wedges the run and its checkout for the rest
+    /// of the process.
+    func testAFailedApplyReleasesItsRunAndRepositoryClaims() async throws {
+        let runId = UUID()
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: runId,
+            root: worktreeRoot
+        )
+        var worktreeReadme = try String(contentsOf: worktree.path.appendingPathComponent("README.md"), encoding: .utf8)
+        worktreeReadme = worktreeReadme.replacingOccurrences(of: "line two", with: "worktree line two")
+        try worktreeReadme.write(
+            to: worktree.path.appendingPathComponent("README.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let mainReadmeURL = repository.appendingPathComponent("README.md")
+        var mainReadme = try String(contentsOf: mainReadmeURL, encoding: .utf8)
+        mainReadme = mainReadme.replacingOccurrences(of: "line two", with: "main line two")
+        try mainReadme.write(to: mainReadmeURL, atomically: true, encoding: .utf8)
+
+        let record = AgentRunRecord(
+            id: runId,
+            role: "Implementer",
+            preset: .implementer,
+            task: "Edit the readme.",
+            backend: .scripted,
+            workingDirectory: worktree.path.path,
+            isolation: worktree.isolation,
+            allowedTools: ["file_write"],
+            status: .completed
+        )
+        AgentRunStore.shared.saveImmediately(record)
+        defer {
+            AgentRunStore.shared.delete(runId: runId, sessionId: nil)
+            Task { await WorkspaceIsolation.cleanup(worktree) }
+            try? FileManager.default.removeItem(at: repository.appendingPathComponent("README.md"))
+            try? mainReadme.write(to: mainReadmeURL, atomically: true, encoding: .utf8)
+        }
+
+        do {
+            _ = try await SubagentApplyService.apply(runId: runId)
+            XCTFail("a conflicting apply must fail")
+        } catch let error as WorkspaceIsolationError {
+            guard case .applyConflicted = error else {
+                return XCTFail("expected applyConflicted, got \(error)")
+            }
+        }
+
+        XCTAssertFalse(
+            SubagentApplyService.isRunInFlight(runId),
+            "a failed apply must release its run claim"
+        )
+        XCTAssertFalse(
+            SubagentApplyService.hasAnyRepositoryInFlight,
+            "a failed apply must release its repository claim"
+        )
+    }
+
+    /// A run can COMMIT and then check the base branch out. The tree is clean,
+    /// so the old empty-change path wrote `appliedAt` and ran `branch -D`,
+    /// leaving the commit reachable only through the reflog. The HEAD check
+    /// refuses the snapshot and the apply keeps the worktree.
+    func testAWorktreeThatCheckedOutTheBaseIsNotAppliedOrDeleted() async throws {
+        let runId = UUID()
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: runId,
+            root: worktreeRoot
+        )
+        try "committed work\n".write(
+            to: worktree.path.appendingPathComponent("committed.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        _ = try await git(["add", "-A"], in: worktree.path)
+        let commit = try await git(["commit", "-m", "run's own commit"], in: worktree.path)
+        XCTAssertEqual(commit.0, 0, commit.2)
+        // The run leaves its branch after committing (the base branch itself
+        // is checked out in the main tree, so a linked worktree cannot take it;
+        // a detached checkout of the base is the reachable "clean tree, HEAD
+        // elsewhere" shape). The branch ref still holds the commit.
+        let checkout = try await git(["checkout", "--detach", worktree.baseCommit], in: worktree.path)
+        XCTAssertEqual(checkout.0, 0, checkout.2)
+
+        let record = AgentRunRecord(
+            id: runId,
+            role: "Implementer",
+            preset: .implementer,
+            task: "Commit a file.",
+            backend: .scripted,
+            workingDirectory: worktree.path.path,
+            isolation: worktree.isolation,
+            allowedTools: ["file_write"],
+            status: .completed
+        )
+        AgentRunStore.shared.saveImmediately(record)
+        defer {
+            AgentRunStore.shared.delete(runId: runId, sessionId: nil)
+            Task { await WorkspaceIsolation.cleanup(worktree) }
+        }
+
+        do {
+            _ = try await SubagentApplyService.apply(runId: runId)
+            XCTFail("a worktree that is no longer on its own branch must not be applied")
+        } catch let error as WorkspaceIsolationError {
+            guard case .worktreeLinkageCompromised(let detail) = error else {
+                return XCTFail("expected worktreeLinkageCompromised, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("HEAD"), detail)
+            XCTAssertTrue(detail.contains(worktree.branch), detail)
+        }
+
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: worktree.path.path),
+            "the worktree is the operator's only copy of the committed work"
+        )
+        XCTAssertNil(AgentRunStore.shared.loadAny(runId: runId)?.appliedAt)
+        let branch = try await git(["rev-parse", "--verify", worktree.branch], in: repository)
+        XCTAssertEqual(branch.0, 0, "the run's branch, and its commit, must still exist")
     }
 
     // MARK: - Nested repositories (gitlinks)

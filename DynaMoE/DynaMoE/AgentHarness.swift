@@ -2376,7 +2376,7 @@ public final class SpawnSubagentTool: AgentTool {
                 "allowed_tools": [
                     "type": "array",
                     "items": ["type": "string"],
-                    "description": "List of tools the subagent is permitted to call (optional). Defaults to the preset's tool set."
+                    "description": "List of tools the subagent is permitted to call (optional). Omit it to use the preset's tool set; an explicit empty list is refused, because a run with no tools cannot finish."
                 ],
                 "context_summary": [
                     "type": "string",
@@ -2447,8 +2447,18 @@ public final class SpawnSubagentTool: AgentTool {
         }
 
         var allowedTools: [String] = []
+        // Nil means the argument was OMITTED (use the preset); an explicit
+        // empty array means "no tools", which a model-backed run cannot start
+        // with and is refused by name in `resolveTools`. Collapsing the two
+        // here is what made `allowed_tools: []` silently grant the preset.
+        var explicitAllowedTools: [String]? = nil
         if let toolsArray = arguments["allowed_tools"] as? [String] {
             allowedTools = toolsArray
+            explicitAllowedTools = toolsArray
+        }
+        if let explicitAllowedTools, explicitAllowedTools.isEmpty {
+            let err = "Error: 'allowed_tools' was an explicit empty list. Omit it to use the preset's tools; a run with no tools cannot finish or change anything."
+            return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: err), nil, err, false)
         }
         let contextSummary = arguments["context_summary"] as? String
         let runInBackground = (arguments["run_in_background"] as? Bool) ?? false
@@ -2472,13 +2482,24 @@ public final class SpawnSubagentTool: AgentTool {
         let parentTurnId = AgentHarness.executingTurnId
             ?? (inRunScope ? nil : AgentHarness.shared.currentTurnId)
         if backendSelection.error == nil, backendSelection.modelBacked {
+            let runId = UUID()
+            // Priced ONCE, from the same pin and measured rate the backend
+            // will consult, so the refusal's number is the number the card
+            // shows and the number admission compares against.
+            let localCostEstimate = LocalAgentBackend.costEstimate(
+                runSessionId: runId,
+                promptTokenEstimate: LocalAgentBackend.spawnPromptTokenEstimate(
+                    task: taskDesc,
+                    contextSummary: contextSummary
+                )
+            )
             let request = AgentSpawnRequest(
                 role: role,
                 taskDescription: taskDesc,
                 contextSummary: contextSummary,
                 presetName: arguments["preset"] as? String,
                 backendPreference: backendSelection.preference,
-                explicitToolNames: allowedTools.isEmpty ? nil : allowedTools,
+                explicitToolNames: explicitAllowedTools,
                 budgetOverrides: Self.budgetOverrides(from: arguments["budget"]),
                 isolation: Self.isolation(from: arguments["isolation"]),
                 workingDirectory: spawnDirectory,
@@ -2487,9 +2508,9 @@ public final class SpawnSubagentTool: AgentTool {
                 parentMode: parentMode,
                 thinking: (arguments["thinking"] as? Bool) ?? false,
                 operatorOverride: false,
+                localCostEstimate: localCostEstimate,
                 priority: .userRequested
             )
-            let runId = UUID()
             do {
                 let plan = try await AgentSpawnResolver.resolve(
                     request,
@@ -2547,6 +2568,10 @@ public final class SpawnSubagentTool: AgentTool {
                 guard !Task.isCancelled else { return Self.stoppedBeforeStartResult() }
                 var overridden = request
                 overridden.operatorOverride = true
+                // The click approves the number the card showed. Admission
+                // refuses if the pin or the measured rate moved while the card
+                // was open, instead of silently admitting a larger estimate.
+                overridden.approvedLocalCost = localCostEstimate
                 do {
                     let plan = try await AgentSpawnResolver.resolve(
                         overridden,
@@ -3259,6 +3284,9 @@ public final class ApplySubagentChangesTool: AgentTool {
                 } else {
                     composed += " The worktree was KEPT: it also holds git-ignored files a patch cannot carry (\(outcome.keptIgnoredFiles.joined(separator: ", "))). Retrieve them manually before the run is cleared."
                 }
+                if outcome.keptBranch {
+                    composed += " Its branch '\(outcome.branch)' was KEPT because it holds commits a patch cannot carry; merge or delete it manually when you are done."
+                }
                 message = composed
             }
             var jsonData: [String: Any] = [
@@ -3269,6 +3297,7 @@ public final class ApplySubagentChangesTool: AgentTool {
                 "already_applied": outcome.alreadyApplied,
                 "applied_at": formatter.string(from: outcome.appliedAt),
                 "kept_ignored_files": outcome.keptIgnoredFiles,
+                "kept_branch": outcome.keptBranch,
                 "message": message
             ]
             if let destination = outcome.destinationBranch {
@@ -4023,6 +4052,11 @@ public final class AgentHarness {
     /// that is not worktree-isolated (or a restored record that predates the
     /// field — those fall back to the snapshot/apply-time verification).
     public private(set) var workspaceRepositoryRoot: URL?
+    /// The branch the worktree was created on. A carded `shell_run` can
+    /// checkout another branch inside the sandbox; a cardless `git_commit`
+    /// must not then move it, so this is the branch the commit guard checks
+    /// HEAD against.
+    public private(set) var workspaceBranch: String?
     public var runApprovalHandler: (@Sendable (AgentApprovalRequest) async -> Bool)?
 
     private init() {
@@ -4060,6 +4094,7 @@ public final class AgentHarness {
         approvalPolicy: AgentApprovalPolicy,
         workspaceIsolated: Bool,
         workspaceRepositoryRoot: URL? = nil,
+        workspaceBranch: String? = nil,
         approvalHandler: (@Sendable (AgentApprovalRequest) async -> Bool)?
     ) throws {
         guard isRunScoped else { throw AgentRunScopeError.notRunScoped }
@@ -4078,6 +4113,7 @@ public final class AgentHarness {
         self.runApprovalPolicy = approvalPolicy
         self.isWorkspaceIsolated = workspaceIsolated
         self.workspaceRepositoryRoot = workspaceRepositoryRoot
+        self.workspaceBranch = workspaceBranch
         self.runApprovalHandler = approvalHandler
     }
 
@@ -6443,11 +6479,15 @@ public final class AgentHarness {
                 runId: runId ?? UUID(),
                 repositoryRoot: repositoryRoot,
                 path: workspace,
-                branch: "",
+                branch: workspaceBranch ?? "",
                 baseCommit: ""
             )
-            if let problem = await WorkspaceIsolation.worktreeLinkageProblem(worktree) {
-                let err = "SUBAGENT POLICY: git_commit was not executed because the worktree's git metadata no longer points at the repository it was created from (\(problem)). Nothing was staged or committed; the worktree and its files were kept."
+            var problem = await WorkspaceIsolation.worktreeLinkageProblem(worktree)
+            if problem == nil {
+                problem = await WorkspaceIsolation.worktreeHeadProblem(worktree)
+            }
+            if let problem {
+                let err = "SUBAGENT POLICY: git_commit was not executed because the worktree is no longer the checkout it was created as (\(problem)). Nothing was staged or committed; the worktree and its files were kept."
                 let json = AgentHarness.toolErrorJSON(tool: call.name, error: err)
                 let rec = ToolCallRecord(
                     name: call.name,

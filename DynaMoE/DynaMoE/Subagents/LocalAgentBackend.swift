@@ -50,7 +50,9 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
         sessionId: UUID,
         thinking: Bool,
         promptTokenEstimate: Int = 0,
+        estimatedCost: LocalSubagentCostEstimate? = nil,
         operatorOverride: Bool = false,
+        approvedEstimate: LocalSubagentCostEstimate? = nil,
         defaults: UserDefaults = .standard
     ) throws -> LocalAgentBackend {
         let engine = CompletionEngine.shared
@@ -59,12 +61,20 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
                 "A local subagent run needs a loaded model. Load a checkpoint in Settings first, or send this work to a cloud backend."
             )
         }
-        let estimate = costEstimate(
+        // The caller's estimate is the one the spawn card showed, computed
+        // from the same pin and rate a moment earlier. Recomputing here is
+        // only the fallback for callers with no card.
+        let estimate = estimatedCost ?? costEstimate(
             runSessionId: sessionId,
             promptTokenEstimate: promptTokenEstimate,
             defaults: defaults
         )
-        try admission(hasLoadedModel: true, estimate: estimate, operatorOverride: operatorOverride)
+        try admission(
+            hasLoadedModel: true,
+            estimate: estimate,
+            operatorOverride: operatorOverride,
+            approvedEstimate: approvedEstimate
+        )
         return LocalAgentBackend(
             descriptor: AgentBackendDescriptor(
                 kind: .local,
@@ -82,19 +92,35 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
     static func admission(
         hasLoadedModel: Bool,
         estimate: LocalSubagentCostEstimate,
-        operatorOverride: Bool
+        operatorOverride: Bool,
+        approvedEstimate: LocalSubagentCostEstimate? = nil
     ) throws {
         guard hasLoadedModel else {
             throw AgentBackendError.unavailable(
                 "A local subagent run needs a loaded model. Load a checkpoint in Settings first, or send this work to a cloud backend."
             )
         }
-        guard estimate.admits(operatorOverride: operatorOverride) else {
+        if operatorOverride,
+           let approvedEstimate,
+           let drift = estimate.approvalDriftMessage(approved: approvedEstimate) {
+            throw AgentBackendError.refused(drift)
+        }
+        guard estimate.admits(
+            operatorOverride: operatorOverride,
+            approvedEstimate: approvedEstimate
+        ) else {
             throw AgentBackendError.refused(
                 (estimate.refusalMessage ?? "This local run exceeds the configured cost limit.")
                     + " Estimated cost: " + estimate.summary + "."
             )
         }
+    }
+
+    /// The prompt size a spawn card prices. One function so the estimate the
+    /// card SHOWS and the estimate `make` compares against can never be
+    /// computed from different inputs.
+    static func spawnPromptTokenEstimate(task: String, contextSummary: String?) -> Int {
+        max(1, (task.count + (contextSummary?.count ?? 0)) / 4 + 600)
     }
 
     /// What this spawn would cost the coordinator. Pure of engine state except the
@@ -134,7 +160,13 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
         do {
             return try await GrammarConstrainedSampler.withTurnToolMask(prepared.maskSchemas) {
                 let launch = try await MainActor.run { () -> CompletionLaunch in
-                    try CompletionEngine.shared.launchTurn(prepared.turn, claim: prepared.claim)
+                    // Cancellation can land during the hop to the main actor,
+                    // after the check above and before this closure runs. The
+                    // check must be INSIDE the hop: a launch resets the KV
+                    // cache and moves the prefix pin, so a stopped run that
+                    // still launched paid for a turn nobody would consume.
+                    if Task.isCancelled { throw AgentBackendError.cancelled }
+                    return try CompletionEngine.shared.launchTurn(prepared.turn, claim: prepared.claim)
                 }
                 return try await withTaskCancellationHandler {
                     try await Self.collect(launch: launch, request: request)

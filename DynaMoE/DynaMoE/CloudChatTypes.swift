@@ -722,6 +722,7 @@ public nonisolated final class CloudTurnReceipt: @unchecked Sendable {
     private var spent: Bool?
     private var terminalResult: CloudTurnResult?
     private var terminalFailure: CloudTurnFailure?
+    private var retryAfter: Double?
 
     public init() {}
 
@@ -748,6 +749,21 @@ public nonisolated final class CloudTurnReceipt: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return terminalFailure
+    }
+
+    /// The provider's `Retry-After` for a refusal that carries one (a 429),
+    /// already clamped by the transport. Nil when the header was absent or
+    /// unparseable.
+    public var retryAfterSeconds: Double? {
+        lock.lock()
+        defer { lock.unlock() }
+        return retryAfter
+    }
+
+    func record(retryAfterSeconds seconds: Double) {
+        lock.lock()
+        retryAfter = seconds
+        lock.unlock()
     }
 
     /// Records the transport's current answer. A later attempt or a terminal

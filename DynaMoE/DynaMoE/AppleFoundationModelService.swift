@@ -417,7 +417,10 @@ public enum AppleFoundationModelService {
     /// information, so both stay out. Returns nil when a message holds
     /// nothing worth keeping, which is what "nothing to compact" keys on.
     nonisolated public static func compactionTranscriptTurn(for message: ChatMessage) -> String? {
-        guard message.role != .system else { return nil }
+        // A prompt-only row is relay machinery the model reads for one turn:
+        // it is not conversation, and folding "User: [subagent report]…" into
+        // the permanent digest invents a turn the operator never sent.
+        guard message.role != .system, message.isPromptOnly != true else { return nil }
         var parts: [String] = []
         let speaker = message.role == .user ? "User" : "Assistant"
         let content = stripLeadingSpeakerLabel(message.content)

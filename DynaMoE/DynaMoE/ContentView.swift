@@ -324,20 +324,39 @@ struct ContentView: View {
         releaseQueuedGenerationFlags(ifOwnedBy: sessionId)
     }
 
+    /// Publishes the generating state for a queued send, and names the
+    /// conversation that owns it.
+    ///
+    /// The owner used to be set only when it was nil, so after any completed
+    /// turn in conversation A a queued send in B set `isGeneratingText` but
+    /// left `generatingSessionId = A`. Its exit checks ownership against B,
+    /// so a relaunch that never launched (session deleted, launch refused,
+    /// retry budget spent) left the composer claiming a generation forever:
+    /// every composer refused sends while B drew a plain Send button.
+    /// A send behind a LIVE generation must not repoint what Stop reads, so
+    /// the pair is only taken over when nothing owns it; a stale flag with no
+    /// task and no queued owner is recovered here too.
+    private func publishQueuedGenerationFlags(sessionId: UUID?) {
+        let hasLiveOwner = generationTask != nil || !deferredRelaunchTasks.isEmpty
+        guard !isGeneratingText || !hasLiveOwner else { return }
+        isGeneratingText = true
+        generatingSessionId = sessionId
+    }
+
     /// Clears the composer's generating state for a send that never became a
     /// turn. Guarded on ownership: a live turn (`generationTask`) keeps its
     /// flag, another conversation's run keeps its own, and a nested queued
     /// relaunch has its own exit to clean up after.
     private func releaseQueuedGenerationFlags(ifOwnedBy sessionId: UUID?) {
-        // A queued task for THIS conversation still owns the flag and clears
-        // it on its own exit. Another conversation's queued send is irrelevant:
-        // waiting for it to drain left this conversation's flag stuck.
-        let hasQueuedOwner = sessionId.map { id in
-            deferredRelaunchSessions.values.contains(id)
-        } ?? !deferredRelaunchTasks.isEmpty
-        guard generationTask == nil,
-              !hasQueuedOwner,
-              generatingSessionId == sessionId else { return }
+        guard generationTask == nil, generatingSessionId == sessionId else { return }
+        // Another queued send still needs the flag: repoint it rather than
+        // clearing it, or the composer loses its Stop control for the rest of
+        // that send's wait. When none remain, the state is genuinely idle.
+        if let next = deferredRelaunchSessions.values.first {
+            isGeneratingText = true
+            generatingSessionId = next
+            return
+        }
         isGeneratingText = false
         generatingSessionId = nil
     }
@@ -6618,12 +6637,7 @@ struct ContentView: View {
             // guarded publication the slot wait further down makes; Stop then
             // cancels exactly this task (`cancelDeferredRelaunches`), and a
             // relaunch that is refused clears the flag itself.
-            if !isGeneratingText {
-                isGeneratingText = true
-            }
-            if generatingSessionId == nil {
-                generatingSessionId = sessionId
-            }
+            publishQueuedGenerationFlags(sessionId: sessionId)
             // Tracked so Stop can cancel it: the operator pressed Stop while
             // the send sat queued behind the preemption, and without this the
             // task relaunched the stopped turn as soon as the engine drained.
@@ -6768,12 +6782,7 @@ struct ContentView: View {
             // ANOTHER session's live generation never repoints the state that
             // Stop and retention read; a refused relaunch below clears the
             // flag itself, and Stop clears it on the way in.
-            if !isGeneratingText {
-                isGeneratingText = true
-            }
-            if generatingSessionId == nil {
-                generatingSessionId = sessionId
-            }
+            publishQueuedGenerationFlags(sessionId: sessionId)
             // Tracked so Stop can cancel it — see the preemption branch above.
             let relaunchKey = UUID()
             if let sessionId { deferredRelaunchSessions[relaunchKey] = sessionId }

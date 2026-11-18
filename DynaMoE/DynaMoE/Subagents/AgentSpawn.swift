@@ -22,6 +22,7 @@ nonisolated enum AgentSpawnError: LocalizedError, Equatable {
     case unknownTool(String)
     case notAvailableToRuns(String)
     case costCeilingWithoutPricing(String)
+    case costCeilingOnUnpricedBackend(String)
     case invalidBudgetOverride(String)
 
     var errorDescription: String? {
@@ -40,6 +41,8 @@ nonisolated enum AgentSpawnError: LocalizedError, Equatable {
             return "Tool '\(name)' exists only in the coordinator's catalog (a dynamically loaded or MCP tool), and a subagent run installs the built-in tools alone."
         case .costCeilingWithoutPricing(let model):
             return "This spawn sets a max_cost_usd ceiling, but no price is recorded for '\(model)', so the ceiling could never bind. Record the model's input and output prices in Settings under Cloud Providers, or clear the ceiling."
+        case .costCeilingOnUnpricedBackend(let backend):
+            return "This spawn sets a max_cost_usd ceiling, but '\(backend)' is not a cloud model: it bills no dollars, so the run would always report $0 spent and the ceiling could never bind. Clear the ceiling, or run this work on a cloud model with recorded prices."
         case .invalidBudgetOverride(let detail):
             return "The spawn's budget was refused: \(detail) The run was not started."
         }
@@ -63,6 +66,14 @@ nonisolated struct AgentSpawnRequest: Sendable {
     var parentMode: AgentMode
     var thinking: Bool
     var operatorOverride: Bool
+    /// The estimate the spawn card was priced with. Resolved once by the
+    /// caller so the number shown and the number admission compares are the
+    /// same inputs.
+    var localCostEstimate: LocalSubagentCostEstimate? = nil
+    /// The estimate the operator actually approved. Admission refuses when a
+    /// recomputed estimate no longer matches it, because a click approves a
+    /// number rather than the idea of a local run.
+    var approvedLocalCost: LocalSubagentCostEstimate? = nil
     var priority: AgentSchedulingPriority
     var sampling: AgentSampling
 
@@ -81,6 +92,8 @@ nonisolated struct AgentSpawnRequest: Sendable {
         parentMode: AgentMode = .code,
         thinking: Bool = false,
         operatorOverride: Bool = false,
+        localCostEstimate: LocalSubagentCostEstimate? = nil,
+        approvedLocalCost: LocalSubagentCostEstimate? = nil,
         priority: AgentSchedulingPriority = .userRequested,
         sampling: AgentSampling = .default
     ) {
@@ -98,6 +111,8 @@ nonisolated struct AgentSpawnRequest: Sendable {
         self.parentMode = parentMode
         self.thinking = thinking
         self.operatorOverride = operatorOverride
+        self.localCostEstimate = localCostEstimate
+        self.approvedLocalCost = approvedLocalCost
         self.priority = priority
         self.sampling = sampling
     }
@@ -156,12 +171,16 @@ enum AgentSpawnResolver {
         let toolNames = try resolveTools(request, definition: definition)
         // A non-finite ceiling is not a budget: `max(0, .nan)` folds to 0 in
         // the budget builder, and a "$0 ceiling" fails the run at step 0 with
-        // a cost failure the operator never asked for. Refuse it at the card,
-        // before any backend or worktree exists to clean up.
-        if let ceiling = request.budgetOverrides?.maxCostUSD, !ceiling.isFinite {
-            throw AgentSpawnError.invalidBudgetOverride(
-                "max_cost_usd must be a finite dollar amount; '\(ceiling)' cannot be enforced as a ceiling."
-            )
+        // a cost failure the operator never asked for. Refuse both at the
+        // card, before any backend or worktree exists to clean up. Zero is
+        // refused too: no step can ever cost less than $0, so the loop would
+        // report "exhausted its cost budget" before doing any work.
+        if let ceiling = request.budgetOverrides?.maxCostUSD {
+            guard ceiling.isFinite, ceiling > 0 else {
+                throw AgentSpawnError.invalidBudgetOverride(
+                    "max_cost_usd must be a finite dollar amount greater than 0; '\(ceiling)' cannot be enforced as a ceiling."
+                )
+            }
         }
         let budget = AgentRolePresetCatalog.budget(for: definition, overrides: request.budgetOverrides)
 
@@ -269,9 +288,17 @@ enum AgentSpawnResolver {
         // `mcp__…` name the run could never configure, so the approved spawn
         // failed at start instead of at the card.
         let catalog = AgentHarness.runScopedToolNames()
-        let requested = request.explicitToolNames?.isEmpty == false
-            ? request.explicitToolNames!
-            : definition.toolNames
+        // An EXPLICIT empty list is not the same as an omitted one. It used to
+        // silently fall back to the preset, so a caller that asked for no
+        // tools got a writer. Refuse it by name instead: a model-backed run
+        // with no tools cannot even call `complete`, so there is no run to
+        // start.
+        if let explicit = request.explicitToolNames, explicit.isEmpty {
+            throw AgentSpawnError.noBackend(
+                "This spawn set allowed_tools to an empty list. A model-backed run with no tools cannot finish or change anything; omit allowed_tools to use the preset's tool set."
+            )
+        }
+        let requested = request.explicitToolNames ?? definition.toolNames
         var seen = Set<String>()
         var resolved: [String] = []
         for raw in requested {
@@ -315,9 +342,14 @@ enum AgentSpawnResolver {
         descriptor: AgentBackendDescriptor,
         defaults: UserDefaults = .standard
     ) -> AgentSpawnError? {
-        guard let ceiling = budget.maxCostUSD, ceiling >= 0 else { return nil }
-        guard descriptor.kind == .cloud,
-              let providerId = descriptor.providerId,
+        guard let ceiling = budget.maxCostUSD, ceiling > 0 else { return nil }
+        guard descriptor.kind == .cloud else {
+            // A local or pipeline backend reports no dollar cost at all, so
+            // the ceiling is inert for a reason recording a price cannot
+            // fix. The old message sent the operator to Cloud Providers.
+            return .costCeilingOnUnpricedBackend(descriptor.displayName)
+        }
+        guard let providerId = descriptor.providerId,
               let modelId = descriptor.modelId,
               CloudPricingStore.pricing(forModel: modelId, providerId: providerId, defaults: defaults) != nil else {
             return .costCeilingWithoutPricing(descriptor.displayName)
@@ -334,16 +366,26 @@ enum AgentSpawnResolver {
     ) throws -> (any AgentModelBackend, AgentSchedulingClass, AgentBackendDescriptor) {
         let engine = CompletionEngine.shared
         let hasLocalModel = engine.loadedModelInfo != nil && engine.promptModelConfig != nil
-        let cloudPreference = SubagentBackendSettings.preferredCloudModel(coordinateModelId: nil, defaults: defaults)
+        let cloudPreference = SubagentBackendSettings.preferredCloudModel(defaults: defaults)
 
         func makeLocal() throws -> (any AgentModelBackend, AgentSchedulingClass, AgentBackendDescriptor) {
-            let estimate = max(1, (task.count + (request.contextSummary?.count ?? 0)) / 4 + 600)
+            let estimate = LocalAgentBackend.spawnPromptTokenEstimate(
+                task: task,
+                contextSummary: request.contextSummary
+            )
             let backend = try LocalAgentBackend.make(
                 runId: runId,
                 sessionId: sessionId,
                 thinking: request.thinking,
                 promptTokenEstimate: estimate,
+                // The first pass shows the number the card was priced with.
+                // An OVERRIDE must be judged against a CURRENT estimate, or a
+                // card left open while the pin or the measured rate moved
+                // would approve a number that is no longer true; `admission`
+                // compares the recomputed estimate against `approvedEstimate`.
+                estimatedCost: request.operatorOverride ? nil : request.localCostEstimate,
                 operatorOverride: request.operatorOverride,
+                approvedEstimate: request.approvedLocalCost,
                 defaults: defaults
             )
             return (backend, .local, backend.descriptor)

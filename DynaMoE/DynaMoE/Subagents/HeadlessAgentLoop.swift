@@ -135,7 +135,15 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             if let maxCost = input.budget.maxCostUSD {
                 if usage.costIsUnpriced {
                     status = .failed
-                    failure = "The run has a \(Self.currency(maxCost)) cost ceiling, but no price is recorded for its model, so the ceiling cannot be enforced."
+                    switch usage.costUnpricedReason {
+                    case .providerOmittedUsage:
+                        // The price IS recorded; the provider withheld the
+                        // counts. Sending the operator to Settings to fix a
+                        // price that already exists is a dead end.
+                        failure = "The run has a \(Self.currency(maxCost)) cost ceiling, but its provider billed a request and reported no usage for it, so neither the tokens nor the cost can be priced. The ceiling cannot be enforced. Clear the ceiling, or check the provider's dashboard for the spend."
+                    case .noPriceRecorded, .none:
+                        failure = "The run has a \(Self.currency(maxCost)) cost ceiling, but no price is recorded for its model, so the ceiling cannot be enforced."
+                    }
                     break
                 }
                 if usage.costUSD >= maxCost {
@@ -231,6 +239,7 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             // context count; `merge` cannot infer it because backends report
             // only the billed sum, and the sum is not what the drawer shows.
             usage.latestPromptTokens = turn.usage.promptTokens
+            usage.latestCompletionTokens = turn.usage.completionTokens
             usage.wallClockSeconds = CFAbsoluteTimeGetCurrent() - start
 
             // The text lands first even when the turn then fails a budget or a

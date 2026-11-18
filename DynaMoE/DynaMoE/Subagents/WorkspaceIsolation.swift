@@ -435,9 +435,44 @@ nonisolated enum WorkspaceIsolation {
     /// retargeted pointer is repaired (when the repo's records are intact) or
     /// refused — never followed.
     static func verifyWorktreeLinkage(_ worktree: AgentWorktree) async throws {
-        if await worktreeLinkageProblem(worktree) == nil { return }
+        if await worktreeLinkageProblem(worktree) == nil {
+            try await verifyWorktreeHead(worktree)
+            return
+        }
         _ = try? await git(["worktree", "repair", worktree.path.path], in: worktree.repositoryRoot)
         if let problem = await worktreeLinkageProblem(worktree) {
+            throw WorkspaceIsolationError.worktreeLinkageCompromised(problem)
+        }
+        try await verifyWorktreeHead(worktree)
+    }
+
+    /// What makes a worktree's HEAD untrustworthy, or nil when it is still on
+    /// the branch `createWorktree` checked out.
+    ///
+    /// A worktree is a real checkout, so a carded `shell_run` can `git
+    /// checkout` anything in it. The next cardless `git_commit` would then
+    /// commit onto — and move — that other branch while the record still
+    /// claims the run's own. The linkage check alone cannot see this: the
+    /// `.git` pointer is intact and points at the right repository. An empty
+    /// recorded branch (a caller that has none to compare against) answers
+    /// nil.
+    static func worktreeHeadProblem(_ worktree: AgentWorktree) async -> String? {
+        guard !worktree.branch.isEmpty else { return nil }
+        guard let (code, out, _) = try? await git(
+            ["rev-parse", "--abbrev-ref", "HEAD"],
+            in: worktree.path
+        ), code == 0 else {
+            return "its HEAD could not be read, so the branch the run was created on cannot be confirmed"
+        }
+        let checkedOut = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard checkedOut == worktree.branch else {
+            return "its HEAD is on '\(checkedOut)', not the branch it was created on ('\(worktree.branch)'). A checkout inside the worktree would make the run commit onto another branch; the worktree was kept so nothing is lost."
+        }
+        return nil
+    }
+
+    static func verifyWorktreeHead(_ worktree: AgentWorktree) async throws {
+        if let problem = await worktreeHeadProblem(worktree) {
             throw WorkspaceIsolationError.worktreeLinkageCompromised(problem)
         }
     }
@@ -786,6 +821,27 @@ nonisolated enum WorkspaceIsolation {
         guard targetPath.hasPrefix(rootPath.hasSuffix("/") ? rootPath : rootPath + "/") else {
             return nil
         }
+        // The RAW comparison above proves the spelling, not the filesystem.
+        // A symlinked directory inside the tree can point outside it, and git
+        // would happily write through it; resolve the deepest existing
+        // ancestor (and the leaf, when it exists) and refuse when it leaves
+        // the resolved root. Both sides are resolved together so `/var` and
+        // `/private/var` spellings still compare.
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: root.path) else { return url }
+        let resolvedRoot = root.resolvingSymlinksInPath().standardizedFileURL.path
+        let resolvedPrefix = resolvedRoot.hasSuffix("/") ? resolvedRoot : resolvedRoot + "/"
+        func isInside(_ resolved: String) -> Bool {
+            resolved == resolvedRoot || resolved.hasPrefix(resolvedPrefix)
+        }
+        if let ancestor = existingAncestor(of: url, fileManager: fileManager) {
+            let resolvedAncestor = ancestor.resolvingSymlinksInPath().standardizedFileURL.path
+            guard isInside(resolvedAncestor) else { return nil }
+        }
+        if fileManager.fileExists(atPath: url.path) {
+            let resolvedLeaf = url.resolvingSymlinksInPath().standardizedFileURL.path
+            guard isInside(resolvedLeaf) else { return nil }
+        }
         return url
     }
 
@@ -958,6 +1014,22 @@ nonisolated enum WorkspaceIsolation {
         return path.hasPrefix(root.hasSuffix("/") ? root : root + "/")
     }
 
+    /// Commits the worktree's branch holds beyond the run's base commit.
+    ///
+    /// A patch carries the WORKING TREE only, so a run that committed before
+    /// it stopped has work no apply will land. The branch is the only copy of
+    /// it, and `cleanup` deletes the branch; nil means git could not answer
+    /// (a record without a base, a ref that no longer exists), which callers
+    /// treat as "do not assume it is empty".
+    static func commitsAheadOfBase(_ worktree: AgentWorktree) async -> Int? {
+        guard !worktree.baseCommit.isEmpty, !worktree.branch.isEmpty else { return nil }
+        guard let (code, out, _) = try? await git(
+            ["rev-list", "--count", "\(worktree.baseCommit)..\(worktree.branch)"],
+            in: worktree.repositoryRoot
+        ), code == 0 else { return nil }
+        return Int(out.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
     /// Files the run created that git ignores. `snapshot` registers intent to
     /// add, which cannot carry them either, so an ignored-only run looks empty
     /// and would otherwise be reported as "no changes" and deleted with its
@@ -1078,7 +1150,16 @@ nonisolated enum WorkspaceIsolation {
     /// change set with hundreds of files cannot turn the card into a wall of
     /// text. Nil when git cannot say (the card then falls back to the recorded
     /// file list).
+    ///
+    /// `git add -N .` below is the same WRITE `snapshot` makes, and it is
+    /// decided by the worktree's `.git` pointer. Reading the stat for a card
+    /// ran it before any linkage check, so merely OPENING the apply card in a
+    /// retargeted worktree wrote intent-to-add entries into the operator's
+    /// index with no approval. The linkage (and HEAD) is verified first; a
+    /// worktree that fails it gets no stat at all, and the card falls back to
+    /// the recorded file list.
     static func diffStat(_ worktree: AgentWorktree, lineLimit: Int = 14) async -> String? {
+        guard (try? await verifyWorktreeLinkage(worktree)) != nil else { return nil }
         _ = try? await git(["add", "-N", "."], in: worktree.path)
         guard let (code, out, _) = try? await git(
             ["diff", worktree.baseCommit, "--stat", "--stat-width=78", "--no-color"],

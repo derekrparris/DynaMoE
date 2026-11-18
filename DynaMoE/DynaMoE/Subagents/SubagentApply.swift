@@ -56,6 +56,10 @@ nonisolated struct SubagentApplyOutcome: Sendable {
     /// landed. A patch cannot carry them, so the tree stays until the
     /// operator retrieves or clears it.
     var keptIgnoredFiles: [String] = []
+    /// The run's branch holds commits a patch cannot carry, so cleanup kept
+    /// it instead of deleting it. The worktree may still be removed; the
+    /// branch is the preserved copy.
+    var keptBranch: Bool = false
 }
 
 @MainActor
@@ -133,6 +137,13 @@ enum SubagentApplyService {
         }
         let record = live?.snapshotRecord() ?? AgentRunStore.shared.loadAny(runId: runId)
         guard let record else { throw SubagentApplyError.runNotFound(runId) }
+        // A RESTORED record has no live instance, so the check above cannot
+        // see it. A run that was interrupted (a crash between launch and its
+        // terminal write) is still working or still holds the tree; applying
+        // its half-written tree would land work the run never finished.
+        guard record.status.isTerminal else {
+            throw SubagentApplyError.stillRunning(record.role)
+        }
         guard case .worktree(let path, let branch) = record.isolation else {
             throw SubagentApplyError.notIsolated(record.role)
         }
@@ -198,6 +209,23 @@ enum SubagentApplyService {
                     "the run's only changes are in git-ignored files (\(named)), which a patch cannot carry. Its worktree was kept so nothing is lost."
                 )
             }
+            // A clean tree is not proof the work is applied. A run that
+            // COMMITTED and then checked the base branch out has no working
+            // changes at all, and cleanup's `branch -D` would leave those
+            // commits only in the reflog. The patch cannot carry them, so the
+            // tree is kept and the operator decides how to land the branch.
+            let ahead = await WorkspaceIsolation.commitsAheadOfBase(worktree)
+            if ahead != 0 {
+                let detail: String
+                if let ahead, ahead > 0 {
+                    detail = "its branch '\(branch)' holds \(ahead) commit\(ahead == 1 ? "" : "s") that a patch cannot carry"
+                } else {
+                    detail = "its branch '\(branch)' cannot be compared with a recorded base commit, so git cannot prove the branch is empty"
+                }
+                throw WorkspaceIsolationError.applyFailed(
+                    "the run's working tree is clean, but \(detail). Nothing was applied and the worktree was kept, so no commit is deleted with the branch."
+                )
+            }
             files = []
         } else {
             let result = try await WorkspaceIsolation.apply(worktree, changeSet: changes)
@@ -240,8 +268,17 @@ enum SubagentApplyService {
                 "the patch landed, but this run's record could not be updated (its conversation may have been deleted). The worktree was kept so the landed changes still have a copy; clear the run manually."
             )
         }
+        // A run can commit some of its work and leave the rest uncommitted;
+        // the patch carries only the latter. Deleting the branch with `-D`
+        // would make the committed half reachable only through the reflog.
+        // nil means git could not compare the branch with a recorded base (an
+        // older record, a pruned ref), so the branch is kept rather than
+        // assumed empty.
+        let keptBranch = await WorkspaceIsolation.commitsAheadOfBase(worktree) != 0
         if keptIgnoredFiles.isEmpty {
-            await WorkspaceIsolation.cleanup(worktree)
+            // The branch is kept while the worktree is removed: the record is
+            // applied, so the tree is no longer the only copy of anything.
+            await WorkspaceIsolation.cleanup(worktree, deleteBranch: !keptBranch)
         } else {
             let named = keptIgnoredFiles.joined(separator: ", ")
             // The record must say why an applied run still has a worktree, or
@@ -279,6 +316,20 @@ enum SubagentApplyService {
             }
         }
 
+        if keptBranch {
+            let note = "The patch was applied, but branch '\(branch)' was kept because it holds commits a patch cannot carry. Merge or delete it manually when you are done."
+            if let live {
+                live.noteKeptBranch(branch)
+            } else {
+                AgentRunStore.shared.mutate(runId: runId, sessionId: record.parentSessionId) { current in
+                    if var report = current.report {
+                        report.openQuestions.append(note)
+                        current.report = report
+                    }
+                }
+            }
+        }
+
         return SubagentApplyOutcome(
             runId: runId,
             role: record.role,
@@ -287,7 +338,8 @@ enum SubagentApplyService {
             appliedAt: appliedAt,
             alreadyApplied: false,
             destinationBranch: destinationBranch,
-            keptIgnoredFiles: keptIgnoredFiles
+            keptIgnoredFiles: keptIgnoredFiles,
+            keptBranch: keptBranch
         )
     }
 }
@@ -369,6 +421,36 @@ enum SubagentApplyControl {
             workingDirectory: destination,
             reason: reason
         )
+    }
+
+    /// A destination summary for the CHAT approval card, resolved without
+    /// touching git.
+    ///
+    /// The coordinator's `apply_subagent_changes` card is raised by the generic
+    /// tool-approval surface, which otherwise showed only
+    /// `subagent_id=…`. Naming the branch, the tree it lands in and the files
+    /// is what lets the operator decide; the inspector's own card already gets
+    /// a live `git diff --stat`, so this is the same information minus the
+    /// stat.
+    static func approvalSummary(forRunId runId: UUID) -> String? {
+        let record = SubagentManager.shared.getSubagent(byId: runId)?.snapshotRecord()
+            ?? AgentRunStore.shared.loadAny(runId: runId)
+        guard let record,
+              case .worktree(let path, let branch) = record.isolation else { return nil }
+        let destination = record.repositoryRoot ?? path
+        let files = record.report?.changedFiles ?? []
+        let count: String
+        switch files.count {
+        case 0: count = "the run's worktree changes"
+        case 1: count = "1 changed file"
+        default: count = "\(files.count) changed files"
+        }
+        var summary = "Applies \(count) from \(branch) to \(destination). Changes land unstaged."
+        if !files.isEmpty {
+            summary += "\n" + files.prefix(8).joined(separator: ", ")
+            if files.count > 8 { summary += ", …" }
+        }
+        return summary
     }
 
     /// Raises the card, then applies. `requestApproval` is injectable so the

@@ -170,6 +170,21 @@ final class AgentRunStoreTests: XCTestCase {
         XCTAssertEqual(restored.usage.contextTokens, 232)
     }
 
+    /// The context chip is "the prompt the model last ingested plus the
+    /// tokens it generated". The last prompt already contains every earlier
+    /// step's generation, so adding the SUMMED `completionTokens` counted
+    /// them twice.
+    func testContextTokensCountsOnlyTheLastStepsGeneration() {
+        var usage = AgentUsage()
+        usage.steps = 3
+        usage.promptTokens = 300
+        usage.completionTokens = 30
+        usage.latestPromptTokens = 220
+        usage.latestCompletionTokens = 10
+        XCTAssertEqual(usage.contextTokens, 230)
+        XCTAssertEqual(usage.totalTokens, 330, "billing still sees every step's sum")
+    }
+
     func testTranscriptToolOutputIsTruncatedBeforeWriting() throws {
         let store = makeStore()
         let sessionId = UUID()
@@ -371,6 +386,55 @@ final class AgentRunStoreTests: XCTestCase {
             [unapplied.id, working.id],
             "exactly the unapplied isolated survivors ride the unscoped bucket"
         )
+    }
+
+    /// A record this build cannot decode is the ONLY thing that keeps a
+    /// UUID-named worktree out of the launch sweep (`pruneStaleWorktrees`
+    /// probes `hasRecordFile`). Deleting a conversation used to remove the
+    /// whole directory, so a schema downgrade plus a conversation delete handed
+    /// that tree to the 14-day clock. The undecodable file moves to the
+    /// unscoped bucket instead.
+    func testDeletingASessionKeepsARecordThisBuildCannotDecode() throws {
+        let store = makeStore()
+        let session = UUID()
+        let runId = UUID()
+        let directory = store.directory(for: session)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let undecodable = directory.appendingPathComponent("\(runId.uuidString).json")
+        // Not a valid record in this schema, but a real file a newer build may
+        // have written. Its CONTENT is never read by the sweep.
+        try Data(#"{"schemaVersion":9999,"id":"\#(runId.uuidString)"}"#.utf8).write(to: undecodable)
+
+        store.deleteSession(session)
+        store.flush()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: undecodable.path))
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: store.directory(for: nil).appendingPathComponent("\(runId.uuidString).json").path
+            ),
+            "an undecodable record must survive the conversation delete"
+        )
+        XCTAssertTrue(store.hasRecordFile(runId: runId))
+    }
+
+    /// `deleteClearableRecords` is the bulk Clear button's store half. It used
+    /// to have no direct coverage, so a predicate regression could delete a
+    /// protected record through the UI path alone.
+    func testDeleteClearableRecordsDeletesOnlyWhatThePredicateAccepts() throws {
+        let store = makeStore()
+        let session = UUID()
+        let keep = record(sessionId: session)
+        let drop = record(sessionId: session)
+        store.saveImmediately(keep)
+        store.saveImmediately(drop)
+        store.flush()
+
+        store.deleteClearableRecords(sessionId: session) { $0.id == drop.id }
+        store.flush()
+
+        XCTAssertNotNil(store.loadAny(runId: keep.id))
+        XCTAssertNil(store.loadAny(runId: drop.id))
     }
 
     /// An apply that completes AFTER its conversation was deleted must land on

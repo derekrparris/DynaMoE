@@ -454,9 +454,52 @@ final class CloudAgentBackendLogicTests: XCTestCase {
         let defaults = freshDefaults("dynamoe-tests-cloud-empty")
         XCTAssertEqual(
             SubagentBackendSettings.preferredCloudModel(
-                coordinateModelId: nil, defaults: defaults, providers: []
+                defaults: defaults, providers: []
             ),
             .noneConfigured
+        )
+    }
+
+    /// Settings promises "empty means a cloud spawn refuses by name", and the
+    /// old code fell back to a registered tool-capable model instead — billing
+    /// the operator on a provider they never named, with a card that named no
+    /// model. A configured provider in the list must not change the answer.
+    func testAnEmptyCloudModelSettingRefusesRatherThanFallingBack() {
+        let defaults = freshDefaults("dynamoe-tests-cloud-empty-fallback")
+        XCTAssertEqual(
+            SubagentBackendSettings.preferredCloudModel(
+                defaults: defaults, providers: [Self.provider]
+            ),
+            .noneConfigured
+        )
+    }
+
+    func testRetryAfterIsHonouredInBothSpellingsAndClamped() {
+        func response(_ value: String) -> HTTPURLResponse {
+            HTTPURLResponse(
+                url: URL(string: "https://example.invalid/v1/chat/completions")!,
+                statusCode: 429,
+                httpVersion: nil,
+                headerFields: ["Retry-After": value]
+            )!
+        }
+        XCTAssertEqual(CloudRetryAfter.seconds(from: response("2")), 2)
+        XCTAssertEqual(CloudRetryAfter.seconds(from: response("0")), 0)
+        XCTAssertEqual(
+            CloudRetryAfter.seconds(from: response("3600")),
+            60,
+            "one retry must not park the run for the provider's full window"
+        )
+        XCTAssertNil(CloudRetryAfter.seconds(from: response("not-a-date")))
+        XCTAssertNil(
+            CloudRetryAfter.seconds(
+                from: HTTPURLResponse(
+                    url: URL(string: "https://example.invalid")!,
+                    statusCode: 429,
+                    httpVersion: nil,
+                    headerFields: nil
+                )!
+            )
         )
     }
 
@@ -466,7 +509,7 @@ final class CloudAgentBackendLogicTests: XCTestCase {
         defaults.set(address, forKey: SubagentBackendSettings.cloudModelKey)
         XCTAssertEqual(
             SubagentBackendSettings.preferredCloudModel(
-                coordinateModelId: nil, defaults: defaults, providers: [Self.provider]
+                defaults: defaults, providers: [Self.provider]
             ),
             .configured(address)
         )
@@ -479,7 +522,7 @@ final class CloudAgentBackendLogicTests: XCTestCase {
         defaults.set("not-a-cloud-model", forKey: SubagentBackendSettings.cloudModelKey)
         XCTAssertEqual(
             SubagentBackendSettings.preferredCloudModel(
-                coordinateModelId: nil, defaults: defaults, providers: [Self.provider]
+                defaults: defaults, providers: [Self.provider]
             ),
             .unresolvable("not-a-cloud-model")
         )
@@ -528,7 +571,7 @@ final class CloudAgentBackendLogicTests: XCTestCase {
             "opt-in: touch /tmp/dynamoe_subagent_cloud_turn"
         )
         var candidates: [String] = []
-        if case .configured(let preferred) = SubagentBackendSettings.preferredCloudModel(coordinateModelId: nil) {
+        if case .configured(let preferred) = SubagentBackendSettings.preferredCloudModel() {
             candidates.append(preferred)
         }
         for model in CloudModelRegistry.makeDiscoveredModels() where !model.id.lowercased().contains("infinite") {
@@ -595,7 +638,7 @@ final class CloudAgentBackendLogicTests: XCTestCase {
             "opt-in: touch /tmp/dynamoe_subagent_cloud_run"
         )
         var candidates: [String] = []
-        if case .configured(let preferred) = SubagentBackendSettings.preferredCloudModel(coordinateModelId: nil) {
+        if case .configured(let preferred) = SubagentBackendSettings.preferredCloudModel() {
             candidates.append(preferred)
         }
         for model in CloudModelRegistry.makeDiscoveredModels() where !model.id.lowercased().contains("infinite") {

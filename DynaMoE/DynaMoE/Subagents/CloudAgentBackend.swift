@@ -58,28 +58,6 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
         }
     }
 
-    /// The model a spawn uses when the caller did not name one: the
-    /// coordinator's own cloud model when it has one, otherwise the first
-    /// registered cloud model that supports tools and has a stored key.
-    static func resolveDefault(coordinateModelId: String?, providers: [CloudProvider] = CloudProviderRegistry.all) -> String? {
-        if let coordinateModelId,
-           let parsed = CloudModelAddress.parseModelId(coordinateModelId, providers: providers) {
-            let specs = CloudModelRegistry.registeredSpecs(for: parsed.provider)
-            if specs.contains(where: { $0.providerModelId == parsed.providerModelId && $0.supportsTools }) {
-                return CloudModelAddress.modelId(providerId: parsed.provider.id, providerModelId: parsed.providerModelId)
-            }
-        }
-        let available = CloudModelRegistry.makeDiscoveredModels(providers: providers)
-        for model in available {
-            guard let resolution = model.cloudResolution else { continue }
-            let specs = CloudModelRegistry.registeredSpecs(for: resolution.provider)
-            if specs.contains(where: { $0.providerModelId == resolution.providerModelId && $0.supportsTools }) {
-                return model.id
-            }
-        }
-        return nil
-    }
-
     func runTurn(_ request: AgentBackendRequest) async throws -> AgentBackendTurn {
         var attempt = 0
         while true {
@@ -104,7 +82,7 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
             } catch let failure as CloudTurnFailure
                 where attempt < 2 && Self.isRetryable(failure, spentRequest: receipt.spentRequest) {
                 Self.recordSpentUsage(receipt, pricing: pricing, into: request.usageLedger)
-                await Self.backoffBeforeRetry(failure)
+                await Self.backoffBeforeRetry(failure, receipt: receipt)
                 if Task.isCancelled { throw AgentBackendError.cancelled }
                 continue
             } catch let failure as CloudTurnFailure {
@@ -189,8 +167,11 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
             // No usage block is not proof the turn was free. The provider may
             // have billed it and omitted the block (a Stop, a dropped terminal
             // frame, an endpoint that never reports usage), so a cost ceiling
-            // must see "unknown", not "$0".
+            // must see "unknown", not "$0". The reason is recorded separately
+            // so the refusal does not send the operator to record a price that
+            // is already there.
             result.costIsUnpriced = true
+            result.costUnpricedReason = .providerOmittedUsage
             return result
         }
         result.promptTokens = usage.promptTokens ?? 0
@@ -204,8 +185,11 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
             // `total_tokens`, which `cost(for:)` refuses to price). Either way
             // the dollar figure is unknown rather than zero — a cost ceiling
             // reading "$0 spent" here would never bind, and the run would
-            // spend an amount the app cannot name.
+            // spend an amount the app cannot name. A recorded price with an
+            // incomplete count is still the provider's omission, not a
+            // missing price.
             result.costIsUnpriced = true
+            result.costUnpricedReason = pricing == nil ? .noPriceRecorded : .providerOmittedUsage
         }
         return result
     }
@@ -240,8 +224,13 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
         return 0
     }
 
-    private static func backoffBeforeRetry(_ failure: CloudTurnFailure) async {
-        let delay = retryDelaySeconds(for: failure)
+    private static func backoffBeforeRetry(
+        _ failure: CloudTurnFailure,
+        receipt: CloudTurnReceipt? = nil
+    ) async {
+        // The provider's Retry-After outranks the fixed fallback: it is the
+        // window that actually refused the request.
+        let delay = receipt?.retryAfterSeconds ?? retryDelaySeconds(for: failure)
         guard delay > 0 else { return }
         try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
     }
@@ -265,6 +254,7 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
         var usage = AgentUsage()
         usage.backendRequests = 1
         usage.costIsUnpriced = true
+        usage.costUnpricedReason = .providerOmittedUsage
         ledger.add(usage)
     }
 
@@ -333,12 +323,16 @@ nonisolated enum SubagentBackendSettings {
     /// pure; a stored address whose provider has no stored key still reaches
     /// `CloudAgentBackend.make` one step later and refuses there with the
     /// provider named, so no path falls through to the default either.
+    ///
+    /// An EMPTY setting is `.noneConfigured`, not a fallback. Settings says
+    /// "empty means a cloud spawn refuses by name", and the old fallback to
+    /// the first registered tool-capable model billed the operator on a
+    /// provider they never named, with an approval card that named no model.
     enum PreferredCloudModel: Equatable {
-        /// Nothing is stored and no default resolves, so a cloud spawn is
-        /// refused with the "no cloud model is configured" message.
+        /// Nothing is stored, so a cloud spawn is refused with the "no cloud
+        /// model is configured" message.
         case noneConfigured
-        /// A usable address: the stored setting when it parses, otherwise the
-        /// coordinator's model or the first registered tool-capable one.
+        /// The stored setting parses to a configured cloud model.
         case configured(String)
         /// The stored setting does not name a configured cloud model. The
         /// payload is the stored text so the refusal can name it.
@@ -346,21 +340,16 @@ nonisolated enum SubagentBackendSettings {
     }
 
     static func preferredCloudModel(
-        coordinateModelId: String?,
         defaults: UserDefaults = .standard,
         providers: [CloudProvider] = CloudProviderRegistry.all
     ) -> PreferredCloudModel {
-        if let stored = defaults.string(forKey: cloudModelKey)?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !stored.isEmpty {
-            guard CloudModelAddress.parseModelId(stored, providers: providers) != nil
-                || CloudModelAddress.parsePath(stored, providers: providers) != nil else {
-                return .unresolvable(stored)
-            }
-            return .configured(stored)
+        let stored = (defaults.string(forKey: cloudModelKey) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !stored.isEmpty else { return .noneConfigured }
+        guard CloudModelAddress.parseModelId(stored, providers: providers) != nil
+            || CloudModelAddress.parsePath(stored, providers: providers) != nil else {
+            return .unresolvable(stored)
         }
-        if let fallback = CloudAgentBackend.resolveDefault(coordinateModelId: coordinateModelId, providers: providers) {
-            return .configured(fallback)
-        }
-        return .noneConfigured
+        return .configured(stored)
     }
 }

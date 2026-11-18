@@ -491,6 +491,25 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         persistRecord()
     }
 
+    /// Records that an apply kept the run's branch because it holds commits a
+    /// patch cannot carry. The worktree may be gone, but the branch is the
+    /// only copy of that committed work and the operator has to land or delete
+    /// it themselves.
+    func noteKeptBranch(_ branch: String) {
+        let note = "The patch was applied, but branch '\(branch)' was kept because it holds commits a patch cannot carry. Merge or delete it manually when you are done."
+        if var current = report {
+            current.openQuestions.append(note)
+            report = current
+        }
+        AgentRunStore.shared.mutate(runId: id, sessionId: parentSessionId) { current in
+            if var report = current.report {
+                report.openQuestions.append(note)
+                current.report = report
+            }
+        }
+        persistRecord()
+    }
+
     /// Writes the current state. Safe to call on every boundary: the store
     /// skips unchanged bytes and dispatches its own IO.
     func persistRecord() {
@@ -709,8 +728,14 @@ public final class SubagentInstance: Identifiable, ObservableObject {
                 // The recorded root is what a cardless `git_commit`'s linkage
                 // re-verification compares against: the worktree's `.git`
                 // pointer is a file inside the sandbox, and only the root
-                // tells the harness where it is SUPPOSED to point.
+                // tells the harness where it is SUPPOSED to point. The branch
+                // is the same contract for HEAD: a carded checkout inside the
+                // sandbox must not let a cardless commit move another branch.
                 workspaceRepositoryRoot: plan.repositoryRoot,
+                workspaceBranch: {
+                    if case .worktree(_, let branch) = plan.isolation { return branch }
+                    return nil
+                }(),
                 approvalHandler: { request in
                     await SubagentApprovalCenter.shared.request(request)
                 }
@@ -809,7 +834,21 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         lock.lock()
         let alreadyFinished = isFinished
         lock.unlock()
-        guard !alreadyFinished else { return }
+        if alreadyFinished {
+            // A Stop owns the terminal record, but the spend of the step it
+            // interrupted is only known once the loop unwinds: a cloud request
+            // the provider billed (with or without a usage block) is merged
+            // into the outcome by the ledger, and `cancel` persisted the
+            // record before that happened. Without this write the inspector
+            // reported $0 for a run the operator actually paid for. Only the
+            // usage is updated; the Stop's summary, status and worktree stay
+            // exactly as its own transition wrote them.
+            if status == .cancelled {
+                usage = outcome.usage
+                persistRecord()
+            }
+            return
+        }
         report = finalReport
         usage = outcome.usage
         lastError = outcome.error
@@ -957,8 +996,12 @@ public final class SubagentInstance: Identifiable, ObservableObject {
                 liveAssistantText += text
             }
         case .toolStarted(let record):
+            guard !hasFinished() else { return }
             liveStatusText = "Running \(record.name)…"
         case .toolFinished(let record):
+            // A Stop latches `isFinished`; a tool event the pump still holds
+            // must not append to the cancelled record and rewrite it on disk.
+            guard !hasFinished() else { return }
             appendTranscriptStep(
                 actionName: record.name,
                 arguments: record.arguments,
@@ -968,8 +1011,11 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             )
             persistRecord()
         case .usage(let usage):
+            // Applied even after a Stop: the cancelled run's partial spend is
+            // persisted once the loop unwinds (see `runModelBackedExecution`).
             self.usage = usage
         case .completed(let report):
+            guard !hasFinished() else { return }
             self.report = report
         }
     }

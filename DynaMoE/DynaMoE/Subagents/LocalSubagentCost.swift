@@ -138,7 +138,28 @@ nonisolated struct LocalSubagentCostEstimate: Equatable, Sendable {
     /// The admission decision. The backend asks this in `make`, so there is no
     /// path that starts a local run without consulting it; the override is the
     /// operator's permission, carried in from the spawn card (invariant 10).
-    func admits(operatorOverride: Bool) -> Bool {
-        !exceedsLimit || operatorOverride
+    ///
+    /// An override approves THE NUMBER THE CARD SHOWED, not the idea of a
+    /// local run. The prefix pin and the measured prefill rate can both move
+    /// while the card is open, and admitting a larger estimate because the old
+    /// card was clicked is consent the operator never gave. `approvedEstimate`
+    /// is that number; nil keeps the older direct-call meaning (a caller with
+    /// no card, e.g. a test or the opt-in published-turn harness).
+    func admits(
+        operatorOverride: Bool,
+        approvedEstimate: LocalSubagentCostEstimate? = nil
+    ) -> Bool {
+        guard exceedsLimit else { return true }
+        guard operatorOverride else { return false }
+        guard let approvedEstimate else { return true }
+        return self == approvedEstimate
+    }
+
+    /// Why an approved estimate no longer covers this spawn, or nil when it
+    /// does.
+    func approvalDriftMessage(approved: LocalSubagentCostEstimate) -> String? {
+        guard self != approved else { return nil }
+        return "The estimated cost changed after the card was shown (was \(approved.summary); now \(summary)). "
+            + "The approval does not cover the new estimate; the run was not started. Try the spawn again to approve the current number."
     }
 }

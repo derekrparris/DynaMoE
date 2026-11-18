@@ -522,6 +522,22 @@ final class AgentSpawnPolicyTests: XCTestCase {
         XCTAssertEqual(tools, ["complete", "file_read"])
     }
 
+    /// An EXPLICIT empty list is not an omitted one. It used to fall back to
+    /// the preset, so a caller that asked for no tools got a writer.
+    func testAnExplicitlyEmptyToolListIsRefusedRatherThanUsingThePreset() {
+        XCTAssertThrowsError(
+            try AgentSpawnResolver.resolveTools(
+                request(tools: []),
+                definition: AgentRolePresetCatalog.definition(for: .implementer)
+            )
+        ) { error in
+            guard case .noBackend(let message)? = error as? AgentSpawnError else {
+                return XCTFail("expected noBackend, got \(error)")
+            }
+            XCTAssertTrue(message.contains("empty list"), message)
+        }
+    }
+
     func testPlanModeStillWithholdsComplete() throws {
         // In plan mode the plain-text plan IS the deliverable, so `complete` is
         // withheld by policy and must not be appended back.
@@ -584,8 +600,13 @@ final class AgentSpawnPolicyTests: XCTestCase {
         )
         XCTAssertEqual(
             AgentSpawnResolver.costCeilingProblem(budget: budget, descriptor: descriptor),
-            .costCeilingWithoutPricing("Local checkpoint"),
-            "a local run's cost is engine time, not dollars, so a dollar ceiling cannot bind"
+            .costCeilingOnUnpricedBackend("Local checkpoint"),
+            "a local run's cost is engine time, not dollars, so a dollar ceiling cannot bind — and the refusal must not send the operator to record a cloud price"
+        )
+        XCTAssertTrue(
+            (AgentSpawnError.costCeilingOnUnpricedBackend("Local checkpoint").errorDescription ?? "")
+                .contains("not a cloud model"),
+            "the refusal names the real reason for a local backend"
         )
     }
 

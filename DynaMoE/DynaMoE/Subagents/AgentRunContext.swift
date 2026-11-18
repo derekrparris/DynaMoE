@@ -55,6 +55,7 @@ final class AgentRunContext {
         approvalPolicy: AgentApprovalPolicy,
         workspaceIsolated: Bool,
         workspaceRepositoryRoot: URL? = nil,
+        workspaceBranch: String? = nil,
         approvalHandler: (@Sendable (AgentApprovalRequest) async -> Bool)?
     ) throws -> AgentRunContext {
         let harness = AgentHarness.makeRunScoped()
@@ -66,6 +67,7 @@ final class AgentRunContext {
             approvalPolicy: approvalPolicy,
             workspaceIsolated: workspaceIsolated,
             workspaceRepositoryRoot: workspaceRepositoryRoot,
+            workspaceBranch: workspaceBranch,
             approvalHandler: approvalHandler
         )
         return AgentRunContext(

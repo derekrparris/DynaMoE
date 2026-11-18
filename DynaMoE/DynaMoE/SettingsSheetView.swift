@@ -253,11 +253,11 @@ struct SettingsSheetView: View {
             }
 
             subagentSettingRow("Cloud model") {
-                TextField("Choose a model id", text: $subagentCloudModel)
+                TextField("cloud-model-<provider>-<model>", text: $subagentCloudModel)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 11))
                     .frame(maxWidth: 260)
-                Text("Upstream model id. There is no automatic fallback: empty means a cloud spawn refuses by name.")
+                Text("A configured cloud model, spelled 'cloud-model-<provider>-<upstream id>' or 'cloud://<provider>/<upstream id>'. There is no automatic fallback: empty means a cloud spawn refuses by name.")
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
