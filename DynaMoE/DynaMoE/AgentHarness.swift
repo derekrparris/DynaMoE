@@ -2461,6 +2461,16 @@ public final class SpawnSubagentTool: AgentTool {
         let spawnDirectory = workingDirectory ?? sessionsWorkingDirectory
 
         let backendSelection = Self.backendSelection(from: arguments)
+        // The turn's identity, not the process-global one: a send that happens
+        // while this tool is awaiting would overwrite `currentTurnId`, and the
+        // run would be stamped with a turn that never asked for it (so Stop
+        // cancelled the wrong runs). A run-scoped harness has no global turn to
+        // fall back to; its identity was passed in, and nil there means nil.
+        let inRunScope = AgentHarness.executingInRunScope
+        let parentSessionId = AgentHarness.executingSessionId
+            ?? (inRunScope ? nil : AgentHarness.shared.currentSessionId)
+        let parentTurnId = AgentHarness.executingTurnId
+            ?? (inRunScope ? nil : AgentHarness.shared.currentTurnId)
         if backendSelection.error == nil, backendSelection.modelBacked {
             let request = AgentSpawnRequest(
                 role: role,
@@ -2472,8 +2482,8 @@ public final class SpawnSubagentTool: AgentTool {
                 budgetOverrides: Self.budgetOverrides(from: arguments["budget"]),
                 isolation: Self.isolation(from: arguments["isolation"]),
                 workingDirectory: spawnDirectory,
-                parentSessionId: AgentHarness.shared.currentSessionId,
-                parentTurnId: AgentHarness.shared.currentTurnId,
+                parentSessionId: parentSessionId,
+                parentTurnId: parentTurnId,
                 parentMode: parentMode,
                 thinking: (arguments["thinking"] as? Bool) ?? false,
                 operatorOverride: false,
@@ -2486,6 +2496,16 @@ public final class SpawnSubagentTool: AgentTool {
                     runId: runId,
                     sessionId: runId
                 )
+                // Stop can land DURING the resolve (worktree creation, backend
+                // resolution). `cancelTurnRuns` has already walked the runs it
+                // knew about, so a run started now would begin afterwards,
+                // stamped with the stopped turn and never cancelled. The plan's
+                // worktree was created for a run that will not start, so it is
+                // removed with it.
+                guard !Task.isCancelled else {
+                    await SubagentInstance.discardWorktree(plan: plan)
+                    return Self.stoppedBeforeStartResult()
+                }
                 let subagent = SubagentManager.shared.spawnModelBacked(
                     plan,
                     id: runId,
@@ -2522,6 +2542,9 @@ public final class SpawnSubagentTool: AgentTool {
                     let declined = "The operator declined this local run's estimated re-prefill cost. Send the task to a cloud backend, raise dynamoe_subagent_local_cost_limit in Settings, or give it a smaller task."
                     return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: declined), nil, declined, false)
                 }
+                // The card can be up for minutes. A Stop during it is the same
+                // decision as a Stop before it, so nothing is started.
+                guard !Task.isCancelled else { return Self.stoppedBeforeStartResult() }
                 var overridden = request
                 overridden.operatorOverride = true
                 do {
@@ -2530,6 +2553,10 @@ public final class SpawnSubagentTool: AgentTool {
                         runId: runId,
                         sessionId: runId
                     )
+                    guard !Task.isCancelled else {
+                        await SubagentInstance.discardWorktree(plan: plan)
+                        return Self.stoppedBeforeStartResult()
+                    }
                     let subagent = SubagentManager.shared.spawnModelBacked(
                         plan,
                         id: runId,
@@ -2553,27 +2580,42 @@ public final class SpawnSubagentTool: AgentTool {
             return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: error), nil, error, false)
         }
 
+        // The legacy pipelines have no worktree of their own. Hearing the
+        // request for one and silently running in the coordinator's directory
+        // is the wrong answer: the work would be unisolated while the caller
+        // believes it is not.
+        let requestedIsolation = Self.isolation(from: arguments["isolation"]).isIsolated
+        guard !Task.isCancelled else { return Self.stoppedBeforeStartResult() }
         let subagent = SubagentManager.shared.spawn(
             role: role,
             taskDescription: taskDesc,
             allowedTools: allowedTools,
             parentMode: parentMode,
             contextSummary: contextSummary,
-            parentSessionId: AgentHarness.shared.currentSessionId,
-            parentTurnId: AgentHarness.shared.currentTurnId,
+            parentSessionId: parentSessionId,
+            parentTurnId: parentTurnId,
             workingDirectory: workingDirectory
         )
         return await Self.respond(
             subagent: subagent,
             runInBackground: runInBackground,
-            maxOutputLength: maxOutputLength
+            maxOutputLength: maxOutputLength,
+            warning: requestedIsolation
+                ? "This spawn ran on the legacy role pipelines, which do not create a worktree: the run works in the coordinator's directory. Choose 'local' or 'cloud' for an isolated workspace."
+                : nil
         )
+    }
+
+    private static func stoppedBeforeStartResult() -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        let text = "The coordinator turn was stopped before the subagent run could start."
+        return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: text), nil, text, false)
     }
 
     private static func respond(
         subagent: SubagentInstance,
         runInBackground: Bool,
-        maxOutputLength: Int
+        maxOutputLength: Int,
+        warning: String? = nil
     ) async -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
         // The notification decision is made at spawn time (before execution
         // starts); a synchronous caller is watching the tool card, and only a
@@ -2591,6 +2633,11 @@ public final class SpawnSubagentTool: AgentTool {
                 "run_in_background": true,
                 "message": msg
             ]
+            if let warning {
+                data["warning"] = warning
+                msg += " Warning: \(warning)"
+                data["message"] = msg
+            }
             if let worktree {
                 data["isolation"] = "worktree"
                 data["worktree"] = worktree.path
@@ -2629,6 +2676,9 @@ public final class SpawnSubagentTool: AgentTool {
         }
         if alreadyApplied {
             data["applied"] = true
+        }
+        if let warning {
+            data["warning"] = warning
         }
         if let backend = subagent.backendDescriptor {
             data["backend"] = backend.displayName
@@ -4292,9 +4342,55 @@ public final class AgentHarness {
         syncGrammar()
     }
 
+    /// A registry rebuild that a live turn or a scoped mask refused.
+    private var grammarSyncDeferred = false
+
+    /// Rebuilds the shared grammar registry from this harness's loaded set.
+    ///
+    /// The registry has two other writers and both can be mid-turn:
+    ///
+    /// - A scoped mask (`GrammarConstrainedSampler.withTurnToolMask`) installs
+    ///   a client's or a run's tool vocabulary around ONE generation and
+    ///   restores the old registry afterwards. A rebuild landing inside that
+    ///   window replaced the scoped vocabulary with the app catalog for the
+    ///   rest of the step, and the model then called tools the mask did not
+    ///   describe (or could not call the ones it had). Reached from MCP
+    ///   connect, a Skills reload and `tools_load`, none of which are keyed on
+    ///   a turn.
+    /// - A generation that is merely READING the registry. Rebuilding it
+    ///   between two tokens changes the vocabulary under the live turn.
+    ///
+    /// Neither may be overwritten, so the rebuild is deferred and applied when
+    /// the next tool executes (the engine is idle then) or at the next
+    /// `setActiveMode`. A deferred rebuild is not lost: the loaded set is
+    /// current, and the next idle assertion re-derives the registry from it.
     private func syncGrammar() {
         guard !isRunScoped else { return }
-        GrammarConstrainedSampler.shared.registerTools(availableToolDefinitions(mode: activeMode))
+        if CompletionEngine.shared.isActive {
+            grammarSyncDeferred = true
+            return
+        }
+        rebuildGrammarRegistry()
+    }
+
+    /// Applies a rebuild a live turn refused. Called where a tool is about to
+    /// run: the engine is idle between steps, which is exactly the moment the
+    /// registry may be rebuilt without disturbing a generation.
+    private func flushDeferredGrammarSync() {
+        guard grammarSyncDeferred, !isRunScoped else { return }
+        guard !CompletionEngine.shared.isActive else { return }
+        rebuildGrammarRegistry()
+    }
+
+    private func rebuildGrammarRegistry() {
+        // The sampler refuses while a scoped mask owns the registry, and that
+        // refusal is atomic with the check. A refused rebuild stays deferred:
+        // the loaded set is already current, and the next idle assertion
+        // re-derives the registry from it.
+        let installed = GrammarConstrainedSampler.registerAppTools(
+            availableToolDefinitions(mode: activeMode)
+        )
+        grammarSyncDeferred = !installed
     }
 
     /// The run's worktree when it has one. A spawn's result and the status
@@ -4355,14 +4451,23 @@ public final class AgentHarness {
     /// Delegation is the primary card: a spawn that can write is a decision the
     /// operator makes once, with the role, backend and tool set in front of
     /// them, rather than a stream of per-call cards they cannot attribute to a
-    /// background run. A read-only spawn, and any spawn in plan mode (whose
-    /// tools are withheld anyway), runs without a card.
+    /// background run. A read-only LOCAL spawn, and any local spawn in plan
+    /// mode, runs without a card.
+    ///
+    /// Plan mode is not a blanket exemption. Its write tools are withheld, but
+    /// the READ tools stay available, so a run that works off-device uploads
+    /// repository content on every `file_read` and `grep_search`, a decision
+    /// the operator has never been shown. The cloud branch therefore has to be
+    /// evaluated before the plan-mode shortcut, including when Settings (not
+    /// the argument) is what resolves to Cloud.
     static func spawnSubagentRequiresApproval(
         arguments: [String: Any],
         mode: AgentMode,
         defaults: UserDefaults = .standard
     ) -> Bool {
-        guard mode != .plan else { return false }
+        if mode == .plan {
+            return spawnResolvesToCloud(arguments: arguments, defaults: defaults)
+        }
         // Sending a run off-device is a decision the operator makes in
         // Settings or on a card that says so. A read-only run is still a run:
         // file_read and grep_search upload repository content on every step.
@@ -4375,6 +4480,29 @@ public final class AgentHarness {
         let explicit = (arguments["allowed_tools"] as? [String]) ?? []
         let intended = explicit.isEmpty ? definition.toolNames : explicit
         return !Set(intended).isDisjoint(with: AgentToolSurface.writeCapable)
+    }
+
+    /// Whether this spawn resolves to the Cloud backend, following the same
+    /// rule `backendSelection` uses: an explicit `cloud` wins, `local`/`legacy`
+    /// never do, and an omitted or `auto` backend takes the Settings choice.
+    static func spawnResolvesToCloud(
+        arguments: [String: Any],
+        defaults: UserDefaults = .standard
+    ) -> Bool {
+        let raw = (arguments["backend"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        switch raw {
+        case "cloud":
+            return true
+        case "local", "legacy":
+            return false
+        default:
+            let stored = defaults.string(forKey: SubagentBackendSettings.backendKey)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            return stored == "cloud"
+        }
     }
 
     /// True when this spawn's `backend` argument forces Cloud while the stored
@@ -4536,6 +4664,29 @@ public final class AgentHarness {
     /// because subagents execute through this same harness concurrently, each in
     /// its own task, with its own parent mode.
     @TaskLocal static var executingTurnMode: AgentMode?
+
+    /// The coordinator TURN and SESSION whose tool is executing, bound by
+    /// `executeTool` exactly like the mode above.
+    ///
+    /// `currentTurnId` is a single stored value overwritten at every send, and
+    /// tool execution overlaps the NEXT send: the engine goes idle while tools
+    /// run, so an operator can send again and replace the stored identity
+    /// while an older turn's `spawn_subagent` is still executing. A child
+    /// spawned there was stamped with the newer turn's id, and Stop then
+    /// cancelled a run the newer turn never started. The task that runs a tool
+    /// is the only thing that knows which turn it belongs to, so the turn
+    /// carries the identity through it instead of reading the global.
+    @TaskLocal static var executingTurnId: UUID?
+    @TaskLocal static var executingSessionId: UUID?
+
+    /// True while the tool being executed belongs to a run-scoped harness (a
+    /// subagent run or a legacy pipeline step) rather than the app's own turn.
+    ///
+    /// Such a harness has no global turn of its own to fall back to: a nested
+    /// `spawn_subagent` must inherit the RUN's parent identity, and reading
+    /// `AgentHarness.shared.currentTurnId` would stamp it with whichever
+    /// operator turn happens to be current.
+    @TaskLocal static var executingInRunScope = false
 
     /// Definitions currently exposed to the model for the turn in flight.
     /// The explicit `availableToolDefinitions(mode:)` is what a caller uses
@@ -4810,7 +4961,7 @@ public final class AgentHarness {
         prompt += """
         # Subagent Role
 
-        You are a subagent working on behalf of a coordinator agent inside DynaMoE. Your role is: \(role).
+        You are a subagent working on behalf of a coordinator agent inside DynaMoE. Your role is: \(AgentHarness.sanitizeText(role)).
 
         The coordinator owns the conversation with the user; you do not. Work only on the task you were given, with the tools listed below, and return a report the coordinator can use. Do not ask the user questions and do not wait for approval you cannot receive.
 
@@ -4931,7 +5082,7 @@ public final class AgentHarness {
         prompt += """
         # Subagent Role
 
-        You are a subagent working on behalf of a coordinator agent inside DynaMoE. Your role is: \(role).
+        You are a subagent working on behalf of a coordinator agent inside DynaMoE. Your role is: \(AgentHarness.sanitizeText(role)).
 
         The coordinator owns the conversation with the user; you do not. Work only on the task you were given and return a report the coordinator can use. Do not ask the user questions.
 
@@ -5855,26 +6006,41 @@ public final class AgentHarness {
 
     /// Runs one parsed call.
     ///
-    /// `mode` is the TURN's mode. Callers that know it pass it by value, because
-    /// `activeMode` is process-global and another turn can move it; a nil value
-    /// keeps the historical behaviour of reading the active mode.
-    public func executeTool(call: ParsedToolCall, workingDirectory: URL? = nil, maxOutputLength: Int? = nil, mode: AgentMode? = nil, approvedSubQEndpoint: URL? = nil) async -> (resultJSON: String, record: ToolCallRecord, isCompleted: Bool) {
+    /// `mode`, `turnId` and `sessionId` are the TURN's. Callers that know them
+    /// pass them by value, because `activeMode` / `currentTurnId` /
+    /// `currentSessionId` are process-global and another turn can move them
+    /// while this call is still awaiting; nil keeps the historical behaviour
+    /// of reading the global.
+    public func executeTool(call: ParsedToolCall, workingDirectory: URL? = nil, maxOutputLength: Int? = nil, mode: AgentMode? = nil, turnId: UUID? = nil, sessionId: UUID? = nil, approvedSubQEndpoint: URL? = nil) async -> (resultJSON: String, record: ToolCallRecord, isCompleted: Bool) {
+        // A tool runs between steps, with the engine idle. That is the one
+        // moment a registry rebuild deferred during a generation can land.
+        flushDeferredGrammarSync()
         let effectiveMode = mode ?? activeMode
         // Bound for the whole call so a tool that takes no `mode:` parameter
         // (`tools_discover`, `tools_load`) answers for THIS turn rather than for
         // whatever `activeMode` holds when its own `await` resumes.
         //
+        // The turn identity is bound for the same reason: `spawn_subagent`
+        // reads it to stamp the run's parent, and a send that happened while
+        // this tool was awaiting must not rewrite that stamp.
+        //
         // The SubQ endpoint is bound for the same reason: the approval card
         // displays a destination, and the call must use THAT one rather than
         // re-read `UserDefaults` after the operator approved a different host.
         return await AgentHarness.$executingTurnMode.withValue(effectiveMode) {
-            await SubQDecideTool.$pinnedEndpoint.withValue(approvedSubQEndpoint) {
-                await self.runToolInTurn(
-                    call: call,
-                    workingDirectory: workingDirectory,
-                    maxOutputLength: maxOutputLength,
-                    effectiveMode: effectiveMode
-                )
+            await AgentHarness.$executingTurnId.withValue(turnId ?? AgentHarness.executingTurnId) {
+                await AgentHarness.$executingSessionId.withValue(sessionId ?? AgentHarness.executingSessionId) {
+                    await AgentHarness.$executingInRunScope.withValue(isRunScoped) {
+                        await SubQDecideTool.$pinnedEndpoint.withValue(approvedSubQEndpoint) {
+                            await self.runToolInTurn(
+                                call: call,
+                                workingDirectory: workingDirectory,
+                                maxOutputLength: maxOutputLength,
+                                effectiveMode: effectiveMode
+                            )
+                        }
+                    }
+                }
             }
         }
     }
@@ -5938,32 +6104,73 @@ public final class AgentHarness {
 
     /// The path with every EXISTING component resolved, so a symlink anywhere
     /// in the path is followed even when the final component does not exist
-    /// yet — which is the one a `file_write` is about to create.
+    /// yet, which is the one a `file_write` is about to create.
     ///
-    /// `URL.resolvingSymlinksInPath()` resolves NOTHING when the leaf is
-    /// absent (verified against Foundation on this OS), so the plain
-    /// prefix check let a write through an in-workspace symlink escape the
-    /// sandbox with no card. The longest existing prefix is resolved first
-    /// and the absent tail is appended back.
+    /// Resolved ONE COMPONENT AT A TIME, and that order is the whole point.
+    /// `standardizedFileURL` collapses `..` lexically, so `<worktree>/link/../x`
+    /// becomes `<worktree>/x` before any symlink is consulted; the kernel,
+    /// however, follows `link` first and then applies `..`, which lands
+    /// outside the worktree. That disagreement let a write past both the
+    /// containment check and the `.git` guard with no card. Walking the
+    /// components keeps the two in step: each component is resolved before
+    /// the next `..` is applied, so `..` is only ever lexical over a path that
+    /// has no symlinks left in it. `URL.resolvingSymlinksInPath()` resolves
+    /// NOTHING when the leaf is absent (verified against Foundation on this
+    /// OS), which is why the walk resolves only what exists and keeps the
+    /// absent tail as written.
+    ///
+    /// A DANGLING symlink is the case Foundation hides: `fileExists` follows
+    /// the link and reports false, and `resolvingSymlinksInPath` leaves it
+    /// where it is, but an `O_CREAT` write follows it and creates the target.
+    /// The link's own destination is read with `destinationOfSymbolicLink`
+    /// and resolved instead. `remainingSymlinkHops` bounds the chain so a
+    /// self-referential link cannot recurse forever; on exhaustion the target
+    /// stays unresolved, which fails containment rather than passing it.
     static func resolvedForContainment(_ url: URL) -> URL {
-        var missing: [String] = []
-        var current = url.standardizedFileURL
+        resolvedForContainment(url, remainingSymlinkHops: 64)
+    }
+
+    private static func resolvedForContainment(_ url: URL, remainingSymlinkHops: Int) -> URL {
         let fileManager = FileManager.default
-        while true {
-            if fileManager.fileExists(atPath: current.path) {
-                var resolved = current.resolvingSymlinksInPath()
-                for component in missing.reversed() {
-                    resolved = resolved.appendingPathComponent(component)
-                }
-                return resolved
-            }
-            missing.append(current.lastPathComponent)
-            let parent = current.deletingLastPathComponent()
-            if parent.path == current.path {
-                return url.standardizedFileURL
-            }
-            current = parent
+        var resolved = URL(fileURLWithPath: "/", isDirectory: true)
+        // Every caller hands in an absolute URL; a relative one is kept as a
+        // path under the current directory so the walk still starts at the root.
+        if !url.path.hasPrefix("/") {
+            resolved = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
         }
+        let components: [String] = url.path.hasPrefix("/")
+            ? Array(url.pathComponents.dropFirst())
+            : url.pathComponents
+        for component in components {
+            switch component {
+            case "", ".":
+                continue
+            case "..":
+                // `resolved` holds no symlinks, so this is the same parent the
+                // kernel would reach. Never climb above the root.
+                if resolved.path != "/" {
+                    resolved.deleteLastPathComponent()
+                }
+            default:
+                let next = resolved.appendingPathComponent(component)
+                if fileManager.fileExists(atPath: next.path) {
+                    resolved = next.resolvingSymlinksInPath()
+                } else if remainingSymlinkHops > 0,
+                          let destination = try? fileManager.destinationOfSymbolicLink(atPath: next.path) {
+                    let target = URL(
+                        fileURLWithPath: destination,
+                        relativeTo: next.deletingLastPathComponent()
+                    ).standardizedFileURL
+                    resolved = resolvedForContainment(
+                        target,
+                        remainingSymlinkHops: remainingSymlinkHops - 1
+                    )
+                } else {
+                    resolved = next
+                }
+            }
+        }
+        return resolved
     }
 
     /// Containment after resolving every existing path component, so a path

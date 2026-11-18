@@ -55,6 +55,7 @@ struct SubagentInspectorView: View {
     /// Guards the async reload: a slow read for the previous conversation must
     /// not overwrite the new one's rows when it lands later.
     @State private var reloadGeneration: UInt64 = 0
+    @State private var confirmClear = false
 
     init(sessionId: UUID?, onClose: @escaping () -> Void) {
         self.sessionId = sessionId
@@ -83,8 +84,18 @@ struct SubagentInspectorView: View {
                     onReject: { approvalCenter.reject($0) },
                     onBack: { withAnimation(.easeInOut(duration: 0.15)) { self.selectedRunId = nil } },
                     onClose: onClose,
-                    onRecordChanged: reloadStored
+                    onRecordChanged: reloadStored,
+                    onDiscard: {
+                        SubagentManager.shared.discard(runId: detail.record.id, sessionId: sessionId)
+                        withAnimation(.easeInOut(duration: 0.15)) { self.selectedRunId = nil }
+                        reloadStored()
+                    }
                 )
+                // A run's pane is reused when the selection moves, and every
+                // scratch field below (apply notice, discard confirmation,
+                // steering draft) belongs to ONE run. Without this identity an
+                // applied run left Apply hidden on the next selection.
+                .id(detail.record.id)
                 .transition(.opacity)
             } else {
                 runList
@@ -98,6 +109,11 @@ struct SubagentInspectorView: View {
         }
         .onChange(of: manager.subagents.count) { _, _ in reloadStored() }
         .onChange(of: manager.activeSubagentsCount) { _, _ in reloadStored() }
+        // A count is not a status. A run moving into an approval wait, or a
+        // stored record whose apply completed, changes no count at all; the
+        // manager's publisher redraws the pane but does not reload the list.
+        // Watching the statuses reloads on exactly those transitions.
+        .onChange(of: manager.subagents.map(\.status)) { _, _ in reloadStored() }
         // The pane is not keyed by conversation, so switching chats left the
         // previous conversation's rows (and any detail selection) on screen.
         // Clear both before loading the new session's records.
@@ -110,6 +126,15 @@ struct SubagentInspectorView: View {
         // A notification click sets the manager's selection; the pane keeps its
         // own selection state, so it has to take the value and clear it.
         .onChange(of: manager.selectedSubagentId) { _, _ in consumeManagerSelection() }
+        // "Clear Finished" is an explicit decision, but deleting a report the
+        // coordinator has never seen is not one the operator gets to make by
+        // accident: a run whose summary is still UNREAD asks first.
+        .alert("Discard unread reports?", isPresented: $confirmClear) {
+            Button("Clear Anyway", role: .destructive) { clearFinished() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("\(unreadTerminalCount) finished run\(unreadTerminalCount == 1 ? "" : "s") still \(unreadTerminalCount == 1 ? "has" : "have") a report the coordinator has not seen. Clearing removes \(unreadTerminalCount == 1 ? "it" : "them") from this list.")
+        }
     }
 
     /// Pending approvals whose run is not the one the detail pane is showing.
@@ -150,9 +175,10 @@ struct SubagentInspectorView: View {
 
             if !terminalRuns.isEmpty {
                 Button(action: {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        manager.clearCompleted(sessionId: sessionId)
-                        reloadStored()
+                    if unreadTerminalCount > 0 {
+                        confirmClear = true
+                    } else {
+                        clearFinished()
                     }
                 }) {
                     Text("Clear Finished")
@@ -365,6 +391,26 @@ struct SubagentInspectorView: View {
         allRecords.filter(\.status.isTerminal)
     }
 
+    /// Finished runs whose report the coordinator has never been shown. The
+    /// bulk clear still removes them (the operator asked), but it says how
+    /// many unread reports go with it first.
+    private var unreadTerminalCount: Int {
+        allRecords.filter { record in
+            guard record.status.isTerminal, !record.summaryRelayed else { return false }
+            // The relay's own fallback: a run with no report can still carry
+            // the failure text the coordinator has never been shown.
+            let summary = record.report?.summary ?? record.error ?? ""
+            return !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }.count
+    }
+
+    private func clearFinished() {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            manager.clearCompleted(sessionId: sessionId)
+            reloadStored()
+        }
+    }
+
     /// Runs started outside a conversation (an API/agent turn with no chat
     /// session) have no bucket of their own, so they ride every inspector
     /// rather than becoming invisible in the one that happens to be open.
@@ -537,6 +583,10 @@ private struct SubagentRunDetailView: View {
     /// Reloading the stored list is what makes a non-live record show the
     /// apply it just completed; a live run publishes its own `appliedAt`.
     var onRecordChanged: () -> Void
+    /// Deletes this finished run and, for an unapplied isolated one, its
+    /// worktree. The bulk "Clear Finished" deliberately skips those, so this
+    /// is the operator's only way to decide a writer's work is not wanted.
+    var onDiscard: () -> Void
 
     @State private var messageDraft = ""
     @State private var showThinking = true
@@ -544,6 +594,7 @@ private struct SubagentRunDetailView: View {
     @State private var applyError: String?
     @State private var applyNotice: String?
     @State private var appliedHereAt: Date?
+    @State private var confirmDiscard = false
 
     /// The record is a value snapshot, so an apply performed from this pane is
     /// shown from local state until the parent reloads; the two are the same
@@ -552,6 +603,15 @@ private struct SubagentRunDetailView: View {
 
     private var canApplyChanges: Bool {
         appliedHereAt == nil && SubagentApplyControl.canApply(record)
+    }
+
+    /// Only a finished, still-unapplied isolated run needs a per-run discard:
+    /// every other finished run is what "Clear Finished" removes. Showing it
+    /// beside Apply makes the keep-or-discard decision the worktree's own.
+    private var canDiscard: Bool {
+        record.status.isTerminal
+            && record.isolation.isIsolated
+            && appliedAt == nil
     }
 
     var body: some View {
@@ -578,6 +638,12 @@ private struct SubagentRunDetailView: View {
                 controls
             }
             .padding(12)
+        }
+        .alert("Discard this run?", isPresented: $confirmDiscard) {
+            Button("Discard", role: .destructive) { onDiscard() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The run's record and its unapplied worktree are deleted. Its branch is removed too. This cannot be undone; apply the run first if you want to keep the work.")
         }
     }
 
@@ -1031,6 +1097,18 @@ private struct SubagentRunDetailView: View {
                             .font(.system(size: 10, weight: .medium))
                     }
                     .buttonStyle(.bordered)
+                }
+
+                if canDiscard {
+                    Button(role: .destructive) {
+                        confirmDiscard = true
+                    } label: {
+                        Label("Discard Run", systemImage: "trash")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.red)
+                    .help("Delete this run's record and its unapplied worktree. Apply it first to keep the work.")
                 }
 
                 Spacer()

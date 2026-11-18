@@ -677,30 +677,50 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
         _ call: AgentToolCall,
         remainingSeconds: TimeInterval
     ) async -> (resultJSON: String, record: ToolCallRecord, isCompleted: Bool)? {
-        let outcome = await withTaskGroup(
-            of: (resultJSON: String, record: ToolCallRecord, isCompleted: Bool)?.self
-        ) { group in
-            group.addTask { await context.execute(call) }
+        await firstResult(
+            deadlineNanoseconds: Self.deadlineNanoseconds(remainingSeconds)
+        ) {
+            await context.execute(call)
+        }
+    }
+
+    /// Runs `work` against a deadline and returns whichever finishes first.
+    ///
+    /// The group's element is optional (the deadline arm returns nil), so
+    /// `next()` is `T??`. Unwrapping only the OUTER optional treats "the
+    /// deadline won" as a result and returns nil before the work's answer is
+    /// collected. A tool that finished at the boundary was reported as a
+    /// wall-clock failure and its record (including a `complete` or a write)
+    /// vanished from the transcript. Unwrap both: a value means the work
+    /// finished first; a nil element means the deadline won, so cancel the
+    /// work and wait for whatever it returns.
+    ///
+    /// Internal rather than private so the deadline race can be tested without
+    /// a model or a real tool.
+    static func firstResult<T: Sendable>(
+        deadlineNanoseconds: UInt64,
+        _ work: @escaping @Sendable () async -> T
+    ) async -> T? {
+        await withTaskGroup(of: T?.self) { group in
+            group.addTask { await work() }
             group.addTask {
-                try? await Task.sleep(
-                    nanoseconds: Self.deadlineNanoseconds(remainingSeconds)
-                )
+                try? await Task.sleep(nanoseconds: deadlineNanoseconds)
                 return nil
             }
-            // Not `group.next()` alone: the deadline arm winning used to drop
-            // the tool's own result on the floor — a tool that finished its
-            // work just before the deadline, or a call refused under the
-            // cancellation that follows, vanished from the transcript with no
-            // `.toolResult`, no `.toolFinished` and no `toolCalls` count. The
-            // tool task is cancelled here and its answer (whatever it managed)
-            // is collected; the caller then records it honestly and the
-            // top-of-loop budget check still fails the run.
             let first = await group.next()
+            if let answer = first ?? nil {
+                group.cancelAll()
+                return Optional(answer)
+            }
             group.cancelAll()
-            if let first { return first }
-            return await group.next() ?? nil
+            // The deadline arm won; the work child is still in the group. Its
+            // own `nil` cannot happen, but the element is optional in the type
+            // whether or not the task has finished, so unwrap it honestly.
+            if let remaining = await group.next() {
+                return remaining
+            }
+            return nil
         }
-        return outcome
     }
 
     /// What a just-finished turn did to the run's budget, or nil. A cost of

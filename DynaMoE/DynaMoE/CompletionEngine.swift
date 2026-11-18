@@ -11787,6 +11787,10 @@ if layer.attnGateProjTensor != nil,
         cachedDeepSeekRuntime = nil
         cachedImageSpans.removeAll()
         stateLock.unlock()
+        // The prefill rate belongs to the checkpoint that measured it. A spawn
+        // priced from the previous model's rate could under-price a much larger
+        // one (or over-price a smaller one) until the next prefill corrects it.
+        PrefillThroughput.reset()
         retired?.runtime.shutdown()
     }
 

@@ -2393,7 +2393,12 @@ struct ContentView: View {
             // load-then-save would revert those fields and re-offer apply on
             // work that already landed. This is the exact defect `mutate`'s own
             // doc names.
-            AgentRunStore.shared.mutate(runId: id, sessionId: sessionId) { current in
+            //
+            // Queued rather than waited on: this runs on the main actor right
+            // after a send is accepted, and nobody reads the flag back
+            // synchronously. The blocking form paid an `ioQueue.sync` and a
+            // durable `fsync` per record before the next frame could draw.
+            AgentRunStore.shared.mutateLater(runId: id, sessionId: sessionId) { current in
                 current.summaryRelayed = true
             }
         }
@@ -5998,7 +6003,8 @@ struct ContentView: View {
                         mode: mode,
                         sessionId: sessionId,
                         messageId: stepMessageId,
-                        myGenerationId: myGenerationId
+                        myGenerationId: myGenerationId,
+                        turnId: cloudTurnId
                     )
                     if outcome.cancelled {
                         if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
@@ -6216,7 +6222,8 @@ struct ContentView: View {
         mode: AgentMode,
         sessionId: UUID,
         messageId: UUID,
-        myGenerationId: UInt64
+        myGenerationId: UInt64,
+        turnId: UUID
     ) async -> (cancelled: Bool, ranComplete: Bool, failureLoop: Bool) {
         let agent = AgentHarness.shared
         var parsed: [ParsedToolCall?] = []
@@ -6363,6 +6370,8 @@ struct ContentView: View {
                 workingDirectory: baseWorkingDirectory,
                 maxOutputLength: maxToolOutputLength,
                 mode: mode,
+                turnId: turnId,
+                sessionId: sessionId,
                 approvedSubQEndpoint: subQEndpoint
             )
             agent.recordToolCallOutcome(
@@ -7624,6 +7633,8 @@ struct ContentView: View {
                             workingDirectory: baseWdURL,
                             maxOutputLength: self.maxToolOutputLength,
                             mode: turnMode,
+                            turnId: agentTurnId,
+                            sessionId: sessionId,
                             approvedSubQEndpoint: subQEndpoint
                         )
                         responseSlots[actionableCallIndices[idx]] = execResult.resultJSON

@@ -248,9 +248,13 @@ final class CloudAgentBackendLogicTests: XCTestCase {
 
     func testRetryabilityIsKeyedOnStatusAndBillingOnly() {
         XCTAssertTrue(CloudAgentBackend.isRetryable(.httpStatus(code: 429, summary: "")))
-        XCTAssertTrue(
+        // A 5xx is not retryable at ANY receipt value. The live transport
+        // records `spent: true` for every 5xx, so the old `spentRequest ==
+        // false` arm could never fire; a 5xx means the provider accepted (and
+        // may have run) the prompt, and a retry can be invoiced twice.
+        XCTAssertFalse(
             CloudAgentBackend.isRetryable(.httpStatus(code: 503, summary: ""), spentRequest: false),
-            "a 5xx is retryable only when the transport says nothing was processed"
+            "no receipt value makes a 5xx safe to re-send"
         )
         XCTAssertFalse(
             CloudAgentBackend.isRetryable(.httpStatus(code: 503, summary: ""), spentRequest: true),

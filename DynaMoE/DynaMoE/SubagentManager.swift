@@ -658,7 +658,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             )
         } catch {
             await scheduler.finish(runId: id)
-            await discardWorktree(plan: plan)
+            await Self.discardWorktree(plan: plan)
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             let cancelled = (error as? AgentSchedulerError) == .cancelled || Task.isCancelled
             finishRun(
@@ -691,6 +691,8 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             context = try AgentRunContext.make(
                 runId: id,
                 sessionId: id,
+                parentTurnId: plan.parentTurnId,
+                parentSessionId: plan.parentSessionId,
                 toolNames: plan.toolNames,
                 workingDirectory: workingDirectoryURL,
                 mode: parentMode,
@@ -706,7 +708,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
                 }
             )
         } catch {
-            await discardWorktree(plan: plan)
+            await Self.discardWorktree(plan: plan)
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             finishRun(
                 summary: message,
@@ -887,7 +889,11 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     /// admission), and git must not be spawned from a cancelled task. The
     /// repository root and base commit travel with the plan so a submodule or
     /// `--separate-git-dir` checkout is still found.
-    private func discardWorktree(plan: AgentSpawnPlan) async {
+    ///
+    /// Static because the spawn path calls it too: a resolve that returned
+    /// after its turn was Stopped created the worktree for a run that will now
+    /// never start.
+    static func discardWorktree(plan: AgentSpawnPlan) async {
         await Task.detached(priority: .utility) {
             guard case .worktree(let path, let branch) = plan.isolation,
                   let worktree = try? await WorkspaceIsolation.open(
@@ -1591,6 +1597,8 @@ final class SubagentToolExecutor {
             workingDirectory: workingDirectory,
             maxOutputLength: stepOutputLimit,
             mode: parentMode,
+            turnId: owner.parentTurnId,
+            sessionId: owner.parentSessionId,
             approvedSubQEndpoint: subQEndpoint
         )
 
@@ -1833,14 +1841,16 @@ public final class SubagentManager: ObservableObject {
                     .filter { !$0.status.isTerminal }
                     .map(\.id))
             }
+            // The relay asks which restored records it still owes; building
+            // that index FIRST keeps the first send from paying for the scan.
+            // The scan is enqueued on the store's own IO queue, so everything
+            // below waits behind it rather than racing it.
+            AgentRunStore.shared.prepareRelayIndex()
             AgentRunStore.shared.reconcileInterruptedRuns(isLive: { liveRunIds.contains($0) })
             AgentRunStore.shared.prune(policy: policy)
             // Temp files an interrupted write left behind (a hard crash between
             // the create and the rename) are orphans nothing else looks at.
             AgentRunStore.shared.sweepOrphanedTempWrites()
-            // The relay asks which restored records it still owes; building
-            // that index here keeps the first send from paying for the scan.
-            AgentRunStore.shared.prepareRelayIndex()
             await WorkspaceIsolation.pruneStaleWorktrees()
         }
     }
@@ -2087,18 +2097,15 @@ public final class SubagentManager: ObservableObject {
         // runs), and nothing can update it, so it is clearable too. Unscoped
         // records ride every inspector, so they are cleared from any
         // conversation.
-        let stored = AgentRunStore.shared.load(sessionId: sessionId)
-            + (sessionId == nil ? [] : AgentRunStore.shared.load(sessionId: nil))
-        var deletedStoredRecord = false
-        for record in stored
-        where !clearedIds.contains(record.id)
-            && (record.status.isTerminal || !liveIds.contains(record.id))
-            && !(record.isolation.isIsolated && record.appliedAt == nil) {
-            AgentRunStore.shared.delete(runId: record.id, sessionId: record.parentSessionId)
-            deletedStoredRecord = true
-        }
-        if !terminal.isEmpty || deletedStoredRecord {
-            AgentRunStore.shared.flush()
+        //
+        // The scan runs on the store's IO queue rather than synchronously here:
+        // decoding a conversation's history on the main actor made the button
+        // a visible stall. A reload enqueued after this call still sees every
+        // delete, because the store's queue is FIFO.
+        AgentRunStore.shared.deleteClearableRecords(sessionId: sessionId) { record in
+            !clearedIds.contains(record.id)
+                && (record.status.isTerminal || !liveIds.contains(record.id))
+                && !(record.isolation.isIsolated && record.appliedAt == nil)
         }
 
         // Synchronous: the manager is main-actor state, and a caller that
@@ -2108,6 +2115,59 @@ public final class SubagentManager: ObservableObject {
         if let sel = selectedSubagentId, !subagents.contains(where: { $0.id == sel }) {
             selectedSubagentId = subagents.first?.id
         }
+    }
+
+    /// Deletes ONE finished run, including the worktree of an unapplied
+    /// isolated run.
+    ///
+    /// `clearCompleted` deliberately refuses to discard an unapplied worktree
+    /// in bulk, because the record is the only thing keeping the tree out of
+    /// the launch sweep. Without this per-run decision, a writer the operator
+    /// decided not to land was permanent: on disk, in every inspector, and
+    /// protected from retention forever. The discard is explicit and
+    /// destructive, and its card says so.
+    public func discard(runId: UUID, sessionId: UUID? = nil) {
+        lock.lock()
+        let instance = subagentsById[runId]
+        lock.unlock()
+        // A live run is stopped, not discarded: deleting its record underneath
+        // it would drop its terminal write and leave an unstoppable worker.
+        guard instance == nil || instance?.status.isTerminal == true else { return }
+        guard let record = instance?.snapshotRecord()
+            ?? AgentRunStore.shared.load(runId: runId, sessionId: sessionId)
+            ?? AgentRunStore.shared.loadAny(runId: runId),
+            record.status.isTerminal else { return }
+
+        lock.lock()
+        subagentsById.removeValue(forKey: runId)
+        instanceObservers.removeValue(forKey: runId)
+        subagentsOrder.removeAll { $0.id == runId }
+        lock.unlock()
+        subagents.removeAll { $0.id == runId }
+        if selectedSubagentId == runId {
+            selectedSubagentId = subagents.first?.id
+        }
+
+        // The worktree belongs to this run alone. Removing the record without
+        // it would motion the directory into the launch sweep; removing the
+        // directory after the record is gone is only safe because this call
+        // holds the path and branch from the record itself. Detached because
+        // git must not run inside a cancelled/main-actor context.
+        if case .worktree(let path, let branch) = record.isolation, record.appliedAt == nil {
+            let repositoryRoot = record.repositoryRoot.map { URL(fileURLWithPath: $0) }
+            let baseCommit = record.baseCommit ?? ""
+            Task.detached(priority: .utility) {
+                guard let worktree = try? await WorkspaceIsolation.open(
+                    path: path,
+                    branch: branch,
+                    repositoryRoot: repositoryRoot,
+                    baseCommit: baseCommit
+                ) else { return }
+                await WorkspaceIsolation.cleanup(worktree)
+            }
+        }
+
+        AgentRunStore.shared.deleteImmediately(runId: runId, sessionId: record.parentSessionId)
     }
 
     public func sendMessage(toSubagentId id: UUID, sender: String = "user", content: String) {

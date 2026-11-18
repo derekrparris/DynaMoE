@@ -87,6 +87,32 @@ final class TurnToolMaskTests: XCTestCase {
         )
     }
 
+    /// A scoped mask owns the registry for its turn. The app catalog used to be
+    /// able to rebuild it from tool registration, a Skills reload or MCP while
+    /// that turn was generating, which left the model calling a vocabulary the
+    /// mask no longer described. The sampler refuses the registration instead.
+    func testAScopedMaskRefusesTheAppCatalogUntilItIsRestored() async {
+        let sampler = GrammarConstrainedSampler.shared
+        sampler.registerToolSchemas([GrammarToolSchema(name: "shell_run")])
+        sampler.reset()
+
+        let installed = await GrammarConstrainedSampler.withTurnToolMask(
+            [GrammarToolSchema(name: "client_only")]
+        ) {
+            XCTAssertTrue(GrammarConstrainedSampler.isScopedMaskInstalled)
+            return GrammarConstrainedSampler.registerAppTools([])
+        }
+
+        XCTAssertFalse(installed, "the app catalog must not replace a live scoped mask")
+        XCTAssertFalse(GrammarConstrainedSampler.isScopedMaskInstalled)
+        sampler.reset()
+        XCTAssertEqual(
+            masked("<tool_call><function=", tokens: ["client_only>", "shell_run>"]),
+            [true, false],
+            "the registry installed before the scoped turn must be restored"
+        )
+    }
+
     func testSnapshotAndRestoreRoundTripsTheRegistry() {
         let sampler = GrammarConstrainedSampler.shared
         sampler.registerToolSchemas([GrammarToolSchema(name: "before")])

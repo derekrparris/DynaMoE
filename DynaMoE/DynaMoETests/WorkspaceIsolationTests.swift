@@ -680,6 +680,83 @@ final class WorkspaceIsolationTests: XCTestCase {
         XCTAssertFalse(status.resultJSON.contains("apply_directive"), status.resultJSON)
     }
 
+    /// An operator who decides a writer's work should not be landed must be
+    /// able to discard it. `clearCompleted` deliberately refuses to make that
+    /// decision in bulk (the record is what protects the worktree), so the
+    /// per-run discard is the only path that can ever remove one. Without it
+    /// the record, the tree and the branch were permanent.
+    func testAnUnappliedIsolatedRunCanBeDiscardedPerRun() async throws {
+        let runId = UUID()
+        let session = UUID()
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: runId,
+            root: worktreeRoot
+        )
+        let written = worktree.path.appendingPathComponent("discard_me.txt")
+        let backend = ScriptedBackend(turns: [
+            ScriptedBackend.ScriptedTurn(
+                text: "",
+                calls: [
+                    AgentToolCall(
+                        name: "file_write",
+                        arguments: ["path": "discard_me.txt", "content": "work the operator does not want\n"]
+                    )
+                ]
+            ),
+            ScriptedBackend.ScriptedTurn(text: "Created the file.")
+        ])
+        let plan = AgentSpawnPlan(
+            role: "Implementer",
+            taskDescription: "Create discard_me.txt.",
+            contextSummary: nil,
+            preset: .implementer,
+            backendDescriptor: .scripted,
+            schedulingClass: .cloud(providerId: "scripted"),
+            backend: backend,
+            toolNames: ["file_write"],
+            budget: AgentBudget(maxSteps: 4, maxCompletionTokens: 4_000, maxWallClockSeconds: 60, maxCostUSD: nil),
+            approvalPolicy: .spawnOnly,
+            isolation: worktree.isolation,
+            thinking: false,
+            sampling: .default,
+            priority: .userRequested,
+            parentSessionId: session,
+            parentTurnId: nil,
+            workingDirectory: worktree.path
+        )
+        let subagent = SubagentManager.shared.spawnModelBacked(plan, id: runId)
+        defer {
+            SubagentManager.shared.clearCompleted(sessionId: session)
+            AgentRunStore.shared.delete(runId: runId, sessionId: session)
+            Task { await WorkspaceIsolation.cleanup(worktree) }
+        }
+
+        _ = await subagent.waitForCompletion()
+        XCTAssertEqual(subagent.status, .completed)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: written.path))
+        XCTAssertNotNil(
+            AgentRunStore.shared.load(runId: runId, sessionId: session),
+            "the terminal record is what keeps the worktree from the launch sweep"
+        )
+
+        SubagentManager.shared.discard(runId: runId, sessionId: session)
+
+        XCTAssertNil(SubagentManager.shared.getSubagent(byId: runId))
+        XCTAssertNil(AgentRunStore.shared.load(runId: runId, sessionId: session))
+        // The worktree cleanup is detached so git is never spawned from the
+        // main actor; wait for it rather than assuming it finished inline.
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline, FileManager.default.fileExists(atPath: worktree.path.path) {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: worktree.path.path),
+            "discarding the run must remove its only copy of the work"
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: written.path))
+    }
+
     func testApplyIsStateChangingAndForbiddenToRuns() {
         XCTAssertTrue(AgentHarness.isStateChanging(toolName: "apply_subagent_changes"))
         XCTAssertTrue(AgentHarness.runScopedForbiddenToolNames.contains("apply_subagent_changes"))

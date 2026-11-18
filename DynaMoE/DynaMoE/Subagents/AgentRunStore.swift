@@ -222,6 +222,27 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         }
     }
 
+    /// Applies a mutation on the store's IO queue WITHOUT waiting for it.
+    ///
+    /// For a caller that updates a field nobody reads back synchronously.
+    /// Marking a report delivered is the case: the blocking `mutate` was an
+    /// `ioQueue.sync` plus a durable `fsync` per record on the main actor,
+    /// paid before the next frame could draw.
+    func mutateLater(
+        runId: UUID,
+        sessionId: UUID?,
+        _ change: @escaping @Sendable (inout AgentRunRecord) -> Void
+    ) {
+        ioQueue.async { [self] in
+            let preferred = fileURL(runId: runId, sessionId: sessionId)
+            let url = existingRecordURL(runId: runId, preferredSession: sessionId) ?? preferred
+            guard var current = decodeRecord(at: url) else { return }
+            change(&current)
+            let bounded = Self.bounded(current)
+            _ = writeNow(bounded, to: url)
+        }
+    }
+
     /// The record's actual file when the preferred bucket no longer holds it.
     private func existingRecordURL(runId: UUID, preferredSession: UUID?) -> URL? {
         let preferred = fileURL(runId: runId, sessionId: preferredSession)
@@ -356,11 +377,18 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     /// How many records the relay still owes one conversation. Cheap after the
     /// first call: the index is built once and maintained by this store.
     func unrelayedRunIds(sessionId: UUID?) -> Set<UUID> {
-        // The fallback for a launch that has not finished preparing the index
-        // runs the scan on the IO queue, never on the caller's (usually main)
-        // thread. It still waits for the answer, but the decode work does not
-        // block the UI while it does.
-        onQueue { [self] in
+        // Steady state: the launch prewarm has finished, so answering is one
+        // lock and a set lookup. The scan below is the first-send fallback for
+        // a launch that has not finished preparing the index; it runs on the
+        // IO queue, never on the caller's (usually main) thread.
+        signatureLock.lock()
+        if relayIndexBuilt {
+            let ids = unrelayedBySession[Self.relayBucket(sessionId)] ?? []
+            signatureLock.unlock()
+            return ids
+        }
+        signatureLock.unlock()
+        return onQueue { [self] in
             signatureLock.lock()
             defer { signatureLock.unlock() }
             ensureRelayIndexLocked()
@@ -438,21 +466,29 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     /// Every run of one conversation, newest first. Unknown newer schema
     /// versions are ignored rather than decoded lossily: a build that writes a
     /// field this one would drop on its next write must not be rewritten.
+    ///
+    /// Ordered behind pending writes and deletes on the store's IO queue. A
+    /// caller that clears and then reloads therefore cannot read the store
+    /// before the deletions it just asked for have landed.
     func load(sessionId: UUID?) -> [AgentRunRecord] {
-        let directory = directory(for: sessionId)
-        guard let names = try? fileManager.contentsOfDirectory(atPath: directory.path) else {
-            return []
+        onQueue { [self] in
+            let directory = directory(for: sessionId)
+            guard let names = try? fileManager.contentsOfDirectory(atPath: directory.path) else {
+                return []
+            }
+            var records: [AgentRunRecord] = []
+            for name in names where name.hasSuffix(".json") {
+                guard let record = decodeRecord(at: directory.appendingPathComponent(name)) else { continue }
+                records.append(record)
+            }
+            return records.sorted { Self.sortDate($0) > Self.sortDate($1) }
         }
-        var records: [AgentRunRecord] = []
-        for name in names where name.hasSuffix(".json") {
-            guard let record = decodeRecord(at: directory.appendingPathComponent(name)) else { continue }
-            records.append(record)
-        }
-        return records.sorted { Self.sortDate($0) > Self.sortDate($1) }
     }
 
     func load(runId: UUID, sessionId: UUID?) -> AgentRunRecord? {
-        decodeRecord(at: fileURL(runId: runId, sessionId: sessionId))
+        onQueue { [self] in
+            decodeRecord(at: fileURL(runId: runId, sessionId: sessionId))
+        }
     }
 
     /// Finds one run without decoding the whole store. The transcript card
@@ -460,39 +496,43 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     /// session with hundreds of finished runs should not be re-parsed to draw
     /// one card.
     func loadAny(runId: UUID) -> AgentRunRecord? {
-        let name = "\(runId.uuidString).json"
-        if let direct = try? fileManager.contentsOfDirectory(atPath: rootURL.path) {
-            for directoryName in direct {
-                let candidate = rootURL
-                    .appendingPathComponent(directoryName, isDirectory: true)
-                    .appendingPathComponent(name, isDirectory: false)
-                if fileManager.fileExists(atPath: candidate.path) {
-                    return decodeRecord(at: candidate)
+        onQueue { [self] in
+            let name = "\(runId.uuidString).json"
+            if let direct = try? fileManager.contentsOfDirectory(atPath: rootURL.path) {
+                for directoryName in direct {
+                    let candidate = rootURL
+                        .appendingPathComponent(directoryName, isDirectory: true)
+                        .appendingPathComponent(name, isDirectory: false)
+                    if fileManager.fileExists(atPath: candidate.path) {
+                        return decodeRecord(at: candidate)
+                    }
                 }
             }
+            return nil
         }
-        return nil
     }
 
     /// Every run across every conversation. Retention and the app's launch
     /// sweep read this; the inspector reads one session.
     func loadAll() -> [AgentRunRecord] {
-        guard let directories = try? fileManager.contentsOfDirectory(atPath: rootURL.path) else {
-            return []
-        }
-        var records: [AgentRunRecord] = []
-        for name in directories {
-            var isDirectory: ObjCBool = false
-            let path = rootURL.appendingPathComponent(name).path
-            guard fileManager.fileExists(atPath: path, isDirectory: &isDirectory),
-                  isDirectory.boolValue else { continue }
-            if let sessionId = UUID(uuidString: name) {
-                records.append(contentsOf: load(sessionId: sessionId))
-            } else {
-                records.append(contentsOf: loadSessionDirectory(named: name))
+        onQueue { [self] in
+            guard let directories = try? fileManager.contentsOfDirectory(atPath: rootURL.path) else {
+                return []
             }
+            var records: [AgentRunRecord] = []
+            for name in directories {
+                var isDirectory: ObjCBool = false
+                let path = rootURL.appendingPathComponent(name).path
+                guard fileManager.fileExists(atPath: path, isDirectory: &isDirectory),
+                      isDirectory.boolValue else { continue }
+                if let sessionId = UUID(uuidString: name) {
+                    records.append(contentsOf: load(sessionId: sessionId))
+                } else {
+                    records.append(contentsOf: loadSessionDirectory(named: name))
+                }
+            }
+            return records.sorted { Self.sortDate($0) > Self.sortDate($1) }
         }
-        return records.sorted { Self.sortDate($0) > Self.sortDate($1) }
     }
 
     /// Marks runs a previous process left mid-flight as failed.
@@ -554,14 +594,51 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     // MARK: - Deletion and retention
 
     func delete(runId: UUID, sessionId: UUID?) {
-        let url = fileURL(runId: runId, sessionId: sessionId)
         ioQueue.async { [self] in
-            noteDeletedRun(runId)
-            try? fileManager.removeItem(at: url)
-            signatureLock.lock()
-            writtenSignatures[url.path] = nil
-            removeRelayLocked(runId: runId, sessionId: sessionId)
-            signatureLock.unlock()
+            deleteLocked(runId: runId, sessionId: sessionId)
+        }
+    }
+
+    /// Deletes a record and locates it the way `mutate` does, so a run
+    /// re-scoped to the unscoped bucket is removed from where it actually
+    /// lives rather than from a path the tombstone refuses to touch.
+    private func deleteLocked(runId: UUID, sessionId: UUID?) {
+        let preferred = fileURL(runId: runId, sessionId: sessionId)
+        let url = existingRecordURL(runId: runId, preferredSession: sessionId) ?? preferred
+        noteDeletedRun(runId)
+        try? fileManager.removeItem(at: url)
+        signatureLock.lock()
+        writtenSignatures[url.path] = nil
+        removeRelayLocked(runId: runId, sessionId: sessionId)
+        signatureLock.unlock()
+    }
+
+    /// Deletes every record `clearable` accepts, scanning on the IO queue.
+    ///
+    /// The cleared-list decision used to be a synchronous load on the main
+    /// actor, which decoded an entire conversation's history before the UI
+    /// could redraw. The scan runs here instead, and the ordering is still
+    /// deterministic: every delete is enqueued before a later `load` (which
+    /// `sync`s this same queue) can run, so a reload immediately after a clear
+    /// cannot refill the rows.
+    func deleteClearableRecords(
+        sessionId: UUID?,
+        clearable: @escaping @Sendable (AgentRunRecord) -> Bool
+    ) {
+        ioQueue.async { [self] in
+            let stored = load(sessionId: sessionId)
+                + (sessionId == nil ? [] : load(sessionId: nil))
+            for record in stored where clearable(record) {
+                deleteLocked(runId: record.id, sessionId: record.parentSessionId)
+            }
+        }
+    }
+
+    /// Synchronous delete for an explicit per-run discard, where a list that
+    /// refills from disk after the call would read as the button failing.
+    func deleteImmediately(runId: UUID, sessionId: UUID?) {
+        onQueue { [self] in
+            deleteLocked(runId: runId, sessionId: sessionId)
         }
     }
 

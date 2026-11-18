@@ -344,10 +344,51 @@ final class AgentSpawnPolicyTests: XCTestCase {
         }
     }
 
-    func testPlanModeNeverAsksForASpawn() {
+    /// Plan mode withholds writes, so a local or legacy spawn cannot change
+    /// anything and needs no card. A spawn that works OFF-DEVICE still does:
+    /// its read tools (`file_read`, `grep_search`) upload repository content on
+    /// every step, which is the decision the spawn card exists for.
+    func testPlanModeOnlyAsksForASpawnThatWorksOffDevice() {
+        let suiteName = "AgentSpawnPolicyTests.plan.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.removeObject(forKey: SubagentBackendSettings.backendKey)
+
+        let base: [String: Any] = ["role": "Shader Optimizer", "task_description": "opt"]
+
+        // No stored backend: `auto` keeps the legacy/local pipelines.
+        XCTAssertFalse(AgentHarness.spawnSubagentRequiresApproval(arguments: base, mode: .plan, defaults: defaults))
         XCTAssertFalse(AgentHarness.spawnSubagentRequiresApproval(
-            arguments: ["role": "Shader Optimizer", "task_description": "opt"],
-            mode: .plan
+            arguments: base.merging(["backend": "local"]) { $1 },
+            mode: .plan,
+            defaults: defaults
+        ))
+        XCTAssertFalse(AgentHarness.spawnSubagentRequiresApproval(
+            arguments: base.merging(["backend": "legacy"]) { $1 },
+            mode: .plan,
+            defaults: defaults
+        ))
+
+        // An explicit Cloud backend asks even in plan mode.
+        XCTAssertTrue(AgentHarness.spawnSubagentRequiresApproval(
+            arguments: base.merging(["backend": "cloud"]) { $1 },
+            mode: .plan,
+            defaults: defaults
+        ))
+
+        // Settings=Cloud makes an omitted/`auto` backend resolve off-device,
+        // so it asks too; an explicit local backend still does not.
+        defaults.set("cloud", forKey: SubagentBackendSettings.backendKey)
+        XCTAssertTrue(AgentHarness.spawnSubagentRequiresApproval(arguments: base, mode: .plan, defaults: defaults))
+        XCTAssertTrue(AgentHarness.spawnSubagentRequiresApproval(
+            arguments: base.merging(["backend": "auto"]) { $1 },
+            mode: .plan,
+            defaults: defaults
+        ))
+        XCTAssertFalse(AgentHarness.spawnSubagentRequiresApproval(
+            arguments: base.merging(["backend": "local"]) { $1 },
+            mode: .plan,
+            defaults: defaults
         ))
     }
 

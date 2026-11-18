@@ -9,7 +9,13 @@ import Foundation
 
 final class AgentRunContext {
     nonisolated let runId: UUID
+    /// The run's own id, used as its backend session. Not the conversation.
     nonisolated let sessionId: UUID
+    /// The coordinator turn/session that spawned this run, so a tool that
+    /// parents something (a nested spawn) stamps THAT identity rather than
+    /// whatever the process-global `currentTurnId` holds when it executes.
+    nonisolated let parentTurnId: UUID?
+    nonisolated let parentSessionId: UUID?
     nonisolated let allowedTools: Set<String>
     nonisolated let mode: AgentMode
     nonisolated let workingDirectory: URL
@@ -19,6 +25,8 @@ final class AgentRunContext {
     init(
         runId: UUID,
         sessionId: UUID,
+        parentTurnId: UUID? = nil,
+        parentSessionId: UUID? = nil,
         allowedTools: Set<String>,
         mode: AgentMode,
         workingDirectory: URL,
@@ -27,6 +35,8 @@ final class AgentRunContext {
     ) {
         self.runId = runId
         self.sessionId = sessionId
+        self.parentTurnId = parentTurnId
+        self.parentSessionId = parentSessionId
         self.allowedTools = allowedTools
         self.mode = mode
         self.workingDirectory = workingDirectory
@@ -37,6 +47,8 @@ final class AgentRunContext {
     static func make(
         runId: UUID,
         sessionId: UUID,
+        parentTurnId: UUID? = nil,
+        parentSessionId: UUID? = nil,
         toolNames: [String],
         workingDirectory: URL,
         mode: AgentMode,
@@ -59,6 +71,8 @@ final class AgentRunContext {
         return AgentRunContext(
             runId: runId,
             sessionId: sessionId,
+            parentTurnId: parentTurnId,
+            parentSessionId: parentSessionId,
             allowedTools: Set(toolNames),
             mode: mode,
             workingDirectory: workingDirectory,
@@ -110,7 +124,9 @@ final class AgentRunContext {
             call: call.parsedCall,
             workingDirectory: workingDirectory,
             maxOutputLength: nil,
-            mode: mode
+            mode: mode,
+            turnId: parentTurnId,
+            sessionId: parentSessionId
         )
     }
 

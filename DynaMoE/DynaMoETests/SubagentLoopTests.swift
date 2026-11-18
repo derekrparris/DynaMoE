@@ -335,6 +335,25 @@ final class SubagentLoopTests: XCTestCase {
         })
     }
 
+    /// The deadline arm must not drop the work's answer. `withTaskGroup` of
+    /// `T?` makes `next()` a `T??`, and unwrapping only the OUTER optional
+    /// treated "the deadline won" as the result: a tool that finished at the
+    /// boundary was reported as a wall-clock failure and its record disappeared
+    /// from the transcript. The deadline here is short enough to win; the work
+    /// is cancelled by the collect path and its value must still come back.
+    func testADeadlineThatWinsStillCollectsTheCompletedResult() async {
+        let value = await HeadlessAgentLoop.firstResult(deadlineNanoseconds: 2_000_000) {
+            try? await Task.sleep(nanoseconds: 40_000_000)
+            return 42
+        }
+        XCTAssertEqual(value, 42, "the cancelled tool's own answer is the result")
+
+        let fast = await HeadlessAgentLoop.firstResult(deadlineNanoseconds: 1_000_000_000) {
+            return 7
+        }
+        XCTAssertEqual(fast, 7, "work that finishes first is returned unchanged")
+    }
+
     func testAStopRacingAToolIsCancelledNotAWallClockFailureAndItsApprovalDoesNotExecute() async throws {
         let workspace = try makeWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }
@@ -1123,6 +1142,108 @@ final class SubagentLoopTests: XCTestCase {
             FileManager.default.fileExists(
                 atPath: workspace.deletingLastPathComponent().appendingPathComponent("\(workspace.lastPathComponent)-escape.txt").path
             )
+        )
+    }
+
+    /// A symlink escape and `..` in ONE path: `<worktree>/link/../x`. The
+    /// kernel follows `link` first and then applies `..`, which lands outside
+    /// the worktree, while a lexical `standardizedFileURL` collapses the pair
+    /// to `<worktree>/x` and calls it inside. Resolving components in order is
+    /// what keeps the two answers the same; this is the case that fails if
+    /// `standardizedFileURL` is ever put back in front of the symlink walk.
+    func testASymlinkFollowedByDotDotEscapesTheWorkspace() async throws {
+        let workspace = try makeWorkspace()
+        let outside = workspace.deletingLastPathComponent()
+            .appendingPathComponent("\(workspace.lastPathComponent)-combo-target", isDirectory: true)
+        let landed = workspace.deletingLastPathComponent()
+            .appendingPathComponent("\(workspace.lastPathComponent)-combo-escaped.txt")
+        defer {
+            try? FileManager.default.removeItem(at: workspace)
+            try? FileManager.default.removeItem(at: outside)
+            try? FileManager.default.removeItem(at: landed)
+        }
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: workspace.appendingPathComponent("shortcut"),
+            withDestinationURL: outside
+        )
+        // `<worktree>/shortcut/../<file>`: the kernel resolves `shortcut` and
+        // then applies `..`, so the write lands beside `outside`, never inside
+        // the worktree a lexical standardisation would name.
+        let target = workspace.appendingPathComponent("shortcut/../\(landed.lastPathComponent)")
+        let counter = CallCounter()
+
+        let backend = ScriptedBackend(turns: [
+            .init(text: "writing", calls: [
+                AgentToolCall(name: "file_write", arguments: ["path": target.path, "content": "escaped"])
+            ]),
+            .init(text: "done", calls: [completeCall("Refused.")])
+        ])
+        let context = try makeContext(
+            workspace: workspace,
+            tools: ["file_write", "complete"],
+            policy: .spawnOnly,
+            isolated: true,
+            handler: { request in
+                counter.increment()
+                XCTAssertTrue(request.containmentEscape, "a symlink followed by .. is a containment failure")
+                return false
+            }
+        )
+
+        _ = await HeadlessAgentLoop().run(input: input(), backend: backend, context: context, emit: { _ in })
+        XCTAssertEqual(counter.count, 1, "the combined escape must produce a card")
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: landed.path),
+            "a declined card must leave the target outside the worktree untouched"
+        )
+    }
+
+    /// A symlink whose target does not exist yet is invisible to Foundation:
+    /// `fileExists` follows the link and says no, and
+    /// `resolvingSymlinksInPath` leaves the link in place. An `O_CREAT` write
+    /// still follows it, so leaving the link path "inside" would let the write
+    /// land anywhere. The link's own destination is what the guard must read.
+    func testADanglingSymlinkEscapeNeedsTheCard() async throws {
+        let workspace = try makeWorkspace()
+        let outside = workspace.deletingLastPathComponent()
+            .appendingPathComponent("\(workspace.lastPathComponent)-dangling-target.txt")
+        defer {
+            try? FileManager.default.removeItem(at: workspace)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        try FileManager.default.createSymbolicLink(
+            atPath: workspace.appendingPathComponent("dangling").path,
+            withDestinationPath: outside.path
+        )
+        let counter = CallCounter()
+
+        let backend = ScriptedBackend(turns: [
+            .init(text: "writing", calls: [
+                AgentToolCall(
+                    name: "file_write",
+                    arguments: ["path": workspace.appendingPathComponent("dangling").path, "content": "escaped"]
+                )
+            ]),
+            .init(text: "done", calls: [completeCall("Refused.")])
+        ])
+        let context = try makeContext(
+            workspace: workspace,
+            tools: ["file_write", "complete"],
+            policy: .spawnOnly,
+            isolated: true,
+            handler: { request in
+                counter.increment()
+                XCTAssertTrue(request.containmentEscape, "a dangling symlink is still an escape")
+                return false
+            }
+        )
+
+        _ = await HeadlessAgentLoop().run(input: input(), backend: backend, context: context, emit: { _ in })
+        XCTAssertEqual(counter.count, 1, "the dangling link's write must produce a card")
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: outside.path),
+            "a declined card must not create the link's target"
         )
     }
 

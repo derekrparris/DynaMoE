@@ -219,11 +219,13 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
             return !billed && spentRequest != true
         case .httpStatus(let code, _):
             if code == 429 { return true }
-            // A 5xx is an answer FROM the provider's edge, and the prompt may
-            // already have run. Retry only when the transport positively says
-            // nothing was processed; nil means nobody decided, which is not
-            // evidence of a free retry.
-            return code >= 500 && spentRequest == false
+            // A 5xx is never retried. It is an answer FROM the provider after
+            // the request was accepted, so the prompt may already have run and
+            // a retry can be invoiced twice. The old arm here required
+            // `spentRequest == false`, which the transport can never report for
+            // a 5xx (it records `spent: statusCode >= 500`), so the branch was
+            // dead; removing it is the honest answer, not retrying.
+            return false
         case .invalidResponse:
             return false
         case .missingAPIKey, .credentialAccessDenied, .credentialNeedsImport, .unsupportedFlavor:

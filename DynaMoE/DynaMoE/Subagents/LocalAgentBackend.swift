@@ -337,6 +337,12 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
                     await launch.handle.task.value
                     throw AgentBackendError.cancelled
                 }
+                // The task is awaited on EVERY exit from this loop, not just
+                // the success and cancellation ones: `withTurnToolMask`
+                // restores the registry when this call unwinds, and a turn
+                // still unwinding would read a vocabulary that no longer
+                // belongs to it.
+                await launch.handle.task.value
                 throw AgentBackendError.transport(failure.message)
             case .finished(let result):
                 // `TurnResult` carries main-actor-isolated value types, so its

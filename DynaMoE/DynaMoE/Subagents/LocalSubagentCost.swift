@@ -43,10 +43,17 @@ nonisolated enum PrefillThroughput {
         recentTokensPerSecond ?? fallbackTokensPerSecond
     }
 
-    static func resetForTesting() {
+    /// Forgets the measured rate. A model switch changes what a prompt costs
+    /// by orders of magnitude: keeping the previous checkpoint's rate would
+    /// price a 510 GB model's spawn from a small model's speed.
+    static func reset() {
         lock.lock()
         measured = nil
         lock.unlock()
+    }
+
+    static func resetForTesting() {
+        reset()
     }
 }
 

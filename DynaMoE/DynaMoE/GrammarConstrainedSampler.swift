@@ -275,16 +275,61 @@ nonisolated public final class GrammarConstrainedSampler {
     /// in-app tool names for every later turn. An empty schema list leaves the
     /// registry alone rather than clearing it: a turn with no tools must not
     /// unregister the app's own.
+    ///
+    /// While one of these is installed the app's own catalog must not rebuild
+    /// the registry: `AgentHarness.syncGrammar` is reached from tool
+    /// registration, Skills and MCP, and a reload landing mid-turn replaced a
+    /// client's vocabulary with the app catalog for the rest of that step.
+    /// `scopedMaskDepth` is the flag it consults.
     nonisolated public static func withTurnToolMask<T>(
         _ schemas: [GrammarToolSchema],
         _ body: () async throws -> T
     ) async rethrows -> T {
         guard !schemas.isEmpty else { return try await body() }
         let previous = shared.snapshotRegistry()
+        // Install and count under one lock, and restore and uncount under it
+        // too, so a `syncGrammar` racing the boundary cannot see "installed"
+        // and still overwrite the registry, nor read "not installed" while it
+        // is about to be.
+        scopedMaskLock.lock()
+        scopedMaskDepth += 1
         shared.registerToolSchemas(schemas)
-        defer { shared.restoreRegistry(previous) }
+        scopedMaskLock.unlock()
+        defer {
+            scopedMaskLock.lock()
+            shared.restoreRegistry(previous)
+            scopedMaskDepth -= 1
+            scopedMaskLock.unlock()
+        }
         return try await body()
     }
+
+    /// True while a scoped mask owns the registry.
+    nonisolated public static var isScopedMaskInstalled: Bool {
+        scopedMaskLock.lock()
+        defer { scopedMaskLock.unlock() }
+        return scopedMaskDepth > 0
+    }
+
+    /// Installs the app's own tool catalog, unless a scoped mask owns the
+    /// registry right now.
+    ///
+    /// The check and the write are one operation under `scopedMaskLock`: a
+    /// caller that tested `isScopedMaskInstalled` and then registered could
+    /// lose the race to a mask installing between the two, and that window is
+    /// exactly the mid-step rewrite this guard exists to prevent. Returns false
+    /// when the registration was refused (the caller may retry later).
+    @discardableResult
+    nonisolated public static func registerAppTools(_ tools: [ToolDefinition]) -> Bool {
+        scopedMaskLock.lock()
+        defer { scopedMaskLock.unlock() }
+        guard scopedMaskDepth == 0 else { return false }
+        shared.registerTools(tools)
+        return true
+    }
+
+    nonisolated private static let scopedMaskLock = NSLock()
+    nonisolated(unsafe) private static var scopedMaskDepth = 0
 
     private func applyRegistry(names: Set<String>, parameterKeys: [String: Set<String>], requiredKeys: [String: Set<String>]) {
         registrationLock.lock()
