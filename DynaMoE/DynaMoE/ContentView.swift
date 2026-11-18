@@ -2227,30 +2227,91 @@ struct ContentView: View {
     /// surfaced into the conversation. The harness injects these as `[SUBAGENT_RESULT]` blocks
     /// after tool turns so the coordinator model can present them to the user — subagents run
     /// in isolation and the user has no other way to receive their results.
+    ///
+    /// A run can finish after the app quits, or after its live instance is gone,
+    /// so the durable record is read too: a terminal record whose
+    /// `summaryRelayed` is still false is exactly the report this relay exists
+    /// to deliver. Live instances come first and their ids suppress the stored
+    /// copy, so one run is never injected twice.
     private func gatherCompletedSubagentRelayResponses(forSession sessionId: UUID?) -> [String] {
         guard let sessionId else { return [] }
-        let pending = SubagentManager.shared.allSubagents.filter {
-            $0.parentSessionId == sessionId
-                && ($0.status == .completed || $0.status == .failed || $0.status == .cancelled)
-                && !$0.isSummaryRelayed
-                && !$0.finalSummary.isEmpty
+        var seen = Set<UUID>()
+        var reports: [String] = []
+        let budget = AgentHarness.charBudget(forTokenBudget: self.maxToolOutputLength)
+
+        func line(role: String, id: UUID, status: String, summary: String) -> String? {
+            let clean = AgentHarness.truncateText(
+                AgentHarness.sanitizeText(summary),
+                limit: budget
+            )
+            guard !clean.isEmpty else { return nil }
+            return "[SUBAGENT_RESULT] role=\(role) id=\(id.uuidString) status=\(status)\n\(clean)"
         }
-        guard !pending.isEmpty else { return [] }
-        return pending.map { s in
-            let clean = AgentHarness.truncateText(AgentHarness.sanitizeText(s.finalSummary), limit: AgentHarness.charBudget(forTokenBudget: self.maxToolOutputLength))
-            return "[SUBAGENT_RESULT] role=\(s.role) id=\(s.id.uuidString) status=\(s.status.rawValue)\n\(clean)"
+
+        for instance in SubagentManager.shared.allSubagents
+        where instance.parentSessionId == sessionId
+            && instance.status.isTerminal
+            && !instance.isSummaryRelayed
+            && !instance.finalSummary.isEmpty {
+            seen.insert(instance.id)
+            if let text = line(
+                role: instance.role,
+                id: instance.id,
+                status: instance.status.rawValue,
+                summary: instance.finalSummary
+            ) {
+                reports.append(text)
+            }
         }
+
+        // Only the records the store's relay index still owes this
+        // conversation are decoded. Reading every record on each send would
+        // parse a session's whole run history to find, usually, nothing.
+        for id in AgentRunStore.shared.unrelayedRunIds(sessionId: sessionId)
+        where !seen.contains(id) {
+            guard let record = AgentRunStore.shared.load(runId: id, sessionId: sessionId) else { continue }
+            let summary = record.report?.summary ?? record.error ?? ""
+            if let text = line(
+                role: record.role,
+                id: record.id,
+                status: record.status.rawValue,
+                summary: summary
+            ) {
+                reports.append(text)
+            }
+        }
+        return reports
     }
 
     /// Marks the given subagent summaries as delivered so the auto-relay does not inject
     /// them into the conversation twice.
-    private func markSubagentSummariesRelayed(_ responses: [String]) {
+    ///
+    /// Delivered means a turn actually STARTED with them: every caller marks
+    /// only after its launch returned true. A restored run has no live instance
+    /// to carry the flag, so its record is rewritten as well; otherwise the
+    /// next turn would inject the same report again.
+    private func markSubagentSummariesRelayed(_ responses: [String], sessionId: UUID?) {
         guard !responses.isEmpty else { return }
-        for s in SubagentManager.shared.allSubagents {
-            if responses.contains(where: { $0.contains(s.id.uuidString) }) {
-                s.isSummaryRelayed = true
-            }
+        let ids = Set(responses.compactMap(Self.relayedRunId(inOutput:)))
+        guard !ids.isEmpty else { return }
+        for instance in SubagentManager.shared.allSubagents where ids.contains(instance.id) {
+            instance.isSummaryRelayed = true
         }
+        for id in ids {
+            guard var record = AgentRunStore.shared.load(runId: id, sessionId: sessionId),
+                  !record.summaryRelayed else { continue }
+            record.summaryRelayed = true
+            AgentRunStore.shared.saveImmediately(record)
+        }
+    }
+
+    /// The run id a relay line carries (`id=<uuid>` is written by the gather
+    /// above). Parsing it is what lets a restored record be marked delivered
+    /// without a second lookup by role and task.
+    private nonisolated static func relayedRunId(inOutput response: String) -> UUID? {
+        guard let key = response.range(of: "id=") else { return nil }
+        let tail = response[key.upperBound...].prefix(36)
+        return UUID(uuidString: String(tail))
     }
 
     /// Waits until every running/pending subagent for the session reaches a terminal state
@@ -3694,7 +3755,7 @@ struct ContentView: View {
                 instructionsText: afmInstructions,
                 responseTokenCeiling: afmResponseTokens
             )
-            markSubagentSummariesRelayed(pendingSubagentRelay)
+            markSubagentSummariesRelayed(pendingSubagentRelay, sessionId: currentSessionId)
             return true
         }
 
@@ -4231,11 +4292,9 @@ struct ContentView: View {
             customPrompt: promptString,
             images: turnImages,
             sessionId: currentSessionId,
-            messageId: assistantMsgId
+            messageId: assistantMsgId,
+            relayedReports: pendingSubagentRelay
         )
-        if launched {
-            markSubagentSummariesRelayed(pendingSubagentRelay)
-        }
         return launched
     }
 
@@ -4998,14 +5057,18 @@ struct ContentView: View {
             // trailing position is what keeps the leading system message — the
             // cached prefix — byte-identical between steps.
             var relayDirective = ""
+            /// The reports the pending directive carries. They stay unmarked
+            /// until a request that carried them actually reached the provider
+            /// (`stepReceipt.spentRequest == true`): marking at gather time
+            /// lost the report whenever the request was refused or failed
+            /// before submission.
+            var relayDirectiveReports: [String] = []
             // A directive belongs to the step that carries it, and both retries
             // below (an image rejection and a context overflow) re-enter this
-            // loop through `continue`. The relay it names was already marked
-            // delivered when it was gathered, so losing it on a retry dropped
-            // those subagent reports — or the forced-synthesis instruction —
-            // permanently. Holds the directive only BETWEEN a failed attempt and
-            // that attempt's retry.
+            // loop through `continue`. Holds the directive and its reports only
+            // BETWEEN a failed attempt and that attempt's retry.
             var carriedStepDirective: String?
+            var carriedStepReports: [String] = []
             // At most one tools-disabled synthesis turn per run, mirroring the
             // weights path's forced-synthesis pass. It also bounds the subagent
             // result-delivery relay below.
@@ -5014,8 +5077,8 @@ struct ContentView: View {
             @MainActor func takeSubagentRelayDirective() -> Bool {
                 let pending = self.gatherCompletedSubagentRelayResponses(forSession: sessionId)
                 guard !pending.isEmpty else { return false }
-                self.markSubagentSummariesRelayed(pending)
                 relayDirective = CloudSubagentRelay.directive(reports: pending)
+                relayDirectiveReports = pending
                 return true
             }
 
@@ -5149,14 +5212,19 @@ struct ContentView: View {
                 // tool rounds continue told every later step to "write the final
                 // answer now" even though that answer was not due yet.
                 let stepDirective: String
+                let stepRelayReports: [String]
                 if let carried = carriedStepDirective {
                     // This iteration is a RETRY of the step that carried the
                     // directive; send the same request shape again.
                     stepDirective = carried
+                    stepRelayReports = carriedStepReports
                     carriedStepDirective = nil
+                    carriedStepReports = []
                 } else {
                     stepDirective = relayDirective
+                    stepRelayReports = relayDirectiveReports
                     relayDirective = ""
+                    relayDirectiveReports = []
                 }
                 // A coordinator directive is APPENDED, never merged into the
                 // system message: that is the prefix the provider cached.
@@ -5393,6 +5461,14 @@ struct ContentView: View {
                     if finishReason == nil { finishReason = recorded.finishReason }
                 }
 
+                // The reports the request carried are delivered only now, after
+                // the transport has said the provider processed the request. A
+                // refusal or a failure before submission leaves them unmarked,
+                // so the next turn offers them again instead of losing them.
+                if !stepRelayReports.isEmpty, stepReceipt.spentRequest == true {
+                    markSubagentSummariesRelayed(stepRelayReports, sessionId: sessionId)
+                }
+
                 // Stop-button cancellation and superseded turns bypass the
                 // success finalizer: the replacement generation owns the UI
                 // flags. Partials already streamed stay in the message, and the
@@ -5469,8 +5545,10 @@ struct ContentView: View {
                         toolCalls: []
                     )
                     // The retry is the SAME step: its directive (a subagent
-                    // relay or the synthesis instruction) has to ride it again.
+                    // relay or the synthesis instruction) and the reports it
+                    // carries have to ride it again.
                     carriedStepDirective = stepDirective
+                    carriedStepReports = stepRelayReports
                     continue
                 }
 
@@ -5526,8 +5604,9 @@ struct ContentView: View {
                     )
                     // Same step, same directive, for the same reason the image
                     // retry keeps it: the report or instruction this attempt
-                    // carried was already marked delivered.
+                    // carried is still undelivered until a request is spent.
                     carriedStepDirective = stepDirective
+                    carriedStepReports = stepRelayReports
                     continue
                 }
 
@@ -5579,6 +5658,7 @@ struct ContentView: View {
                         // Same step, same directive: a compaction must not eat
                         // the report or the instruction this attempt carried.
                         carriedStepDirective = stepDirective
+                        carriedStepReports = stepRelayReports
                         continue
                     }
                     contextCompactionFailure = outcome.failure
@@ -6260,7 +6340,7 @@ struct ContentView: View {
     /// it, because a launch refused AFTER the messages were appended (lost slot,
     /// engine not ready) is otherwise reported to the caller as accepted work.
     @discardableResult
-    private func startAutoregressiveGeneration(customPrompt: String? = nil, promptTokens: [UInt32]? = nil, images: [TurnImage] = [], carriedImageSpans: [TurnImageSpan] = [], sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0, isInThinkingContinuation: Bool = false, forceSynthesis: Bool = false, preemptionRetry: Bool = false) -> Bool {
+    private func startAutoregressiveGeneration(customPrompt: String? = nil, promptTokens: [UInt32]? = nil, images: [TurnImage] = [], carriedImageSpans: [TurnImageSpan] = [], sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0, isInThinkingContinuation: Bool = false, forceSynthesis: Bool = false, preemptionRetry: Bool = false, relayedReports: [String] = []) -> Bool {
         guard let summary = summary,
               let tokenizer = tokenizer else {
             let err = "❌ Metal or Tokenizer not ready for text generation. Please load model and tokenizer in Settings."
@@ -6312,7 +6392,12 @@ struct ContentView: View {
                     agentStep: agentStep,
                     isInThinkingContinuation: isInThinkingContinuation,
                     forceSynthesis: forceSynthesis,
-                    preemptionRetry: true
+                    preemptionRetry: true,
+                    // The reports this send carries are marked delivered only
+                    // when the retry actually launches. Returning `true` here
+                    // used to let the caller mark them even if the retry was
+                    // refused, dropping them permanently.
+                    relayedReports: relayedReports
                 )
             }
             return true
@@ -6479,6 +6564,11 @@ struct ContentView: View {
             showStatus(err, kind: .warning)
             return false
         }
+
+        // The turn that carries a relayed subagent report has actually started.
+        // Marking earlier (before the launch, or before a deferred retry that
+        // could still be refused) is what used to lose reports permanently.
+        markSubagentSummariesRelayed(relayedReports, sessionId: sessionId)
 
         // In-app turn log: one request-log row per chat/agent turn (source
         // chatUI; bodies follow the Store Request Content toggle, the rendered
@@ -7264,10 +7354,11 @@ struct ContentView: View {
                         // Auto-relay: completed background subagents whose final reports have
                         // not yet reached the conversation get injected as SUBAGENT_RESULT
                         // blocks here, so the coordinator can present them to the user.
+                        // Marked only when the continuation this response turn
+                        // feeds actually launches; a launch refused between
+                        // here and there must leave them pending.
                         let relayResponses = await MainActor.run {
-                            let r = self.gatherCompletedSubagentRelayResponses(forSession: sessionId)
-                            self.markSubagentSummariesRelayed(r)
-                            return r
+                            self.gatherCompletedSubagentRelayResponses(forSession: sessionId)
                         }
                         let allResponses = toolResponses + relayResponses
 
@@ -7357,7 +7448,8 @@ struct ContentView: View {
                                 carriedImageSpans: promptImageSpans,
                                 sessionId: sessionId,
                                 messageId: nextAssistantMsgId,
-                                agentStep: agentStep + 1
+                                agentStep: agentStep + 1,
+                                relayedReports: relayResponses
                             )
                         }
                         return
@@ -7434,10 +7526,10 @@ struct ContentView: View {
                         // them to the user instead of dropping them.
                         if !ranCompleteTool {
                             await self.awaitSessionSubagents(sessionId: sessionId, timeout: 120)
+                            // Same rule as the mid-run relay: delivered only
+                            // once the relay turn launches.
                             let pendingRelay = await MainActor.run {
-                                let r = self.gatherCompletedSubagentRelayResponses(forSession: sessionId)
-                                self.markSubagentSummariesRelayed(r)
-                                return r
+                                self.gatherCompletedSubagentRelayResponses(forSession: sessionId)
                             }
                             if !pendingRelay.isEmpty {
                                 let endTag = (modelConfig?.isGemma4Model == true) ? "<turn|>" : ((modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>") )
@@ -7481,7 +7573,8 @@ struct ContentView: View {
                                         sessionId: sessionId,
                                         messageId: relayMsgId,
                                         agentStep: agentStep + 1,
-                                        forceSynthesis: true
+                                        forceSynthesis: true,
+                                        relayedReports: pendingRelay
                                     )
                                 }
                                 return

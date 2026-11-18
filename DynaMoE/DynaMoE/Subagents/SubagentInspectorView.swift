@@ -65,8 +65,10 @@ struct SubagentInspectorView: View {
                 usageStrip
             }
             Divider()
-            if selectedRunId == nil, !approvalCenter.pending.isEmpty {
-                approvalStack
+            // Approvals for a run other than the one being read stay visible:
+            // an unanswered card was hidden by merely selecting a run.
+            if !orphanApprovals.isEmpty {
+                approvalStack(orphanApprovals)
                 Divider()
             }
             if let selectedRunId, let detail = detailRecord(for: selectedRunId) {
@@ -87,9 +89,27 @@ struct SubagentInspectorView: View {
         }
         .frame(minWidth: 340, idealWidth: 420, maxWidth: 560)
         .background(Color(NSColor.windowBackgroundColor))
-        .onAppear(perform: reloadStored)
+        .onAppear {
+            reloadStored()
+            consumeManagerSelection()
+        }
         .onChange(of: manager.subagents.count) { _ in reloadStored() }
         .onChange(of: manager.activeSubagentsCount) { _ in reloadStored() }
+        // A notification click sets the manager's selection; the pane keeps its
+        // own selection state, so it has to take the value and clear it.
+        .onChange(of: manager.selectedSubagentId) { _, _ in consumeManagerSelection() }
+    }
+
+    /// Pending approvals whose run is not the one the detail pane is showing.
+    private var orphanApprovals: [PendingSubagentApproval] {
+        guard let selectedRunId else { return approvalCenter.pending }
+        return approvalCenter.pending.filter { $0.request.runId != selectedRunId }
+    }
+
+    private func consumeManagerSelection() {
+        guard let id = manager.selectedSubagentId else { return }
+        selectedRunId = id
+        manager.selectedSubagentId = nil
     }
 
     // MARK: Header
@@ -223,12 +243,12 @@ struct SubagentInspectorView: View {
         return String(format: "%.1fs", seconds)
     }
 
-    private var approvalStack: some View {
+    private func approvalStack(_ entries: [PendingSubagentApproval]) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("WAITING FOR YOUR DECISION")
                 .font(.system(size: 9, weight: .bold))
                 .foregroundColor(.orange)
-            ForEach(approvalCenter.pending) { entry in
+            ForEach(entries) { entry in
                 ActionConfirmationView(
                     confirmation: SubagentApprovalCenter.confirmation(for: entry.request),
                     onApprove: { approvalCenter.approve(entry.id) },
@@ -1124,12 +1144,26 @@ struct SubagentInlineRunCard: View {
     @State private var storedRecord: AgentRunRecord?
 
     var body: some View {
-        if let instance = manager.allSubagents.first(where: { $0.id == runId }) {
-            card(instance.snapshotRecord(), live: instance)
-        } else if let record = storedRecord {
-            card(record, live: nil)
-        } else {
-            EmptyView()
+        // The task is attached HERE, not to the card: when neither a live
+        // instance nor a stored record is present the card branch is EmptyView,
+        // so a task inside it never ran and a restored run's spawn card stayed
+        // blank forever.
+        Group {
+            if let instance = manager.allSubagents.first(where: { $0.id == runId }) {
+                card(instance.snapshotRecord(), live: instance)
+            } else if let record = storedRecord {
+                card(record, live: nil)
+            } else {
+                EmptyView()
+            }
+        }
+        .task(id: runId) {
+            guard storedRecord == nil,
+                  manager.allSubagents.first(where: { $0.id == runId }) == nil else { return }
+            let record = await Task.detached(priority: .utility) {
+                AgentRunStore.shared.loadAny(runId: runId)
+            }.value
+            storedRecord = record
         }
     }
 
@@ -1181,14 +1215,6 @@ struct SubagentInlineRunCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.purple.opacity(0.05))
         .cornerRadius(6)
-        .task(id: runId) {
-            if storedRecord == nil {
-                let record = await Task.detached(priority: .utility) {
-                    AgentRunStore.shared.loadAny(runId: runId)
-                }.value
-                storedRecord = record
-            }
-        }
     }
 }
 

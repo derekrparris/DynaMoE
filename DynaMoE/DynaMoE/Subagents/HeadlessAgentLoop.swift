@@ -272,9 +272,22 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                         output: AgentHarness.renderToolResultForModel(AgentHarness.toolErrorJSON(tool: call.name, error: error)),
                         error: error
                     )
+                    // A refusal is still a tool call the model made. It used to
+                    // `continue` before both loop guards saw it, so a model that
+                    // kept calling a tool it was never given ran until its step
+                    // budget with no escalation.
+                    usage.toolCalls += 1
+                    await context.noteToolOutcome(record, call: call)
                     append(kind: .toolResult, step: step, record: record)
                     messages.append(.toolResult(callId: call.id, name: call.name, content: error, isError: true))
                     emit(.toolFinished(record))
+                    if let tripped = await context.trippedGuard() {
+                        status = .blocked
+                        failure = "The run was stopped by its loop guard: \(tripped)."
+                        append(kind: .status, step: step, text: failure)
+                        finishedRun = true
+                        break
+                    }
                     continue
                 }
 
@@ -286,7 +299,23 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 )
                 emit(.toolStarted(running))
 
-                let execution = await context.execute(call)
+                // The wall-clock budget is a promise about the whole run, not
+                // just its model turns. A shell command may take up to two
+                // minutes, so a single call could outlive the budget that the
+                // next top-of-loop check would then report.
+                let remainingBeforeTool = Double(input.budget.maxWallClockSeconds)
+                    - (CFAbsoluteTimeGetCurrent() - start)
+                guard let execution = await Self.runTool(
+                    context,
+                    call,
+                    remainingSeconds: remainingBeforeTool
+                ) else {
+                    status = .failed
+                    failure = "The run exceeded its \(input.budget.maxWallClockSeconds)-second wall-clock budget while '\(call.name)' was running."
+                    append(kind: .status, step: step, text: failure)
+                    finishedRun = true
+                    break
+                }
                 var record = execution.record
                 record.id = running.id
                 usage.toolCalls += 1
@@ -308,7 +337,7 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 }
             }
             if finishedRun {
-                if status != .cancelled { status = .completed }
+                if status != .cancelled, failure == nil { status = .completed }
                 finished = true
                 break
             }
@@ -400,6 +429,31 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
         }
     }
 
+    /// Runs one tool under whatever is left of the wall-clock budget. Nil means
+    /// the deadline won; the tool's task is cancelled and the group waits for
+    /// it to stop (a `shell_run` child is killed by `runProcess`'s own
+    /// cancellation handler).
+    private static func runTool(
+        _ context: AgentRunContext,
+        _ call: AgentToolCall,
+        remainingSeconds: TimeInterval
+    ) async -> (resultJSON: String, record: ToolCallRecord, isCompleted: Bool)? {
+        let outcome = await withTaskGroup(
+            of: (resultJSON: String, record: ToolCallRecord, isCompleted: Bool)?.self
+        ) { group in
+            group.addTask { await context.execute(call) }
+            group.addTask {
+                try? await Task.sleep(
+                    nanoseconds: UInt64(max(0, remainingSeconds) * 1_000_000_000)
+                )
+                return nil
+            }
+            defer { group.cancelAll() }
+            return await group.next() ?? nil
+        }
+        return outcome
+    }
+
     /// What a just-finished turn did to the run's budget, or nil. A cost of
     /// exactly the ceiling is allowed for a turn that then stopped: the ceiling
     /// is the most the run may SPEND, and the next step's pre-check would stop
@@ -431,10 +485,14 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
     }
 
     private static func initialTaskText(task: String, context: String?) -> String {
+        // The coordinator's task and context are model-authored text that lands
+        // in the worker's prompt. A chat-template marker in either would open
+        // or close a turn and let the text speak as the system.
+        let task = AgentHarness.sanitizeText(task)
         guard let context, !context.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return task
         }
-        return task + "\n\nCoordinator context:\n" + context
+        return task + "\n\nCoordinator context:\n" + AgentHarness.sanitizeText(context)
     }
 
     private static func bounded(_ text: String, limit: Int) -> String {
@@ -451,6 +509,10 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
         for entry in transcript {
             guard let record = entry.toolRecord else { continue }
             guard record.name == "file_write" || record.name == "file_edit" else { continue }
+            // A failed or refused write changed nothing. Listing it told the
+            // operator (and the persisted report) that a file had been edited
+            // when the call had been rejected or had errored out.
+            guard record.status == .success else { continue }
             guard let path = record.arguments["path"], !path.isEmpty else { continue }
             if seen.insert(path).inserted {
                 files.append(path)

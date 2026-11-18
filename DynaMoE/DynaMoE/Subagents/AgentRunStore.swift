@@ -50,6 +50,15 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         static let thinking = 16_384
         static let status = 2_048
         static let task = 16_384
+        /// One tool argument (a `file_write` body is the usual offender). The
+        /// record is a summary of what happened, not a second copy of the file:
+        /// the arguments and `rawArguments` together used to store a written
+        /// file twice in a 0644 JSON file.
+        static let argumentValue = 2_048
+        static let rawArguments = 8_192
+        /// A coordinator message or the spawn's conversation excerpt.
+        static let message = 8_192
+        static let contextSummary = 16_384
         /// A worktree diff is the report's most useful artifact, so it gets a
         /// larger budget than a single tool output. Applying never reads this
         /// copy: the live worktree supplies the full patch.
@@ -87,6 +96,21 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     private let ioQueue = DispatchQueue(label: "dynamoe.agent-run-store", qos: .utility)
     private let signatureLock = NSLock()
     private var writtenSignatures: [String: SHA256Digest] = [:]
+    /// Runs and sessions a caller deleted. Writes are queued, so a save that
+    /// was captured before its delete can land after it and bring the file
+    /// back; the tombstone is what makes the delete final. Bounded because only
+    /// the most recent deletions can still have an in-flight save behind them.
+    private var deletedRunIds: Set<UUID> = []
+    private var deletedRunOrder: [UUID] = []
+    private var deletedSessionIds: Set<UUID> = []
+    private var deletedSessionOrder: [UUID] = []
+    private let maximumTombstones = 512
+    /// Terminal records whose report has not been relayed, keyed by session
+    /// bucket. Built once from disk (off the main actor at launch) and kept
+    /// current by `writeNow`/`delete`. The report relay asks this instead of
+    /// decoding every record in a conversation on each send.
+    private var unrelayedBySession: [String: Set<UUID>] = [:]
+    private var relayIndexBuilt = false
 
     init(
         rootURL: URL = AgentRunStore.defaultRootURL,
@@ -147,9 +171,19 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     }
 
     private func writeNow(_ record: AgentRunRecord, to url: URL) {
+        signatureLock.lock()
+        let wasDeleted = deletedRunIds.contains(record.id)
+            || (record.parentSessionId.map { deletedSessionIds.contains($0) } ?? false)
+        signatureLock.unlock()
+        if wasDeleted { return }
+
         let directory = url.deletingLastPathComponent()
         do {
-            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+            try fileManager.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
         } catch {
             print("⚠️ [AgentRunStore] could not create \(directory.lastPathComponent): \(error.localizedDescription)")
             return
@@ -172,15 +206,94 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         if previous == signature,
            fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory),
            !isDirectory.boolValue {
+            noteRelayMembership(record)
             return
         }
         do {
             try data.write(to: url, options: .atomic)
+            // A run's record carries the task, the conversation excerpt,
+            // thinking and tool output. Application Support is user-readable by
+            // default, which is the wrong floor for that content; the file is
+            // owner-only from the moment it exists. The directory is set as
+            // well so the filename (a run id) is not world-listable.
+            try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            try? fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
             signatureLock.lock()
             writtenSignatures[key] = signature
             signatureLock.unlock()
+            noteRelayMembership(record)
         } catch {
             print("⚠️ [AgentRunStore] failed to write run \(record.id): \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - Unrelayed index
+
+    /// How many records the relay still owes one conversation. Cheap after the
+    /// first call: the index is built once and maintained by this store.
+    func unrelayedRunIds(sessionId: UUID?) -> Set<UUID> {
+        signatureLock.lock()
+        defer { signatureLock.unlock() }
+        ensureRelayIndexLocked()
+        return unrelayedBySession[Self.relayBucket(sessionId)] ?? []
+    }
+
+    /// Builds the index off the caller's thread. The manager's launch sweep
+    /// calls this so the first send does not pay for the scan.
+    func prepareRelayIndex() {
+        signatureLock.lock()
+        defer { signatureLock.unlock() }
+        ensureRelayIndexLocked()
+    }
+
+    private static func relayBucket(_ sessionId: UUID?) -> String {
+        sessionId?.uuidString ?? unscopedSessionDirectory
+    }
+
+    private func ensureRelayIndexLocked() {
+        guard !relayIndexBuilt else { return }
+        relayIndexBuilt = true
+        guard let directories = try? fileManager.contentsOfDirectory(atPath: rootURL.path) else { return }
+        for name in directories {
+            let directory = rootURL.appendingPathComponent(name, isDirectory: true)
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: directory.path, isDirectory: &isDirectory),
+                  isDirectory.boolValue,
+                  let files = try? fileManager.contentsOfDirectory(atPath: directory.path) else { continue }
+            for file in files where file.hasSuffix(".json") {
+                guard let data = try? Data(contentsOf: directory.appendingPathComponent(file)),
+                      let record = try? JSONDecoder().decode(AgentRunRecord.self, from: data),
+                      record.schemaVersion <= AgentRunRecord.currentSchemaVersion,
+                      record.status.isTerminal,
+                      !record.summaryRelayed else { continue }
+                addRelayLocked(record)
+            }
+        }
+    }
+
+    private func addRelayLocked(_ record: AgentRunRecord) {
+        let bucket = Self.relayBucket(record.parentSessionId)
+        unrelayedBySession[bucket, default: []].insert(record.id)
+    }
+
+    private func removeRelayLocked(runId: UUID, sessionId: UUID?) {
+        let bucket = Self.relayBucket(sessionId)
+        unrelayedBySession[bucket]?.remove(runId)
+        if unrelayedBySession[bucket]?.isEmpty == true {
+            unrelayedBySession.removeValue(forKey: bucket)
+        }
+    }
+
+    /// A save or a delete changes what the relay owes. Called from the write
+    /// queue; the index is additive until built, so a save that lands before
+    /// the scan cannot be lost by it.
+    private func noteRelayMembership(_ record: AgentRunRecord) {
+        signatureLock.lock()
+        defer { signatureLock.unlock() }
+        if record.status.isTerminal, !record.summaryRelayed {
+            addRelayLocked(record)
+        } else {
+            removeRelayLocked(runId: record.id, sessionId: record.parentSessionId)
         }
     }
 
@@ -302,9 +415,11 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     func delete(runId: UUID, sessionId: UUID?) {
         let url = fileURL(runId: runId, sessionId: sessionId)
         ioQueue.async { [self] in
+            noteDeletedRun(runId)
             try? fileManager.removeItem(at: url)
             signatureLock.lock()
             writtenSignatures[url.path] = nil
+            removeRelayLocked(runId: runId, sessionId: sessionId)
             signatureLock.unlock()
         }
     }
@@ -314,12 +429,37 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     func deleteSession(_ sessionId: UUID) {
         let url = directory(for: sessionId)
         ioQueue.async { [self] in
+            noteDeletedSession(sessionId)
             try? fileManager.removeItem(at: url)
             signatureLock.lock()
             for key in writtenSignatures.keys where key.hasPrefix(url.path) {
                 writtenSignatures[key] = nil
             }
+            unrelayedBySession.removeValue(forKey: Self.relayBucket(sessionId))
             signatureLock.unlock()
+        }
+    }
+
+    /// Caller holds no lock; both helpers take `signatureLock` themselves.
+    private func noteDeletedRun(_ runId: UUID) {
+        signatureLock.lock()
+        defer { signatureLock.unlock() }
+        guard deletedRunIds.insert(runId).inserted else { return }
+        deletedRunOrder.append(runId)
+        while deletedRunOrder.count > maximumTombstones {
+            let oldest = deletedRunOrder.removeFirst()
+            deletedRunIds.remove(oldest)
+        }
+    }
+
+    private func noteDeletedSession(_ sessionId: UUID) {
+        signatureLock.lock()
+        defer { signatureLock.unlock() }
+        guard deletedSessionIds.insert(sessionId).inserted else { return }
+        deletedSessionOrder.append(sessionId)
+        while deletedSessionOrder.count > maximumTombstones {
+            let oldest = deletedSessionOrder.removeFirst()
+            deletedSessionIds.remove(oldest)
         }
     }
 
@@ -339,11 +479,18 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
             if index < policy.keepNewest { continue }
             if date >= cutoff { continue }
             if date >= youngestAllowed { continue }
+            // An old record can still be LIVE: the retention clock runs from a
+            // run's start, and a long-running job (or a restored record waiting
+            // on a slow operator approval) would otherwise be deleted underneath
+            // its own instance, which then rewrites it anyway.
+            guard record.status.isTerminal else { continue }
             let url = fileURL(runId: record.id, sessionId: record.parentSessionId)
             if (try? fileManager.removeItem(at: url)) != nil {
+                noteDeletedRun(record.id)
                 removed.append(record.id)
                 signatureLock.lock()
                 writtenSignatures[url.path] = nil
+                removeRelayLocked(runId: record.id, sessionId: record.parentSessionId)
                 signatureLock.unlock()
             }
         }
@@ -359,6 +506,15 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     nonisolated static func bounded(_ record: AgentRunRecord) -> AgentRunRecord {
         var bounded = record
         bounded.task = truncate(record.task, to: TranscriptBudget.task)
+        bounded.contextSummary = record.contextSummary.map {
+            truncate($0, to: TranscriptBudget.contextSummary)
+        }
+        bounded.error = record.error.map { truncate($0, to: TranscriptBudget.status) }
+        bounded.messages = record.messages.map { message in
+            var message = message
+            message.content = truncate(message.content, to: TranscriptBudget.message)
+            return message
+        }
         bounded.transcript = record.transcript.map { entry in
             var entry = entry
             switch entry.kind {
@@ -369,6 +525,13 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
                 if var call = entry.toolRecord {
                     call.output = call.output.map { truncate($0, to: TranscriptBudget.toolOutput) }
                     call.error = call.error.map { truncate($0, to: TranscriptBudget.status) }
+                    call.rawArguments = truncate(call.rawArguments, to: TranscriptBudget.rawArguments)
+                    call.arguments = call.arguments.mapValues {
+                        truncate($0, to: TranscriptBudget.argumentValue)
+                    }
+                    call.pinnedEndpoint = call.pinnedEndpoint.map {
+                        truncate($0, to: TranscriptBudget.status)
+                    }
                     entry.toolRecord = call
                 }
             case .assistantThinking:
@@ -383,6 +546,16 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         if var report = bounded.report {
             report.summary = truncate(report.summary, to: TranscriptBudget.assistantText)
             report.diff = report.diff.map { truncate($0, to: TranscriptBudget.reportDiff) }
+            report.risks = report.risks.map { truncate($0, to: TranscriptBudget.status) }
+            report.openQuestions = report.openQuestions.map {
+                truncate($0, to: TranscriptBudget.status)
+            }
+            report.findings = report.findings.map { finding in
+                var finding = finding
+                finding.claim = truncate(finding.claim, to: TranscriptBudget.status)
+                finding.evidence = truncate(finding.evidence, to: TranscriptBudget.message)
+                return finding
+            }
             bounded.report = report
         }
         return bounded

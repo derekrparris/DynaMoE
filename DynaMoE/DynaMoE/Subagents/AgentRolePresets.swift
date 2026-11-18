@@ -146,14 +146,31 @@ nonisolated enum AgentRolePresetCatalog {
     /// Read-only runs may be automatic; a run that can write on the main tree
     /// asks before every change, one that writes inside its own worktree asks
     /// once at spawn, and plan mode denies writes outright.
+    ///
+    /// `definition`'s own tool names are only a DEFAULT: a spawn may replace
+    /// them with `allowed_tools`, so the decision reads the tools the run was
+    /// actually given. Deriving it from the preset meant `preset:"explore"` +
+    /// `allowed_tools:["file_write"]` was classified read-only, approved with
+    /// no card, and then denied every write by its own run scope — with a
+    /// worktree, an empty one after the operator had approved a writer.
+    static func approvalPolicy(
+        toolNames: [String],
+        mode: AgentMode,
+        isolated: Bool = false
+    ) -> AgentApprovalPolicy {
+        if mode == .plan { return .deny }
+        let canMutate = !Set(toolNames).isDisjoint(with: AgentToolSurface.writeCapable)
+        guard canMutate else { return .auto }
+        return isolated ? .spawnOnly : .everyStateChange
+    }
+
+    /// The preset-only form, for callers that have no resolved tool list.
     static func approvalPolicy(
         preset definition: AgentPresetDefinition,
         mode: AgentMode,
         isolated: Bool = false
     ) -> AgentApprovalPolicy {
-        if mode == .plan { return .deny }
-        guard definition.canMutate else { return .auto }
-        return isolated ? .spawnOnly : .everyStateChange
+        approvalPolicy(toolNames: definition.toolNames, mode: mode, isolated: isolated)
     }
 }
 

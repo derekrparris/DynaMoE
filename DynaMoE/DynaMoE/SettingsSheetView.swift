@@ -195,7 +195,6 @@ struct SettingsSheetView: View {
     @AppStorage(SubagentBackendSettings.cloudModelKey) private var subagentCloudModel: String = ""
     @AppStorage(LocalSubagentCostEstimate.limitDefaultsKey) private var subagentLocalCostLimit: Double = LocalSubagentCostEstimate.defaultLimitSeconds
     @AppStorage("dynamoe_subagent_notifications") private var subagentNotifications: Bool = true
-    @AppStorage("dynamoe_subagent_local_capacity") private var subagentLocalCapacity: Int = 1
     @AppStorage("dynamoe_subagent_cloud_per_provider") private var subagentCloudPerProvider: Int = 3
     @AppStorage("dynamoe_subagent_cloud_global") private var subagentCloudGlobal: Int = 6
     @AppStorage("dynamoe_subagent_retention_runs") private var subagentRetentionRuns: Int = 200
@@ -279,9 +278,11 @@ struct SettingsSheetView: View {
             }
 
             subagentSettingRow("Concurrency") {
-                Stepper("Local \(subagentLocalCapacity)", value: $subagentLocalCapacity, in: 1...4)
+                // The engine is single-flight, so a local permit above one only
+                // queues runs at the engine until their 120 s wait expires.
+                Text("Local 1 (one engine turn at a time)")
                     .font(.system(size: 11))
-                    .onChange(of: subagentLocalCapacity) { _, _ in reloadSubagentSchedulerLimits() }
+                    .foregroundColor(.secondary)
                 Stepper("Cloud/provider \(subagentCloudPerProvider)", value: $subagentCloudPerProvider, in: 1...8)
                     .font(.system(size: 11))
                     .onChange(of: subagentCloudPerProvider) { _, _ in reloadSubagentSchedulerLimits() }

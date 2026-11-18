@@ -124,6 +124,11 @@ nonisolated struct AgentSpawnPlan: @unchecked Sendable {
     /// worktree's own git metadata cannot name it (a submodule, or a repo using
     /// `--separate-git-dir`).
     var repositoryRoot: URL? = nil
+    /// The commit the worktree was cut from. Persisted because recomputing it
+    /// as `merge-base(branch, HEAD)` answers a different question: a reset or a
+    /// rebase on the main branch below the fork point moves that merge base, so
+    /// a run's apparent change would grow or shrink without its work changing.
+    var baseCommit: String? = nil
 }
 
 /// Turns a request into a plan, or refuses by name.
@@ -154,6 +159,7 @@ enum AgentSpawnResolver {
         // resolves: a local cost refusal re-resolves the request, and a worktree
         // created before it would be left behind.
         var worktreeRepository: URL?
+        var worktreeBaseCommit: String?
         if request.isolation.isIsolated {
             guard !Set(toolNames).isDisjoint(with: AgentToolSurface.writeCapable) else {
                 throw AgentSpawnError.unsupportedIsolation(
@@ -194,6 +200,7 @@ enum AgentSpawnResolver {
                 )
                 isolation = worktree.isolation
                 workingDirectory = worktree.path
+                worktreeBaseCommit = worktree.baseCommit
             } catch {
                 let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 throw AgentSpawnError.unsupportedIsolation(detail)
@@ -201,7 +208,7 @@ enum AgentSpawnResolver {
         }
 
         let approvalPolicy = AgentRolePresetCatalog.approvalPolicy(
-            preset: definition,
+            toolNames: toolNames,
             mode: request.parentMode,
             isolated: isolation.isIsolated
         )
@@ -224,7 +231,8 @@ enum AgentSpawnResolver {
             parentSessionId: request.parentSessionId,
             parentTurnId: request.parentTurnId,
             workingDirectory: workingDirectory,
-            repositoryRoot: worktreeRepository
+            repositoryRoot: worktreeRepository,
+            baseCommit: worktreeBaseCommit
         )
     }
 

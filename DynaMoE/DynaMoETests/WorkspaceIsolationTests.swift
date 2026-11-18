@@ -136,6 +136,127 @@ final class WorkspaceIsolationTests: XCTestCase {
         XCTAssertTrue(changes.isEmpty)
         XCTAssertEqual(changes.changedFiles, [])
         XCTAssertTrue(changes.diff.isEmpty)
+        let clean = await WorkspaceIsolation.hasNoWorkingTreeChanges(worktree)
+        XCTAssertTrue(
+            clean,
+            "cleanup may only trust an empty change set once git agrees the tree is clean"
+        )
+    }
+
+    /// A diff of a non-UTF-8 text file fails `runProcess`'s UTF-8 decode and
+    /// came back as an empty string. The name list still had the file, so the
+    /// "patch" was empty: `git apply` answered "No valid patches" forever, and
+    /// the empty change set also authorized deleting the only copy of the run's
+    /// work.
+    func testASnapshotRefusesAChangedFileItCannotRepresent() async throws {
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: UUID(),
+            root: worktreeRoot
+        )
+        // Latin-1 "café\n" is text to git (no NUL) and invalid UTF-8 to Swift.
+        let latin1 = Data([0x63, 0x61, 0x66, 0xE9, 0x0A])
+        try latin1.write(to: worktree.path.appendingPathComponent("latin1.txt"))
+
+        do {
+            _ = try await WorkspaceIsolation.snapshot(worktree, diffLimit: nil)
+            XCTFail("a changed file with no representable patch must not look empty")
+        } catch let error as WorkspaceIsolationError {
+            guard case .snapshotFailed(let detail) = error else {
+                return XCTFail("expected snapshotFailed, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("patch"), detail)
+        }
+        let stillDirty = await WorkspaceIsolation.hasNoWorkingTreeChanges(worktree)
+        XCTAssertFalse(
+            stillDirty,
+            "git still reports the change, so nothing may be deleted as 'no changes'"
+        )
+    }
+
+    func testARecordedBaseCommitIgnoresARewrittenMainBranch() async throws {
+        try "second\n".write(
+            to: repository.appendingPathComponent("second.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try await git(["add", "-A"], in: repository)
+        try await git(["commit", "-m", "second"], in: repository)
+        let fork = try await git(["rev-parse", "HEAD"], in: repository)
+        let forkCommit = fork.1.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: UUID(),
+            root: worktreeRoot
+        )
+        XCTAssertEqual(worktree.baseCommit, forkCommit)
+        try "worktree change\n".write(
+            to: worktree.path.appendingPathComponent("worktree.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        // Rewind the main branch below the fork point and move it somewhere
+        // else. The branch the worktree is on still starts at `forkCommit`, so
+        // only `merge-base` moves.
+        let rootResult = try await git(["rev-list", "--max-parents=0", "HEAD"], in: repository)
+        let rootCommit = rootResult.1.trimmingCharacters(in: .whitespacesAndNewlines)
+        try await git(["reset", "--hard", rootCommit], in: repository)
+        try "main moved\n".write(
+            to: repository.appendingPathComponent("moved.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try await git(["add", "-A"], in: repository)
+        try await git(["commit", "-m", "moved"], in: repository)
+
+        let recorded = try await WorkspaceIsolation.open(
+            path: worktree.path.path,
+            branch: worktree.branch,
+            repositoryRoot: repository,
+            baseCommit: worktree.baseCommit
+        )
+        XCTAssertEqual(recorded.baseCommit, forkCommit)
+        let changes = try await WorkspaceIsolation.snapshot(recorded)
+        XCTAssertEqual(
+            changes.changedFiles,
+            ["worktree.txt"],
+            "the recorded base must keep the main branch's rewrite out of the run's diff"
+        )
+
+        let derived = try await WorkspaceIsolation.open(
+            path: worktree.path.path,
+            branch: worktree.branch,
+            repositoryRoot: repository
+        )
+        XCTAssertNotEqual(
+            derived.baseCommit,
+            forkCommit,
+            "a recomputed merge base is what the record exists to avoid"
+        )
+        _ = await WorkspaceIsolation.cleanup(worktree)
+    }
+
+    /// The apply path snapshots the main tree before writing and restores it on
+    /// a partial failure. The rollback is what makes "the write failed" mean
+    /// "your tree is unchanged", so it is exercised directly.
+    func testARollbackSnapshotRestoresExistingFilesAndRemovesNewOnes() throws {
+        let readme = repository.appendingPathComponent("README.md")
+        let original = try String(contentsOf: readme, encoding: .utf8)
+        let added = repository.appendingPathComponent("added.txt")
+        let rollback = try WorkspaceIsolation.stageRollback(["README.md", "added.txt"], in: repository)
+        defer { try? FileManager.default.removeItem(at: rollback.directory) }
+
+        try "partially applied\n".write(to: readme, atomically: true, encoding: .utf8)
+        try "created by the failed apply\n".write(to: added, atomically: true, encoding: .utf8)
+
+        XCTAssertTrue(rollback.restore(in: repository))
+        XCTAssertEqual(try String(contentsOf: readme, encoding: .utf8), original)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: added.path),
+            "a file the failed apply created must be removed again"
+        )
     }
 
     func testSnapshotBoundsOnlyItsDisplayCopy() async throws {

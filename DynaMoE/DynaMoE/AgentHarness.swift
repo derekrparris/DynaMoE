@@ -3852,6 +3852,27 @@ public final class AgentHarness {
         return count
     }
 
+    /// Counts an identical WITHHELD call, without the reset a real mutation
+    /// performs.
+    ///
+    /// `recordToolCallFingerprint` clears every count when a mutating tool runs,
+    /// because a successful write invalidates an earlier read. A withheld
+    /// `file_write` changed nothing, so counting it there would reset the
+    /// repeat guard on every refusal and let a model that keeps asking for a
+    /// tool it never had run to its step budget. It still has to count as a
+    /// repeat, which is what this does.
+    @discardableResult
+    public func recordWithheldToolCall(toolName: String, arguments: [String: Any]) -> Int {
+        guard Self.mutatingToolNames.contains(toolName) else {
+            return recordToolCallFingerprint(toolName: toolName, arguments: arguments)
+        }
+        let fingerprint = Self.toolCallFingerprint(toolName: toolName, arguments: arguments)
+        let count = (repeatedToolCallCounts[fingerprint] ?? 0) + 1
+        repeatedToolCallCounts[fingerprint] = count
+        maxRepeatedToolCallCount = max(maxRepeatedToolCallCount, count)
+        return count
+    }
+
     /// Tools seeded into the prompt on startup — the "fundamental" set.
     /// Kept minimal: every schema here costs prefill tokens on every turn, and each
     /// load/unload event invalidates the KV-cache prefix (full re-prefill). The model

@@ -34,13 +34,17 @@ enum SubagentNotifier {
         set { UserDefaults.standard.set(newValue, forKey: enabledKey) }
     }
 
-    /// Called once per finished run. The summary is the same text the
-    /// coordinator receives, so a notice never claims more than the report.
+    /// Called once per finished run.
+    ///
+    /// The banner deliberately carries no summary. A notification is rendered
+    /// on the lock screen and in Notification Centre, outside the app's own
+    /// privacy boundary, while a run's report can quote source code, paths and
+    /// tool output. The role and outcome are enough to decide whether to open
+    /// the inspector, which is where the report belongs.
     static func runFinished(
         runId: UUID,
         role: String,
         status: SubagentStatus,
-        summary: String,
         parentSessionId: UUID?
     ) {
         guard status == .completed || status == .failed else { return }
@@ -51,15 +55,13 @@ enum SubagentNotifier {
 
         guard isEnabled, !isRunningTests, Bundle.main.bundleIdentifier != nil else { return }
 
-        let body = summary
-            .replacingOccurrences(of: "\n", with: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !body.isEmpty else { return }
         let content = UNMutableNotificationContent()
         content.title = status == .completed
             ? "\(role) finished"
             : "\(role) failed"
-        content.body = String(body.prefix(180))
+        content.body = status == .completed
+            ? "Open DynaMoE to read the report."
+            : "Open DynaMoE to see what went wrong."
         content.sound = .default
         var info: [String: String] = ["runId": runId.uuidString]
         if let parentSessionId { info["sessionId"] = parentSessionId.uuidString }

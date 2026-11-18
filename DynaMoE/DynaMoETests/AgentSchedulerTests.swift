@@ -228,6 +228,40 @@ final class AgentSchedulerTests: XCTestCase {
         await scheduler.cancelRuns(parentSessionId: session, reason: "turn stopped")
         XCTAssertEqual(recorder.names, ["ours"])
     }
+
+    /// The instance's execution task starts asynchronously, so a Stop can reach
+    /// the scheduler before its registration exists. That cancellation used to
+    /// be dropped, and the run then started normally.
+    func testACancellationBeforeRegistrationIsAppliedWhenTheRunRegisters() async {
+        let scheduler = makeScheduler(.default)
+        let recorder = CancellationRecorder()
+        let runId = UUID()
+
+        await scheduler.cancel(runId: runId, reason: "stopped before start")
+        let cancelledEarly = await scheduler.isCancelled(runId: runId)
+        XCTAssertTrue(cancelledEarly)
+
+        await scheduler.register(
+            runId: runId, parentRunId: nil, parentSessionId: nil,
+            schedulingClass: .cloud(providerId: "p"), priority: .userRequested,
+            cancel: { recorder.record("run", $0) }
+        )
+        XCTAssertEqual(recorder.reasons, ["stopped before start"])
+
+        do {
+            _ = try await scheduler.acquire(
+                .cloud(providerId: "p"),
+                priority: .userRequested,
+                runId: runId,
+                timeout: 1
+            )
+            XCTFail("a run cancelled before registration must not be admitted")
+        } catch AgentSchedulerError.cancelled {
+            // expected
+        } catch {
+            XCTFail("expected a cancellation, got \(error)")
+        }
+    }
 }
 
 // MARK: - Test recorders (lock boxes, not actors: the closures are synchronous)

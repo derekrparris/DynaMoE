@@ -119,6 +119,35 @@ final class AgentSpawnPolicyTests: XCTestCase {
         )
     }
 
+    /// `allowed_tools` can hand a read-only preset a writer, and the approval
+    /// policy used to read the PRESET: explore + file_write classified as
+    /// automatic, so the operator saw no card, and the run scope then denied
+    /// every write it had been given — inside a worktree, an empty one.
+    func testApprovalPolicyReadsTheToolsTheRunWasGiven() {
+        let explore = AgentRolePresetCatalog.definition(for: .explore)
+        let withWriter = explore.toolNames + ["file_write"]
+        XCTAssertEqual(
+            AgentRolePresetCatalog.approvalPolicy(toolNames: withWriter, mode: .code),
+            .everyStateChange
+        )
+        XCTAssertEqual(
+            AgentRolePresetCatalog.approvalPolicy(toolNames: withWriter, mode: .code, isolated: true),
+            .spawnOnly
+        )
+        XCTAssertEqual(
+            AgentRolePresetCatalog.approvalPolicy(toolNames: withWriter, mode: .plan),
+            .deny
+        )
+        XCTAssertEqual(
+            AgentRolePresetCatalog.approvalPolicy(
+                toolNames: explore.toolNames,
+                mode: .code
+            ),
+            .auto,
+            "a read-only tool set still runs without cards"
+        )
+    }
+
     // MARK: - Spawn approval
 
     func testAWriteCapableSpawnNeedsApproval() {

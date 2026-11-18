@@ -384,6 +384,71 @@ final class SubagentLoopTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: target.path))
     }
 
+    /// A write the operator refused changed nothing, so the report must not
+    /// claim the file as one of the run's changed files.
+    func testARejectedWriteIsNotReportedAsAChangedFile() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let target = workspace.appendingPathComponent("Denied.txt")
+
+        let backend = ScriptedBackend(turns: [
+            .init(text: "writing", calls: [
+                AgentToolCall(name: "file_write", arguments: ["path": target.path, "content": "no"])
+            ]),
+            .init(text: "done", calls: [completeCall("The write was denied.")])
+        ])
+        let context = try makeContext(
+            workspace: workspace,
+            tools: ["file_write", "complete"],
+            policy: .everyStateChange,
+            handler: { _ in false }
+        )
+
+        let outcome = await HeadlessAgentLoop().run(
+            input: input(),
+            backend: backend,
+            context: context,
+            emit: { _ in }
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+        XCTAssertEqual(outcome.report?.changedFiles, [])
+    }
+
+    /// A withheld call used to `continue` before either loop guard saw it, so a
+    /// model that kept asking for a tool it was never given ran to its step
+    /// budget without escalating.
+    func testARepeatedWithheldCallTripsTheLoopGuard() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let target = workspace.appendingPathComponent("Never.txt")
+        let withheld = AgentToolCall(
+            name: "file_write",
+            arguments: ["path": target.path, "content": "nope"]
+        )
+
+        let backend = ScriptedBackend(turns: [
+            .init(text: "trying", calls: [withheld, withheld, withheld, withheld])
+        ])
+        let context = try makeContext(workspace: workspace, tools: ["complete"])
+
+        let outcome = await HeadlessAgentLoop().run(
+            input: input(budget: AgentBudget(
+                maxSteps: 4,
+                maxCompletionTokens: 200,
+                maxWallClockSeconds: 20,
+                maxCostUSD: nil
+            )),
+            backend: backend,
+            context: context,
+            emit: { _ in }
+        )
+
+        XCTAssertEqual(outcome.status, .blocked)
+        XCTAssertTrue(outcome.error?.contains("loop guard") == true, outcome.error ?? "no error")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+    }
+
     func testPerRunHarnessDoesNotMutateSharedHarness() async throws {
         let workspace = try makeWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }

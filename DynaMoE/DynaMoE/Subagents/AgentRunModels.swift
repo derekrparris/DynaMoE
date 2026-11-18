@@ -330,6 +330,10 @@ nonisolated struct AgentRunRecord: Identifiable, Codable, Equatable, Sendable {
     /// root from git, which cannot name the main worktree of a submodule or a
     /// `--separate-git-dir` repository from a linked worktree alone.
     var repositoryRoot: String?
+    /// The commit the worktree was cut from. Optional and additive. Snapshots
+    /// are taken against it, so a reset or rebase on the main branch cannot
+    /// change what a restored run appears to have changed.
+    var baseCommit: String?
     var schemaVersion: Int
 
     static let currentSchemaVersion = 1
@@ -360,6 +364,7 @@ nonisolated struct AgentRunRecord: Identifiable, Codable, Equatable, Sendable {
         summaryRelayed: Bool = false,
         appliedAt: Date? = nil,
         repositoryRoot: String? = nil,
+        baseCommit: String? = nil,
         schemaVersion: Int = AgentRunRecord.currentSchemaVersion
     ) {
         self.id = id
@@ -387,6 +392,7 @@ nonisolated struct AgentRunRecord: Identifiable, Codable, Equatable, Sendable {
         self.summaryRelayed = summaryRelayed
         self.appliedAt = appliedAt
         self.repositoryRoot = repositoryRoot
+        self.baseCommit = baseCommit
         self.schemaVersion = schemaVersion
     }
 }

@@ -151,19 +151,34 @@ final class AgentRunIntegrationTests: XCTestCase {
 
     func testCancellingAFinishedRunCannotRewriteItsRecord() async throws {
         let backend = ScriptedBackend(turns: [.init(text: "the answer")])
+        let session = UUID()
         let subagent = SubagentManager.shared.spawnModelBacked(
-            plan(backend: backend, sessionId: UUID()),
+            plan(backend: backend, sessionId: session),
             id: UUID()
         )
         let summary = await subagent.waitForCompletion()
         XCTAssertEqual(subagent.status, .completed)
         let completedAt = subagent.completedAt
+        AgentRunStore.shared.flush()
+        let stored = try XCTUnwrap(
+            AgentRunStore.shared.load(runId: subagent.id, sessionId: session),
+            "the finished run must have a durable record"
+        )
+        XCTAssertEqual(stored.status, .completed)
 
         subagent.cancel(reason: "quitting")
+        AgentRunStore.shared.flush()
 
         XCTAssertEqual(subagent.status, .completed, "a finished run must keep its terminal status")
         XCTAssertEqual(subagent.finalSummary, summary)
         XCTAssertEqual(subagent.completedAt, completedAt)
+        let afterCancel = try XCTUnwrap(
+            AgentRunStore.shared.load(runId: subagent.id, sessionId: session),
+            "cancelling on the way out must not delete the record"
+        )
+        XCTAssertEqual(afterCancel.status, .completed)
+        XCTAssertEqual(afterCancel.completedAt, stored.completedAt)
+        XCTAssertEqual(afterCancel.report?.summary, stored.report?.summary)
     }
 
     /// "Clear Finished" used to match only completed and cancelled runs, so a

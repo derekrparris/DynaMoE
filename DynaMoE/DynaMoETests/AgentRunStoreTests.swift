@@ -278,4 +278,118 @@ final class AgentRunStoreTests: XCTestCase {
         let remaining = store.load(sessionId: sessionId)
         XCTAssertEqual(remaining.map(\.id), [keep.id])
     }
+
+    /// A store is a record of work, not a second line of defence: task,
+    /// conversation excerpt, thinking and tool output all live in it, and an
+    /// Application Support write is world-readable by default.
+    func testARecordAndItsDirectoryAreOwnerOnly() throws {
+        let store = makeStore()
+        let sessionId = UUID()
+        let run = record(sessionId: sessionId)
+        store.saveImmediately(run)
+
+        let fileURL = store.fileURL(runId: run.id, sessionId: sessionId)
+        let fileAttributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+        XCTAssertEqual(fileAttributes[.posixPermissions] as? NSNumber, 0o600)
+        let directoryAttributes = try FileManager.default.attributesOfItem(
+            atPath: store.directory(for: sessionId).path
+        )
+        XCTAssertEqual(directoryAttributes[.posixPermissions] as? NSNumber, 0o700)
+    }
+
+    /// `file_write` stores its body in `arguments["content"]` and again in
+    /// `rawArguments`. Both are bounded now, along with the fields that had no
+    /// limit at all.
+    func testBoundingCoversArgumentsContextAndMessages() {
+        let huge = String(repeating: "x", count: 50_000)
+        var record = record(sessionId: UUID())
+        record.contextSummary = huge
+        record.messages = [AgentMessageRecord(sender: "user", content: huge)]
+        record.transcript = [AgentTranscriptEntry(
+            index: 0,
+            stepIndex: 0,
+            kind: .toolCall,
+            toolRecord: ToolCallRecord(
+                name: "file_write",
+                arguments: ["path": "Sources/File.swift", "content": huge],
+                rawArguments: huge
+            )
+        )]
+
+        let bounded = AgentRunStore.bounded(record)
+        let call = bounded.transcript[0].toolRecord
+        XCTAssertEqual(call?.arguments["path"], "Sources/File.swift")
+        XCTAssertLessThan(call?.arguments["content"]?.count ?? .max, 2_200)
+        XCTAssertLessThan(call?.rawArguments.count ?? .max, 8_500)
+        XCTAssertLessThan(bounded.contextSummary?.count ?? .max, 16_700)
+        XCTAssertLessThan(bounded.messages[0].content.count, 8_500)
+    }
+
+    /// A save captured before its delete used to be queued behind it and write
+    /// the file back. The tombstone is what makes a delete final.
+    func testAQueuedSaveCannotResurrectADeletedRecord() throws {
+        let store = makeStore()
+        let sessionId = UUID()
+        let run = record(sessionId: sessionId)
+        store.saveImmediately(run)
+        store.flush()
+
+        store.delete(runId: run.id, sessionId: sessionId)
+        store.save(run)
+        store.flush()
+
+        XCTAssertNil(
+            store.load(runId: run.id, sessionId: sessionId),
+            "a queued save must not recreate a deleted record"
+        )
+    }
+
+    /// Retention's clock starts at a run's start, so an old record can still be
+    /// live. Pruning it deletes the file out from under its own instance.
+    func testRetentionNeverPrunesALiveRecord() throws {
+        let store = makeStore()
+        let sessionId = UUID()
+        let now = Date()
+        let ancient = now.addingTimeInterval(-90 * 86_400)
+        let live = record(
+            sessionId: sessionId,
+            createdAt: ancient,
+            completedAt: nil,
+            status: .running
+        )
+        store.saveImmediately(live)
+
+        let removed = store.prune(
+            now: now,
+            policy: .init(keepNewest: 0, keepDays: 0, minimumAgeHours: 0)
+        )
+        XCTAssertTrue(removed.isEmpty)
+        XCTAssertNotNil(store.load(runId: live.id, sessionId: sessionId))
+    }
+
+    /// The report relay asks this index instead of decoding a conversation's
+    /// whole run history on every send, so it has to be complete after a
+    /// relaunch and has to follow a record that is delivered or deleted.
+    func testTheRelayIndexFindsUnrelayedRecordsOnDiskAndFollowsChanges() throws {
+        let store = makeStore()
+        let sessionId = UUID()
+        let pending = record(sessionId: sessionId)
+        var delivered = record(sessionId: sessionId)
+        delivered.summaryRelayed = true
+        store.saveImmediately(pending)
+        store.saveImmediately(delivered)
+
+        // A fresh store answers from disk, which is the relaunch case.
+        let restored = AgentRunStore(rootURL: root)
+        XCTAssertEqual(restored.unrelayedRunIds(sessionId: sessionId), [pending.id])
+
+        var marked = pending
+        marked.summaryRelayed = true
+        store.saveImmediately(marked)
+        XCTAssertFalse(store.unrelayedRunIds(sessionId: sessionId).contains(pending.id))
+
+        store.delete(runId: delivered.id, sessionId: sessionId)
+        store.flush()
+        XCTAssertFalse(store.unrelayedRunIds(sessionId: sessionId).contains(delivered.id))
+    }
 }

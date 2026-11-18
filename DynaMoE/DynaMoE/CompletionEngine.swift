@@ -850,6 +850,12 @@ public final class CompletionEngine: @unchecked Sendable {
                     ),
                     promptTokenIds: expandedPromptIds.map { Int($0) }
                 )
+                // The runtime continues from `reusablePrefix`, i.e. everything
+                // above it is rewritten. A pin that claims more rows is stale
+                // from here on, and a cancelled turn (which never records a new
+                // one) would otherwise leave it for the owner's next turn to
+                // reuse over overwritten slots.
+                PrefixCacheManager.shared.invalidateIfNotPreserved(reusablePrefix)
 
                 let prep = TurnPrepInfo(
                     prefixTokensReused: reusablePrefix,
@@ -996,6 +1002,12 @@ public final class CompletionEngine: @unchecked Sendable {
                                 let rate: Double? = done > 0 && elapsed > 0.05
                                     ? Double(done) / elapsed
                                     : nil
+                                // This family never reached the generic prefill
+                                // path's `PrefillThroughput.note`, so spawn pricing
+                                // on a DeepSeek checkpoint always used the 5 tok/s
+                                // fallback. The final rate is this process's own
+                                // measurement, which is what that store is for.
+                                if isFinal, let rate { PrefillThroughput.note(tokensPerSecond: rate) }
                                 emit(.prefillProgress(
                                     status: dsPrefillStatus(done: done, total: total, rate: rate),
                                     speed: rate,
@@ -2359,6 +2371,13 @@ public final class CompletionEngine: @unchecked Sendable {
             print("🔁 [PREFIX] Gemma sliding-ring window rows were overwritten past the pin (\(PrefixCacheManager.shared.currentPinnedCount) pinned, reusing \(prefixTokensReused)) — full re-prefill")
             prefixTokensReused = 0
         }
+
+        // The reset below keeps only `prefixTokensReused` rows. If that is less
+        // than the pin claims, the old pin describes rows this turn overwrites
+        // (or a fresh allocation zeroed), so it must not be offered to its
+        // owner later. A cancelled turn never reaches recordTurn, which is what
+        // used to leave such a pin behind; see `invalidateIfNotPreserved`.
+        PrefixCacheManager.shared.invalidateIfNotPreserved(prefixTokensReused)
 
         // Prompt-dump diagnostic for the tool-call spiral bisection
         // (defaults write DRP.DynaMoE dynamoe_dump_prompts -bool YES).
@@ -11630,6 +11649,25 @@ if layer.attnGateProjTensor != nil,
         defer { stateLock.unlock() }
         guard currentGenerationTask != nil, activeTurnPriority == .background else { return false }
         currentGenerationTask?.cancel()
+        activeTurnCancelled = true
+        return true
+    }
+
+    /// Cancels one specific turn, addressed by the generation id its launch
+    /// returned.
+    ///
+    /// `cancelBackgroundTurn` names a PRIORITY, which is right for preemption —
+    /// an operator's send outranks whatever background work is current — and
+    /// wrong for a caller that owns a particular turn. By the time a cancelled
+    /// subagent run unwinds, the slot may already belong to its successor, so a
+    /// priority-scoped cancel could stop the wrong turn. The id makes ownership
+    /// explicit, and a stale id is a no-op.
+    @discardableResult
+    public func cancelTurn(id: UInt64) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard id == currentGenerationId, let task = currentGenerationTask else { return false }
+        task.cancel()
         activeTurnCancelled = true
         return true
     }

@@ -57,7 +57,11 @@ nonisolated struct AgentSchedulerLimits: Equatable, Sendable {
     /// a positive number, because a capacity of zero would deadlock the queue.
     static func configured(defaults: UserDefaults = .standard) -> AgentSchedulerLimits {
         var limits = AgentSchedulerLimits()
-        if let value = positiveInteger(defaults, "dynamoe_subagent_local_capacity") { limits.local = value }
+        // The engine is single-flight: a second local permit cannot run a turn,
+        // it can only hold a scheduler ticket while its run waits at the engine
+        // and then fails on the queue timeout. An older build allowed 1...4
+        // here, so the stored value is ignored rather than trusted.
+        limits.local = 1
         if let value = positiveInteger(defaults, "dynamoe_subagent_cloud_per_provider") { limits.cloudPerProvider = value }
         if let value = positiveInteger(defaults, "dynamoe_subagent_cloud_global") { limits.cloudGlobal = value }
         if let value = positiveInteger(defaults, "dynamoe_subagent_afm_capacity") { limits.appleFoundationModel = value }
@@ -129,6 +133,12 @@ actor AgentScheduler {
     private var waiters: [UUID: Waiter] = [:]
     private var nextSequence: UInt64 = 0
     private var cancelledRunIds: Set<UUID> = []
+    /// A cancellation can arrive before its run has registered (the instance's
+    /// execution task starts asynchronously). Dropping it left the run free to
+    /// start afterwards, so the reason waits here until `register` consumes it.
+    private var pendingCancellations: [UUID: String] = [:]
+    private var pendingCancellationOrder: [UUID] = []
+    private let maximumPendingCancellations = 128
     private var registry: [UUID: Registration] = [:]
 
     private struct Registration {
@@ -224,6 +234,12 @@ actor AgentScheduler {
             priority: priority,
             cancel: cancel
         )
+        // A Stop that landed before this registration is not stale: the run has
+        // not consumed it, so it is applied now that the closure exists.
+        if let reason = pendingCancellations.removeValue(forKey: runId) {
+            pendingCancellationOrder.removeAll { $0 == runId }
+            cancelSubtree(runId: runId, reason: reason)
+        }
     }
 
     /// Stops one run: a queued run fails its wait, a live one is cancelled, and
@@ -271,6 +287,9 @@ actor AgentScheduler {
     func finish(runId: UUID) {
         registry.removeValue(forKey: runId)
         cancelledRunIds.remove(runId)
+        if pendingCancellations.removeValue(forKey: runId) != nil {
+            pendingCancellationOrder.removeAll { $0 == runId }
+        }
     }
 
     // MARK: - Observation
@@ -289,7 +308,7 @@ actor AgentScheduler {
 
     /// True once a cancellation has been requested for `runId`.
     func isCancelled(runId: UUID) -> Bool {
-        cancelledRunIds.contains(runId)
+        cancelledRunIds.contains(runId) || pendingCancellations[runId] != nil
     }
 
     // MARK: - Internals
@@ -305,6 +324,16 @@ actor AgentScheduler {
         let children = registry.filter { $0.value.parentRunId == runId }.map(\.key)
         if registry[runId] != nil || waiters.values.contains(where: { $0.runId == runId }) {
             cancelledRunIds.insert(runId)
+        } else {
+            // Unknown run ids are a cancellation that arrived before the run
+            // registered. Remember it instead of dropping it; `register`
+            // applies it and `finish` forgets it if the run never comes back.
+            pendingCancellations[runId] = reason
+            pendingCancellationOrder.append(runId)
+            while pendingCancellationOrder.count > maximumPendingCancellations {
+                let oldest = pendingCancellationOrder.removeFirst()
+                pendingCancellations.removeValue(forKey: oldest)
+            }
         }
         registry[runId]?.cancel(reason)
         for child in children {

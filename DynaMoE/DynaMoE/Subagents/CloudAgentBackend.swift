@@ -35,6 +35,17 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
             ?? CloudModelAddress.parsePath(address, providers: providers) else {
             return .failure(.unavailable("'\(address)' is not a configured cloud model."))
         }
+        // `resolveDefault` only ever picks a model recorded as tool-capable, but
+        // an explicit address bypassed that check. A run whose model cannot call
+        // tools has no way to do anything: it answers the task in prose and
+        // never reaches `complete`.
+        if let spec = CloudModelRegistry.registeredSpecs(for: parsed.provider)
+            .first(where: { $0.providerModelId == parsed.providerModelId }),
+           !spec.supportsTools {
+            return .failure(.unavailable(
+                "'\(parsed.providerModelId)' is recorded as not supporting tool calling in Settings ▸ Cloud Providers, and a subagent run needs tools. Choose a tool-capable model."
+            ))
+        }
         switch CloudChatClient.makeStoredResult(provider: parsed.provider) {
         case .success(let client):
             return .success(CloudAgentBackend(
@@ -79,8 +90,11 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
             let receipt = CloudTurnReceipt()
             do {
                 return try await performTurn(request, receipt: receipt)
-            } catch let failure as CloudTurnFailure where attempt < 2 && Self.isRetryable(failure) {
+            } catch let failure as CloudTurnFailure
+                where attempt < 2 && Self.isRetryable(failure, spentRequest: receipt.spentRequest) {
                 Self.recordSpentUsage(receipt, pricing: pricing, into: request.usageLedger)
+                await Self.backoffBeforeRetry(failure)
+                if Task.isCancelled { throw AgentBackendError.cancelled }
                 continue
             } catch let failure as CloudTurnFailure {
                 Self.recordSpentUsage(receipt, pricing: pricing, into: request.usageLedger)
@@ -182,20 +196,38 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
         return result
     }
 
-    static func isRetryable(_ failure: CloudTurnFailure) -> Bool {
+    static func isRetryable(_ failure: CloudTurnFailure, spentRequest: Bool? = nil) -> Bool {
         switch failure {
         case .transport(_, let billed):
             // A request that provably never left the Mac is safe to send again.
             // One that may have reached inference is not: the retry can be
             // invoiced a second time for a turn the caller will never see.
-            return !billed
+            return !billed && spentRequest != true
         case .httpStatus(let code, _):
-            return code == 429 || code >= 500
+            if code == 429 { return true }
+            // A 5xx is an answer FROM the provider's edge, and the prompt may
+            // already have run. Retry only when the transport positively says
+            // nothing was processed; nil means nobody decided, which is not
+            // evidence of a free retry.
+            return code >= 500 && spentRequest == false
         case .invalidResponse:
             return false
         case .missingAPIKey, .credentialAccessDenied, .credentialNeedsImport, .unsupportedFlavor:
             return false
         }
+    }
+
+    /// A rate-limited request is retried once, but not immediately: an
+    /// immediate retry is the request the provider's window just refused.
+    static func retryDelaySeconds(for failure: CloudTurnFailure) -> Double {
+        if case .httpStatus(let code, _) = failure, code == 429 { return 0.75 }
+        return 0
+    }
+
+    private static func backoffBeforeRetry(_ failure: CloudTurnFailure) async {
+        let delay = retryDelaySeconds(for: failure)
+        guard delay > 0 else { return }
+        try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
     }
 
     /// Prices an attempt that produced no turn. A billed attempt whose provider

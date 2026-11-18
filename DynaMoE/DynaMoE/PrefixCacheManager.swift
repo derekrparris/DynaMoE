@@ -226,6 +226,31 @@ nonisolated public final class PrefixCacheManager: @unchecked Sendable {
         }
     }
 
+    /// Drops the pin when a launch carries fewer rows forward than the pin
+    /// claims.
+    ///
+    /// `preservePrefixCount` is what the KV reset actually retains. When it is
+    /// smaller than the pin, the rows above it are either overwritten by this
+    /// turn's prefill or were never copied because the reset allocated fresh
+    /// (zero-filled) buffers — yet `activeSessionId` and `pinnedTokenIds` still
+    /// describe the old sequence. The owner's next turn would match that list
+    /// exactly and attend over rows that no longer hold it.
+    ///
+    /// The cancelled-turn case is what made this routine: a cancelled turn
+    /// records nothing and invalidates nothing, so a partial preservation used
+    /// to outlive it. Invalidating here also covers a turn from ANOTHER session
+    /// resetting the cache, which is the same state arriving by a different
+    /// route. A launch that preserves the whole pin is left alone: it can only
+    /// append, so the pinned rows stay valid even if that turn never finishes.
+    public func invalidateIfNotPreserved(_ preservedCount: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !pinnedTokenIds.isEmpty, preservedCount < pinnedTokenIds.count else { return }
+        pinnedTokenIds.removeAll(keepingCapacity: true)
+        activeSessionId = nil
+        pinnedAsOfDate = nil
+    }
+
     /// Resets telemetry metrics.
     public func resetMetrics() {
         lock.lock()

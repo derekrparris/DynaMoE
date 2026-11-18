@@ -102,7 +102,8 @@ enum SubagentApplyService {
             worktree = try await WorkspaceIsolation.open(
                 path: path,
                 branch: branch,
-                repositoryRoot: record.repositoryRoot.map { URL(fileURLWithPath: $0, isDirectory: true) }
+                repositoryRoot: record.repositoryRoot.map { URL(fileURLWithPath: $0, isDirectory: true) },
+                baseCommit: record.baseCommit
             )
         } catch {
             let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
@@ -119,6 +120,15 @@ enum SubagentApplyService {
         let changes = try await WorkspaceIsolation.snapshot(worktree, diffLimit: nil)
         let files: [String]
         if changes.isEmpty {
+            // An empty change set is not proof the tree is empty: a patch whose
+            // text could not be decoded comes back empty too. Ask git directly
+            // before the "no changes" path is allowed to delete the worktree,
+            // because that directory is the only copy of an unapplied run.
+            guard await WorkspaceIsolation.hasNoWorkingTreeChanges(worktree) else {
+                throw WorkspaceIsolationError.applyFailed(
+                    "git reports changes in the worktree that the snapshot could not express as a patch, so nothing was applied and the worktree was kept."
+                )
+            }
             // `snapshot` can only see what git does. A run whose work is all in
             // ignored files looks empty, and cleaning up after "no changes"
             // would destroy the only copy. Name them and keep the tree.

@@ -246,7 +246,7 @@ nonisolated enum WorkspaceIsolation {
         }
 
         let (code, _, stderr) = try await git(
-            ["worktree", "add", "-b", branch, worktreeURL.path, "HEAD"],
+            ["worktree", "add", "-b", branch, worktreeURL.path, baseCommit],
             in: rootPath
         )
         guard code == 0 else {
@@ -272,12 +272,19 @@ nonisolated enum WorkspaceIsolation {
 
     /// Rebuilds a worktree's metadata from the repository itself, which is what
     /// a run restored from disk needs: the record keeps its path and branch, and
-    /// the base commit is the merge base of the branch and the main tree's HEAD.
-    /// (A run's own commits move the branch, never the merge base.)
+    /// `recordedBase` is the commit the worktree was cut from.
+    ///
+    /// A recorded base is preferred over `merge-base(branch, HEAD)` because the
+    /// two answer different questions once the main branch is reset or rebased:
+    /// the branch still starts at the commit the run was given, while the merge
+    /// base moves, so the run's apparent change would grow or shrink without its
+    /// work changing. The recorded commit must still exist and still be an
+    /// ancestor of the branch; otherwise the derivation is the only option left.
     static func open(
         path: String,
         branch: String,
-        repositoryRoot recordedRoot: URL? = nil
+        repositoryRoot recordedRoot: URL? = nil,
+        baseCommit recordedBase: String? = nil
     ) async throws -> AgentWorktree {
         let worktreeURL = URL(fileURLWithPath: path, isDirectory: true)
         var isDirectory: ObjCBool = false
@@ -298,17 +305,23 @@ nonisolated enum WorkspaceIsolation {
               branchCode == 0 else {
             throw WorkspaceIsolationError.worktreeMissing("\(path) (\(branch))")
         }
-        let baseResult = try? await git(
-            ["merge-base", branch, "HEAD"],
-            in: repositoryRoot
-        )
-        guard let baseResult, baseResult.0 == 0 else {
-            let detail = baseResult?.2.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            throw WorkspaceIsolationError.snapshotFailed(
-                detail.isEmpty ? "git merge-base failed" : detail
+        let baseCommit: String
+        if let recordedBase,
+           let pinned = await verifiedBaseCommit(recordedBase, on: branch, in: repositoryRoot) {
+            baseCommit = pinned
+        } else {
+            let baseResult = try? await git(
+                ["merge-base", branch, "HEAD"],
+                in: repositoryRoot
             )
+            guard let baseResult, baseResult.0 == 0 else {
+                let detail = baseResult?.2.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                throw WorkspaceIsolationError.snapshotFailed(
+                    detail.isEmpty ? "git merge-base failed" : detail
+                )
+            }
+            baseCommit = baseResult.1.trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        let baseCommit = baseResult.1.trimmingCharacters(in: .whitespacesAndNewlines)
         return AgentWorktree(
             runId: UUID(uuidString: worktreeURL.lastPathComponent) ?? UUID(),
             repositoryRoot: repositoryRoot,
@@ -316,6 +329,29 @@ nonisolated enum WorkspaceIsolation {
             branch: branch,
             baseCommit: baseCommit
         )
+    }
+
+    /// The recorded commit, resolved to a full id, when it still exists and is
+    /// still part of the branch's history. Nil means the derivation in `open`
+    /// has to answer instead.
+    private static func verifiedBaseCommit(
+        _ recorded: String,
+        on branch: String,
+        in repositoryRoot: URL
+    ) async -> String? {
+        let trimmed = recorded.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let (verifyCode, verifyOut, _) = try? await git(
+                  ["rev-parse", "--verify", "\(trimmed)^{commit}"],
+                  in: repositoryRoot
+              ), verifyCode == 0 else { return nil }
+        let resolved = verifyOut.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !resolved.isEmpty,
+              let (ancestorCode, _, _) = try? await git(
+                  ["merge-base", "--is-ancestor", resolved, branch],
+                  in: repositoryRoot
+              ), ancestorCode == 0 else { return nil }
+        return resolved
     }
 
     static func open(_ isolation: AgentIsolation) async throws -> AgentWorktree {
@@ -367,6 +403,22 @@ nonisolated enum WorkspaceIsolation {
         guard diffCode == 0 else {
             throw WorkspaceIsolationError.snapshotFailed(
                 diffErr.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        }
+
+        // The two halves come from the same tree, so one with entries and the
+        // other empty is not "no changes": it means the patch could not be
+        // represented. `runProcess` decodes stdout as UTF-8 and a diff of a
+        // non-UTF-8 text file fails that decode, leaving an empty string. Left
+        // unchecked, that empty patch reached `git apply` and failed with the
+        // bare "No valid patches", made every later apply fail the same way,
+        // and let an "empty" snapshot authorize deleting the worktree - the only
+        // copy of the run's work.
+        if changedFiles.isEmpty != diffOut.isEmpty {
+            throw WorkspaceIsolationError.snapshotFailed(
+                changedFiles.isEmpty
+                    ? "git reported no changed files but produced a patch, so the worktree index is inconsistent. The worktree was kept."
+                    : "git reported \(changedFiles.count) changed file(s) but produced no usable patch. A file whose contents are not UTF-8 is the usual cause; the worktree was kept so nothing is lost."
             )
         }
 
@@ -557,7 +609,7 @@ nonisolated enum WorkspaceIsolation {
     }
 
     /// A repository-relative path that cannot escape the main tree.
-    private static func safeURL(for path: String, in root: URL) -> URL? {
+    static func safeURL(for path: String, in root: URL) -> URL? {
         guard !path.isEmpty, !path.hasPrefix("/") else { return nil }
         let components = path.split(separator: "/", omittingEmptySubsequences: false)
         guard !components.contains(".."), !components.contains("") else { return nil }
@@ -577,7 +629,7 @@ nonisolated enum WorkspaceIsolation {
     }
 
     /// The main tree's current bytes for every path the patch can touch.
-    private struct ApplyRollback {
+    struct ApplyRollback {
         var directory: URL
         var entries: [(relativePath: String, original: URL?)]
 
@@ -610,7 +662,7 @@ nonisolated enum WorkspaceIsolation {
         }
     }
 
-    private static func stageRollback(_ paths: [String], in root: URL) throws -> ApplyRollback {
+    static func stageRollback(_ paths: [String], in root: URL) throws -> ApplyRollback {
         let fileManager = FileManager.default
         let directory = fileManager.temporaryDirectory
             .appendingPathComponent("dynamoe-rollback-\(UUID().uuidString)", isDirectory: true)
@@ -728,6 +780,22 @@ nonisolated enum WorkspaceIsolation {
                 guard entry.hasPrefix("!! ") else { return nil }
                 return String(entry.dropFirst(3))
             }
+    }
+
+    /// Whether git itself agrees the worktree has nothing to land.
+    ///
+    /// `snapshot` stages with `git add -A`, so an unchanged tree reports no
+    /// status entries and a changed one still does even when its diff could not
+    /// be decoded. Cleanup is destructive, and an empty `WorkspaceChangeSet` is
+    /// not proof: it is also what a decode failure produces (see `snapshot`).
+    /// Anything other than a successful, empty status is treated as "do not
+    /// delete".
+    static func hasNoWorkingTreeChanges(_ worktree: AgentWorktree) async -> Bool {
+        guard let (code, stdout, _) = try? await git(
+            ["status", "--porcelain", "-z"],
+            in: worktree.path
+        ), code == 0 else { return false }
+        return stdout.isEmpty
     }
 
     /// Removes worktrees older than `olderThan` that no live run can still be

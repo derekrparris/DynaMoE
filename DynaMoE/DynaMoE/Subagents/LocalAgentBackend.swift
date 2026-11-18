@@ -127,7 +127,22 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
                 let launch = try await MainActor.run { () -> CompletionLaunch in
                     try CompletionEngine.shared.launchTurn(prepared.turn, claim: prepared.claim)
                 }
-                return try await Self.collect(launch: launch, request: request)
+                return try await withTaskCancellationHandler {
+                    try await Self.collect(launch: launch, request: request)
+                } onCancel: {
+                    // The engine's layer loops run on `runOnLargeStack`'s plain
+                    // thread, where `Task.isCancelled` is always false and only
+                    // `activeTurnCancelled` stops them. Cancelling this handle
+                    // alone would leave the turn generating for minutes while it
+                    // holds the single slot, so the cancellation is forwarded to
+                    // the engine by generation id. `collect` then awaits that
+                    // turn, which is what keeps the tool mask below this closure
+                    // installed until the engine has stopped reading it.
+                    launch.handle.cancel()
+                    Task { @MainActor in
+                        _ = CompletionEngine.shared.cancelTurn(id: launch.handle.generationId)
+                    }
+                }
             }
         } catch {
             // `launchTurn` releases the claim it was handed on every path it
@@ -249,6 +264,14 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
         var emittedText = ""
         var emittedThinking = ""
         for await event in launch.stream {
+            // The run's task is cancelled from outside this loop. The stream
+            // itself may already have ended, so the check has to come before
+            // the switch: the failure this used to report was a malformed
+            // response, which reads as the model breaking rather than a Stop.
+            if Task.isCancelled {
+                await stop(launch)
+                throw AgentBackendError.cancelled
+            }
             switch event {
             case .started, .priming, .prefillProgress:
                 continue
@@ -262,7 +285,10 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
                 emittedThinking = frame.thinkingText
                 emittedText = frame.responseText
             case .failedTurn(let failure):
-                if failure.cancelled || Task.isCancelled { throw AgentBackendError.cancelled }
+                if failure.cancelled || Task.isCancelled {
+                    await launch.handle.task.value
+                    throw AgentBackendError.cancelled
+                }
                 throw AgentBackendError.transport(failure.message)
             case .finished(let result):
                 // `TurnResult` carries main-actor-isolated value types, so its
@@ -270,7 +296,27 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
                 return await MainActor.run { Self.turn(from: result) }
             }
         }
+        if Task.isCancelled {
+            await stop(launch)
+            throw AgentBackendError.cancelled
+        }
+        // The stream only ends without a result when the engine's task is gone,
+        // so awaiting it is immediate here and guarantees no turn outlives the
+        // tool mask this call is nested in.
+        await launch.handle.task.value
         throw AgentBackendError.malformedResponse("The local engine's stream closed without a result.")
+    }
+
+    /// Cancels the turn this run started and waits for the engine to release
+    /// it. The caller restores the grammar registry when this returns, so a
+    /// turn still generating would consult a vocabulary that no longer belongs
+    /// to it.
+    private static func stop(_ launch: CompletionLaunch) async {
+        launch.handle.cancel()
+        await MainActor.run {
+            _ = CompletionEngine.shared.cancelTurn(id: launch.handle.generationId)
+        }
+        await launch.handle.task.value
     }
 
     /// What arrived since the last frame. Frames carry the whole text so far, so a

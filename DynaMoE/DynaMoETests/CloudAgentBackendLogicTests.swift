@@ -248,7 +248,18 @@ final class CloudAgentBackendLogicTests: XCTestCase {
 
     func testRetryabilityIsKeyedOnStatusAndBillingOnly() {
         XCTAssertTrue(CloudAgentBackend.isRetryable(.httpStatus(code: 429, summary: "")))
-        XCTAssertTrue(CloudAgentBackend.isRetryable(.httpStatus(code: 503, summary: "")))
+        XCTAssertTrue(
+            CloudAgentBackend.isRetryable(.httpStatus(code: 503, summary: ""), spentRequest: false),
+            "a 5xx is retryable only when the transport says nothing was processed"
+        )
+        XCTAssertFalse(
+            CloudAgentBackend.isRetryable(.httpStatus(code: 503, summary: ""), spentRequest: true),
+            "a 5xx after the provider ran the prompt can be billed twice"
+        )
+        XCTAssertFalse(
+            CloudAgentBackend.isRetryable(.httpStatus(code: 503, summary: ""), spentRequest: nil),
+            "an undecided receipt is not evidence of a free retry"
+        )
         XCTAssertFalse(CloudAgentBackend.isRetryable(.httpStatus(code: 400, summary: "")))
         XCTAssertFalse(CloudAgentBackend.isRetryable(.httpStatus(code: 404, summary: "")))
         XCTAssertFalse(CloudAgentBackend.isRetryable(.transport("x", billed: true)))

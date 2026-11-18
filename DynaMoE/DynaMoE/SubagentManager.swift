@@ -398,7 +398,8 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             depth: 0,
             summaryRelayed: isSummaryRelayed,
             appliedAt: appliedAt,
-            repositoryRoot: plan?.repositoryRoot?.path
+            repositoryRoot: plan?.repositoryRoot?.path,
+            baseCommit: plan?.baseCommit
         )
     }
 
@@ -732,14 +733,24 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             return outcome.report
         }
         if outcome.status == .cancelled || Task.isCancelled {
-            if let worktree = try? await WorkspaceIsolation.open(path: path, branch: branch) {
+            if let worktree = try? await WorkspaceIsolation.open(
+                path: path,
+                branch: branch,
+                repositoryRoot: plan.repositoryRoot,
+                baseCommit: plan.baseCommit
+            ) {
                 await WorkspaceIsolation.cleanup(worktree)
             }
             return outcome.report
         }
         guard var report = outcome.report else { return nil }
         do {
-            let worktree = try await WorkspaceIsolation.open(path: path, branch: branch)
+            let worktree = try await WorkspaceIsolation.open(
+                path: path,
+                branch: branch,
+                repositoryRoot: plan.repositoryRoot,
+                baseCommit: plan.baseCommit
+            )
             let changes = try await WorkspaceIsolation.snapshot(worktree)
             report.changedFiles = changes.changedFiles
             report.diff = changes.diff.isEmpty ? nil : changes.diff
@@ -876,7 +887,6 @@ public final class SubagentInstance: Identifiable, ObservableObject {
                 runId: id,
                 role: role,
                 status: status,
-                summary: summary,
                 parentSessionId: parentSessionId
             )
         }
@@ -1605,6 +1615,11 @@ public final class SubagentManager: ObservableObject {
     private var subagentsById: [UUID: SubagentInstance] = [:]
     private var spawnsSincePrune = 0
     private var subagentsOrder: [SubagentInstance] = []
+    /// How many FINISHED instances stay in memory. The drawer only needs the
+    /// recent ones; older terminal runs are restored from their durable records
+    /// on demand. Without a bound, a long session kept every run it ever
+    /// spawned - each one an ObservableObject holding its full transcript.
+    private let maximumRetainedTerminalInstances = 50
     /// Live instances are ObservableObjects on their own, but the inspector
     /// observes the MANAGER. Forwarding their changes keeps the list, the live
     /// stream and the new usage strip refreshing together; without it a
@@ -1649,6 +1664,9 @@ public final class SubagentManager: ObservableObject {
             // this owner exists, so the launch sweep closes those records first.
             AgentRunStore.shared.reconcileInterruptedRuns()
             AgentRunStore.shared.prune(policy: policy)
+            // The relay asks which restored records it still owes; building
+            // that index here keeps the first send from paying for the scan.
+            AgentRunStore.shared.prepareRelayIndex()
             await WorkspaceIsolation.pruneStaleWorktrees()
         }
     }
@@ -1733,6 +1751,43 @@ public final class SubagentManager: ObservableObject {
                 self.subagents.insert(instance, at: 0)
                 if self.selectedSubagentId == nil {
                     self.selectedSubagentId = instance.id
+                }
+            }
+        }
+        trimRetainedTerminalInstances()
+    }
+
+    /// Drops the oldest FINISHED instances past the in-memory bound. Their
+    /// records stay on disk, which is what the inspector and the report relay
+    /// read once the object is gone.
+    private func trimRetainedTerminalInstances() {
+        lock.lock()
+        var finishedSeen = 0
+        var removed: [UUID] = []
+        subagentsOrder.removeAll { instance in
+            guard instance.status.isTerminal else { return false }
+            finishedSeen += 1
+            guard finishedSeen > maximumRetainedTerminalInstances else { return false }
+            removed.append(instance.id)
+            return true
+        }
+        for id in removed {
+            subagentsById.removeValue(forKey: id)
+            instanceObservers.removeValue(forKey: id)
+        }
+        lock.unlock()
+        guard !removed.isEmpty else { return }
+        let ids = Set(removed)
+        if Thread.isMainThread {
+            subagents.removeAll { ids.contains($0.id) }
+            if let selected = selectedSubagentId, ids.contains(selected) {
+                selectedSubagentId = subagents.first?.id
+            }
+        } else {
+            DispatchQueue.main.async {
+                self.subagents.removeAll { ids.contains($0.id) }
+                if let selected = self.selectedSubagentId, ids.contains(selected) {
+                    self.selectedSubagentId = self.subagents.first?.id
                 }
             }
         }

@@ -525,7 +525,10 @@ internal final class CompletionTurnHandle: @unchecked Sendable {
         self.task = task
     }
 
-    func cancel() {
+    /// Nonisolated because a caller's cancellation handler runs off the main
+    /// actor; `Task.cancel()` is safe from any context and the handle is
+    /// immutable.
+    nonisolated func cancel() {
         task.cancel()
     }
 }
