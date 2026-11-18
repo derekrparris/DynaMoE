@@ -205,27 +205,31 @@ final class CloudAgentBackendLogicTests: XCTestCase {
         }
     }
 
-    func testATransportFailureIsRetriedOnlyWhenThePromptCouldHaveBeenBilled() async throws {
-        let (billedBackend, billedRecorder) = Self.backend { attempt, continuation in
+    func testATransportFailureIsRetriedOnlyWhenThePromptProvablyNeverLeft() async throws {
+        // A send that never reached the provider is safe to repeat.
+        let (unbilledBackend, unbilledRecorder) = Self.backend { attempt, continuation in
             if attempt == 1 {
-                continuation.yield(.failed(.transport("connection dropped", billed: true)))
+                continuation.yield(.failed(.transport("offline", billed: false)))
             } else {
                 continuation.yield(.finished(CloudTurnResult(text: "ok", thinking: "", finishReason: "stop", usage: nil)))
             }
             continuation.finish()
         }
-        _ = try await billedBackend.runTurn(Self.request())
-        XCTAssertEqual(billedRecorder.count, 2)
+        let turn = try await unbilledBackend.runTurn(Self.request())
+        XCTAssertEqual(turn.text, "ok")
+        XCTAssertEqual(unbilledRecorder.count, 2)
 
-        let (unbilledBackend, unbilledRecorder) = Self.backend { _, continuation in
-            continuation.yield(.failed(.transport("offline", billed: false)))
+        // A request that MAY have reached inference is not: a retry can be
+        // invoiced twice for a turn the caller never sees.
+        let (billedBackend, billedRecorder) = Self.backend { _, continuation in
+            continuation.yield(.failed(.transport("connection dropped after send", billed: true)))
             continuation.finish()
         }
         do {
-            _ = try await unbilledBackend.runTurn(Self.request())
-            XCTFail("an unbilled transport failure must still fail the step")
+            _ = try await billedBackend.runTurn(Self.request())
+            XCTFail("a possibly-invoiced transport failure must fail the step")
         } catch {
-            XCTAssertEqual(unbilledRecorder.count, 1)
+            XCTAssertEqual(billedRecorder.count, 1)
         }
     }
 
@@ -247,8 +251,8 @@ final class CloudAgentBackendLogicTests: XCTestCase {
         XCTAssertTrue(CloudAgentBackend.isRetryable(.httpStatus(code: 503, summary: "")))
         XCTAssertFalse(CloudAgentBackend.isRetryable(.httpStatus(code: 400, summary: "")))
         XCTAssertFalse(CloudAgentBackend.isRetryable(.httpStatus(code: 404, summary: "")))
-        XCTAssertTrue(CloudAgentBackend.isRetryable(.transport("x", billed: true)))
-        XCTAssertFalse(CloudAgentBackend.isRetryable(.transport("x", billed: false)))
+        XCTAssertFalse(CloudAgentBackend.isRetryable(.transport("x", billed: true)))
+        XCTAssertTrue(CloudAgentBackend.isRetryable(.transport("x", billed: false)))
         XCTAssertFalse(CloudAgentBackend.isRetryable(.invalidResponse("x")))
         XCTAssertFalse(CloudAgentBackend.isRetryable(.unsupportedFlavor(flavor: "anthropic")))
     }
@@ -363,7 +367,15 @@ final class CloudAgentBackendLogicTests: XCTestCase {
         XCTAssertEqual(priced.promptTokens, 0)
         XCTAssertEqual(priced.completionTokens, 0)
         XCTAssertEqual(priced.costUSD, 0)
-        XCTAssertEqual(CloudAgentBackend.usage(from: nil, pricing: CloudPricing(input: 2.0, output: 8.0)).costUSD, 0)
+        XCTAssertFalse(priced.costIsUnpriced, "a reported zero-count block IS a measured zero")
+    }
+
+    func testAMissingUsageBlockIsUnknownRatherThanFree() {
+        // A Stop or a dropped terminal frame leaves a billed request with no
+        // usage block. A max_cost_usd ceiling must see "unknown", not "$0".
+        let mapped = CloudAgentBackend.usage(from: nil, pricing: CloudPricing(input: 2.0, output: 8.0))
+        XCTAssertEqual(mapped.costUSD, 0)
+        XCTAssertTrue(mapped.costIsUnpriced)
     }
 
     // MARK: - Request shape

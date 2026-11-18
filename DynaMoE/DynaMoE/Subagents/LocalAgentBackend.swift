@@ -121,7 +121,7 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
     }
 
     func runTurn(_ request: AgentBackendRequest) async throws -> AgentBackendTurn {
-        let prepared = try await MainActor.run { try Self.prepare(request, thinkingEnabled: thinkingEnabled) }
+        let prepared = try await Self.prepare(request, thinkingEnabled: thinkingEnabled)
         do {
             return try await GrammarConstrainedSampler.withTurnToolMask(prepared.maskSchemas) {
                 let launch = try await MainActor.run { () -> CompletionLaunch in
@@ -146,13 +146,54 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
     }
 
     @MainActor
-    static func prepare(_ request: AgentBackendRequest, thinkingEnabled: Bool) throws -> Prepared {
+    static func prepare(_ request: AgentBackendRequest, thinkingEnabled: Bool) async throws -> Prepared {
         let engine = CompletionEngine.shared
         guard let info = engine.loadedModelInfo, let config = engine.promptModelConfig else {
             throw AgentBackendError.unavailable(
                 "A local subagent run needs a loaded model. Load a checkpoint in Settings first."
             )
         }
+        // The engine has ONE generation slot and the chat UI and API server use
+        // it directly. A background run's next step is not a reason to fail:
+        // any chat turn running when that step starts would otherwise kill the
+        // run permanently. Wait, bounded by the same queue budget the server
+        // uses, instead of treating "busy" as "unavailable".
+        let claim = try await waitForEngineSlot(engine)
+        do {
+            return try prepare(request, thinkingEnabled: thinkingEnabled, engine: engine, info: info, config: config, claim: claim)
+        } catch {
+            claim.release()
+            throw error
+        }
+    }
+
+    /// Polls the single-flight ledger until a claim is granted. A claim, not a
+    /// probe: the slot cannot be taken between the check and the launch.
+    @MainActor
+    private static func waitForEngineSlot(_ engine: CompletionEngine) async throws -> TurnSlotClaim {
+        let timeout = AgentSchedulerLimits.configured().queueTimeoutSeconds
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            if let claim = engine.reserveTurnSlot() { return claim }
+            if Task.isCancelled { throw AgentBackendError.cancelled }
+            if Date() >= deadline {
+                throw AgentBackendError.unavailable(
+                    "The local engine stayed busy for \(Int(timeout)) s, so this run could not take its next step. Send again when the current turn finishes."
+                )
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+    }
+
+    @MainActor
+    private static func prepare(
+        _ request: AgentBackendRequest,
+        thinkingEnabled: Bool,
+        engine: CompletionEngine,
+        info: CompletionEngine.LoadedModelInfo,
+        config: ModelConfig,
+        claim: TurnSlotClaim
+    ) throws -> Prepared {
         let prompt = renderPrompt(
             systemPrompt: request.systemPrompt,
             messages: request.messages,
@@ -171,11 +212,6 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
         }
         guard !promptTokenIds.isEmpty else {
             throw AgentBackendError.malformedResponse("The subagent prompt tokenized to zero tokens.")
-        }
-        guard let claim = engine.reserveTurnSlot() else {
-            throw AgentBackendError.unavailable(
-                "The local engine is busy with another turn. A local subagent run needs the generation slot; retry when the turn finishes."
-            )
         }
         let turn = CompletionTurnRequest(
             promptTokenIds: promptTokenIds,

@@ -21,6 +21,7 @@ nonisolated enum SubagentApplyError: LocalizedError, Equatable {
     case notIsolated(String)
     case stillRunning(String)
     case alreadyApplying(String)
+    case repositoryBusy(String)
     case worktreeGone(String)
 
     var errorDescription: String? {
@@ -33,6 +34,8 @@ nonisolated enum SubagentApplyError: LocalizedError, Equatable {
             return "'\(role)' is still running. Wait for it to finish, then apply its changes."
         case .alreadyApplying(let role):
             return "'\(role)' is already being applied. Wait for that apply to finish."
+        case .repositoryBusy(let role):
+            return "Another run from the same repository is being applied while '\(role)' is ready to land. Applying two patches to one tree at once can leave a mixed result; wait for that apply to finish."
         case .worktreeGone(let detail):
             return detail
         }
@@ -50,12 +53,21 @@ nonisolated struct SubagentApplyOutcome: Sendable {
 
 @MainActor
 enum SubagentApplyService {
-    /// One apply per run at a time. The `appliedAt` check below is the durable
-    /// guard, but it is written only after the patch lands; the coordinator's
-    /// tool and the inspector's button can otherwise reach `snapshot` together
-    /// and both try to write the same patch. Two writers race here, so the
-    /// guard has to exist before the first `await`, not after it.
+    /// One apply per run at a time, and one per REPOSITORY.
+    ///
+    /// The `appliedAt` check below is the durable guard, but it is written only
+    /// after the patch lands; the coordinator's tool and the inspector's button
+    /// can otherwise reach `snapshot` together and both try to write the same
+    /// patch. Two writers race here, so the guard has to exist before the first
+    /// `await`, not after it.
+    ///
+    /// The repository claim covers two DIFFERENT runs of one checkout: their
+    /// `git apply --check` calls can interleave with each other's writes, so one
+    /// runs against a tree the other has already started changing. It is taken
+    /// after the worktree is resolved and before the snapshot, in the same
+    /// MainActor turn that checks it, so no second apply can interleave.
     private static var inFlight: Set<UUID> = []
+    private static var repositoriesInFlight: Set<String> = []
 
     static func apply(runId: UUID) async throws -> SubagentApplyOutcome {
         guard !inFlight.contains(runId) else {
@@ -87,15 +99,36 @@ enum SubagentApplyService {
 
         let worktree: AgentWorktree
         do {
-            worktree = try await WorkspaceIsolation.open(path: path, branch: branch)
+            worktree = try await WorkspaceIsolation.open(
+                path: path,
+                branch: branch,
+                repositoryRoot: record.repositoryRoot.map { URL(fileURLWithPath: $0, isDirectory: true) }
+            )
         } catch {
             let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             throw SubagentApplyError.worktreeGone(detail)
         }
 
+        let repositoryKey = worktree.repositoryRoot.standardizedFileURL.path
+        guard !repositoriesInFlight.contains(repositoryKey) else {
+            throw SubagentApplyError.repositoryBusy(record.role)
+        }
+        repositoriesInFlight.insert(repositoryKey)
+        defer { repositoriesInFlight.remove(repositoryKey) }
+
         let changes = try await WorkspaceIsolation.snapshot(worktree, diffLimit: nil)
         let files: [String]
         if changes.isEmpty {
+            // `snapshot` can only see what git does. A run whose work is all in
+            // ignored files looks empty, and cleaning up after "no changes"
+            // would destroy the only copy. Name them and keep the tree.
+            let ignored = await WorkspaceIsolation.ignoredFiles(worktree)
+            if !ignored.isEmpty {
+                let named = ignored.prefix(5).joined(separator: ", ")
+                throw WorkspaceIsolationError.applyFailed(
+                    "the run's only changes are in git-ignored files (\(named)), which a patch cannot carry. Its worktree was kept so nothing is lost."
+                )
+            }
             files = []
         } else {
             let result = try await WorkspaceIsolation.apply(worktree, changeSet: changes)
@@ -208,15 +241,20 @@ enum SubagentApplyControl {
             throw SubagentApplyControlError.nothingToApply(record.role)
         }
 
-        var destination: String? = nil
-        if let repository = await WorkspaceIsolation.owningRepository(for: URL(fileURLWithPath: path)) {
+        var destination: String? = record.repositoryRoot
+        if destination == nil,
+           let repository = await WorkspaceIsolation.owningRepository(for: URL(fileURLWithPath: path)) {
             destination = repository.path
         }
         guard let request = applyRequest(for: record, destination: destination) else {
             throw SubagentApplyControlError.nothingToApply(record.role)
         }
 
-        let ask = requestApproval ?? { await SubagentApprovalCenter.shared.request($0) }
+        let ask = requestApproval ?? {
+            // Landing a patch is never a Turbo bypass: the contract in
+            // SUBAGENTS.md requires its own card.
+            await SubagentApprovalCenter.shared.request($0, honorsTurbo: false)
+        }
         guard await ask(request) else { throw SubagentApplyControlError.approvalDenied }
         return try await SubagentApplyService.apply(runId: runId)
     }

@@ -7,6 +7,17 @@
 
 import Foundation
 
+nonisolated enum AgentLoopError: LocalizedError, Equatable {
+    case wallClockExceeded
+
+    var errorDescription: String? {
+        switch self {
+        case .wallClockExceeded:
+            return "The run exceeded its wall-clock budget."
+        }
+    }
+}
+
 nonisolated struct AgentLoopInput: Sendable {
     var role: String
     var task: String
@@ -61,6 +72,10 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
         let start = CFAbsoluteTimeGetCurrent()
         var transcript: [AgentTranscriptEntry] = []
         var usage = AgentUsage()
+        // Spend a failed or cancelled cloud attempt incurred is recorded here;
+        // it has no turn to carry it. Drained after every step so the budget
+        // checks below see it.
+        let usageLedger = AgentUsageLedger()
         var index = 0
 
         @discardableResult
@@ -139,13 +154,25 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 sessionId: input.sessionId,
                 onDelta: { text, isThinking in
                     sink(.assistantDelta(entryId: isThinking ? deltaThinkingId : deltaTextId, text: text, isThinking: isThinking))
-                }
+                },
+                usageLedger: usageLedger
             )
 
             let turn: AgentBackendTurn
             do {
-                turn = try await backend.runTurn(request)
+                // A step is bounded, not merely checked between steps: a
+                // provider that stops responding would otherwise run past the
+                // wall-clock budget with the scheduler ticket still held.
+                let remaining = Double(input.budget.maxWallClockSeconds) - elapsed
+                turn = try await Self.runTurn(backend, request, remainingSeconds: remaining)
+            } catch AgentLoopError.wallClockExceeded {
+                usage.merge(usageLedger.drain())
+                status = .failed
+                failure = "The run exceeded its \(input.budget.maxWallClockSeconds)-second wall-clock budget."
+                append(kind: .status, step: step, text: failure)
+                break
             } catch {
+                usage.merge(usageLedger.drain())
                 if Task.isCancelled || (error as? AgentBackendError) == .cancelled {
                     status = .cancelled
                     failure = "The run was cancelled."
@@ -160,12 +187,18 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             usage.backendRequests += 1
             usage.steps += 1
             usage.merge(turn.usage)
+            // Failed or cancelled attempts inside this same step (a retry that
+            // never produced a turn) are billed too.
+            usage.merge(usageLedger.drain())
             // A step's prompt size is the run's "last ingested prompt" for the
             // context count; `merge` cannot infer it because backends report
             // only the billed sum, and the sum is not what the drawer shows.
             usage.latestPromptTokens = turn.usage.promptTokens
             usage.wallClockSeconds = CFAbsoluteTimeGetCurrent() - start
 
+            // The text lands first even when the turn then fails a budget or a
+            // truncation check: what the model managed to say is part of the
+            // transcript, it just is not reported as a finished answer.
             if !turn.thinking.isEmpty {
                 append(kind: .assistantThinking, step: step, text: turn.thinking, id: deltaThinkingId)
             }
@@ -174,6 +207,45 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 finalText = turn.text
             }
             emit(.usage(usage))
+
+            // The budget checks at the TOP of the loop only see what earlier
+            // steps spent. A final turn that crosses a ceiling must not be
+            // reported as a completion, and a truncated answer is not an answer.
+            if let problem = Self.postTurnBudgetFailure(
+                input: input,
+                usage: usage,
+                elapsed: CFAbsoluteTimeGetCurrent() - start
+            ) {
+                status = .failed
+                failure = problem
+                append(kind: .status, step: step, text: problem)
+                break
+            }
+            let loweredReason = turn.finishReason.lowercased()
+            let unusableReason = Self.finishReasonIsTruncated(turn.finishReason)
+                || loweredReason == "toolfreeze"
+                || loweredReason == "degeneratecycle"
+                || loweredReason == "stopped"
+            if turn.calls.isEmpty, unusableReason {
+                // A token-capped turn is a fragment. A `toolFreeze` with no
+                // executable call is the local parser filtering a malformed
+                // one: the turn stopped on a call boundary that produced
+                // nothing to run. `degenerateCycle` and `stopped` are the
+                // decode loop's own "no positive break reason" endings.
+                status = .failed
+                switch loweredReason {
+                case "toolfreeze":
+                    failure = "The backend stopped on a tool-call boundary that produced no complete call, so nothing could run."
+                case "degeneratecycle":
+                    failure = "The backend stopped because it began repeating itself, so its text is not a considered answer."
+                case "stopped":
+                    failure = "The backend's decode loop stopped without reaching an end-of-turn reason, so its text is a fragment."
+                default:
+                    failure = "The backend stopped at its token limit (finish reason '\(turn.finishReason)') before the run finished, so its text is a fragment rather than an answer."
+                }
+                append(kind: .status, step: step, text: failure)
+                break
+            }
 
             guard !turn.calls.isEmpty else {
                 finished = true
@@ -258,6 +330,7 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             failure = "The backend produced no final answer."
         }
 
+        usage.merge(usageLedger.drain())
         usage.wallClockSeconds = CFAbsoluteTimeGetCurrent() - start
         // Derive what the run actually said. A `complete` call's summary is the
         // run's considered answer; without one, a completed run's final text is
@@ -300,6 +373,61 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             usage: usage,
             error: failure
         )
+    }
+
+    /// Runs one backend turn under the wall-clock deadline. The timeout task
+    /// cancelling its sibling is what stops the HTTP stream or local decode;
+    /// the parent run is not cancelled, so the failure is a budget result, not
+    /// a Stop.
+    private static func runTurn(
+        _ backend: any AgentModelBackend,
+        _ request: AgentBackendRequest,
+        remainingSeconds: TimeInterval
+    ) async throws -> AgentBackendTurn {
+        try await withThrowingTaskGroup(of: AgentBackendTurn.self) { group in
+            group.addTask { try await backend.runTurn(request) }
+            group.addTask {
+                try await Task.sleep(
+                    nanoseconds: UInt64(max(0, remainingSeconds) * 1_000_000_000)
+                )
+                throw AgentLoopError.wallClockExceeded
+            }
+            defer { group.cancelAll() }
+            guard let first = try await group.next() else {
+                throw AgentBackendError.malformedResponse("The backend produced no turn.")
+            }
+            return first
+        }
+    }
+
+    /// What a just-finished turn did to the run's budget, or nil. A cost of
+    /// exactly the ceiling is allowed for a turn that then stopped: the ceiling
+    /// is the most the run may SPEND, and the next step's pre-check would stop
+    /// it from spending more.
+    private static func postTurnBudgetFailure(
+        input: AgentLoopInput,
+        usage: AgentUsage,
+        elapsed: TimeInterval
+    ) -> String? {
+        if elapsed >= Double(input.budget.maxWallClockSeconds) {
+            return "The run exceeded its \(input.budget.maxWallClockSeconds)-second wall-clock budget."
+        }
+        if let maxCost = input.budget.maxCostUSD {
+            if usage.costIsUnpriced {
+                return "The run has a \(currency(maxCost)) cost ceiling, but no price is recorded for its model, so the ceiling cannot be enforced."
+            }
+            if usage.costUSD > maxCost {
+                return "The run spent \(currency(usage.costUSD)), over its \(currency(maxCost)) cost budget."
+            }
+        }
+        return nil
+    }
+
+    static func finishReasonIsTruncated(_ reason: String) -> Bool {
+        let lowered = reason.lowercased()
+        if lowered == "length" || lowered == "lengthcapped" { return true }
+        if lowered.contains("max_tokens") || lowered.contains("max_output_tokens") { return true }
+        return false
     }
 
     private static func initialTaskText(task: String, context: String?) -> String {

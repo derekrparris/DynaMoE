@@ -57,6 +57,38 @@ final class AgentRunStoreTests: XCTestCase {
         )
     }
 
+    func testAnInterruptedRunIsClosedAtLaunchAndAFreshOneIsLeftAlone() throws {
+        let store = makeStore()
+        let session = UUID()
+        let staleId = UUID()
+        let freshId = UUID()
+        let now = Date()
+        store.saveImmediately(record(
+            id: staleId,
+            sessionId: session,
+            createdAt: now.addingTimeInterval(-3_600),
+            status: .running
+        ))
+        store.saveImmediately(record(
+            id: freshId,
+            sessionId: session,
+            createdAt: now,
+            status: .running
+        ))
+
+        let closed = store.reconcileInterruptedRuns(now: now, graceSeconds: 60)
+
+        XCTAssertEqual(closed, [staleId])
+        let stale = try XCTUnwrap(store.load(runId: staleId, sessionId: session))
+        XCTAssertEqual(stale.status, .failed)
+        XCTAssertNotNil(stale.error, "the closed record names what happened")
+        XCTAssertEqual(
+            try XCTUnwrap(store.load(runId: freshId, sessionId: session)).status,
+            .running,
+            "a run young enough to be in flight must not be closed"
+        )
+    }
+
     func testARunRoundTripsThroughDisk() throws {
         let store = makeStore()
         let sessionId = UUID()

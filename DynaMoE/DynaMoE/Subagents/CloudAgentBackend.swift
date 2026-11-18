@@ -73,17 +73,29 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
         var attempt = 0
         while true {
             attempt += 1
+            // Every attempt gets its own receipt. A failure or a Stop can end
+            // the event stream without a terminal event, and the receipt is the
+            // only evidence left of what the provider may have billed.
+            let receipt = CloudTurnReceipt()
             do {
-                return try await performTurn(request)
+                return try await performTurn(request, receipt: receipt)
             } catch let failure as CloudTurnFailure where attempt < 2 && Self.isRetryable(failure) {
+                Self.recordSpentUsage(receipt, pricing: pricing, into: request.usageLedger)
                 continue
             } catch let failure as CloudTurnFailure {
+                Self.recordSpentUsage(receipt, pricing: pricing, into: request.usageLedger)
                 throw AgentBackendError.transport(failure.errorDescription ?? "The cloud request failed.")
+            } catch {
+                Self.recordSpentUsage(receipt, pricing: pricing, into: request.usageLedger)
+                throw error
             }
         }
     }
 
-    private func performTurn(_ request: AgentBackendRequest) async throws -> AgentBackendTurn {
+    private func performTurn(
+        _ request: AgentBackendRequest,
+        receipt: CloudTurnReceipt
+    ) async throws -> AgentBackendTurn {
         let messages = Self.wireMessages(systemPrompt: request.systemPrompt, messages: request.messages)
         let params = CloudChatGenerationParams(
             temperature: request.sampling.temperature,
@@ -96,7 +108,8 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
             model: providerModelId,
             messages: messages,
             params: params,
-            tools: request.tools.isEmpty ? nil : request.tools
+            tools: request.tools.isEmpty ? nil : request.tools,
+            receipt: receipt
         )
 
         var result: CloudTurnResult?
@@ -147,7 +160,14 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
 
     static func usage(from usage: CloudUsage?, pricing: CloudPricing?) -> AgentUsage {
         var result = AgentUsage()
-        guard let usage else { return result }
+        guard let usage else {
+            // No usage block is not proof the turn was free. The provider may
+            // have billed it and omitted the block (a Stop, a dropped terminal
+            // frame, an endpoint that never reports usage), so a cost ceiling
+            // must see "unknown", not "$0".
+            result.costIsUnpriced = true
+            return result
+        }
         result.promptTokens = usage.promptTokens ?? 0
         result.completionTokens = usage.completionTokens ?? 0
         result.cachedTokens = usage.cachedTokens ?? 0
@@ -165,7 +185,10 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
     static func isRetryable(_ failure: CloudTurnFailure) -> Bool {
         switch failure {
         case .transport(_, let billed):
-            return billed
+            // A request that provably never left the Mac is safe to send again.
+            // One that may have reached inference is not: the retry can be
+            // invoiced a second time for a turn the caller will never see.
+            return !billed
         case .httpStatus(let code, _):
             return code == 429 || code >= 500
         case .invalidResponse:
@@ -173,6 +196,28 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
         case .missingAPIKey, .credentialAccessDenied, .credentialNeedsImport, .unsupportedFlavor:
             return false
         }
+    }
+
+    /// Prices an attempt that produced no turn. A billed attempt whose provider
+    /// sent no usage block is recorded as unpriced rather than as free, so a
+    /// cost ceiling cannot read an invisible request as $0.
+    private static func recordSpentUsage(
+        _ receipt: CloudTurnReceipt,
+        pricing: CloudPricing?,
+        into ledger: AgentUsageLedger?
+    ) {
+        guard let ledger else { return }
+        if let result = receipt.result {
+            var usage = Self.usage(from: result.usage, pricing: pricing)
+            usage.backendRequests = 1
+            ledger.add(usage)
+            return
+        }
+        guard receipt.spentRequest == true else { return }
+        var usage = AgentUsage()
+        usage.backendRequests = 1
+        usage.costIsUnpriced = true
+        ledger.add(usage)
     }
 
     static func wireMessages(systemPrompt: String, messages: [AgentBackendMessage]) -> [CloudChatMessage] {

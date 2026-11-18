@@ -138,6 +138,14 @@ nonisolated enum WorkspaceIsolation {
     }
 
     /// The main repository that owns a linked worktree.
+    ///
+    /// The parent of `--git-common-dir` is the repository root only for an
+    /// ordinary checkout. A submodule's common dir lives at
+    /// `<super>/.git/modules/<name>` and records its checkout in
+    /// `core.worktree`; a `--separate-git-dir` repository records nothing at
+    /// all, which is why a run's own record persists the root and `open`
+    /// prefers it. This derivation is the fallback for a record that predates
+    /// that field and for the launch sweep, which only has the path.
     static func owningRepository(for worktree: URL) async -> URL? {
         guard let (code, stdout, _) = try? await git(
             ["rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -146,7 +154,67 @@ nonisolated enum WorkspaceIsolation {
         let common = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !common.isEmpty else { return nil }
         let gitDirectory = URL(fileURLWithPath: common, isDirectory: true)
-        return gitDirectory.deletingLastPathComponent()
+
+        if let (configCode, configOut, _) = try? await git(
+            ["--git-dir", common, "config", "--get", "core.worktree"],
+            in: worktree
+        ), configCode == 0 {
+            let recorded = configOut.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !recorded.isEmpty {
+                let root = URL(fileURLWithPath: recorded, relativeTo: gitDirectory)
+                    .standardizedFileURL
+                if await isMainWorktree(root, owning: worktree) { return root }
+            }
+        }
+
+        if let (listCode, listOut, _) = try? await git(
+            ["worktree", "list", "--porcelain"],
+            in: worktree
+        ), listCode == 0 {
+            let first = listOut
+                .split(separator: "\n")
+                .first { $0.hasPrefix("worktree ") }
+                .map { String($0.dropFirst("worktree ".count)) }
+            if let first, !first.isEmpty {
+                let root = URL(fileURLWithPath: first, isDirectory: true)
+                if await isMainWorktree(root, owning: worktree) { return root }
+            }
+        }
+
+        let parent = gitDirectory.deletingLastPathComponent()
+        if await isMainWorktree(parent, owning: worktree) { return parent }
+        return nil
+    }
+
+    /// True when `candidate` is a working tree of the SAME repository as
+    /// `worktree`. It rejects both the linked worktree itself and a bare git
+    /// directory, either of which would make `apply` write to the wrong tree.
+    private static func isMainWorktree(_ candidate: URL, owning worktree: URL) async -> Bool {
+        // The worktree itself is a working tree of the same repository; it is
+        // not the place a patch may land.
+        guard candidate.standardizedFileURL != worktree.standardizedFileURL else { return false }
+        guard let (topCode, topOut, _) = try? await git(
+            ["rev-parse", "--show-toplevel"],
+            in: candidate
+        ), topCode == 0 else { return false }
+        let top = topOut.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !top.isEmpty else { return false }
+        guard URL(fileURLWithPath: top).resolvingSymlinksInPath().standardizedFileURL
+            == candidate.resolvingSymlinksInPath().standardizedFileURL else { return false }
+
+        guard let (worktreeCode, worktreeOut, _) = try? await git(
+            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            in: worktree
+        ), worktreeCode == 0,
+        let (candidateCode, candidateOut, _) = try? await git(
+            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            in: candidate
+        ), candidateCode == 0 else { return false }
+        let a = URL(fileURLWithPath: worktreeOut.trimmingCharacters(in: .whitespacesAndNewlines))
+            .resolvingSymlinksInPath().standardizedFileURL
+        let b = URL(fileURLWithPath: candidateOut.trimmingCharacters(in: .whitespacesAndNewlines))
+            .resolvingSymlinksInPath().standardizedFileURL
+        return a == b
     }
 
     // MARK: Creating
@@ -206,14 +274,24 @@ nonisolated enum WorkspaceIsolation {
     /// a run restored from disk needs: the record keeps its path and branch, and
     /// the base commit is the merge base of the branch and the main tree's HEAD.
     /// (A run's own commits move the branch, never the merge base.)
-    static func open(path: String, branch: String) async throws -> AgentWorktree {
+    static func open(
+        path: String,
+        branch: String,
+        repositoryRoot recordedRoot: URL? = nil
+    ) async throws -> AgentWorktree {
         let worktreeURL = URL(fileURLWithPath: path, isDirectory: true)
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
               isDirectory.boolValue else {
             throw WorkspaceIsolationError.worktreeMissing(path)
         }
-        guard let repositoryRoot = await owningRepository(for: worktreeURL) else {
+        var repositoryRoot: URL?
+        if let recordedRoot, await isMainWorktree(recordedRoot, owning: worktreeURL) {
+            repositoryRoot = recordedRoot
+        } else {
+            repositoryRoot = await owningRepository(for: worktreeURL)
+        }
+        guard let repositoryRoot else {
             throw WorkspaceIsolationError.notAGitRepository(path)
         }
         guard let (branchCode, _, _) = try? await git(["rev-parse", "--verify", branch], in: repositoryRoot),
@@ -334,10 +412,19 @@ nonisolated enum WorkspaceIsolation {
             let status = token.first.map(String.init) ?? ""
             if ["A", "B", "C", "D", "M", "R", "T", "U", "X"].contains(status) {
                 let isRename = status == "R" || status == "C"
-                let pathIndex = index + (isRename ? 2 : 1)
-                guard pathIndex < tokens.count else { break }
-                append(tokens[pathIndex])
-                index = pathIndex + 1
+                if isRename {
+                    // BOTH sides: the patch deletes the old path as well, so
+                    // the pre-flight and the rollback snapshot have to know it
+                    // or a failed rename could leave the file gone.
+                    guard index + 2 < tokens.count else { break }
+                    append(tokens[index + 1])
+                    append(tokens[index + 2])
+                    index += 3
+                } else {
+                    guard index + 1 < tokens.count else { break }
+                    append(tokens[index + 1])
+                    index += 2
+                }
             } else {
                 index += 1
             }
@@ -347,9 +434,14 @@ nonisolated enum WorkspaceIsolation {
 
     // MARK: Applying
 
-    /// Applies the run's net change to the main tree. `git apply` validates the
-    /// whole patch before touching a file, so a failure leaves the working tree
-    /// as it was; a conflict is reported, never resolved silently.
+    /// Applies the run's net change to the main tree.
+    ///
+    /// `git apply --check` validates the whole patch, but the apply that follows
+    /// is NOT atomic: a write that fails partway through (a permission, a full
+    /// disk, a path replaced between the two calls) leaves the files it already
+    /// wrote in place. The main tree is snapshotted first and restored if the
+    /// apply fails, so a reported failure really does leave it as it was. A
+    /// conflict is reported by name, never resolved silently.
     static func apply(
         _ worktree: AgentWorktree,
         changeSet: WorkspaceChangeSet? = nil
@@ -371,6 +463,7 @@ nonisolated enum WorkspaceIsolation {
             throw WorkspaceIsolationError.applyFailed("the patch was truncated before it could be applied")
         }
         try await refuseIfTheMainTreeIsMidOperation(worktree.repositoryRoot)
+        try refuseIfTargetsAreNotWritable(changes.changedFiles, in: worktree.repositoryRoot)
 
         let patchURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("dynamoe-\(worktree.branch.replacingOccurrences(of: "/", with: "-")).patch")
@@ -394,13 +487,24 @@ nonisolated enum WorkspaceIsolation {
             throw WorkspaceIsolationError.applyFailed(detail)
         }
 
+        let rollback = try stageRollback(changes.changedFiles, in: worktree.repositoryRoot)
+        defer { try? FileManager.default.removeItem(at: rollback.directory) }
+
         let (applyCode, _, applyErr) = try await git(
             ["apply", "--binary", "--whitespace=nowarn", patchURL.path],
             in: worktree.repositoryRoot
         )
         guard applyCode == 0 else {
+            let detail = applyErr.trimmingCharacters(in: .whitespacesAndNewlines)
+            let restored = rollback.restore(in: worktree.repositoryRoot)
+            let suffix = detail.isEmpty ? "" : " " + detail
+            if restored {
+                throw WorkspaceIsolationError.applyFailed(
+                    "the write failed partway through and was rolled back." + suffix
+                )
+            }
             throw WorkspaceIsolationError.applyFailed(
-                applyErr.trimmingCharacters(in: .whitespacesAndNewlines)
+                "the write failed partway through and the rollback did NOT fully restore the tree; inspect it before retrying." + suffix
             )
         }
         return WorkspaceApplyResult(
@@ -408,6 +512,136 @@ nonisolated enum WorkspaceIsolation {
             branch: worktree.branch,
             diffWasTruncated: false
         )
+    }
+
+    /// Refuses a patch whose destination the process could not write BEFORE a
+    /// byte is touched. `git apply --check` only reads, so a read-only target
+    /// passes it and fails during the real apply.
+    private static func refuseIfTargetsAreNotWritable(_ paths: [String], in root: URL) throws {
+        let fileManager = FileManager.default
+        for path in paths {
+            guard let target = safeURL(for: path, in: root) else {
+                throw WorkspaceIsolationError.applyFailed("the patch names an unsafe path: \(path)")
+            }
+            var isDirectory: ObjCBool = false
+            if fileManager.fileExists(atPath: target.path, isDirectory: &isDirectory) {
+                guard !isDirectory.boolValue, fileManager.isWritableFile(atPath: target.path) else {
+                    throw WorkspaceIsolationError.applyFailed(
+                        "'\(path)' exists and is not a writable file, so the patch cannot land there."
+                    )
+                }
+            }
+            guard let ancestor = existingAncestor(of: target, fileManager: fileManager) else {
+                throw WorkspaceIsolationError.applyFailed(
+                    "no existing directory holds '\(path)', so the patch cannot land there."
+                )
+            }
+            guard fileManager.isWritableFile(atPath: ancestor.path) else {
+                throw WorkspaceIsolationError.applyFailed(
+                    "the directory holding '\(path)' is not writable."
+                )
+            }
+        }
+    }
+
+    private static func existingAncestor(of url: URL, fileManager: FileManager) -> URL? {
+        var candidate = url.deletingLastPathComponent()
+        while candidate.path != "/" {
+            var isDirectory: ObjCBool = false
+            if fileManager.fileExists(atPath: candidate.path, isDirectory: &isDirectory) {
+                return isDirectory.boolValue ? candidate : nil
+            }
+            candidate = candidate.deletingLastPathComponent()
+        }
+        return nil
+    }
+
+    /// A repository-relative path that cannot escape the main tree.
+    private static func safeURL(for path: String, in root: URL) -> URL? {
+        guard !path.isEmpty, !path.hasPrefix("/") else { return nil }
+        let components = path.split(separator: "/", omittingEmptySubsequences: false)
+        guard !components.contains(".."), !components.contains("") else { return nil }
+        let url = root.appendingPathComponent(path)
+        // Compare the RAW spellings. `standardizedFileURL` and
+        // `resolvingSymlinksInPath` both rewrite `/private/var/...` to
+        // `/var/...` (and disagree about a child that does not exist yet), so
+        // either one compared two spellings of the same tree and refused every
+        // file the patch would create. `..` and empty components are already
+        // rejected above, so the prefix holds by construction.
+        let rootPath = root.path
+        let targetPath = url.path
+        guard targetPath.hasPrefix(rootPath.hasSuffix("/") ? rootPath : rootPath + "/") else {
+            return nil
+        }
+        return url
+    }
+
+    /// The main tree's current bytes for every path the patch can touch.
+    private struct ApplyRollback {
+        var directory: URL
+        var entries: [(relativePath: String, original: URL?)]
+
+        func restore(in root: URL) -> Bool {
+            let fileManager = FileManager.default
+            var restoredEverything = true
+            for entry in entries {
+                guard let target = WorkspaceIsolation.safeURL(for: entry.relativePath, in: root) else {
+                    restoredEverything = false
+                    continue
+                }
+                do {
+                    if let original = entry.original {
+                        try fileManager.createDirectory(
+                            at: target.deletingLastPathComponent(),
+                            withIntermediateDirectories: true
+                        )
+                        if fileManager.fileExists(atPath: target.path) {
+                            try fileManager.removeItem(at: target)
+                        }
+                        try fileManager.copyItem(at: original, to: target)
+                    } else if fileManager.fileExists(atPath: target.path) {
+                        try fileManager.removeItem(at: target)
+                    }
+                } catch {
+                    restoredEverything = false
+                }
+            }
+            return restoredEverything
+        }
+    }
+
+    private static func stageRollback(_ paths: [String], in root: URL) throws -> ApplyRollback {
+        let fileManager = FileManager.default
+        let directory = fileManager.temporaryDirectory
+            .appendingPathComponent("dynamoe-rollback-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        } catch {
+            throw WorkspaceIsolationError.applyFailed(
+                "could not prepare a rollback snapshot: \(error.localizedDescription)"
+            )
+        }
+        var entries: [(String, URL?)] = []
+        for path in paths {
+            guard let target = safeURL(for: path, in: root) else {
+                throw WorkspaceIsolationError.applyFailed("the patch names an unsafe path: \(path)")
+            }
+            guard fileManager.fileExists(atPath: target.path) else {
+                entries.append((path, nil))
+                continue
+            }
+            let copy = directory.appendingPathComponent(UUID().uuidString)
+            do {
+                try fileManager.copyItem(at: target, to: copy)
+            } catch {
+                try? fileManager.removeItem(at: directory)
+                throw WorkspaceIsolationError.applyFailed(
+                    "could not snapshot '\(path)' before applying: \(error.localizedDescription)"
+                )
+            }
+            entries.append((path, copy))
+        }
+        return ApplyRollback(directory: directory, entries: entries)
     }
 
     /// Applying during a merge or rebase is a different operation than applying
@@ -441,6 +675,12 @@ nonisolated enum WorkspaceIsolation {
     /// Removes the worktree and its branch. Called on cancel and after a
     /// successful apply; never on a completed run that has not been applied,
     /// because the worktree is then the only copy of work worth applying.
+    ///
+    /// A path and branch restored from disk are treated as untrusted: the branch
+    /// is deleted only when it carries this app's prefix, and the directory is
+    /// removed by hand only when it is under this process's worktree root. A
+    /// `git worktree remove` naming something else fails harmlessly; the manual
+    /// fallback would not.
     @discardableResult
     static func cleanup(
         _ worktree: AgentWorktree,
@@ -452,13 +692,42 @@ nonisolated enum WorkspaceIsolation {
             in: worktree.repositoryRoot
         )
         _ = try? await git(["worktree", "prune"], in: worktree.repositoryRoot)
-        if fileManager.fileExists(atPath: worktree.path.path) {
+        if fileManager.fileExists(atPath: worktree.path.path),
+           isInsideProcessWorktreeRoot(worktree.path) {
             try? fileManager.removeItem(at: worktree.path)
         }
-        if deleteBranch, worktree.branch != "HEAD" {
+        if deleteBranch,
+           worktree.branch != "HEAD",
+           worktree.branch.hasPrefix(branchPrefix) {
             _ = try? await git(["branch", "-D", worktree.branch], in: worktree.repositoryRoot)
         }
         return !fileManager.fileExists(atPath: worktree.path.path)
+    }
+
+    /// Whether a path may be deleted by the launch sweep or an apply. Only this
+    /// process's own worktree root qualifies; a record's path is data.
+    static func isInsideProcessWorktreeRoot(_ url: URL) -> Bool {
+        let root = processRootURL.standardizedFileURL.resolvingSymlinksInPath().path
+        let path = url.standardizedFileURL.resolvingSymlinksInPath().path
+        guard !root.isEmpty else { return false }
+        return path.hasPrefix(root.hasSuffix("/") ? root : root + "/")
+    }
+
+    /// Files the run created that git ignores. `snapshot` stages with `git add
+    /// -A`, which cannot carry them, so an ignored-only run looks empty and
+    /// would otherwise be reported as "no changes" and deleted with its
+    /// worktree. Naming them lets the apply refuse and keep the tree.
+    static func ignoredFiles(_ worktree: AgentWorktree) async -> [String] {
+        guard let (code, stdout, _) = try? await git(
+            ["status", "--porcelain", "--ignored=matching", "-z"],
+            in: worktree.path
+        ), code == 0 else { return [] }
+        return stdout
+            .split(separator: "\0", omittingEmptySubsequences: true)
+            .compactMap { entry -> String? in
+                guard entry.hasPrefix("!! ") else { return nil }
+                return String(entry.dropFirst(3))
+            }
     }
 
     /// Removes worktrees older than `olderThan` that no live run can still be
@@ -481,6 +750,17 @@ nonisolated enum WorkspaceIsolation {
             let values = try? path.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
             let created = values?.creationDate ?? values?.contentModificationDate ?? now
             guard now.timeIntervalSince(created) >= olderThan else { continue }
+
+            // A worktree is the ONLY full copy of a run that has not been
+            // applied. Age is not evidence that its work is safe to destroy:
+            // the record keeps a bounded diff, not the files. Leave it alone
+            // until the operator applies or clears the run.
+            if let runId = UUID(uuidString: name),
+               let record = AgentRunStore.shared.loadAny(runId: runId),
+               record.appliedAt == nil,
+               record.status != .cancelled {
+                continue
+            }
 
             if let repositoryRoot = await owningRepository(for: path),
                let (branchCode, branchOut, _) = try? await git(

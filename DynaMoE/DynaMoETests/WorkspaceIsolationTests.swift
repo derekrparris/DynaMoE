@@ -231,6 +231,55 @@ final class WorkspaceIsolationTests: XCTestCase {
         XCTAssertFalse(after.contains("worktree line two"))
     }
 
+    /// `git apply --check` only reads, so a read-only destination passed the
+    /// check and then failed during the real apply, leaving the files it had
+    /// already written in place. The pre-flight must refuse before any write.
+    func testAnUnwritableTargetLeavesEveryFileUntouched() async throws {
+        let marker = "stable line\n"
+        try marker.write(
+            to: repository.appendingPathComponent("applied.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try await git(["add", "-A"], in: repository)
+        try await git(["commit", "-m", "add applied"], in: repository)
+
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: UUID(),
+            root: worktreeRoot
+        )
+        var readme = try String(contentsOf: worktree.path.appendingPathComponent("README.md"), encoding: .utf8)
+        readme += "should not land\n"
+        try readme.write(to: worktree.path.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+        try "changed\n".write(
+            to: worktree.path.appendingPathComponent("applied.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let appliedURL = repository.appendingPathComponent("applied.txt")
+        try FileManager.default.setAttributes([.posixPermissions: 0o444], ofItemAtPath: appliedURL.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: appliedURL.path) }
+
+        do {
+            _ = try await WorkspaceIsolation.apply(worktree)
+            XCTFail("an unwritable destination must be refused")
+        } catch let error as WorkspaceIsolationError {
+            guard case .applyFailed = error else {
+                return XCTFail("expected applyFailed, got \(error)")
+            }
+        }
+
+        let mainReadme = try String(contentsOf: repository.appendingPathComponent("README.md"), encoding: .utf8)
+        XCTAssertFalse(mainReadme.contains("should not land"), "no file may be written before the refusal")
+        XCTAssertEqual(
+            try String(contentsOf: appliedURL, encoding: .utf8),
+            marker,
+            "the unwritable file must keep its original bytes"
+        )
+    }
+
     func testOpenRefusesAPathThatIsGone() async throws {
         do {
             _ = try await WorkspaceIsolation.open(
@@ -610,6 +659,61 @@ final class WorkspaceIsolationTests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    /// A submodule's common git dir lives under `<super>/.git/modules`, so
+    /// taking its parent named the modules directory as the repository root
+    /// and every snapshot/apply then ran in the wrong tree. `core.worktree`
+    /// records the checkout, and that is what the derivation reads.
+    func testOwningRepositoryResolvesASubmoduleWorktreeToItsCheckout() async throws {
+        let superRepository = try makeTemporaryDirectory("super")
+        let innerRepository = try makeTemporaryDirectory("inner")
+        let linked = try makeTemporaryDirectory("linked")
+        defer {
+            try? FileManager.default.removeItem(at: superRepository)
+            try? FileManager.default.removeItem(at: innerRepository)
+            try? FileManager.default.removeItem(at: linked)
+        }
+
+        try await git(["init", "-b", "main"], in: innerRepository)
+        try "inner\n".write(
+            to: innerRepository.appendingPathComponent("inner.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try await git(["add", "-A"], in: innerRepository)
+        try await git(["commit", "-m", "init"], in: innerRepository)
+
+        try await git(["init", "-b", "main"], in: superRepository)
+        try "outer\n".write(
+            to: superRepository.appendingPathComponent("outer.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try await git(["add", "-A"], in: superRepository)
+        try await git(["commit", "-m", "init"], in: superRepository)
+        let added = try await git(
+            ["-c", "protocol.file.allow=always", "submodule", "add", innerRepository.path, "sub"],
+            in: superRepository
+        )
+        XCTAssertEqual(added.0, 0, added.2)
+        try await git(["commit", "-m", "add submodule"], in: superRepository)
+
+        let submodule = superRepository.appendingPathComponent("sub", isDirectory: true)
+        let linkedPath = linked.appendingPathComponent("wt", isDirectory: true)
+        let worktree = try await git(
+            ["worktree", "add", "-b", "agent-wt", linkedPath.path, "HEAD"],
+            in: submodule
+        )
+        XCTAssertEqual(worktree.0, 0, worktree.2)
+
+        let root = await WorkspaceIsolation.owningRepository(for: linkedPath)
+        XCTAssertEqual(
+            root?.resolvingSymlinksInPath().standardizedFileURL,
+            submodule.resolvingSymlinksInPath().standardizedFileURL,
+            "a submodule worktree must resolve to the submodule checkout, not <super>/.git/modules"
+        )
+        _ = try? await git(["worktree", "remove", "--force", linkedPath.path], in: submodule)
+    }
 
     private func makeTemporaryDirectory(_ label: String) throws -> URL {
         let url = FileManager.default.temporaryDirectory

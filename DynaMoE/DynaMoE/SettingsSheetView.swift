@@ -281,10 +281,13 @@ struct SettingsSheetView: View {
             subagentSettingRow("Concurrency") {
                 Stepper("Local \(subagentLocalCapacity)", value: $subagentLocalCapacity, in: 1...4)
                     .font(.system(size: 11))
+                    .onChange(of: subagentLocalCapacity) { _, _ in reloadSubagentSchedulerLimits() }
                 Stepper("Cloud/provider \(subagentCloudPerProvider)", value: $subagentCloudPerProvider, in: 1...8)
                     .font(.system(size: 11))
+                    .onChange(of: subagentCloudPerProvider) { _, _ in reloadSubagentSchedulerLimits() }
                 Stepper("Cloud total \(subagentCloudGlobal)", value: $subagentCloudGlobal, in: 1...16)
                     .font(.system(size: 11))
+                    .onChange(of: subagentCloudGlobal) { _, _ in reloadSubagentSchedulerLimits() }
             }
 
             Toggle("Notify when a background run finishes", isOn: $subagentNotifications)
@@ -299,11 +302,15 @@ struct SettingsSheetView: View {
                     .font(.system(size: 11))
             }
 
-            Text("A local run holds the engine one step at a time, so the coordinator re-prefills after it. The cost limit is how long that wait may be before the spawn card asks first. Runs are listed in the Subagent Inspector and survive relaunch; concurrency limits apply to the next launch.")
+            Text("A local run holds the engine one step at a time, so the coordinator re-prefills after it. The cost limit is how long that wait may be before the spawn card asks first. Runs are listed in the Subagent Inspector and survive relaunch; a concurrency change applies to the next spawn.")
                 .font(.system(size: 10))
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
+    }
+
+    private func reloadSubagentSchedulerLimits() {
+        Task { await AgentScheduler.shared.reloadLimits() }
     }
 
     private func subagentSettingRow<Content: View>(

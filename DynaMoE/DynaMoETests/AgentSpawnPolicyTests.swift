@@ -151,6 +151,59 @@ final class AgentSpawnPolicyTests: XCTestCase {
         ))
     }
 
+    func testAReadOnlySpawnThatForcesCloudNeedsAnOffDeviceCard() {
+        let suiteName = "AgentSpawnPolicyTests-cloud-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let arguments: [String: Any] = [
+            "role": "Codebase Researcher",
+            "task_description": "read only",
+            "allowed_tools": ["file_read", "grep_search"],
+            "backend": "cloud"
+        ]
+
+        XCTAssertTrue(
+            AgentHarness.spawnSubagentRequiresApproval(
+                arguments: arguments,
+                mode: .code,
+                defaults: defaults
+            ),
+            "a read-only run still uploads repository content when it runs in the cloud"
+        )
+
+        defaults.set("cloud", forKey: SubagentBackendSettings.backendKey)
+        XCTAssertFalse(
+            AgentHarness.spawnSubagentRequiresApproval(
+                arguments: arguments,
+                mode: .code,
+                defaults: defaults
+            ),
+            "the Settings choice already names the off-device backend, so this read-only spawn needs no second card"
+        )
+    }
+
+    func testLandingAWorktreeIsNeverABypass() {
+        XCTAssertFalse(
+            AgentHarness.turboModeMayBypassApproval(
+                toolName: "apply_subagent_changes",
+                arguments: ["subagent_id": UUID().uuidString],
+                mode: .code
+            ),
+            "SUBAGENTS.md gives an apply its own card even in Turbo Mode"
+        )
+    }
+
+    func testARunScopedCatalogIsTheBuiltinInstallAndStillForbidsDelegation() {
+        let names = AgentHarness.runScopedToolNames()
+        XCTAssertTrue(names.contains("file_read"))
+        XCTAssertTrue(names.contains("complete"))
+        // The installer registers these so the shared catalog can name them,
+        // but a run may never be GIVEN one. The spawn path checks the forbidden
+        // set before the catalog, which is what keeps delegation one level.
+        XCTAssertTrue(AgentHarness.runScopedForbiddenToolNames.contains("spawn_subagent"))
+        XCTAssertTrue(AgentHarness.runScopedForbiddenToolNames.contains("apply_subagent_changes"))
+    }
+
     func testPlanModeNeverAsksForASpawn() {
         XCTAssertFalse(AgentHarness.spawnSubagentRequiresApproval(
             arguments: ["role": "Shader Optimizer", "task_description": "opt"],

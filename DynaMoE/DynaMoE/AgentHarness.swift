@@ -3906,6 +3906,17 @@ public final class AgentHarness {
         AgentHarness(runScoped: true)
     }
 
+    /// The tools a run-scoped harness actually installs.
+    ///
+    /// A spawn must validate against THIS, not `shared.tools`: the coordinator
+    /// also has dynamically loaded and MCP tools, and a run given one of those
+    /// is refused at `configureRunScope` after the operator already approved the
+    /// card. Failing at the spawn names the same fact earlier and changes
+    /// nothing about what a run can do.
+    public static func runScopedToolNames() -> Set<String> {
+        Set(makeRunScoped().tools.keys)
+    }
+
     public func configureRunScope(
         runId: UUID,
         toolNames: [String],
@@ -4263,8 +4274,16 @@ public final class AgentHarness {
     /// them, rather than a stream of per-call cards they cannot attribute to a
     /// background run. A read-only spawn, and any spawn in plan mode (whose
     /// tools are withheld anyway), runs without a card.
-    static func spawnSubagentRequiresApproval(arguments: [String: Any], mode: AgentMode) -> Bool {
+    static func spawnSubagentRequiresApproval(
+        arguments: [String: Any],
+        mode: AgentMode,
+        defaults: UserDefaults = .standard
+    ) -> Bool {
         guard mode != .plan else { return false }
+        // Sending a run off-device is a decision the operator makes in
+        // Settings or on a card that says so. A read-only run is still a run:
+        // file_read and grep_search upload repository content on every step.
+        if spawnsWorkOffDevice(arguments: arguments, defaults: defaults) { return true }
         let preset = AgentRolePresetCatalog.preset(
             named: arguments["preset"] as? String,
             role: arguments["role"] as? String ?? ""
@@ -4273,6 +4292,23 @@ public final class AgentHarness {
         let explicit = (arguments["allowed_tools"] as? [String]) ?? []
         let intended = explicit.isEmpty ? definition.toolNames : explicit
         return !Set(intended).isDisjoint(with: AgentToolSurface.writeCapable)
+    }
+
+    /// True when this spawn's `backend` argument forces Cloud while the stored
+    /// Settings choice does not already say Cloud. An omitted or `auto` backend
+    /// follows Settings, so that path needs no extra card.
+    static func spawnsWorkOffDevice(
+        arguments: [String: Any],
+        defaults: UserDefaults = .standard
+    ) -> Bool {
+        let raw = (arguments["backend"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard raw == "cloud" else { return false }
+        let stored = defaults.string(forKey: SubagentBackendSettings.backendKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return stored != "cloud"
     }
 
     /// Whether Turbo Mode may skip the approval prompt for this call.
@@ -4291,6 +4327,12 @@ public final class AgentHarness {
         mode: AgentMode,
         subQEndpoint: URL? = nil
     ) -> Bool {
+        // Landing isolated work is the one write the contract reserves for its
+        // own card: Turbo is a blanket switch over ROUTINE writes, and a patch
+        // appearing in the operator's tree with no card is not routine. Checked
+        // before `requiresApproval` so plan mode's withholding cannot turn this
+        // into a bypass either.
+        if toolName == "apply_subagent_changes" { return false }
         guard requiresApproval(
             toolName: toolName,
             arguments: arguments,

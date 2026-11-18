@@ -11113,7 +11113,16 @@ if layer.attnGateProjTensor != nil,
                             let chunkEnd = min(chunkStart + chunkCap, prefillTokens.count)
                             let chunk = Array(prefillTokens[chunkStart..<chunkEnd])
                             let chunkOk = runOnLargeStack {
-                                runLayerWisePrefill(promptTokens: chunk, startPos: UInt32(startPos) + UInt32(chunkStart), chunkIndex: chunkIndex, chunkCount: totalPrefillChunks, prefillProgress: { s, sp, rs in emit(.prefillProgress(status: s, speed: sp, rssGB: rs)) })
+                                runLayerWisePrefill(promptTokens: chunk, startPos: UInt32(startPos) + UInt32(chunkStart), chunkIndex: chunkIndex, chunkCount: totalPrefillChunks, prefillProgress: { s, sp, rs in
+                                    // The local subagent spawn prices its
+                                    // re-prefill from the last rate this
+                                    // process measured. The batched branch is
+                                    // now the normal one, so a missing note
+                                    // here left every spawn priced at the
+                                    // 5 tok/s fallback.
+                                    if sp > 0 { PrefillThroughput.note(tokensPerSecond: sp) }
+                                    emit(.prefillProgress(status: s, speed: sp, rssGB: rs))
+                                })
                             }
                             if !chunkOk {
                                 // The chunk returns false for a cancelled turn as well as for

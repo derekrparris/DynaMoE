@@ -246,6 +246,35 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         return records.sorted { Self.sortDate($0) > Self.sortDate($1) }
     }
 
+    /// Marks runs a previous process left mid-flight as failed.
+    ///
+    /// A record is written `.running` before the work starts and only reaches
+    /// a terminal status when the run finishes, so a crash or a force-quit
+    /// leaves a record the inspector lists as ACTIVE with no live instance to
+    /// Stop and no way to clear it. Nothing can be in flight before the
+    /// manager that owns runs exists, so at launch every non-terminal record
+    /// older than `graceSeconds` is an orphan; it is rewritten as `.failed`
+    /// rather than left claiming to be working.
+    @discardableResult
+    func reconcileInterruptedRuns(
+        now: Date = Date(),
+        graceSeconds: TimeInterval = 60
+    ) -> [UUID] {
+        var reconciled: [UUID] = []
+        for var record in loadAll() where !record.status.isTerminal {
+            let started = record.startedAt ?? record.createdAt
+            guard now.timeIntervalSince(started) >= graceSeconds else { continue }
+            record.status = .failed
+            record.completedAt = record.completedAt ?? now
+            if record.error == nil {
+                record.error = "The app quit before this run finished. Its last recorded state is kept below."
+            }
+            saveImmediately(record)
+            reconciled.append(record.id)
+        }
+        return reconciled
+    }
+
     /// A directory whose name is not a UUID still belongs to some run (an
     /// unscoped bucket, or a session deleted while its runs were not). It is
     /// read so retention can prune it, never attributed to a conversation.

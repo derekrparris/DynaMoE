@@ -20,6 +20,7 @@ nonisolated enum AgentSpawnError: LocalizedError, Equatable {
     case noBackend(String)
     case forbiddenTool(String)
     case unknownTool(String)
+    case notAvailableToRuns(String)
     case costCeilingWithoutPricing(String)
 
     var errorDescription: String? {
@@ -34,6 +35,8 @@ nonisolated enum AgentSpawnError: LocalizedError, Equatable {
             return "Tool '\(name)' may never be given to a subagent run."
         case .unknownTool(let name):
             return "Tool '\(name)' is not installed, so it cannot be given to a subagent run."
+        case .notAvailableToRuns(let name):
+            return "Tool '\(name)' exists only in the coordinator's catalog (a dynamically loaded or MCP tool), and a subagent run installs the built-in tools alone."
         case .costCeilingWithoutPricing(let model):
             return "This spawn sets a max_cost_usd ceiling, but no price is recorded for '\(model)', so the ceiling could never bind. Record the model's input and output prices in Settings under Cloud Providers, or clear the ceiling."
         }
@@ -116,6 +119,11 @@ nonisolated struct AgentSpawnPlan: @unchecked Sendable {
     var parentSessionId: UUID?
     var parentTurnId: UUID?
     var workingDirectory: URL
+    /// The repository an isolated worktree was cut from. Persisted with the run
+    /// so a restored record can apply to the operator's tree even when the
+    /// worktree's own git metadata cannot name it (a submodule, or a repo using
+    /// `--separate-git-dir`).
+    var repositoryRoot: URL? = nil
 }
 
 /// Turns a request into a plan, or refuses by name.
@@ -215,7 +223,8 @@ enum AgentSpawnResolver {
             priority: request.priority,
             parentSessionId: request.parentSessionId,
             parentTurnId: request.parentTurnId,
-            workingDirectory: workingDirectory
+            workingDirectory: workingDirectory,
+            repositoryRoot: worktreeRepository
         )
     }
 
@@ -235,7 +244,11 @@ enum AgentSpawnResolver {
         _ request: AgentSpawnRequest,
         definition: AgentPresetDefinition
     ) throws -> [String] {
-        let catalog = AgentHarness.shared.tools
+        // A run's harness is `makeRunScoped()`, which installs the built-ins
+        // only. Validating here against the coordinator's catalog accepted an
+        // `mcp__…` name the run could never configure, so the approved spawn
+        // failed at start instead of at the card.
+        let catalog = AgentHarness.runScopedToolNames()
         let requested = request.explicitToolNames?.isEmpty == false
             ? request.explicitToolNames!
             : definition.toolNames
@@ -247,7 +260,10 @@ enum AgentSpawnResolver {
             if AgentHarness.runScopedForbiddenToolNames.contains(name) {
                 throw AgentSpawnError.forbiddenTool(name)
             }
-            guard catalog[name] != nil else {
+            guard catalog.contains(name) else {
+                if AgentHarness.shared.tools[name] != nil {
+                    throw AgentSpawnError.notAvailableToRuns(name)
+                }
                 throw AgentSpawnError.unknownTool(name)
             }
             // Plan mode's promise covers the work it delegates: advertise only
@@ -261,7 +277,7 @@ enum AgentSpawnResolver {
             throw AgentSpawnError.noBackend("Every tool this run asked for is withheld in the current mode, so there is nothing it could do.")
         }
         for name in alwaysAvailableToolNames where !seen.contains(name) {
-            guard catalog[name] != nil else { continue }
+            guard catalog.contains(name) else { continue }
             if PlanModePolicy.withholds(name, in: request.parentMode) { continue }
             resolved.append(name)
         }

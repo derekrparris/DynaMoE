@@ -88,6 +88,114 @@ final class AgentRunIntegrationTests: XCTestCase {
         XCTAssertFalse(subagent.isSummaryRelayed, "the manager never marks a run relayed on its own")
     }
 
+    /// A completion that stopped at the token limit is a fragment, not an
+    /// answer. It used to be reported `.completed` because the loop never read
+    /// the backend's finish reason.
+    func testATokenCappedTurnIsAFailureRatherThanAnAnswer() async throws {
+        let backend = ScriptedBackend(turns: [
+            .init(text: "The scheduler lives in", finishReason: "lengthCapped")
+        ])
+        let subagent = SubagentManager.shared.spawnModelBacked(
+            plan(backend: backend, sessionId: UUID()),
+            id: UUID()
+        )
+        _ = await subagent.waitForCompletion()
+        XCTAssertEqual(subagent.status, .failed)
+        XCTAssertTrue(
+            subagent.lastError?.contains("token limit") == true,
+            subagent.lastError ?? "no error recorded"
+        )
+    }
+
+    func testADegenerateCycleTurnIsAFailureRatherThanAnAnswer() async throws {
+        let backend = ScriptedBackend(turns: [
+            .init(text: "again again again", finishReason: "degenerateCycle")
+        ])
+        let subagent = SubagentManager.shared.spawnModelBacked(
+            plan(backend: backend, sessionId: UUID()),
+            id: UUID()
+        )
+        _ = await subagent.waitForCompletion()
+        XCTAssertEqual(subagent.status, .failed)
+        XCTAssertTrue(
+            subagent.lastError?.contains("repeating itself") == true,
+            subagent.lastError ?? "no error recorded"
+        )
+    }
+
+    /// The budget checks used to run only BEFORE a step, so the final turn
+    /// could overspend a cost ceiling and still be reported as a completion.
+    func testAFinalTurnThatOverspendsTheCostCeilingFailsTheRun() async throws {
+        var usage = AgentUsage()
+        usage.promptTokens = 1_000
+        usage.completionTokens = 1_000
+        usage.costUSD = 5
+        usage.backendRequests = 1
+        let backend = ScriptedBackend(turns: [.init(text: "done", usage: usage)])
+        var runPlan = plan(backend: backend, sessionId: UUID())
+        runPlan.budget = AgentBudget(
+            maxSteps: 3,
+            maxCompletionTokens: 200,
+            maxWallClockSeconds: 20,
+            maxCostUSD: 1
+        )
+        let subagent = SubagentManager.shared.spawnModelBacked(runPlan, id: UUID())
+        _ = await subagent.waitForCompletion()
+        XCTAssertEqual(subagent.status, .failed)
+        XCTAssertTrue(
+            subagent.lastError?.contains("cost budget") == true,
+            subagent.lastError ?? "no error recorded"
+        )
+        XCTAssertGreaterThan(subagent.usage.costUSD, 1)
+    }
+
+    func testCancellingAFinishedRunCannotRewriteItsRecord() async throws {
+        let backend = ScriptedBackend(turns: [.init(text: "the answer")])
+        let subagent = SubagentManager.shared.spawnModelBacked(
+            plan(backend: backend, sessionId: UUID()),
+            id: UUID()
+        )
+        let summary = await subagent.waitForCompletion()
+        XCTAssertEqual(subagent.status, .completed)
+        let completedAt = subagent.completedAt
+
+        subagent.cancel(reason: "quitting")
+
+        XCTAssertEqual(subagent.status, .completed, "a finished run must keep its terminal status")
+        XCTAssertEqual(subagent.finalSummary, summary)
+        XCTAssertEqual(subagent.completedAt, completedAt)
+    }
+
+    /// "Clear Finished" used to match only completed and cancelled runs, so a
+    /// failed run (and its record) could never be cleared from the inspector.
+    func testClearFinishedRemovesFailedRunsAndTheirRecords() async throws {
+        let backend = ScriptedBackend(turns: [
+            .init(text: "truncated", finishReason: "lengthCapped")
+        ])
+        let session = UUID()
+        let runId = UUID()
+        let subagent = SubagentManager.shared.spawnModelBacked(
+            plan(backend: backend, sessionId: session),
+            id: runId
+        )
+        _ = await subagent.waitForCompletion()
+        XCTAssertEqual(subagent.status, .failed)
+        AgentRunStore.shared.flush()
+
+        SubagentManager.shared.clearCompleted(sessionId: session)
+
+        XCTAssertNil(SubagentManager.shared.getSubagent(byId: runId))
+        XCTAssertNil(AgentRunStore.shared.load(runId: runId, sessionId: session))
+    }
+
+    func testFinishReasonTruncationIsRecognised() {
+        XCTAssertTrue(HeadlessAgentLoop.finishReasonIsTruncated("length"))
+        XCTAssertTrue(HeadlessAgentLoop.finishReasonIsTruncated("lengthCapped"))
+        XCTAssertTrue(HeadlessAgentLoop.finishReasonIsTruncated("max_tokens"))
+        XCTAssertFalse(HeadlessAgentLoop.finishReasonIsTruncated("stop"))
+        XCTAssertFalse(HeadlessAgentLoop.finishReasonIsTruncated("toolFreeze"))
+    }
+
     func testTheRunRendersTheWorkersPromptWithItsOwnTools() async throws {
         let backend = ScriptedBackend(turns: [.init(text: "done")])
         let session = UUID()

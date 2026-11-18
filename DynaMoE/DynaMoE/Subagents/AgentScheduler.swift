@@ -121,7 +121,7 @@ actor AgentScheduler {
         var sequence: UInt64
     }
 
-    private let limits: AgentSchedulerLimits
+    private var limits: AgentSchedulerLimits
     private let pollIntervalNanoseconds: UInt64
 
     private var tickets: [AgentSchedulingClass: Set<UUID>] = [:]
@@ -148,6 +148,13 @@ actor AgentScheduler {
     }
 
     var currentLimits: AgentSchedulerLimits { limits }
+
+    /// Re-reads the Settings values. A capacity change applies to the NEXT
+    /// admission; the comment beside the settings promised that, and a `let`
+    /// snapshot taken at first use made it false until the app relaunched.
+    func reloadLimits(_ limits: AgentSchedulerLimits = .configured()) {
+        self.limits = limits
+    }
 
     // MARK: - Admission
 

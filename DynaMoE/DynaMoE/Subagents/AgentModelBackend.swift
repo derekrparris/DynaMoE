@@ -17,6 +17,41 @@ nonisolated struct AgentBackendRequest: @unchecked Sendable {
     var thinking: Bool
     var sessionId: UUID
     var onDelta: (@Sendable (String, Bool) -> Void)?
+    /// Spend a backend incurred on an attempt that never returned a turn.
+    /// A failed or cancelled cloud request can still be invoiced, and the
+    /// normal `AgentBackendTurn.usage` path cannot carry it because there is
+    /// no turn. The loop merges whatever this holds into the run's usage.
+    var usageLedger: AgentUsageLedger? = nil
+}
+
+/// A lock-guarded place for out-of-band usage. Only a backend that can be
+/// billed without producing a turn writes here; a successful turn's usage
+/// still travels on the turn itself, so nothing is counted twice.
+nonisolated final class AgentUsageLedger: @unchecked Sendable {
+    private let lock = NSLock()
+    private var usage = AgentUsage()
+
+    init() {}
+
+    func add(_ delta: AgentUsage) {
+        lock.lock()
+        usage.merge(delta)
+        lock.unlock()
+    }
+
+    func drain() -> AgentUsage {
+        lock.lock()
+        defer { lock.unlock() }
+        let drained = usage
+        usage = AgentUsage()
+        return drained
+    }
+
+    var snapshot: AgentUsage {
+        lock.lock()
+        defer { lock.unlock() }
+        return usage
+    }
 }
 
 nonisolated struct AgentBackendTurn: @unchecked Sendable {

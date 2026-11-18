@@ -299,7 +299,14 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     /// Stops the run with a reason it can report. The scheduler's cancellation
     /// tree, the Stop button and the run's own preemption all land here.
     public func cancel(reason: String) {
+        // A finished run has already written its report. Cancelling it on the
+        // way out (Quit calls `cancelAll`) must not rewrite a completed record
+        // as `.cancelled`, or erase the summary the operator waited for.
         lock.lock()
+        guard !isFinished, !status.isTerminal else {
+            lock.unlock()
+            return
+        }
         executionTask?.cancel()
         executionTask = nil
         isFinished = true
@@ -390,7 +397,8 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             error: status == .failed ? (lastError ?? finalSummary) : nil,
             depth: 0,
             summaryRelayed: isSummaryRelayed,
-            appliedAt: appliedAt
+            appliedAt: appliedAt,
+            repositoryRoot: plan?.repositoryRoot?.path
         )
     }
 
@@ -837,17 +845,27 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         duration: Double,
         liveStatus: String
     ) {
+        // A cancel can land while the execution task is unwinding. Whichever
+        // transition reaches this point FIRST owns the record; a later one must
+        // not overwrite a terminal summary (or delete an applied worktree).
+        // `isFinished` is the ownership flag, not `status`: the event pump also
+        // publishes a terminal status just before this runs, and treating that
+        // as "already finished" left every waiter parked forever.
+        lock.lock()
+        guard !isFinished else {
+            lock.unlock()
+            return
+        }
+        isFinished = true
+        let continuations = completionContinuations
+        completionContinuations.removeAll()
+        lock.unlock()
+
         self.status = status
         completedAt = Date()
         executionDurationSeconds = duration
         finalSummary = summary
         liveStatusText = liveStatus
-
-        lock.lock()
-        isFinished = true
-        let continuations = completionContinuations
-        completionContinuations.removeAll()
-        lock.unlock()
 
         for continuation in continuations {
             continuation.resume(returning: summary)
@@ -1626,6 +1644,10 @@ public final class SubagentManager: ObservableObject {
         // between creating one and applying it has no other owner.
         let policy = AgentRunStore.configuredPolicy()
         Task.detached(priority: .utility) {
+            // A record left `.running` by a crash has no live instance to Stop
+            // and no terminal status to clear. Nothing can be in flight before
+            // this owner exists, so the launch sweep closes those records first.
+            AgentRunStore.shared.reconcileInterruptedRuns()
             AgentRunStore.shared.prune(policy: policy)
             await WorkspaceIsolation.pruneStaleWorktrees()
         }
@@ -1766,10 +1788,11 @@ public final class SubagentManager: ObservableObject {
         let terminal: [SubagentInstance]
         lock.lock()
         terminal = subagentsOrder.filter {
-            ($0.status == .completed || $0.status == .cancelled)
+            $0.status.isTerminal
                 && (sessionId == nil || $0.parentSessionId == sessionId)
         }
         let clearedIds = Set(terminal.map(\.id))
+        let liveIds = Set(subagentsOrder.map(\.id))
         subagentsOrder.removeAll(where: { clearedIds.contains($0.id) })
         for id in clearedIds {
             subagentsById.removeValue(forKey: id)
@@ -1781,11 +1804,34 @@ public final class SubagentManager: ObservableObject {
             AgentRunStore.shared.delete(runId: instance.id, sessionId: instance.parentSessionId)
         }
 
-        DispatchQueue.main.async {
-            self.subagents.removeAll(where: { clearedIds.contains($0.id) })
-            if let sel = self.selectedSubagentId, !self.subagents.contains(where: { $0.id == sel }) {
-                self.selectedSubagentId = self.subagents.first?.id
-            }
+        // The inspector lists TERMINAL records whether or not a live instance
+        // exists, and a record is only removed from disk when it is cleared
+        // here. Clearing just the instances left every restored, failed or
+        // interrupted run behind, so the list refilled from the store as soon
+        // as it reloaded. A non-terminal record with NO live instance is the
+        // same kind of leftover (a crash before `reconcileInterruptedRuns`
+        // runs), and nothing can update it, so it is clearable too. Unscoped
+        // records ride every inspector, so they are cleared from any
+        // conversation.
+        let stored = AgentRunStore.shared.load(sessionId: sessionId)
+            + (sessionId == nil ? [] : AgentRunStore.shared.load(sessionId: nil))
+        var deletedStoredRecord = false
+        for record in stored
+        where !clearedIds.contains(record.id)
+            && (record.status.isTerminal || !liveIds.contains(record.id)) {
+            AgentRunStore.shared.delete(runId: record.id, sessionId: record.parentSessionId)
+            deletedStoredRecord = true
+        }
+        if !terminal.isEmpty || deletedStoredRecord {
+            AgentRunStore.shared.flush()
+        }
+
+        // Synchronous: the manager is main-actor state, and a caller that
+        // clears and then asks for the run must not still find it through the
+        // published array while an async removal is still queued.
+        subagents.removeAll(where: { clearedIds.contains($0.id) })
+        if let sel = selectedSubagentId, !subagents.contains(where: { $0.id == sel }) {
+            selectedSubagentId = subagents.first?.id
         }
     }
 

@@ -852,7 +852,10 @@ Implemented, with the decisions worth carrying:
   every apply case while listing nothing in the inspector.
 - **Applying is `git apply`, not a merge.** `git apply --check` validates the
   whole patch before anything is written, so a conflict leaves the main tree
-  exactly as it was and is reported by name. A merge would bring history and
+  exactly as it was and is reported by name. The apply itself is NOT atomic:
+  a destination that fails partway through (read-only, full disk) is why every
+  target is pre-flighted for writability and the touched files are snapshotted
+  and restored if the write still fails. A merge would bring history and
   create merge state, and the coordinator may have uncommitted work. Applied
   changes are deliberately left UNSTAGED: the coordinator (or the operator)
   decides what becomes a commit. A merge or rebase already in progress in the
@@ -864,14 +867,21 @@ Implemented, with the decisions worth carrying:
   always be applied in full. `apply_subagent_changes` re-reads the LIVE diff,
   applies it, writes `appliedAt` synchronously, then removes the worktree; a
   second call is a no-op that says so. A launch sweep removes worktrees older
-  than 14 days, which is the only owner of a run interrupted between creation
-  and apply.
+  than 14 days, but NEVER one whose record has not been applied: the record
+  keeps only a bounded diff, so the worktree is the only full copy. A run whose
+  work is entirely in git-ignored files refuses to apply rather than reporting
+  "no changes" and deleting the tree. A launch sweep also closes records left
+  `.running` by a crash, so they are terminal and clearable.
 - **Approval moves to spawn for an isolated writer.** `.spawnOnly` means the
   operator approves the delegation once, with the worktree and branch in front
   of them, and the run's writes inside its own tree need no per-call card.
   `apply_subagent_changes` is itself state-changing, so landing the work always
-  gets its own card. `targetsApplicationPreferences` stays absolute on every
-  path.
+  gets its own card, and Turbo Mode may never bypass it.
+  `targetsApplicationPreferences` stays absolute on every path. A spawn's
+  `backend: "cloud"` is off-device consent: when the Settings choice does not
+  already name Cloud, even a read-only spawn gets a card that says so. A
+  run-scoped approval waits for a BOUNDED time, so an unanswered card cannot
+  hold the scheduler ticket forever.
 - **The coordinator is told how to finish the job.** A spawn's result (and
   `get_subagent_status` at a terminal state) carries `isolation`, `worktree`,
   `branch` and a directive naming `apply_subagent_changes` and the run id.

@@ -121,6 +121,11 @@ nonisolated enum AgentIsolation: Codable, Equatable, Sendable {
         if case .worktree(let path, _) = self { return path }
         return nil
     }
+
+    var worktreeBranch: String? {
+        if case .worktree(_, let branch) = self { return branch }
+        return nil
+    }
 }
 
 nonisolated public enum AgentApprovalPolicy: String, Codable, Equatable, Sendable {
@@ -320,6 +325,11 @@ nonisolated struct AgentRunRecord: Identifiable, Codable, Equatable, Sendable {
     /// were. Optional and additive: records written before Phase 4 decode with
     /// no value, and a newer build's field is never rewritten by an older one.
     var appliedAt: Date?
+    /// The main repository an isolated worktree was cut from. Optional and
+    /// additive: a record written before this field falls back to deriving the
+    /// root from git, which cannot name the main worktree of a submodule or a
+    /// `--separate-git-dir` repository from a linked worktree alone.
+    var repositoryRoot: String?
     var schemaVersion: Int
 
     static let currentSchemaVersion = 1
@@ -349,6 +359,7 @@ nonisolated struct AgentRunRecord: Identifiable, Codable, Equatable, Sendable {
         depth: Int = 0,
         summaryRelayed: Bool = false,
         appliedAt: Date? = nil,
+        repositoryRoot: String? = nil,
         schemaVersion: Int = AgentRunRecord.currentSchemaVersion
     ) {
         self.id = id
@@ -375,6 +386,7 @@ nonisolated struct AgentRunRecord: Identifiable, Codable, Equatable, Sendable {
         self.depth = depth
         self.summaryRelayed = summaryRelayed
         self.appliedAt = appliedAt
+        self.repositoryRoot = repositoryRoot
         self.schemaVersion = schemaVersion
     }
 }

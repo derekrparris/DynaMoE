@@ -29,12 +29,26 @@ final class SubagentApprovalCenter: ObservableObject {
 
     private init() {}
 
+    static let approvalTimeoutKey = "dynamoe_subagent_approval_timeout"
+    static let defaultApprovalTimeout: TimeInterval = 600
+
+    /// Bounded so a card nobody answers cannot hold a scheduler ticket (and a
+    /// run's engine work) for the rest of the process's life.
+    static func resolvedApprovalTimeout(defaults: UserDefaults = .standard) -> TimeInterval {
+        guard let stored = defaults.object(forKey: approvalTimeoutKey) as? Double,
+              stored > 0 else { return defaultApprovalTimeout }
+        return stored
+    }
+
     /// Asks the operator. `honorsTurbo` is false for decisions Turbo Mode must
     /// not make on the operator's behalf — the local cost refusal is the one
     /// case: bypassing routine writes is the point of Turbo, spending more than
-    /// the configured re-prefill budget is not.
+    /// the configured re-prefill budget is not. Landing a run's work is the
+    /// other: the SUBAGENTS.md contract gives every apply its own card, and a
+    /// blanket switch must not insert a patch with no human in the loop.
     func request(_ request: AgentApprovalRequest, honorsTurbo: Bool = true) async -> Bool {
         if honorsTurbo,
+           request.toolName != "apply_subagent_changes",
            TurboModeSettings.isEnabled,
            AgentHarness.turboModeMayBypassApproval(
                toolName: request.toolName,
@@ -47,7 +61,26 @@ final class SubagentApprovalCenter: ObservableObject {
         pending.append(entry)
         SubagentManager.shared.isDrawerOpen = true
         defer { pending.removeAll { $0.id == entry.id } }
-        return await ActionApprovalManager.shared.waitForApproval(id: entry.id)
+
+        let timeout = min(Self.resolvedApprovalTimeout(), 86_400)
+        let approved = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                await ActionApprovalManager.shared.waitForApproval(id: entry.id)
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+        if !approved {
+            // Resolve the card even when the timeout won, so a late click
+            // cannot leave a decision for an id nobody is waiting on.
+            ActionApprovalManager.shared.reject(id: entry.id)
+        }
+        return approved
     }
 
     func approve(_ id: UUID) {

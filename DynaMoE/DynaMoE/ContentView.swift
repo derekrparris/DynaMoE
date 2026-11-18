@@ -1846,7 +1846,11 @@ struct ContentView: View {
             ChatSessionStore.shared.flushPendingIO()
             // No subagent outlives the app: a child's cloud stream, local step or
             // pending approval card would otherwise be cut off without a report.
+            // `cancelAll` skips runs that already finished; the store flush then
+            // makes sure the last record (including a completed one) is on disk
+            // before the process exits, because every other write is queued.
             SubagentManager.shared.cancelAll()
+            AgentRunStore.shared.flush()
             ActionApprovalManager.shared.cancelAll()
         }
         .task {
@@ -2197,13 +2201,18 @@ struct ContentView: View {
     /// locally rendered prompt has no such cost, and every family renders a
     /// `.user` turn, so one hidden message reaches them all without touching a
     /// template.
-    private func insertStartOfTurnSubagentRelay(sessionIdx: Int, sessionId: UUID) {
+    /// Appends the relay message and returns the reports it carries. The
+    /// caller marks them delivered only once the turn actually launches: a
+    /// launch refused here (or a quit before it starts) would otherwise drop
+    /// the hidden message on the next send while its reports were already
+    /// flagged as seen.
+    @discardableResult
+    private func insertStartOfTurnSubagentRelay(sessionIdx: Int, sessionId: UUID) -> [String] {
         // A directive belongs to exactly one turn; a later send must not find
         // the previous one still in history and re-read reports it already saw.
         sessions[sessionIdx].messages.removeAll { $0.isPromptOnly == true }
         let pending = gatherCompletedSubagentRelayResponses(forSession: sessionId)
-        guard !pending.isEmpty else { return }
-        markSubagentSummariesRelayed(pending)
+        guard !pending.isEmpty else { return [] }
         sessions[sessionIdx].messages.append(
             ChatMessage(
                 role: .user,
@@ -2211,6 +2220,7 @@ struct ContentView: View {
                 isPromptOnly: true
             )
         )
+        return pending
     }
 
     /// Collects final reports from this session's completed subagents that have not yet been
@@ -3551,8 +3561,14 @@ struct ContentView: View {
         // reports as a trailing directive (`startCloudGeneration`), which keeps
         // the provider's cached prefix intact; every other backend renders the
         // transcript locally, so an extra hidden turn costs nothing.
+        let pendingSubagentRelay: [String]
         if !sendSessionUsesCloud {
-            insertStartOfTurnSubagentRelay(sessionIdx: sessionIdx, sessionId: currentSessionId)
+            pendingSubagentRelay = insertStartOfTurnSubagentRelay(
+                sessionIdx: sessionIdx,
+                sessionId: currentSessionId
+            )
+        } else {
+            pendingSubagentRelay = []
         }
 
         let userMsg = ChatMessage(
@@ -3678,6 +3694,7 @@ struct ContentView: View {
                 instructionsText: afmInstructions,
                 responseTokenCeiling: afmResponseTokens
             )
+            markSubagentSummariesRelayed(pendingSubagentRelay)
             return true
         }
 
@@ -4210,12 +4227,16 @@ struct ContentView: View {
         // the turn's messages, so a caller that treats the send as accepted
         // would be left in the new mode with nothing running. The plan handoff
         // unwinds those messages and rolls its mode change back on `false`.
-        return startAutoregressiveGeneration(
+        let launched = startAutoregressiveGeneration(
             customPrompt: promptString,
             images: turnImages,
             sessionId: currentSessionId,
             messageId: assistantMsgId
         )
+        if launched {
+            markSubagentSummariesRelayed(pendingSubagentRelay)
+        }
+        return launched
     }
 
     // MARK: - Tokenizer Execution
@@ -6300,7 +6321,8 @@ struct ContentView: View {
         // Derive model/thinking from the session this generation belongs to, not
         // the current selection, so an async send that resumed after a selection
         // change still formats with the conversation's own model.
-        let generationSession = sessionId.flatMap { id in sessions.first(where: { $0.id == id }) }        // The turn's agent surface, resolved ONCE and carried by value for the
+        let generationSession = sessionId.flatMap { id in sessions.first(where: { $0.id == id }) }
+        // The turn's agent surface, resolved ONCE and carried by value for the
         // rest of the turn. `AgentHarness.activeMode` is process-global, so
         // reading it at each tool call meant a mode flip while the turn ran
         // could hand a plan turn a write tool. Every tool execution and every

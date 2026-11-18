@@ -9,6 +9,7 @@ import SwiftUI
 import SwiftData
 import Combine
 import Sparkle
+import UserNotifications
 
 final class UpdaterViewModel: ObservableObject {
     static let shared = UpdaterViewModel()
@@ -138,6 +139,12 @@ struct DynaMoEApp: App {
         // only; the model reads a SKILL.md on demand with `skill_load`.
         if !isTesting {
             SkillsRegistry.shared.bootstrap()
+        }
+
+        // A finish banner is only useful if its click lands somewhere. The
+        // delegate opens the inspector on the run the notice names.
+        if !isTesting {
+            UNUserNotificationCenter.current().delegate = SubagentNotificationDelegate.shared
         }
     }
 

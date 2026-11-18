@@ -246,6 +246,22 @@ struct TimelineStepCardView: View {
             return names.count == 1 ? first : "\(first) +\(names.count - 1)"
         case "complete":
             return call.arguments["summary"] ?? "Completed"
+        case "spawn_subagent":
+            let role = call.arguments["role"] ?? "Subagent"
+            let backend = (call.arguments["backend"] ?? "").lowercased()
+            return backend == "cloud" ? "\(role) · off-device" : "\(role)"
+        case "apply_subagent_changes":
+            let raw = call.arguments["subagent_id"] ?? call.arguments["run_id"]
+            if let raw,
+               let id = UUID(uuidString: raw),
+               let live = SubagentManager.shared.getSubagent(byId: id) {
+                if let branch = live.modelPlan?.isolation.worktreeBranch {
+                    return "\(live.role) · \(branch)"
+                }
+                return live.role
+            }
+            if let branch = call.arguments["branch"] { return branch }
+            return "Apply isolated changes"
         default:
             return call.rawArguments
         }

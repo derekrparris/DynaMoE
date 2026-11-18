@@ -19,8 +19,12 @@ import UserNotifications
 enum SubagentNotifier {
     static let enabledKey = "dynamoe_subagent_notifications"
 
-    private static var requestedAuthorization = false
-    private static var isAuthorized = false
+    /// Requests queued while authorization is being resolved. A second run
+    /// finishing in that window used to be dropped because the cached answer
+    /// was still `false`.
+    private static var pendingRequests: [UNNotificationRequest] = []
+    private static var isRequestingAuthorization = false
+    private static let maximumQueuedNotices = 8
 
     static var isEnabled: Bool {
         get {
@@ -66,11 +70,49 @@ enum SubagentNotifier {
             content: content,
             trigger: nil
         )
-        requestAuthorizationIfNeeded { granted in
-            guard granted else { return }
+        pendingRequests.append(request)
+        if pendingRequests.count > maximumQueuedNotices {
+            pendingRequests.removeFirst(pendingRequests.count - maximumQueuedNotices)
+        }
+        deliverPendingNotifications()
+    }
+
+    /// Reads the CURRENT authorization on every notice, then posts or queues.
+    /// The old code cached the first answer forever, so a permission granted in
+    /// System Settings afterwards could never take effect, and a second finish
+    /// during the first check saw `false` and vanished.
+    private static func deliverPendingNotifications() {
+        guard !isRequestingAuthorization, !pendingRequests.isEmpty else { return }
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            DispatchQueue.main.async {
+                switch settings.authorizationStatus {
+                case .authorized, .provisional, .ephemeral:
+                    postPendingNotifications()
+                case .denied:
+                    pendingRequests.removeAll()
+                case .notDetermined:
+                    guard !isRequestingAuthorization else { return }
+                    isRequestingAuthorization = true
+                    UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in
+                        DispatchQueue.main.async {
+                            isRequestingAuthorization = false
+                            deliverPendingNotifications()
+                        }
+                    }
+                @unknown default:
+                    pendingRequests.removeAll()
+                }
+            }
+        }
+    }
+
+    private static func postPendingNotifications() {
+        let requests = pendingRequests
+        pendingRequests.removeAll()
+        for request in requests {
             UNUserNotificationCenter.current().add(request) { error in
                 if let error {
-                    print("⚠️ [SubagentNotifier] could not post \(role): \(error.localizedDescription)")
+                    print("⚠️ [SubagentNotifier] could not post: \(error.localizedDescription)")
                 }
             }
         }
@@ -84,37 +126,41 @@ enum SubagentNotifier {
             || ProcessInfo.processInfo.environment["XCTestBundlePath"] != nil
     }
 
-    private static func requestAuthorizationIfNeeded(_ completion: @escaping (Bool) -> Void) {
-        if requestedAuthorization {
-            completion(isAuthorized)
-            return
-        }
-        requestedAuthorization = true
-        // Every static above is main-actor state, so the answer comes back to
-        // the main actor before it is recorded. The completion itself runs on
-        // whichever queue the notification framework used; posting a request
-        // does not care, but reading `isAuthorized` does.
-        UNUserNotificationCenter.current().getNotificationSettings { settings in
-            DispatchQueue.main.async {
-                switch settings.authorizationStatus {
-                case .authorized, .provisional, .ephemeral:
-                    isAuthorized = true
-                    completion(true)
-                case .denied:
-                    isAuthorized = false
-                    completion(false)
-                case .notDetermined:
-                    UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, _ in
-                        DispatchQueue.main.async {
-                            isAuthorized = granted
-                            completion(granted)
-                        }
-                    }
-                @unknown default:
-                    isAuthorized = false
-                    completion(false)
-                }
+}
+
+/// Makes a banner click mean something. Without a delegate, macOS delivers the
+/// click to nobody and the run the operator tapped stays unopened in a window
+/// they were not looking at.
+@MainActor
+final class SubagentNotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
+    static let shared = SubagentNotificationDelegate()
+
+    private override init() {
+        super.init()
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler:
+            @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        if let raw = response.notification.request.content.userInfo["runId"] as? String,
+           let runId = UUID(uuidString: raw) {
+            Task { @MainActor in
+                NSApp.activate(ignoringOtherApps: true)
+                SubagentManager.shared.selectedSubagentId = runId
+                SubagentManager.shared.isDrawerOpen = true
             }
         }
+        completionHandler()
     }
 }
