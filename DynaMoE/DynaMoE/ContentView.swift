@@ -292,6 +292,10 @@ struct ContentView: View {
     /// Tracked here so `stopAutoregressiveGeneration` can reach them; a task
     /// removes its own entry when it exits.
     @State private var deferredRelaunchTasks: [UUID: Task<Void, Never>] = [:]
+    /// The conversation each queued relaunch would run in. Deleting a
+    /// conversation must cancel its own relaunches; cancelling every session's
+    /// would abort an unrelated send the operator is waiting on.
+    @State private var deferredRelaunchSessions: [UUID: UUID] = [:]
 
     /// Cancels every queued relaunch. Called from Stop and from the paths that
     /// tear a generation down before replacing it, so a superseded send cannot
@@ -301,6 +305,18 @@ struct ContentView: View {
             relaunch.cancel()
         }
         deferredRelaunchTasks.removeAll()
+        deferredRelaunchSessions.removeAll()
+    }
+
+    /// Cancels only the relaunches belonging to one conversation. A deleted
+    /// conversation's queued send used to relaunch into a session that no
+    /// longer existed, running an invisible turn nothing could stop.
+    private func cancelDeferredRelaunches(sessionId: UUID) {
+        for (key, queuedSession) in deferredRelaunchSessions where queuedSession == sessionId {
+            deferredRelaunchTasks[key]?.cancel()
+            deferredRelaunchTasks[key] = nil
+            deferredRelaunchSessions[key] = nil
+        }
     }
 
     /// The operator TURN whose generation is (or was last) active: minted on a
@@ -422,6 +438,10 @@ struct ContentView: View {
         }
     }
     @State private var selectedSessionId: UUID? = nil
+    /// A notification tap that names a conversation the history load has not
+    /// finished restoring. Dropping it left the drawer showing whichever
+    /// conversation happened to be selected; it is applied after the load.
+    @State private var pendingRevealSessionId: UUID? = nil
     /// Identity of the single empty conversation the view starts with, so a
     /// successful history load drops only that placeholder and not a user-created
     /// empty chat, which may already carry a chosen model or settings.
@@ -1303,6 +1323,10 @@ struct ContentView: View {
             // invisible, unstoppable work whose terminal write the store's
             // tombstone then drops.
             for id in removedIds {
+                // A queued send for an evicted conversation must not relaunch
+                // into it later; the retention sweep removed the session the
+                // task would have run in.
+                cancelDeferredRelaunches(sessionId: id)
                 SubagentManager.shared.cancelSession(
                     sessionId: id,
                     reason: "The conversation was removed by chat retention."
@@ -1552,6 +1576,11 @@ struct ContentView: View {
                     },
                     onDeleteSession: { id in
                         PrefixCacheManager.shared.invalidate(sessionId: id)
+                        // A send queued behind a preemption or a busy slot
+                        // belongs to this conversation. Left armed, it would
+                        // relaunch into a session that no longer exists and
+                        // run a turn nothing can see or stop.
+                        cancelDeferredRelaunches(sessionId: id)
                         // A manual compaction is a task, not a per-session view
                         // flag: deleting the conversation removed the session
                         // but left the task summarizing (and billing) it. The
@@ -1914,6 +1943,7 @@ struct ContentView: View {
         }
         .task {
             await loadPersistedSessionsIfNeeded()
+            applyPendingReveal()
         }
         .task {
             while !Task.isCancelled {
@@ -2386,13 +2416,10 @@ struct ContentView: View {
     /// state, and the weights and cloud teardowns both reach this from a background turn.
     private func awaitSessionSubagents(sessionId: UUID?, timeout: TimeInterval) async {
         guard let sessionId else { return }
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            let stillRunning = SubagentManager.shared.allSubagents.contains {
-                $0.parentSessionId == sessionId && ($0.status == .running || $0.status == .pending)
+        await SubagentRelayWait.wait(sessionId: sessionId, timeout: timeout) { id in
+            SubagentManager.shared.allSubagents.contains {
+                $0.parentSessionId == id && ($0.status == .running || $0.status == .pending)
             }
-            if !stillRunning { return }
-            try? await Task.sleep(nanoseconds: 250_000_000)
         }
     }
 
@@ -4543,9 +4570,27 @@ struct ContentView: View {
     private func revealConversationForSubagentRun(_ note: Notification) {
         guard let info = note.userInfo as? [String: Any],
               let raw = info["sessionId"] as? String,
-              let sessionId = UUID(uuidString: raw),
-              sessions.contains(where: { $0.id == sessionId }) else { return }
-        selectedSessionId = sessionId
+              let sessionId = UUID(uuidString: raw) else { return }
+        if sessions.contains(where: { $0.id == sessionId }) {
+            selectedSessionId = sessionId
+            pendingRevealSessionId = nil
+        } else if !hasAttemptedInitialLoad {
+            // The tap can arrive while the history load is still decoding. Hold
+            // it rather than discarding it; `applyPendingReveal` runs after the
+            // load and selects it when the conversation exists.
+            pendingRevealSessionId = sessionId
+        }
+    }
+
+    private func applyPendingReveal() {
+        guard let pending = pendingRevealSessionId else { return }
+        if sessions.contains(where: { $0.id == pending }) {
+            selectedSessionId = pending
+            pendingRevealSessionId = nil
+        } else if hasAttemptedInitialLoad {
+            // Loaded and still absent: the conversation really is gone.
+            pendingRevealSessionId = nil
+        }
     }
 
     // MARK: - Apple Foundation Model (System On-Device) Generation
@@ -6061,6 +6106,11 @@ struct ContentView: View {
                 if toolsEnabled, !ranComplete, !ranSynthesisTurn,
                    AgentStepBudget.allowsAnotherStep(step: step, cap: self.agentStepCap) {
                     await self.awaitSessionSubagents(sessionId: sessionId, timeout: 120)
+                    // The wait can last two minutes; a Stop or a replacement
+                    // send during it owns the turn now. The loop-top check
+                    // already ran, so without this the relay relabelled a
+                    // stopped generation as running again.
+                    guard !Task.isCancelled, self.ownsGeneration(myGenerationId) else { return }
                 }
                 if toolsEnabled, !ranComplete, !ranSynthesisTurn,
                    AgentStepBudget.allowsAnotherStep(step: step, cap: self.agentStepCap),
@@ -6465,6 +6515,10 @@ struct ContentView: View {
                 sessions[sIdx].messages[mIdx].isThinking = false
             }
             showStatus(err, kind: .warning)
+            // A retry that brought a claim for the engine slot returns here
+            // before the `defer` that owns it exists; the slot would stay
+            // claimed with no turn to release it.
+            slotCarry?.release()
             return false
         }
 
@@ -6479,6 +6533,9 @@ struct ContentView: View {
             isGeneratingText = false
             generationTask = nil
             showStatus(err, kind: .warning)
+            // See the model-not-ready branch: a carried claim has no owner
+            // beyond this call.
+            slotCarry?.release()
             return false
         }
 
@@ -6518,16 +6575,27 @@ struct ContentView: View {
             // the send sat queued behind the preemption, and without this the
             // task relaunched the stopped turn as soon as the engine drained.
             let relaunchKey = UUID()
+            if let sessionId { deferredRelaunchSessions[relaunchKey] = sessionId }
             deferredRelaunchTasks[relaunchKey] = Task { @MainActor in
-                defer { self.deferredRelaunchTasks[relaunchKey] = nil }
+                defer {
+                    self.deferredRelaunchTasks[relaunchKey] = nil
+                    self.deferredRelaunchSessions[relaunchKey] = nil
+                }
                 await AgentScheduler.shared.preemptLocalRuns()
                 CompletionEngine.shared.cancelBackgroundTurn()
                 await CompletionEngine.shared.awaitIdle()
                 guard !Task.isCancelled else { return }
+                if let sessionId, !self.sessions.contains(where: { $0.id == sessionId }) {
+                    return
+                }
                 // The runs just cancelled release their claims as they unwind;
                 // taking the claim HERE means the retry cannot lose to another
                 // claimant the slot it paid for with their cancellation.
                 let reclaimed = CompletionEngine.shared.reserveTurnSlot()
+                // Losing the claim AFTER paying for it with a cancellation must
+                // not lose the operator's send too. Passing `preemptionRetry:
+                // false` when the claim is nil routes the retry into the normal
+                // wait branch instead of letting it launch with no authority.
                 _ = self.startAutoregressiveGeneration(
                     customPrompt: customPrompt,
                     promptTokens: promptTokens,
@@ -6538,7 +6606,7 @@ struct ContentView: View {
                     agentStep: agentStep,
                     isInThinkingContinuation: isInThinkingContinuation,
                     forceSynthesis: forceSynthesis,
-                    preemptionRetry: true,
+                    preemptionRetry: reclaimed != nil,
                     slotCarry: reclaimed,
                     // The reports this send carries are marked delivered only
                     // when the retry actually launches. Returning `true` here
@@ -6646,8 +6714,12 @@ struct ContentView: View {
             }
             // Tracked so Stop can cancel it — see the preemption branch above.
             let relaunchKey = UUID()
+            if let sessionId { deferredRelaunchSessions[relaunchKey] = sessionId }
             deferredRelaunchTasks[relaunchKey] = Task { @MainActor in
-                defer { self.deferredRelaunchTasks[relaunchKey] = nil }
+                defer {
+                    self.deferredRelaunchTasks[relaunchKey] = nil
+                    self.deferredRelaunchSessions[relaunchKey] = nil
+                }
                 var held: TurnSlotClaim?
                 let deadline = Date().addingTimeInterval(120)
                 while held == nil, Date() < deadline {
@@ -6659,6 +6731,10 @@ struct ContentView: View {
                 guard !Task.isCancelled else {
                     // A claim won in a task the operator has stopped must go
                     // back, or it wedges the engine for everyone.
+                    held?.release()
+                    return
+                }
+                if let sessionId, !self.sessions.contains(where: { $0.id == sessionId }) {
                     held?.release()
                     return
                 }
@@ -6685,11 +6761,16 @@ struct ContentView: View {
                     CompletionEngine.shared.cancelBackgroundTurn()
                     await CompletionEngine.shared.awaitIdle()
                     guard !Task.isCancelled else { return }
+                    if let sessionId, !self.sessions.contains(where: { $0.id == sessionId }) {
+                        return
+                    }
                     // Reclaimed here, not inside the retry, so the retry
                     // cannot lose the slot the preemption paid for — the run
                     // just cancelled is permanently gone; its slot must not
                     // be lost to a race on top of that.
                     let reclaimed = CompletionEngine.shared.reserveTurnSlot()
+                    // Same rule as the immediate preemption above: a nil
+                    // claim re-enters the wait instead of launching unauthorised.
                     _ = self.startAutoregressiveGeneration(
                         customPrompt: customPrompt,
                         promptTokens: promptTokens,
@@ -6700,7 +6781,7 @@ struct ContentView: View {
                         agentStep: agentStep,
                         isInThinkingContinuation: isInThinkingContinuation,
                         forceSynthesis: forceSynthesis,
-                        preemptionRetry: true,
+                        preemptionRetry: reclaimed != nil,
                         slotCarry: reclaimed,
                         relayedReports: relayedReports
                     )
@@ -7793,6 +7874,15 @@ struct ContentView: View {
                         // them to the user instead of dropping them.
                         if !ranCompleteTool {
                             await self.awaitSessionSubagents(sessionId: sessionId, timeout: 120)
+                            // The wait above can last two minutes. A Stop (or a
+                            // replacement send that took the generation) during
+                            // it must win: relaunching here generated into a
+                            // conversation the operator had stopped.
+                            guard !Task.isCancelled else { return }
+                            let stillOwnsGeneration = await MainActor.run {
+                                self.ownsGeneration(myGenerationId)
+                            }
+                            guard stillOwnsGeneration else { return }
                             // Same rule as the mid-run relay: delivered only
                             // once the relay turn launches.
                             let pendingRelay = await MainActor.run {
@@ -7820,6 +7910,12 @@ struct ContentView: View {
                                     encode: { try tokenizer.encode(text: $0) }
                                 )
                                 await MainActor.run {
+                                    // The splice above is another suspension.
+                                    // Re-check at the launch itself, so a Stop
+                                    // that lands during it cannot append an
+                                    // empty relay turn to a stopped generation.
+                                    guard !Task.isCancelled,
+                                          self.ownsGeneration(myGenerationId) else { return }
                                     let relayMsgId = UUID()
                                     if let sId = sessionId, let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
                                         let relayMsg = ChatMessage(

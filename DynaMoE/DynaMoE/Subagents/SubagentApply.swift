@@ -204,21 +204,30 @@ enum SubagentApplyService {
         let destinationBranch = await WorkspaceIsolation.currentBranch(of: worktree.repositoryRoot)
 
         let appliedAt = Date()
+        let recordUpdated: Bool
         if let live {
-            live.markApplied(at: appliedAt, files: files, appliedTo: destinationBranch)
+            recordUpdated = live.markApplied(at: appliedAt, files: files, appliedTo: destinationBranch)
         } else {
             // Mutated against the CURRENT record on the store's IO queue, not
             // restored from the copy this apply loaded seconds ago: a
             // `summaryRelayed` write landing mid-apply would otherwise be
             // reverted here and the report injected a second time.
-            AgentRunStore.shared.mutate(runId: runId, sessionId: record.parentSessionId) { current in
+            recordUpdated = AgentRunStore.shared.mutate(runId: runId, sessionId: record.parentSessionId) { current in
                 current.appliedAt = appliedAt
                 current.appliedToBranch = destinationBranch
                 if var report = current.report, !files.isEmpty {
                     report.changedFiles = files
                     current.report = report
                 }
-            }
+            } != nil
+        }
+        // The patch has landed, but a record that still says "unapplied" with
+        // no worktree is the one state the Apply UI can never resolve. Keep the
+        // tree and say so instead of reporting a clean apply.
+        guard recordUpdated else {
+            throw WorkspaceIsolationError.applyFailed(
+                "the patch landed, but this run's record could not be updated (its conversation may have been deleted). The worktree was kept so the landed changes still have a copy; clear the run manually."
+            )
         }
         if keptIgnoredFiles.isEmpty {
             await WorkspaceIsolation.cleanup(worktree)

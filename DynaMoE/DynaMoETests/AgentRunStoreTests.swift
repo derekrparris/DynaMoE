@@ -373,6 +373,57 @@ final class AgentRunStoreTests: XCTestCase {
         )
     }
 
+    /// An apply that completes AFTER its conversation was deleted must land on
+    /// the re-scoped record. The apply path still holds the old session id, and
+    /// the store's tombstone refused a write to the old path — so the worktree
+    /// was cleaned up while the surviving record still said unapplied, and
+    /// `prune` then skipped that record forever.
+    func testAMutateAfterASessionDeleteLandsOnTheRescopedRecord() throws {
+        let store = makeStore()
+        let session = UUID()
+        let runId = UUID()
+        let unapplied = record(
+            id: runId,
+            sessionId: session,
+            isolation: .worktree(path: "/tmp/w/x", branch: "dynamoe/run-x"),
+            appliedAt: nil
+        )
+        store.saveImmediately(unapplied)
+        store.deleteSession(session)
+        store.flush()
+
+        let appliedAt = Date()
+        let returned = store.mutate(runId: runId, sessionId: session) { current in
+            current.appliedAt = appliedAt
+            current.appliedToBranch = "main"
+        }
+
+        XCTAssertNotNil(returned, "the re-scoped record must still be mutable by id")
+        let reloaded = try XCTUnwrap(store.loadAny(runId: runId))
+        XCTAssertEqual(reloaded.appliedAt, appliedAt)
+        XCTAssertEqual(reloaded.appliedToBranch, "main")
+        XCTAssertNil(reloaded.parentSessionId)
+    }
+
+    /// A mutation that cannot be written reports nil instead of the record it
+    /// read. The apply path consumes this answer; a false success cleaned up
+    /// worktrees for records that still said unapplied.
+    func testAMutateReportsARefusedWriteAsNil() throws {
+        let store = makeStore()
+        let session = UUID()
+        let saved = record(sessionId: session)
+        store.saveImmediately(saved)
+        store.delete(runId: saved.id, sessionId: session)
+        store.flush()
+
+        XCTAssertNil(
+            store.mutate(runId: saved.id, sessionId: session) { current in
+                current.status = .completed
+            },
+            "a deleted run is not a successful mutation"
+        )
+    }
+
     func testDeletingOneRunLeavesItsSessionAlone() throws {
         let store = makeStore()
         let sessionId = UUID()

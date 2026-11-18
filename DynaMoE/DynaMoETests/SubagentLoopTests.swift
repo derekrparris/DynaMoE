@@ -1300,6 +1300,174 @@ final class SubagentLoopTests: XCTestCase {
             "a history this far over budget must lose whole oldest blocks"
         )
     }
+
+    /// A steering note can arrive BETWEEN two assistant turns. The drop pass
+    /// used to end a block only at the next assistant, so the range swallowed
+    /// the note in front of it and a mid-run directive vanished once the
+    /// history crossed the budget.
+    func testTheDropPassNeverDropsASteeringNote() {
+        var messages: [AgentBackendMessage] = [.user("Do the task.")]
+        let huge = String(repeating: "x", count: 4_000)
+        let notes = ["focus on the token budget", "do not touch the network"]
+        for step in 0..<90 {
+            messages.append(contentsOf: assistantBlock(text: huge, thinking: "", toolResults: [huge, huge]))
+            if step == 10 || step == 40 {
+                messages.append(.user(notes[step == 10 ? 0 : 1]))
+            }
+        }
+        messages.append(contentsOf: assistantBlock(text: "recent", thinking: "", toolResults: ["recent result"]))
+
+        let compacted = HeadlessAgentLoop.compactContextIfNeeded(messages)
+        for note in notes {
+            XCTAssertTrue(
+                compacted.contains { message in
+                    if case .user(let text) = message { return text == note }
+                    return false
+                },
+                "a steering note must survive the whole block-drop pass: \(note)"
+            )
+        }
+        XCTAssertLessThanOrEqual(
+            compacted.reduce(0) { $0 + $1.textAndThinkingCount },
+            HeadlessAgentLoop.contextCharacterBudget
+        )
+    }
+
+    /// A turn can emit several calls. When a Stop lands mid-turn, every call
+    /// that never ran still needs a result entry: the assistant text names
+    /// them, and a transcript with calls and no result read as if they had
+    /// silently succeeded.
+    func testACancelledTurnRecordsTheCallsItNeverRan() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let gate = Gate()
+        let backend = ScriptedBackend(turns: [
+            .init(text: "three calls", calls: [
+                AgentToolCall(name: "shell_run", arguments: ["command": "touch blocked.txt"]),
+                AgentToolCall(name: "file_read", arguments: ["path": "one.txt"]),
+                AgentToolCall(name: "file_read", arguments: ["path": "two.txt"])
+            ])
+        ])
+        let context = try makeContext(
+            workspace: workspace,
+            tools: ["shell_run", "file_read", "complete"],
+            policy: .everyStateChange,
+            handler: { _ in
+                await gate.wait()
+                return true
+            }
+        )
+
+        let task = Task {
+            await HeadlessAgentLoop().run(
+                input: input(budget: AgentBudget(
+                    maxSteps: 4,
+                    maxCompletionTokens: 2_000,
+                    maxWallClockSeconds: 600,
+                    maxCostUSD: nil
+                )),
+                backend: backend,
+                context: context,
+                emit: { _ in }
+            )
+        }
+        try await Task.sleep(nanoseconds: 300_000_000)
+        task.cancel()
+        gate.resume()
+        let outcome = await task.value
+
+        XCTAssertEqual(outcome.status, .cancelled, outcome.error ?? "")
+        let abandoned = outcome.transcript.compactMap { entry -> ToolCallRecord? in
+            guard entry.kind == .toolResult,
+                  let record = entry.toolRecord,
+                  record.error?.contains("Not completed") == true else { return nil }
+            return record
+        }
+        XCTAssertEqual(
+            abandoned.map(\.name), ["file_read", "file_read"],
+            "the two calls behind the stopped one must each get a result"
+        )
+    }
+
+    // MARK: - Turbo cannot bypass the two reserved cards
+
+    /// On case-insensitive APFS a not-yet-existing `.GIT` is the same directory
+    /// as `.git`. The component check used to be case-sensitive, so a write
+    /// through that spelling got no card and Turbo was not even consulted.
+    func testADotGitPathInAnyCaseGetsItsOwnCard() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let counter = CallCounter()
+
+        let backend = ScriptedBackend(turns: [
+            .init(text: "writing", calls: [
+                AgentToolCall(
+                    name: "file_write",
+                    arguments: ["path": "vendor/sub/.GIT/config", "content": "x"]
+                )
+            ]),
+            .init(text: "done", calls: [completeCall("Refused.")])
+        ])
+        let context = try makeContext(
+            workspace: workspace,
+            tools: ["file_write", "complete"],
+            policy: .spawnOnly,
+            isolated: true,
+            handler: { request in
+                counter.increment()
+                XCTAssertTrue(request.containmentEscape)
+                return false
+            }
+        )
+
+        _ = await HeadlessAgentLoop().run(input: input(), backend: backend, context: context, emit: { _ in })
+        XCTAssertEqual(counter.count, 1, "a case-variant .GIT is still git metadata")
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: workspace.appendingPathComponent("vendor/sub/.GIT/config").path
+            )
+        )
+    }
+
+    /// SUBAGENTS.md §7 reserves a shell for a real card in every policy. The
+    /// `.everyStateChange` branch used to ask with `containmentEscape: false`,
+    /// which Turbo Mode is allowed to skip.
+    func testAShellRunInEveryStateChangeIsACardTurboCannotBypass() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let counter = CallCounter()
+
+        let backend = ScriptedBackend(turns: [
+            .init(text: "running", calls: [
+                AgentToolCall(name: "shell_run", arguments: ["command": "echo hello"])
+            ]),
+            .init(text: "done", calls: [completeCall("Refused.")])
+        ])
+        let context = try makeContext(
+            workspace: workspace,
+            tools: ["shell_run", "complete"],
+            policy: .everyStateChange,
+            handler: { request in
+                counter.increment()
+                XCTAssertTrue(
+                    request.containmentEscape,
+                    "a shell must never be bypassable by Turbo Mode"
+                )
+                let bypassed = await MainActor.run {
+                    SubagentApprovalCenter.turboBypasses(
+                        request: request,
+                        honorsTurbo: true,
+                        turboEnabled: true
+                    )
+                }
+                XCTAssertFalse(bypassed)
+                return false
+            }
+        )
+
+        _ = await HeadlessAgentLoop().run(input: input(), backend: backend, context: context, emit: { _ in })
+        XCTAssertEqual(counter.count, 1)
+    }
 }
 
 private extension AgentBackendMessage {

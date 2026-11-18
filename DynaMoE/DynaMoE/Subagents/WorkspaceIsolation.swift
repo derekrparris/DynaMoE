@@ -26,6 +26,7 @@ nonisolated enum WorkspaceIsolationError: LocalizedError, Equatable {
     case snapshotFailed(String)
     case applyFailed(String)
     case applyConflicted(String)
+    case nestedRepositoryUnsupported(String)
 
     var errorDescription: String? {
         switch self {
@@ -47,6 +48,8 @@ nonisolated enum WorkspaceIsolationError: LocalizedError, Equatable {
             return "Could not apply the run's changes: \(detail)"
         case .applyConflicted(let detail):
             return "The run's changes conflict with the current working tree: \(detail)"
+        case .nestedRepositoryUnsupported(let path):
+            return "The run's worktree contains a nested git repository at '\(path)', which a patch cannot carry: git can only record a gitlink, and applying one reports success while leaving the nested files behind. Nothing was applied and the worktree was kept so nothing is lost."
         }
     }
 }
@@ -491,6 +494,13 @@ nonisolated enum WorkspaceIsolation {
             )
         }
 
+        // A nested repository is a gitlink, and `git apply` reports success
+        // while writing only an empty directory. Refuse it at the first place
+        // the patch is read, so the report names it and the worktree is kept.
+        if let nested = nestedRepositoryPath(inPatch: diffOut) {
+            throw WorkspaceIsolationError.nestedRepositoryUnsupported(nested)
+        }
+
         // The two halves come from the same tree, so one with entries and the
         // other empty is not "no changes": it means the patch could not be
         // represented. `runProcess` decodes stdout as UTF-8 and a diff of a
@@ -569,6 +579,48 @@ nonisolated enum WorkspaceIsolation {
         return files.sorted()
     }
 
+    /// The destination path of a `diff --git a/<a> b/<b>` header, or nil.
+    private static func diffDestination(of header: Substring) -> String? {
+        let payload = String(header.dropFirst("diff --git ".count))
+        // The b/ side is after the last " b/"; a quoted path with spaces still
+        // leaves this delimiter intact on the common spellings we can read.
+        guard let separator = payload.range(of: " b/", options: .backwards) else { return nil }
+        let path = payload[separator.upperBound...]
+        return path.isEmpty ? nil : String(path)
+    }
+
+    /// The first file in a patch that git can only express as a gitlink
+    /// (mode 160000, a nested repository/submodule), or nil.
+    ///
+    /// `git apply` does NOT fail on one: it writes an empty directory, warns
+    /// "unable to rmdir", and exits 0 while the nested contents never land.
+    /// Treating that exit status as success is what let the apply path report
+    /// "applied N files" and then delete the worktree, the only copy of the
+    /// nested files.
+    static func nestedRepositoryPath(inPatch diff: String) -> String? {
+        var current: String?
+        for line in diff.split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.hasPrefix("diff --git ") {
+                current = diffDestination(of: line)
+                continue
+            }
+            // A gitlink's mode appears in the index line, which is present for
+            // both an added and an updated submodule (the latter has no
+            // "new file mode" line).
+            if line.hasPrefix("index "),
+               line.split(separator: " ").contains("160000") {
+                return current ?? "a nested repository"
+            }
+            if line.hasPrefix("new file mode 160000")
+                || line.hasPrefix("deleted file mode 160000")
+                || line.hasPrefix("old mode 160000")
+                || line.hasPrefix("new mode 160000") {
+                return current ?? "a nested repository"
+            }
+        }
+        return nil
+    }
+
     // MARK: Applying
 
     /// Applies the run's net change to the main tree.
@@ -598,6 +650,12 @@ nonisolated enum WorkspaceIsolation {
         }
         guard !changes.diffWasTruncated else {
             throw WorkspaceIsolationError.applyFailed("the patch was truncated before it could be applied")
+        }
+        // `snapshot` refuses one, but a caller can hand a change set in
+        // directly. Check again before a byte is touched: `git apply` exits 0
+        // on a gitlink while writing only an empty directory.
+        if let nested = nestedRepositoryPath(inPatch: changes.diff) {
+            throw WorkspaceIsolationError.nestedRepositoryUnsupported(nested)
         }
         // The patch was read through the worktree's git linkage, and a
         // retargeted `.git` pointer could have made that read describe another

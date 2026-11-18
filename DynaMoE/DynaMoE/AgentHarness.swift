@@ -5926,8 +5926,14 @@ public final class AgentHarness {
     /// `.gitmodules` are ordinary files and do not match. Symlinks are
     /// resolved through `resolvedForContainment`, so a link named `build`
     /// that points into `.git` cannot smuggle a write past the check.
+    ///
+    /// The component match folds case: on case-insensitive APFS a leaf that
+    /// does not exist yet (`<worktree>/.GIT`) is the same directory the write
+    /// would create, and a case-sensitive compare let it through uncarded.
     static func pathTouchesGitMetadata(_ url: URL) -> Bool {
-        resolvedForContainment(url).pathComponents.contains(".git")
+        resolvedForContainment(url).pathComponents.contains {
+            $0.lowercased() == ".git"
+        }
     }
 
     /// The path with every EXISTING component resolved, so a symlink anywhere
@@ -6031,7 +6037,24 @@ public final class AgentHarness {
             }
             return .allow
         case .everyStateChange:
-            if stateChanging { return ask("it changes files, the repository or the system") }
+            if stateChanging {
+                // SUBAGENTS.md §7 reserves these two for a real card in EVERY
+                // policy: a shell is arbitrary code with its own cwd, and a
+                // `.git` rewrite can redirect every later git call. Turbo is a
+                // switch over routine writes, so neither is bypassable.
+                if call.name == "shell_run" {
+                    return ask("it runs an arbitrary shell command", containmentEscape: true)
+                }
+                if call.name == "file_write" || call.name == "file_edit",
+                   let path = call.arguments["path"] as? String, !path.isEmpty,
+                   Self.pathTouchesGitMetadata(Self.resolvePath(path, workingDirectory: workingDirectory)) {
+                    return ask(
+                        "it writes git metadata, which can redirect the run's commits into another repository",
+                        containmentEscape: true
+                    )
+                }
+                return ask("it changes files, the repository or the system")
+            }
             if appPreferences { return ask("it would rewrite DynaMoE's own preferences") }
             if subQNeedsApproval { return ask("it uploads the state or local image bytes") }
             return .allow

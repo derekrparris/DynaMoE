@@ -300,8 +300,9 @@ Termination:
 - Step/token/time/cost budget → `.failed` (budget) with a partial report.
 - Cancellation → `.cancelled`.
 - Guard trip → `.blocked`.
-- Backend error → `.failed` with the error, retried at most twice for retryable
-  transport failures.
+- Backend error → `.failed` with the error. `CloudAgentBackend.runTurn` retries
+  exactly once, and only when the failure is retryable AND the receipt proves
+  nothing was sent; a spent request is never re-sent or re-billed.
 
 The loop never invents a finding. A finding must cite a tool result or the
 model's own text; the report renderer refuses an empty evidence string.
@@ -382,8 +383,11 @@ struct AgentBackendTurn {
   If the estimate exceeds `dynamoe_subagent_local_cost_limit` (default 120 s),
   the spawn is refused with the estimate unless the operator overrides it on the
   approval card.
-- If the model family cannot parse tool calls reliably, the run is refused by
-  name rather than run without tools.
+- Tool calls are read from the family's rendered dialect by the same parser the
+  chat turn uses; there is no separate pre-spawn capability gate. A family
+  whose output the parser cannot recognise yields no calls (a final answer),
+  and a `toolfreeze` turn that produced no complete call fails the run by name
+  in `HeadlessAgentLoop`.
 
 ### AppleFMBackend
 
@@ -475,10 +479,15 @@ enum AgentApprovalPolicy {
 - A snapshot registers new files as intent-to-add (`git add -N`) rather than
   staging content: a linked worktree shares the operator's object DB, and
   staging blobbed every file the run touched into it just to read a patch
-  back. The patch carries the same bytes either way. One honest limit follows
-  from reading the patch as text: a file whose content is not valid UTF-8
-  cannot be expressed, so such a change is refused by name and the worktree
-  kept — the operator retrieves or converts the file by hand.
+  back. The patch carries the same bytes either way. Two honest limits follow
+  from reading the patch as text, and both are refused by name with the
+  worktree kept — the operator retrieves or converts the work by hand: a file
+  whose content is not valid UTF-8 cannot be expressed, and a nested git
+  repository can only be expressed as a gitlink. `git apply` exits **0** on a
+  gitlink while writing an empty directory and leaving the nested files
+  unapplied, so treating its exit status as success reported a landed apply and
+  deleted the only copy. `snapshot` refuses one, and `apply` checks a supplied
+  change set again before touching a byte.
 - Non-git workspace: writers run on the main tree only with per-call approval;
   otherwise the spawn is refused.
 - Read-only runs never touch a worktree.
@@ -834,11 +843,15 @@ Implemented, with the decisions worth carrying:
   one mapping from runtime state to `AgentRunRecord`; the loop's own transcript
   replaces the step list at the terminal boundary, so the persisted run, the
   inspector and the drawer cannot disagree about what happened. `isSummaryRelayed`
-  persists on change, which is what makes "unread" survive a relaunch.
-- **Notifications are a Dock bounce plus an opt-in banner.** The bounce needs no
-  permission and cannot outlive the moment; the banner asks on first use, is
-  skipped under XCTest (a headless runner must not meet a permission dialog),
-  and names the run rather than claiming more than the summary did.
+  persists on change, which is what makes "unread" survive a relaunch. A run
+  parked on an approval card publishes `.waitingForApproval` and returns to
+  `.running` when the card is answered, so a blocked run is not drawn as busy.
+- **Notifications are a Dock bounce plus an opt-in banner.** The bounce happens
+  whenever the app is not frontmost and needs no permission; the banner is OFF
+  until the operator enables it in Settings, is posted only while the app is
+  not frontmost, is skipped under XCTest (a headless runner must not meet a
+  permission dialog), and names the run rather than claiming more than the
+  summary did.
 - **The start-of-turn relay has two shapes because the caches differ.** The
   cloud path initializes its trailing directive before the first request
   (`takeSubagentRelayDirective()`), keeping the provider's cached prefix intact.
@@ -1049,6 +1062,7 @@ Append one line per session so the next session knows where work stopped.
 
 | Date | Session | Result |
 |---|---|---|
+| 2026-11-18 | review round 3: two blockers, majors, minors | (1) The result-delivery wait is now Stop-sensitive end to end: `SubagentRelayWait` checks `Task.isCancelled` (the old polling loop spun to its 120 s deadline under cancellation), and BOTH teardown paths guard `!Task.isCancelled` and generation ownership after the wait — the weights path before gathering and again before its relay launch, the cloud path before `takeSubagentRelayDirective`, whose loop-top check had already run. (2) A nested git repository is refused as a gitlink (`nestedRepositoryUnsupported`) in `snapshot` AND from a caller-supplied change set in `apply`, before a byte is touched; `git apply` exits 0 on one while writing an empty directory, and the old success path deleted the worktree, the only copy of the nested files. (3) `SubagentInspectorView` gained `.onChange(of: sessionId)`, clearing the old rows and detail selection before loading the new conversation. (4) `.running` is published only if the run is still unfinished (a synchronous `hasFinished()` lock read) in both execution paths, so a Stop in the scheduler's grant window cannot overwrite a cancelled record. Minors: a block-drop range ends at the first `.user` (steering notes survive compaction); `pathTouchesGitMetadata` folds case (`.GIT` on APFS); the two model-not-ready early returns release a carried `TurnSlotClaim`, and a nil re-claim after preemption re-enters the slot wait instead of launching unauthorised; manual delete and chat retention cancel that session's queued relaunches and a relaunch re-checks the session exists; `mutate` locates the record by id when its conversation was deleted (so an apply's `appliedAt` reaches the re-scoped record) and reports a refused write as nil; the relay index fallback scans on the IO queue; a mid-turn cancellation/deadline records every call it did not run; `shell_run` and `.git` writes are containment escapes in `.everyStateChange` too (Turbo can no longer bypass them); the banner is opt-in and posts only while the app is not frontmost; the cost strip marks a mixed total with `+`; `waitingForApproval` is emitted for an unanswered card; a notification tap that beats the history load is held until the load finishes. (§5 retry, §6 tool parsing, §7 gitlinks/Turbo, §11 notifications and status, §16 cloud defaults corrected.) |
 | 2026-11-18 | review crash + majors | Round 3's findings closed. (1) BLOCKER: `deleteSession` re-scoped its survivors from inside `ioQueue.async` and called `saveImmediately`, whose `ioQueue.sync` libdispatch-aborted the process ("dispatch_sync called on queue already owned by current thread") — deleting a conversation that owned an unapplied isolated run crashed the app, and the PR's own delete-session test took the test process down with it. Every synchronous entry point (`saveImmediately`, `mutate`, `prune`, `sweepOrphanedTempWrites`, `flush`) now goes through `onQueue`, which uses a `DispatchSpecificKey` to run INLINE when the caller already holds the store's queue, so the class of defect cannot recur. (2) A fresh send queued behind the preemption drain now publishes the generating state (guarded like the continuation's slot wait), so Stop is drawn for the whole drain instead of the composer showing a plain Send button while a relaunch it cannot cancel is pending. (3) The AFM path marks a relayed report delivered only when `startAppleFoundationModelGeneration` actually started a turn: it returned true for an unavailable on-device model, so the report was consumed having reached no model. (4) The three single-flight invariants round 3 asked for: `LocalAgentBackend.withStepClaim` (the per-step claim is injected/observed so an early throw between grant and launch is provable without a checkpoint), stale-id no-op coverage for `cancelTurn(id:)` against a preparing claim, and the per-repository apply claim via a DEBUG seam (`repositoryKey` is now one function). Minors: the DS launch no longer drops the prefix pin before the runner can refuse — `DeepSeekV41TurnRunner.run` gained `onCacheWillChange`, fired past its own refusal gates and immediately before the resume/reset, which is where `invalidateIfNotPreserved` now runs (the generic path's rule, applied to this one). SUBAGENTS §6's retry sentence now matches the code (one retry, only when the failure proves nothing was billed). Verified: `AgentRunStoreTests` 23 (the crashing case passes, no process restart), `EngineTurnSlotTests` 11, `LocalAgentBackendLogicTests` 24, `WorkspaceIsolationTests` 36, plus the six other subagent suites and the DeepSeek turn-loop/parity suites — 284 executed, 2 skipped (opt-in live cloud), 0 failures. |
 | 2026-11-18 | review majors + minors | All five review majors closed. (1) "Clear Finished" no longer disposes unapplied isolated work: `clearCompleted` skips the records the 14-day sweep protects (both its live-instance and stored-record paths — the guard `prune` already has), and `deleteSession` RE-SCOPES those records to the unscoped bucket instead of deleting them: they ride every inspector with their Apply/Clear buttons, `prune` keeps skipping them, a still-working survivor is closed as cancelled with a note, and `summaryRelayed` is set so the relay never injects a deleted conversation's report into an unrelated one; §10 records the exception (write-new-before-remove-old, so a crash between the two leaves a duplicate the sweep still protects). (2) The legacy `spawn` path passes `parentTurnId`, so a Stop reaches the children the stopped turn spawned instead of missing the filter. (3) Chat retention protects every session with a live run (`SubagentManager.liveRunSessionIds`) and cancels a session's runs before its records go — a run whose record is deleted underneath it is invisible, unstoppable, and its terminal write is dropped by the store's tombstone. (4) Manual conversation delete does the same (§10). (5) In-loop compaction is budget-gated: under the 160k-character budget the history comes back UNCHANGED so each step's prompt extends the last byte for byte and the local KV prefix pin survives the step; folding runs only when the budget demands it, one deliberate re-prefill per fold cycle instead of one per step (SubQ 0.996). Minors: `send_subagent_message` refuses a finished run instead of reporting `delivered: true` into a channel nothing drains; the Stop race that left a cancelled run's live object carrying a completed report the store never accepted is guarded (the worktree readback await is the window); the apply mid-operation refusal covers cherry-pick, revert and bisect beside merge/rebase; a send queued on the engine slot publishes the generating state so Stop is visible for the whole 120 s wait (guarded so it never repoints another session's state) and the deadline preempt announces itself like the immediate one; `snapshot` registers intent-to-add (`git add -N .`) instead of staging, so a worktree's files stop blobbing into the operator's shared object DB — verified byte-identical appliable patch, zero new blobs — and the non-UTF-8 apply refusal is documented in §7. Tests: turn-scoped cancel (the path Stop takes), deleteSession re-scope, under-budget compaction, mid-operation refusals (merge/cherry-pick/revert/bisect with a settled control), object-store no-bloat (`cat-file -e` on the content hash), and the single-flight refusal via a DEBUG seam (the in-flight window is one git call and cannot be raced deterministically). 9 suites, 137 executed, 0 failures. Mid-apply task cancellation stays covered by the two rollback cases rather than a racy interleaving. |
 | 2026-11-17 | PR #104 review findings | Addressed the reviewer's three blockers plus three should-fixes. (1) `complete` is now in every run's tool set: `AgentSpawnResolver.alwaysAvailableToolNames` appends it after the preset/explicit list is filtered (`resolveTools`), still withheld in plan mode, so `endsAgentRun` is reachable and the grammar/tool mask advertises it. The worker prompt was also mismatched to the backend: cloud runs were taught the LOCAL XML dialect while their provider receives native function declarations, so `SubagentManager` now picks `buildCloudWorkerSystemPrompt` for `.cloud` and the local prompt for everything else. (2) The report is derived rather than hardcoded: `AgentReportBuilder` turns the run's own transcript into findings (one per substantive claim, evidence naming the step and the tool results in front of it), open questions (question-marked lines), and a best-effort partial summary (the LONGEST assistant text, not the last preamble), so a budget-exhausted run keeps its finished analysis; `get_subagent_status` now relays findings and open questions, and `SubagentInstance.lastError` keeps the failure reason out of the summary banner. (3) Worktree isolation is enforced per call: `.spawnOnly` auto-approves `file_write`/`file_edit` only when the resolved (symlink-resolved) path is inside the worktree and `git_commit` only when it runs there, while `shell_run` — arbitrary code with its own `cwd` — always gets the per-change card. Should-fixes: the two legacy pipeline tests pass `backend: legacy` explicitly instead of reading `dynamoe_subagent_backend` from the operator's defaults; `AgentUsage.costIsUnpriced` records that a billed token count had no price, the spawn refuses a `max_cost_usd` ceiling that no recorded price could bind, and the loop fails closed if a ceiling meets unpriced usage; `TurnPriority` and the settings copy now say preemption CANCELS rather than yields/pauses. Tests: 6 resolver/report cases in `AgentSpawnPolicyTests`, 5 loop cases (findings, partial summary, two containment cases, shell card, unpriced ceiling), 3 cloud usage cases, 1 cloud-prompt case. Subagent suites 78 green (2 opt-in cloud skipped). |
@@ -1068,15 +1082,23 @@ Append one line per session so the next session knows where work stopped.
 ## 16. Open questions
 
 - Cloud provider defaults: Phase 3 shipped the Settings field
-  (`dynamoe_subagent_cloud_model`, an upstream model id). Resolution is
-  stored value → coordinator's model when it supports tools → first discovered
-  tool-capable model, with one refusal rule between the first two: a stored
-  value that does not name a configured cloud model is REFUSED by name at
-  spawn time (and flagged in Settings where it is typed) rather than silently
-  substituted, because the substituted run would be billed on a provider the
-  operator never chose. Still open: whether the CHEAPEST tool-capable
-  profile should lead that chain instead of the coordinator's, which needs a
-  price source the registry does not carry.
+  (`dynamoe_subagent_cloud_model`, an upstream model id). The stored value is
+  the ONLY resolution: `AgentSpawn.resolveBackend` passes
+  `coordinateModelId: nil`, so there is no coordinator-model or
+  first-discovered fallback. An empty value refuses a cloud spawn by name
+  (`noneConfigured`), and a stored value that does not name a configured cloud
+  model is also refused by name (and flagged in Settings where it is typed),
+  rather than silently substituted — the substituted run would be billed on a
+  provider the operator never chose. `.auto` still prefers a loaded local
+  checkpoint. Still open: whether a real default chain (cheapest or
+  coordinator's tool-capable model) should exist; it needs a price source the
+  registry does not carry and an explicit product decision.
+- Cooperative cancellation boundaries: `runTurn` and `runTool` use
+  `withTaskGroup`, which always awaits its children after `cancelAll()`. A
+  backend stream or tool that ignores cancellation therefore keeps the run,
+  and its scheduler ticket, alive past Stop and the wall clock. Every backend
+  and tool in this app honours cancellation; a hard-abandonment path is not
+  built.
 - Model-backed default: decided in Phase 3 — it stays an explicit Settings
   choice. The picker offers "Role pipelines (no model)", "Local model" and
   "Cloud model"; an unset value keeps the legacy pipelines. Sending work to a

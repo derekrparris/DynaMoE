@@ -1502,4 +1502,82 @@ final class WorkspaceIsolationTests: XCTestCase {
         XCTAssertEqual(applied.changedFiles, ["same_repo.txt"])
         XCTAssertTrue(FileManager.default.fileExists(atPath: repository.appendingPathComponent("same_repo.txt").path))
     }
+
+    // MARK: - Nested repositories (gitlinks)
+
+    /// `git diff` can only express a nested repository as a gitlink, and
+    /// `git apply` reports success on one while writing an empty directory and
+    /// leaving the nested files behind. Treating that as a landed apply deleted
+    /// the worktree, the only copy of those files.
+    func testANestedRepositoryRefusesTheSnapshotAndKeepsItsFiles() async throws {
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: UUID(),
+            root: worktreeRoot
+        )
+        let nested = worktree.path.appendingPathComponent("vendor/tool", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        try await git(["init", "-b", "main"], in: nested)
+        try "nested work\n".write(
+            to: nested.appendingPathComponent("nested.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try await git(["add", "-A"], in: nested)
+        try await git(["commit", "-m", "nested"], in: nested)
+
+        do {
+            _ = try await WorkspaceIsolation.snapshot(worktree, diffLimit: nil)
+            XCTFail("a nested repository must be refused, not expressed as a gitlink")
+        } catch let error as WorkspaceIsolationError {
+            guard case .nestedRepositoryUnsupported = error else {
+                return XCTFail("expected nestedRepositoryUnsupported, got \(error)")
+            }
+        }
+
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: nested.appendingPathComponent("nested.txt").path),
+            "refusing the patch must keep the only copy of the nested files"
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: worktree.path.path))
+    }
+
+    /// A caller may hand `apply` its own change set, so the refusal cannot live
+    /// only in `snapshot`.
+    func testAnApplyRefusesAGitlinkInASuppliedChangeSet() async throws {
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: UUID(),
+            root: worktreeRoot
+        )
+        let gitlinkPatch = """
+        diff --git a/vendor/tool b/vendor/tool
+        new file mode 160000
+        index 0000000..1111111
+        --- /dev/null
+        +++ b/vendor/tool
+        @@ -0,0 +1 @@
+        +Subproject commit 1111111111111111111111111111111111111111
+        """
+        let changes = WorkspaceChangeSet(
+            changedFiles: ["vendor/tool"],
+            diff: gitlinkPatch,
+            diffWasTruncated: false
+        )
+
+        do {
+            _ = try await WorkspaceIsolation.apply(worktree, changeSet: changes)
+            XCTFail("a gitlink in a supplied change set must be refused before any byte is written")
+        } catch let error as WorkspaceIsolationError {
+            guard case .nestedRepositoryUnsupported(let path) = error else {
+                return XCTFail("expected nestedRepositoryUnsupported, got \(error)")
+            }
+            XCTAssertEqual(path, "vendor/tool")
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: repository.appendingPathComponent("vendor/tool").path),
+            "a refused apply must not have created the empty directory git would write"
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: worktree.path.path))
+    }
 }

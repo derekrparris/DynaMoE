@@ -7,8 +7,8 @@
 //  A subagent works while the user reads something else, so a run that ends is
 //  only useful if it can be noticed without watching the inspector. The Dock
 //  bounce is unconditional (it is not a permission and does not survive the
-//  moment); the banner is opt-out and only requested when the operator has left
-//  the app.
+//  moment); the banner is opt-IN and only posted when the operator has left
+//  the app. SUBAGENTS.md §11 states both.
 //
 
 import AppKit
@@ -35,7 +35,9 @@ enum SubagentNotifier {
     static var isEnabled: Bool {
         get {
             let stored = UserDefaults.standard.object(forKey: enabledKey) as? Bool
-            return stored ?? true
+            // Opt-in: an absent key means no banner until the operator turns
+            // it on in Settings.
+            return stored ?? false
         }
         set { UserDefaults.standard.set(newValue, forKey: enabledKey) }
     }
@@ -55,11 +57,15 @@ enum SubagentNotifier {
     ) {
         guard status == .completed || status == .failed else { return }
 
-        if !NSApp.isActive {
+        let isInactive = !NSApp.isActive
+        if isInactive {
             NSApp.requestUserAttention(.informationalRequest)
         }
 
-        guard isEnabled, !isRunningTests, Bundle.main.bundleIdentifier != nil else { return }
+        // A finish notice exists for a run the operator is not watching. While
+        // DynaMoE is frontmost the inspector is one click away, and a banner
+        // over the app is noise the doc never promised.
+        guard isInactive, isEnabled, !isRunningTests, Bundle.main.bundleIdentifier != nil else { return }
 
         let content = UNMutableNotificationContent()
         content.title = status == .completed

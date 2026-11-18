@@ -194,7 +194,7 @@ struct SettingsSheetView: View {
     @AppStorage(SubagentBackendSettings.backendKey) private var subagentBackend: String = ""
     @AppStorage(SubagentBackendSettings.cloudModelKey) private var subagentCloudModel: String = ""
     @AppStorage(LocalSubagentCostEstimate.limitDefaultsKey) private var subagentLocalCostLimit: Double = LocalSubagentCostEstimate.defaultLimitSeconds
-    @AppStorage("dynamoe_subagent_notifications") private var subagentNotifications: Bool = true
+    @AppStorage("dynamoe_subagent_notifications") private var subagentNotifications: Bool = false
     @AppStorage("dynamoe_subagent_cloud_per_provider") private var subagentCloudPerProvider: Int = 3
     @AppStorage("dynamoe_subagent_cloud_global") private var subagentCloudGlobal: Int = 6
     @AppStorage("dynamoe_subagent_retention_runs") private var subagentRetentionRuns: Int = 200
@@ -232,7 +232,7 @@ struct SettingsSheetView: View {
         guard !trimmed.isEmpty,
               CloudModelAddress.parseModelId(trimmed) == nil,
               CloudModelAddress.parsePath(trimmed) == nil else { return nil }
-        return "'\(trimmed)' is not a configured cloud model. Subagent runs that need the cloud will refuse until it is fixed or cleared; leave it empty to use the provider default."
+        return "'\(trimmed)' is not a configured cloud model. Subagent runs that need the cloud will refuse until it is fixed or cleared."
     }
 
     // MARK: - Delegated run controls
@@ -253,13 +253,14 @@ struct SettingsSheetView: View {
             }
 
             subagentSettingRow("Cloud model") {
-                TextField("Provider default", text: $subagentCloudModel)
+                TextField("Choose a model id", text: $subagentCloudModel)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 11))
                     .frame(maxWidth: 260)
-                Text("Upstream model id")
+                Text("Upstream model id. There is no automatic fallback: empty means a cloud spawn refuses by name.")
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             if let cloudModelWarning = subagentCloudModelWarning {
@@ -291,10 +292,11 @@ struct SettingsSheetView: View {
                     .onChange(of: subagentCloudGlobal) { _, _ in reloadSubagentSchedulerLimits() }
             }
 
-            Toggle("Notify when a background run finishes", isOn: $subagentNotifications)
+            Toggle("Notify when a run finishes while DynaMoE isn't frontmost", isOn: $subagentNotifications)
                 .font(.system(size: 11))
                 .toggleStyle(.switch)
                 .controlSize(.mini)
+                .help("Off by default. The Dock bounce still happens whenever the app is in the background.")
 
             subagentSettingRow("Keep runs") {
                 Stepper("\(subagentRetentionRuns) runs", value: $subagentRetentionRuns, in: 20...2000, step: 20)

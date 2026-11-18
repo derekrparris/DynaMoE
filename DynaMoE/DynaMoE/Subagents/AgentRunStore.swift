@@ -178,10 +178,11 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     /// losing the last run is the one outcome worth pausing for. Safe to call
     /// from the store's own queue: it runs inline there instead of
     /// `ioQueue.sync`-ing the queue it is already executing on.
-    func saveImmediately(_ record: AgentRunRecord) {
+    @discardableResult
+    func saveImmediately(_ record: AgentRunRecord) -> Bool {
         let url = fileURL(runId: record.id, sessionId: record.parentSessionId)
         let bounded = Self.bounded(record)
-        onQueue { [self] in
+        return onQueue { [self] in
             writeNow(bounded, to: url)
         }
     }
@@ -197,26 +198,54 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     /// seconds ago cannot revert fields other writers changed in between. The
     /// apply path used to restore its stale copy and clobber a
     /// `summaryRelayed` write landing mid-apply, which re-injected an already
-    /// relayed report at the next send. Returns the record as it stands after
-    /// the mutation, or nil when no decodable record exists.
+    /// relayed report at the next send.
+    ///
+    /// Returns the record as it stands after the mutation, or nil when no
+    /// decodable record exists OR the write was refused (a tombstoned session,
+    /// a full disk). Reporting success for a refused write let callers treat
+    /// the change as landed when it never reached disk.
+    ///
+    /// The file is located by id, not assumed to be under `sessionId`: a
+    /// conversation delete RE-SCOPES an unapplied isolated run to the unscoped
+    /// bucket, and a caller still holding the old session id used to mutate a
+    /// path the tombstone refused — losing the apply's `appliedAt` forever.
     @discardableResult
     func mutate(runId: UUID, sessionId: UUID?, _ change: (inout AgentRunRecord) -> Void) -> AgentRunRecord? {
-        let url = fileURL(runId: runId, sessionId: sessionId)
         return onQueue { [self] in
+            let preferred = fileURL(runId: runId, sessionId: sessionId)
+            let url = existingRecordURL(runId: runId, preferredSession: sessionId) ?? preferred
             guard var current = decodeRecord(at: url) else { return nil }
             change(&current)
             let bounded = Self.bounded(current)
-            writeNow(bounded, to: url)
+            guard writeNow(bounded, to: url) else { return nil }
             return bounded
         }
     }
 
-    private func writeNow(_ record: AgentRunRecord, to url: URL) {
+    /// The record's actual file when the preferred bucket no longer holds it.
+    private func existingRecordURL(runId: UUID, preferredSession: UUID?) -> URL? {
+        let preferred = fileURL(runId: runId, sessionId: preferredSession)
+        if fileManager.fileExists(atPath: preferred.path) { return preferred }
+        let name = "\(runId.uuidString).json"
+        guard let directories = try? fileManager.contentsOfDirectory(atPath: rootURL.path) else {
+            return nil
+        }
+        for directory in directories {
+            let candidate = rootURL
+                .appendingPathComponent(directory, isDirectory: true)
+                .appendingPathComponent(name, isDirectory: false)
+            if fileManager.fileExists(atPath: candidate.path) { return candidate }
+        }
+        return nil
+    }
+
+    @discardableResult
+    private func writeNow(_ record: AgentRunRecord, to url: URL) -> Bool {
         signatureLock.lock()
         let wasDeleted = deletedRunIds.contains(record.id)
             || (record.parentSessionId.map { deletedSessionIds.contains($0) } ?? false)
         signatureLock.unlock()
-        if wasDeleted { return }
+        if wasDeleted { return false }
 
         let directory = url.deletingLastPathComponent()
         do {
@@ -227,7 +256,7 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
             )
         } catch {
             print("⚠️ [AgentRunStore] could not create \(directory.lastPathComponent): \(error.localizedDescription)")
-            return
+            return false
         }
         let data: Data
         do {
@@ -236,7 +265,7 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
             data = try encoder.encode(record)
         } catch {
             print("⚠️ [AgentRunStore] failed to encode run \(record.id): \(error.localizedDescription)")
-            return
+            return false
         }
         let signature = SHA256.hash(data: data)
         let key = url.path
@@ -248,7 +277,7 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
            fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory),
            !isDirectory.boolValue {
             noteRelayMembership(record)
-            return
+            return true
         }
         do {
             // A run's record carries the task, the conversation excerpt,
@@ -264,8 +293,10 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
             writtenSignatures[key] = signature
             signatureLock.unlock()
             noteRelayMembership(record)
+            return true
         } catch {
             print("⚠️ [AgentRunStore] failed to write run \(record.id): \(error.localizedDescription)")
+            return false
         }
     }
 
@@ -325,10 +356,16 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     /// How many records the relay still owes one conversation. Cheap after the
     /// first call: the index is built once and maintained by this store.
     func unrelayedRunIds(sessionId: UUID?) -> Set<UUID> {
-        signatureLock.lock()
-        defer { signatureLock.unlock() }
-        ensureRelayIndexLocked()
-        return unrelayedBySession[Self.relayBucket(sessionId)] ?? []
+        // The fallback for a launch that has not finished preparing the index
+        // runs the scan on the IO queue, never on the caller's (usually main)
+        // thread. It still waits for the answer, but the decode work does not
+        // block the UI while it does.
+        onQueue { [self] in
+            signatureLock.lock()
+            defer { signatureLock.unlock() }
+            ensureRelayIndexLocked()
+            return unrelayedBySession[Self.relayBucket(sessionId)] ?? []
+        }
     }
 
     /// Builds the index OFF the caller's thread. The scan decodes every record

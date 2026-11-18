@@ -64,7 +64,14 @@ final class SubagentApprovalCenter: ObservableObject {
         let entry = PendingSubagentApproval(id: UUID(), request: request)
         pending.append(entry)
         SubagentManager.shared.isDrawerOpen = true
-        defer { pending.removeAll { $0.id == entry.id } }
+        // The card is visible and the run is blocked on it, so the drawer must
+        // say so. Without this a run waiting on the operator read as `.running`
+        // for as long as the card sat unanswered.
+        SubagentManager.shared.noteApprovalWait(for: request)
+        defer {
+            pending.removeAll { $0.id == entry.id }
+            SubagentManager.shared.noteApprovalResolved(runId: request.runId)
+        }
 
         let timeout = min(Self.resolvedApprovalTimeout(), 86_400)
         let approved = await withTaskGroup(of: Bool.self) { group in

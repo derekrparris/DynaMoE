@@ -288,10 +288,37 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             messages.append(.assistant(text: turn.text, thinking: turn.thinking, calls: turn.calls))
 
             var finishedRun = false
-            for call in turn.calls {
+            // A turn can emit several calls. When a cancellation or the
+            // wall-clock deadline stops the run mid-turn, every call that did
+            // not run still needs a result entry: the assistant text names
+            // them, and without a record the transcript showed calls that
+            // simply vanished.
+            func recordAbandoned(
+                _ calls: ArraySlice<AgentToolCall>,
+                reason: String,
+                recordStatus: ToolExecutionStatus = .withheld
+            ) {
+                for call in calls {
+                    let message = "Not completed: \(reason)"
+                    let record = ToolCallRecord(
+                        name: call.name,
+                        arguments: call.arguments.mapValues { String(describing: $0) },
+                        rawArguments: call.rawArguments,
+                        status: recordStatus,
+                        output: AgentHarness.renderToolResultForModel(
+                            AgentHarness.toolErrorJSON(tool: call.name, error: message)
+                        ),
+                        error: message
+                    )
+                    append(kind: .toolResult, step: step, record: record)
+                    emit(.toolFinished(record))
+                }
+            }
+            for (offset, call) in turn.calls.enumerated() {
                 if Task.isCancelled {
                     status = .cancelled
                     failure = "The run was cancelled."
+                    recordAbandoned(turn.calls[offset...], reason: "the run was cancelled.")
                     finishedRun = true
                     break
                 }
@@ -318,6 +345,10 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                         status = .blocked
                         failure = "The run was stopped by its loop guard: \(tripped)."
                         append(kind: .status, step: step, text: failure)
+                        recordAbandoned(
+                            turn.calls[(offset + 1)...],
+                            reason: "the run's loop guard stopped it."
+                        )
                         finishedRun = true
                         break
                     }
@@ -362,6 +393,10 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                     }
                     status = .cancelled
                     failure = "The run was cancelled."
+                    recordAbandoned(
+                        turn.calls[(offset + 1)...],
+                        reason: "the run was cancelled."
+                    )
                     finishedRun = true
                     break
                 }
@@ -369,6 +404,11 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                     status = .failed
                     failure = "The run exceeded its \(input.budget.maxWallClockSeconds)-second wall-clock budget while '\(call.name)' was running."
                     append(kind: .status, step: step, text: failure)
+                    recordAbandoned(
+                        turn.calls[offset...],
+                        reason: failure ?? "the run's wall-clock budget ran out.",
+                        recordStatus: .error
+                    )
                     finishedRun = true
                     break
                 }
@@ -583,7 +623,10 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
         // Folding alone did not fit (many steps, or very large recent turns).
         // Drop whole aged blocks, oldest first, until it does. The ranges
         // collected never touch the task, a steering note, or the recent
-        // window, because the search stops at `recentWindowStart`.
+        // window: the search stops at `recentWindowStart`, and a block ENDS at
+        // the first `.user` because a steering note can arrive between two
+        // assistant turns. Ending only at the next assistant dropped that note
+        // with the block in front of it.
         var droppedRanges: [Range<Int>] = []
         var searchFrom = 0
         while total > contextCharacterBudget, searchFrom < recentWindowStart {
@@ -592,6 +635,7 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             }) else { break }
             var blockEnd = recentWindowStart
             for index in (blockStart + 1)..<recentWindowStart {
+                if case .user = folded[index] { blockEnd = index; break }
                 if case .assistant = folded[index] { blockEnd = index; break }
             }
             let removed = folded[blockStart..<blockEnd].reduce(0) { $0 + Self.contextCharacterCount(of: $1) }

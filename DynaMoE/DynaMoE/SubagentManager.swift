@@ -336,6 +336,22 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         }
     }
 
+    /// The run is parked on an approval card. `waitingForApproval` existed in
+    /// the status model and the inspector's orange rendering but nothing ever
+    /// emitted it, so every parked run read as `.running`.
+    func noteApprovalWait(toolName: String) {
+        apply(.status(
+            .waitingForApproval,
+            detail: "Waiting for approval to run \(toolName)…"
+        ))
+    }
+
+    /// The card was answered (approved, declined or timed out) and the loop
+    /// owns the run again.
+    func noteApprovalResolved() {
+        apply(.status(.running, detail: "Working on \(role)…"))
+    }
+
     /// Appends an inter-agent message from coordinator or user.
     public func addMessage(sender: String, content: String) {
         let msg = SubagentMessage(sender: sender, content: content)
@@ -419,14 +435,33 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     /// `appliedTo` is the branch the destination had CHECKED OUT: an apply
     /// lands on whatever is checked out, and the record is the only place
     /// that answers where the work went.
-    func markApplied(at date: Date, files: [String], appliedTo: String? = nil) {
+    ///
+    /// Returns false when the record could not be updated. A conversation
+    /// delete re-scopes an unapplied run to the unscoped bucket and tombstones
+    /// its old directory; writing the live snapshot to the old path was
+    /// silently refused, so the worktree was cleaned up while the surviving
+    /// record still said unapplied. `mutate` locates the record by id for
+    /// exactly that case.
+    @discardableResult
+    func markApplied(at date: Date, files: [String], appliedTo: String? = nil) -> Bool {
         appliedAt = date
         appliedToBranch = appliedTo
         if var report, !files.isEmpty {
             report.changedFiles = files
             self.report = report
         }
-        AgentRunStore.shared.saveImmediately(snapshotRecord())
+        let written = AgentRunStore.shared.mutate(runId: id, sessionId: parentSessionId) { current in
+            current.appliedAt = date
+            current.appliedToBranch = appliedTo
+            if !files.isEmpty, var report = current.report {
+                report.changedFiles = files
+                current.report = report
+            }
+        } != nil
+        // Keeps the rest of the live state fresh in the normal case. A dropped
+        // write here cannot lose `appliedAt`: the mutation above already wrote it.
+        persistRecord()
+        return written
     }
 
     /// Records that this run's worktree was kept after an apply because it
@@ -434,11 +469,16 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     /// does not read as unfinished business without a reason.
     func noteKeptIgnoredFiles(_ files: [String]) {
         guard !files.isEmpty else { return }
+        let note = "The tracked patch was applied, but the worktree was kept: it also holds files a patch cannot carry (\(files.joined(separator: ", "))). Retrieve them manually before clearing the run."
         if var current = report {
-            current.openQuestions.append(
-                "The tracked patch was applied, but the worktree was kept: it also holds files a patch cannot carry (\(files.joined(separator: ", "))). Retrieve them manually before clearing the run."
-            )
+            current.openQuestions.append(note)
             report = current
+        }
+        AgentRunStore.shared.mutate(runId: id, sessionId: parentSessionId) { current in
+            if var report = current.report {
+                report.openQuestions.append(note)
+                current.report = report
+            }
         }
         persistRecord()
     }
@@ -519,6 +559,16 @@ public final class SubagentInstance: Identifiable, ObservableObject {
 
     // MARK: - Execution Lifecycle
 
+    /// `isFinished` read without touching the lock from an async context.
+    /// A Stop can latch it while this run is suspended in the scheduler's
+    /// grant, and a later `status = .running` would overwrite a cancelled
+    /// record the store (and the drawer) already treats as terminal.
+    private func hasFinished() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return isFinished
+    }
+
     public func startExecution() {
         guard status == .pending else { return }
 
@@ -542,9 +592,13 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         let startTime = CFAbsoluteTimeGetCurrent()
 
         await MainActor.run {
+            guard !self.hasFinished() else { return }
             self.status = .running
             self.liveStatusText = "Analyzing task requirements..."
         }
+        // A Stop in the hop above owns the record; the pipeline must not run
+        // tools for a run that is already terminal.
+        guard !hasFinished() else { return }
 
         var accumulatedSummary = ""
 
@@ -622,6 +676,11 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             }
         }
 
+        // A Stop can land between the scheduler's last cancellation read and
+        // this MainActor continuation. The `defer` above still releases the
+        // ticket, but publishing `.running` here would overwrite the cancelled
+        // record and leave `clearCompleted` counting it as active forever.
+        guard !hasFinished(), !Task.isCancelled else { return }
         status = .running
         liveStatusText = "Working on \(plan.role)…"
 
@@ -1924,6 +1983,16 @@ public final class SubagentManager: ObservableObject {
         lock.lock()
         defer { lock.unlock() }
         return subagentsById[id] ?? subagents.first(where: { $0.id == id })
+    }
+
+    /// The approval center's own hooks. Resolved through the live instance so
+    /// a restored record (which has no loop to park) is left alone.
+    func noteApprovalWait(for request: AgentApprovalRequest) {
+        getSubagent(byId: request.runId)?.noteApprovalWait(toolName: request.toolName)
+    }
+
+    func noteApprovalResolved(runId: UUID) {
+        getSubagent(byId: runId)?.noteApprovalResolved()
     }
 
     public func cancel(byId id: UUID) {

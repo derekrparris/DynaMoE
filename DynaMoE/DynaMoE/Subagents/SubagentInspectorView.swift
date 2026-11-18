@@ -52,6 +52,9 @@ struct SubagentInspectorView: View {
 
     @State private var selectedRunId: UUID?
     @State private var stored: [AgentRunRecord] = []
+    /// Guards the async reload: a slow read for the previous conversation must
+    /// not overwrite the new one's rows when it lands later.
+    @State private var reloadGeneration: UInt64 = 0
 
     init(sessionId: UUID?, onClose: @escaping () -> Void) {
         self.sessionId = sessionId
@@ -95,6 +98,15 @@ struct SubagentInspectorView: View {
         }
         .onChange(of: manager.subagents.count) { _, _ in reloadStored() }
         .onChange(of: manager.activeSubagentsCount) { _, _ in reloadStored() }
+        // The pane is not keyed by conversation, so switching chats left the
+        // previous conversation's rows (and any detail selection) on screen.
+        // Clear both before loading the new session's records.
+        .onChange(of: sessionId) { _, _ in
+            selectedRunId = nil
+            stored = []
+            reloadStored()
+            consumeManagerSelection()
+        }
         // A notification click sets the manager's selection; the pane keeps its
         // own selection state, so it has to take the value and clear it.
         .onChange(of: manager.selectedSubagentId) { _, _ in consumeManagerSelection() }
@@ -182,11 +194,17 @@ struct SubagentInspectorView: View {
                 usageStat(compactTokens(totals.tokens), "tokens")
                     .help("Context this conversation's runs are carrying: each run's last request size plus the tokens it generated, summed over runs. Every backend counts the full prompt a request carried, so this is not a running total of what each step billed; spend prices those.")
             }
-            if totals.cost > 0 {
+            if totals.unpriced {
+                // A total printed beside unpriced runs reads as the whole
+                // conversation's spend, which it is not. The plus makes it a
+                // floor, and the help names which runs are missing.
+                usageStat(
+                    totals.cost > 0 ? String(format: "$%.4f+", totals.cost) : "unpriced",
+                    "spend"
+                )
+                .help("One or more runs billed tokens for a model with no recorded price, so their spend is unknown rather than zero. A figure shown with '+' is a floor: it excludes those runs. Record input and output prices under Cloud Providers to see them priced.")
+            } else if totals.cost > 0 {
                 usageStat(String(format: "$%.4f", totals.cost), "spend")
-            } else if totals.unpriced {
-                usageStat("unpriced", "spend")
-                    .help("One or more runs billed tokens for a model with no recorded price, so their spend is unknown rather than zero. Record input and output prices under Cloud Providers to see it.")
             }
             if totals.seconds > 0 {
                 usageStat(compactDuration(totals.seconds), "time")
@@ -371,6 +389,8 @@ struct SubagentInspectorView: View {
     }
 
     private func reloadStored() {
+        reloadGeneration &+= 1
+        let generation = reloadGeneration
         let sessionId = sessionId
         Task {
             let records = await Task.detached(priority: .utility) {
@@ -380,6 +400,7 @@ struct SubagentInspectorView: View {
                 }
                 return records
             }.value
+            guard generation == self.reloadGeneration else { return }
             self.stored = records
         }
     }
