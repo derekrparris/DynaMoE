@@ -657,6 +657,81 @@ final class AgentSpawnPolicyTests: XCTestCase {
         )
     }
 
+    /// The operator's standing cap BOUNDS a budget the spawn names, because
+    /// that number comes from the model. A prompt-injected
+    /// `{"max_cost_usd": 500}` used to replace a $5 cap outright, and a
+    /// read-only cloud spawn raises no card to show it.
+    func testAModelSuppliedCeilingAboveTheOperatorsCapIsRefused() {
+        let suiteName = "AgentSpawnPolicyTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        SubagentBackendSettings.setCloudCostCeiling(5, defaults: defaults)
+
+        let descriptor = AgentBackendDescriptor(
+            kind: .cloud,
+            providerId: "synthetic",
+            modelId: "syn:large:text",
+            displayName: "Syn Large"
+        )
+        var greedy = AgentBudget.standard
+        greedy.maxCostUSD = 500
+        XCTAssertThrowsError(
+            try AgentSpawnResolver.applyOperatorCeiling(
+                budget: greedy,
+                descriptor: descriptor,
+                defaults: defaults
+            )
+        ) { error in
+            guard let spawnError = error as? AgentSpawnError,
+                  case .budgetAboveOperatorCeiling(let requested, let ceiling) = spawnError else {
+                return XCTFail("expected budgetAboveOperatorCeiling, got \(error)")
+            }
+            XCTAssertEqual(requested, 500)
+            XCTAssertEqual(ceiling, 5)
+            let message = spawnError.errorDescription ?? ""
+            XCTAssertTrue(message.contains("500.00"), message)
+            XCTAssertTrue(message.contains("5.00"), message)
+            XCTAssertTrue(message.contains("not started"), message)
+        }
+
+        // At or under the cap is the caller's own number, untouched.
+        var modest = AgentBudget.standard
+        modest.maxCostUSD = 5
+        let atCap = try? AgentSpawnResolver.applyOperatorCeiling(
+            budget: modest,
+            descriptor: descriptor,
+            defaults: defaults
+        )
+        XCTAssertEqual(atCap?.budget.maxCostUSD, 5)
+        XCTAssertEqual(atCap?.usesOperatorCeiling, false)
+
+        // Naming nothing gets the operator's cap, marked as theirs so the
+        // unpriced-model refusal blames the right field.
+        let inherited = try? AgentSpawnResolver.applyOperatorCeiling(
+            budget: .standard,
+            descriptor: descriptor,
+            defaults: defaults
+        )
+        XCTAssertEqual(inherited?.budget.maxCostUSD, 5)
+        XCTAssertEqual(inherited?.usesOperatorCeiling, true)
+
+        // A local run bills no dollars, so the cap never applies to it.
+        var localBudget = AgentBudget.standard
+        localBudget.maxCostUSD = 500
+        let local = try? AgentSpawnResolver.applyOperatorCeiling(
+            budget: localBudget,
+            descriptor: AgentBackendDescriptor(
+                kind: .local,
+                providerId: nil,
+                modelId: nil,
+                displayName: "Local checkpoint"
+            ),
+            defaults: defaults
+        )
+        XCTAssertEqual(local?.budget.maxCostUSD, 500, "a cloud cap does not bound a local run's dollars")
+        XCTAssertEqual(local?.usesOperatorCeiling, false)
+    }
+
     /// The operator's standing cap is what bounds a cloud spawn that names no
     /// budget of its own: presets carry none, and a read-only cloud spawn
     /// raises no card. It is read from the same defaults domain Settings

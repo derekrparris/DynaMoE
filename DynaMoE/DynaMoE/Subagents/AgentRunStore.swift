@@ -443,12 +443,18 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     /// A failure a test can inject into the durable write, so the recovery
     /// paths (a prior record surviving, a retry succeeding, the digest cache
     /// refusing to skip) can be exercised without a full disk.
+    ///
+    /// Only the SEAM below is DEBUG-only: a shipped build has no caller for it,
+    /// and a mutable process-global that can make durable writes fail is not
+    /// something to carry into Release. The type stays in both so the write
+    /// helper's signature does not have to be conditional.
     nonisolated enum StoreWriteFault: Sendable, Equatable {
         case write
         case fsync
         case rename
     }
 
+#if DEBUG
     private let faultLock = NSLock()
     nonisolated(unsafe) private var injectedWriteFault: (@Sendable () -> StoreWriteFault?)?
 
@@ -464,6 +470,11 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         defer { faultLock.unlock() }
         return injectedWriteFault?()
     }
+#else
+    /// No injection point exists in a shipped build, so the durable write is
+    /// never asked to fail on purpose.
+    private func currentWriteFault() -> StoreWriteFault? { nil }
+#endif
 
     /// Callers run on the IO queue, so the post hops to the main queue where
     /// the observers (the inspector, the inline run card) live.
@@ -926,18 +937,39 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         // the record was already gone, and a save captured before this delete
         // is queued behind it. Skipping the tombstone here let that save
         // recreate a run the operator had deleted.
+        //
+        // EVERY copy is attempted. Returning on the first failure left the
+        // copies after it on disk with no tombstone and no `postRecordsDidChange`,
+        // so the row the operator had just deleted stayed invisible to the UI
+        // and immortal in the store.
+        var removed: [URL] = []
+        var removalFailed = false
         for url in urls {
             var isDirectory: ObjCBool = false
             guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) else { continue }
-            guard (try? fileManager.removeItem(at: url)) != nil else { return }
+            if (try? fileManager.removeItem(at: url)) != nil {
+                removed.append(url)
+            } else {
+                removalFailed = true
+            }
         }
-        noteDeletedRun(runId)
         signatureLock.lock()
-        for url in urls {
+        for url in removed {
             writtenSignatures[url.path] = nil
         }
-        removeRelayEverywhereLocked(runId: runId)
+        // A survivor means the id is NOT dead: a tombstone would make every
+        // later write refuse to touch it, hiding a record that is still there.
+        // The copies that DID go stop being served from the signature cache,
+        // and the UI hears about the change so the row reflects the truth.
+        if !removalFailed {
+            removeRelayEverywhereLocked(runId: runId)
+        }
         signatureLock.unlock()
+        guard !removalFailed else {
+            postRecordsDidChange()
+            return
+        }
+        noteDeletedRun(runId)
         SubagentNotifier.withdraw(runId: runId)
         postRecordsDidChange()
     }
@@ -1096,8 +1128,12 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
             signatureLock.unlock()
             // A delivered banner for a run whose conversation is gone is a tap
             // that lands on nothing (the inspector cannot show the run and the
-            // selection pins an id with no row).
-            for record in decoded {
+            // selection pins an id with no row) — EXCEPT for the runs rescued
+            // above. Those still hold worktree work and now live in the
+            // unscoped bucket, so their banner is the one notice that a tree is
+            // waiting for a keep-or-clear decision; withdrawing it was the only
+            // signal that decision lost.
+            for record in decoded where !record.holdsWorktreeWork {
                 SubagentNotifier.withdraw(runId: record.id)
             }
             postRecordsDidChange()
@@ -1190,6 +1226,10 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
                 signatureLock.unlock()
                 SubagentNotifier.withdraw(runId: record.id)
             }
+            // Retention is a store mutation like any other: without this the
+            // inspector kept drawing rows whose files (and banners) were gone
+            // until something unrelated published.
+            if !removed.isEmpty { postRecordsDidChange() }
             return removed
         }
     }

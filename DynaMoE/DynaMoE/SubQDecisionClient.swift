@@ -1339,6 +1339,22 @@ public final class SubQDecideTool: AgentTool {
         return String(safe.prefix(maximumLabelCharacters)) + "…"
     }
 
+    /// Whether the WIRE arguments carry at least one image.
+    ///
+    /// `approvalDetail` reads the raw JSON for the same reason the approval
+    /// decision has to: the card and the Turbo verdict are also built from a
+    /// `[String: String]` display copy, where `arguments["images"]` is a
+    /// described array rather than an array. Keying the upload card on the
+    /// decoded dictionary alone made that card dead in exactly the hop it
+    /// matters in.
+    public static func uploadsImages(rawArguments: String?) -> Bool {
+        guard let rawArguments, rawArguments.contains("\"images\""),
+              let data = rawArguments.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let images = object["images"] as? [Any] else { return false }
+        return !images.isEmpty
+    }
+
     /// What the approval card must show: the ORIGIN the state (and any image
     /// bytes) go to, plus the files themselves. `endpointString` is the
     /// destination the turn loop pinned beside the record, which is what the

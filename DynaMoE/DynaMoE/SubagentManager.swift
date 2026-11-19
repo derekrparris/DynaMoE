@@ -771,10 +771,11 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             )
         } catch {
             await scheduler.finish(runId: id)
-            await Self.discardWorktree(plan: plan)
-            // The tree is gone; the record must not keep claiming it as
-            // unapplied work nothing may clear.
-            forgetDiscardedWorktree()
+            // Only a PROVEN removal lets the record stop claiming the tree:
+            // one that survived is the only copy of the run's work.
+            if await Self.discardWorktree(plan: plan) {
+                forgetDiscardedWorktree()
+            }
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             let cancelled = (error as? AgentSchedulerError) == .cancelled || Task.isCancelled
             finishRun(
@@ -799,8 +800,9 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         // Clean up the unused worktree too so the cancelled record does not
         // strand it or stay retention-exempt.
         guard !hasFinished(), !Task.isCancelled else {
-            await Self.discardWorktree(plan: plan)
-            forgetDiscardedWorktree()
+            if await Self.discardWorktree(plan: plan) {
+                forgetDiscardedWorktree()
+            }
             if !hasFinished() {
                 finishRun(
                     summary: "The run was cancelled.",
@@ -844,8 +846,9 @@ public final class SubagentInstance: Identifiable, ObservableObject {
                 }
             )
         } catch {
-            await Self.discardWorktree(plan: plan)
-            forgetDiscardedWorktree()
+            if await Self.discardWorktree(plan: plan) {
+                forgetDiscardedWorktree()
+            }
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             finishRun(
                 summary: message,
@@ -1077,16 +1080,27 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     /// Static because the spawn path calls it too: a resolve that returned
     /// after its turn was Stopped created the worktree for a run that will now
     /// never start.
-    static func discardWorktree(plan: AgentSpawnPlan) async {
-        await Task.detached(priority: .utility) {
-            guard case .worktree(let path, let branch) = plan.isolation,
-                  let worktree = try? await WorkspaceIsolation.open(
-                      path: path,
-                      branch: branch,
-                      repositoryRoot: plan.repositoryRoot,
-                      baseCommit: plan.baseCommit
-                  ) else { return }
-            await WorkspaceIsolation.cleanup(worktree)
+    ///
+    /// Returns whether the run has NO worktree left. `cleanup`'s answer used to
+    /// be dropped here, so a tree that survived removal (an immutable file, a
+    /// corrupt admin entry) was followed by `forgetDiscardedWorktree()`: the
+    /// record started claiming `isolation: none`, the launch sweep stopped
+    /// protecting the tree, and the branch it still needs became an orphan with
+    /// no Discard path left in the UI. A `false` keeps the record naming the
+    /// tree so the inspector can still offer that decision.
+    static func discardWorktree(plan: AgentSpawnPlan) async -> Bool {
+        await Task.detached(priority: .utility) { () -> Bool in
+            guard case .worktree(let path, let branch) = plan.isolation else { return true }
+            if !FileManager.default.fileExists(atPath: path) { return true }
+            // No `.git` pointer to open means no proof this is our tree, so
+            // nothing is deleted and the record must keep naming it.
+            guard let worktree = try? await WorkspaceIsolation.open(
+                path: path,
+                branch: branch,
+                repositoryRoot: plan.repositoryRoot,
+                baseCommit: plan.baseCommit
+            ) else { return false }
+            return await WorkspaceIsolation.cleanup(worktree)
         }.value
     }
 
@@ -1844,7 +1858,12 @@ final class SubagentToolExecutor {
             mode: parentMode,
             turnId: owner.parentTurnId,
             sessionId: owner.parentSessionId,
-            approvedSubQEndpoint: subQEndpoint
+            approvedSubQEndpoint: subQEndpoint,
+            // This path runs on the SHARED harness rather than a run-scoped
+            // one, and no card is raised for anything but `subq_decide`: the
+            // run chose the command and nobody reviewed it, so its children get
+            // the allowlist instead of the operator's environment.
+            unreviewed: true
         )
 
         let readable = exec.record.output ?? exec.record.error ?? exec.resultJSON
@@ -2409,9 +2428,7 @@ public final class SubagentManager: ObservableObject {
     /// destructive, and its card says so.
     @discardableResult
     public func discard(runId: UUID, sessionId: UUID? = nil) async -> Bool {
-        lock.lock()
-        let instance = subagentsById[runId]
-        lock.unlock()
+        let instance = instanceSnapshot(runId)
         // A live run is stopped, not discarded: deleting its record underneath
         // it would drop its terminal write and leave an unstoppable worker.
         // Also wait until execution has unwound (the same gate Apply uses) so
@@ -2430,6 +2447,15 @@ public final class SubagentManager: ObservableObject {
         // `repositoryRoot` can be stale, which is exactly when a narrower check
         // would miss the claim it was meant to find.
         guard !SubagentApplyService.hasAnyRepositoryInFlight else { return false }
+        // …and the checks above only cover the moment they run. Removing the
+        // tree below is an `await`, so an Apply click landing inside it applied
+        // a patch into a directory being deleted and then stamped `appliedAt`
+        // on a record this method tombstones. Claiming the run for the whole
+        // discard closes that window at its source: `apply` consults the same
+        // claim, and both sides take it in one MainActor turn with no
+        // suspension in between, so neither can start inside the other.
+        guard SubagentApplyService.beginDiscard(runId) else { return false }
+        defer { SubagentApplyService.endDiscard(runId) }
 
         // The worktree belongs to this run alone, and it is the only copy of
         // work a patch cannot carry. Remove it BEFORE the record: if removal
@@ -2473,11 +2499,7 @@ public final class SubagentManager: ObservableObject {
             }
         }
 
-        lock.lock()
-        subagentsById.removeValue(forKey: runId)
-        instanceObservers.removeValue(forKey: runId)?.cancel()
-        subagentsOrder.removeAll { $0.id == runId }
-        lock.unlock()
+        forgetInstance(runId)
         subagents.removeAll { $0.id == runId }
         if selectedSubagentId == runId {
             selectedSubagentId = subagents.first?.id
@@ -2485,6 +2507,26 @@ public final class SubagentManager: ObservableObject {
 
         AgentRunStore.shared.deleteImmediately(runId: runId, sessionId: record.parentSessionId)
         return true
+    }
+
+    /// Reads one instance under the lock, synchronously.
+    ///
+    /// `NSLock.lock()` is `noasync`, so an `async` method may not take it
+    /// directly (a warning today, a hard error in Swift 6 mode). Confining the
+    /// lock to a synchronous helper is the same shape `MCPClient` uses.
+    private func instanceSnapshot(_ runId: UUID) -> SubagentInstance? {
+        lock.lock()
+        defer { lock.unlock() }
+        return subagentsById[runId]
+    }
+
+    /// Drops every in-memory registry entry for one run, in one lock hold.
+    private func forgetInstance(_ runId: UUID) {
+        lock.lock()
+        subagentsById.removeValue(forKey: runId)
+        instanceObservers.removeValue(forKey: runId)?.cancel()
+        subagentsOrder.removeAll { $0.id == runId }
+        lock.unlock()
     }
 
     public func sendMessage(toSubagentId id: UUID, sender: String = "user", content: String) {

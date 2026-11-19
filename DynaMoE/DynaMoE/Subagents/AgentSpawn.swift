@@ -24,6 +24,7 @@ nonisolated enum AgentSpawnError: LocalizedError, Equatable {
     case costCeilingWithoutPricing(String)
     case costCeilingOnUnpricedBackend(String)
     case operatorCostCeilingNeedsPricing(model: String, ceiling: Double)
+    case budgetAboveOperatorCeiling(requested: Double, ceiling: Double)
     case invalidBudgetOverride(String)
 
     var errorDescription: String? {
@@ -49,6 +50,12 @@ nonisolated enum AgentSpawnError: LocalizedError, Equatable {
                 format: "The operator's default cloud spend cap is $%.2f per run, but no price is recorded for '%@', so the cap could not be enforced. Record the model's input and output prices in Settings under Cloud Providers, or clear the cap under Agent & Tools.",
                 ceiling,
                 model
+            )
+        case .budgetAboveOperatorCeiling(let requested, let ceiling):
+            return String(
+                format: "This spawn asks for a $%.2f ceiling, above the operator's standing cloud spend cap of $%.2f per run. The run was not started. Ask for no more than the cap, or raise it under Agent & Tools.",
+                requested,
+                ceiling
             )
         case .invalidBudgetOverride(let detail):
             return "The spawn's budget was refused: \(detail) The run was not started."
@@ -154,6 +161,13 @@ nonisolated struct AgentSpawnPlan: @unchecked Sendable {
     /// rebase on the main branch below the fork point moves that merge base, so
     /// a run's apparent change would grow or shrink without its work changing.
     var baseCommit: String? = nil
+
+    /// The worktree this plan created, when it created one. Used by the
+    /// stop-before-start paths to name a tree they could not remove.
+    var worktreePath: String? {
+        if case .worktree(let path, _) = isolation { return path }
+        return nil
+    }
 }
 
 /// Turns a request into a plan, or refuses by name.
@@ -228,17 +242,21 @@ enum AgentSpawnResolver {
         // The operator's standing ceiling is applied HERE, after the backend is
         // known and before that check: presets carry none, and a read-only
         // cloud spawn raises no card, so without this a spawn that never named
-        // a budget had no operator-visible bound on what it could spend. It
-        // applies only where nothing was asked for — an explicit
-        // `max_cost_usd` is the caller's number, and a local run bills no
-        // dollars, so neither is replaced.
-        var usesOperatorCeiling = false
-        if descriptor.kind == .cloud,
-           budget.maxCostUSD == nil,
-           let operatorCeiling = SubagentBackendSettings.cloudCostCeiling(defaults: defaults) {
-            budget.maxCostUSD = operatorCeiling
-            usesOperatorCeiling = true
-        }
+        // a budget had no operator-visible bound on what it could spend.
+        //
+        // It BOUNDS a budget the spawn did name, too. `budget` arrives from the
+        // model (`spawn_subagent`'s `budget` argument), so a prompt-injected
+        // `{"max_cost_usd": 500}` used to replace the operator's $5 cap with
+        // one the model wrote, and a read-only cloud spawn raises no card to
+        // show it. Clamping instead would run a number nobody asked for, so the
+        // spawn is refused by name and the message carries both figures.
+        let ceilingDecision = try Self.applyOperatorCeiling(
+            budget: budget,
+            descriptor: descriptor,
+            defaults: defaults
+        )
+        budget = ceilingDecision.budget
+        let usesOperatorCeiling = ceilingDecision.usesOperatorCeiling
         if let problem = Self.costCeilingProblem(
             budget: budget,
             descriptor: descriptor,
@@ -356,6 +374,41 @@ enum AgentSpawnResolver {
             resolved.append(name)
         }
         return resolved.sorted()
+    }
+
+    /// The budget one spawn will actually run under, after the operator's
+    /// standing cloud cap has been applied.
+    ///
+    /// Pure so a test can pin the rule without a backend. `budget` arrives from
+    /// the model (`spawn_subagent`'s `budget` argument), so a prompt-injected
+    /// `{"max_cost_usd": 500}` used to REPLACE the operator's $5 cap with one
+    /// the model wrote — and a read-only cloud spawn raises no card that would
+    /// have shown it. A spawn that names no ceiling gets the operator's; one
+    /// that names a larger one is refused by name rather than clamped, because
+    /// a silent clamp runs a number the caller never asked for.
+    ///
+    /// A local or pipeline backend bills no dollars, so neither branch applies.
+    static func applyOperatorCeiling(
+        budget: AgentBudget,
+        descriptor: AgentBackendDescriptor,
+        defaults: UserDefaults = .standard
+    ) throws -> (budget: AgentBudget, usesOperatorCeiling: Bool) {
+        guard descriptor.kind == .cloud,
+              let operatorCeiling = SubagentBackendSettings.cloudCostCeiling(defaults: defaults) else {
+            return (budget, false)
+        }
+        if let requested = budget.maxCostUSD {
+            guard requested <= operatorCeiling else {
+                throw AgentSpawnError.budgetAboveOperatorCeiling(
+                    requested: requested,
+                    ceiling: operatorCeiling
+                )
+            }
+            return (budget, false)
+        }
+        var bounded = budget
+        bounded.maxCostUSD = operatorCeiling
+        return (bounded, true)
     }
 
     /// Why this spawn's cost ceiling cannot bind, or nil when it can.

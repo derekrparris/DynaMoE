@@ -11715,6 +11715,44 @@ if layer.attnGateProjTensor != nil,
         return turnSlotLedger.cancelClaim(ifPriority: .background)
     }
 
+    /// A token naming the background turn that holds — or is about to hold —
+    /// the engine slot. Nil when the holder is interactive or there is none.
+    ///
+    /// A preempting send has to `await` between deciding to preempt (it
+    /// cancels the queued runs first) and cancelling the turn, and an
+    /// `await` is long enough for the holder to change. `cancelBackgroundTurn()`
+    /// names a PRIORITY, so it would have stopped whatever background turn
+    /// held the slot by then rather than the one the caller looked at; this
+    /// token lets `cancelBackgroundTurn(token:)` answer "not that one" instead.
+    public var activeBackgroundTurnToken: UInt64? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        if currentGenerationTask != nil {
+            return activeTurnPriority == .background ? currentGenerationId : nil
+        }
+        guard turnSlotLedger.claimedPriority == .background else { return nil }
+        return turnSlotLedger.claimedTicket
+    }
+
+    /// Cancels the background turn with this token, and nothing else.
+    ///
+    /// False means the named turn is no longer the holder, so the caller must
+    /// NOT treat the engine as draining: the honest answer is "that turn is
+    /// gone", which the send path turns into a notice rather than killing
+    /// somebody else's work.
+    @discardableResult
+    public func cancelBackgroundTurn(token: UInt64) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        if let task = currentGenerationTask {
+            guard activeTurnPriority == .background, currentGenerationId == token else { return false }
+            task.cancel()
+            activeTurnCancelled = true
+            return true
+        }
+        return turnSlotLedger.cancelClaim(ticket: token)
+    }
+
     /// Cancels one specific turn, addressed by the generation id its launch
     /// returned.
     ///

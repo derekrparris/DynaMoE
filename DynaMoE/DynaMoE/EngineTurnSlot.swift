@@ -137,6 +137,28 @@ nonisolated final class TurnSlotLedger: @unchecked Sendable {
         return true
     }
 
+    /// Ticket of the outstanding claim, or nil when the slot is unclaimed.
+    ///
+    /// A token for a caller that has to `await` between deciding to preempt and
+    /// doing it: a claim released and re-taken carries a NEW ticket, so a stale
+    /// token cannot stop the successor that took its place.
+    var claimedTicket: UInt64? {
+        lock.lock()
+        defer { lock.unlock() }
+        return outstanding == 0 ? nil : outstanding
+    }
+
+    /// Drops the outstanding claim only when it is still the one named.
+    @discardableResult
+    func cancelClaim(ticket: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard ticket != 0, outstanding == ticket else { return false }
+        outstanding = 0
+        outstandingPriority = .interactive
+        return true
+    }
+
     func holds(_ ticket: UInt64) -> Bool {
         lock.lock()
         defer { lock.unlock() }

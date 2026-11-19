@@ -63,6 +63,56 @@ final class SubagentApprovalCenterTests: XCTestCase {
         ))
     }
 
+    /// Both halves of containment are escape cards. The read that TAINTS a run
+    /// and the egress that carries the taint out were created with the default
+    /// `false`, so Turbo approved them silently — the one path a read of
+    /// `~/.ssh/id_ed25519` had out of the sandbox.
+    func testTurboNeverBypassesAnOutOfWorkspaceReadOrItsEgress() {
+        for tool in ["file_read", "lint_diagnostics", "web_fetch", "subq_decide"] {
+            XCTAssertFalse(SubagentApprovalCenter.turboBypasses(
+                request: request(tool: tool, containmentEscape: true),
+                honorsTurbo: true,
+                turboEnabled: true
+            ), "\(tool) escaped containment, so its card is not routine")
+        }
+    }
+
+    /// `subq_decide` uploads local image bytes whatever the endpoint is, and
+    /// the approval request only keeps the STRING form of the arguments — where
+    /// an `images` array is a description. The wire form is what keeps that
+    /// card alive under Turbo.
+    func testTurboNeverBypassesTheSubQImageUploadCard() {
+        let wire = #"{"state":"is this red?","questions":{},"images":[{"path":"shot.png"}]}"#
+        let displayOnly = AgentApprovalRequest(
+            runId: UUID(),
+            toolName: "subq_decide",
+            arguments: ["state": "is this red?", "images": "[(path: shot.png)]"],
+            workingDirectory: nil,
+            reason: "test",
+            rawArguments: wire
+        )
+        XCTAssertFalse(SubagentApprovalCenter.turboBypasses(
+            request: displayOnly,
+            honorsTurbo: true,
+            turboEnabled: true
+        ), "an image upload is not a routine write")
+
+        // The decoded form answers the same question on the turn path.
+        XCTAssertFalse(AgentHarness.turboModeMayBypassApproval(
+            toolName: "subq_decide",
+            arguments: ["state": "x", "images": [["path": "shot.png"]]],
+            mode: .code,
+            subQEndpoint: URL(string: "https://api.subq.ai/v1/systemone")
+        ))
+        // A text-only call against SubQ's own origin stays bypassable.
+        XCTAssertTrue(AgentHarness.turboModeMayBypassApproval(
+            toolName: "subq_decide",
+            arguments: ["state": "x"],
+            mode: .code,
+            subQEndpoint: URL(string: "https://api.subq.ai/v1/systemone")
+        ))
+    }
+
     func testTurboNeverBypassesAnAppPreferenceWrite() {
         XCTAssertFalse(SubagentApprovalCenter.turboBypasses(
             request: request(

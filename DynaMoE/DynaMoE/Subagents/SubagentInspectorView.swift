@@ -119,6 +119,23 @@ struct SubagentInspectorView: View {
                 // applied run left Apply hidden on the next selection.
                 .id(detail.record.id)
                 .transition(.opacity)
+                // The second alert lives HERE, not beside "Clear finished
+                // runs?" on the container: SwiftUI keeps one presentation
+                // modifier per view, so chaining two `.alert`s left the one
+                // that lost silently dead — and the loser was the only feedback
+                // a failed Discard had. It also only applies to the detail pane,
+                // which is the only place a discard can be started.
+                .alert(
+                    "Discard failed",
+                    isPresented: Binding(
+                        get: { discardFailure != nil },
+                        set: { if !$0 { discardFailure = nil } }
+                    )
+                ) {
+                    Button("OK", role: .cancel) { discardFailure = nil }
+                } message: {
+                    Text(discardFailure ?? "")
+                }
             } else {
                 runList
             }
@@ -163,17 +180,6 @@ struct SubagentInspectorView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(clearFinishedMessage)
-        }
-        .alert(
-            "Discard failed",
-            isPresented: Binding(
-                get: { discardFailure != nil },
-                set: { if !$0 { discardFailure = nil } }
-            )
-        ) {
-            Button("OK", role: .cancel) { discardFailure = nil }
-        } message: {
-            Text(discardFailure ?? "")
         }
     }
 
@@ -465,12 +471,28 @@ struct SubagentInspectorView: View {
         allRecords.filter(\.status.isTerminal)
     }
 
+    /// The rows "Clear Finished" will actually delete.
+    ///
+    /// `allRecords` is what the LIST shows, which with `showsAllSessions` on
+    /// includes other conversations' runs. `clearCompleted(sessionId:)` only
+    /// removes this conversation's rows plus the UNSCOPED ones (a run started
+    /// by an API turn belongs to no chat and rides every inspector), so the
+    /// confirmation used to promise to delete rows the button leaves alone.
+    private var clearableRuns: [AgentRunRecord] {
+        terminalRuns.filter { record in
+            let ownedByThisConversation = sessionId == nil
+                || record.parentSessionId == sessionId
+                || record.parentSessionId == nil
+            return ownedByThisConversation && !record.holdsWorktreeWork
+        }
+    }
+
     /// Finished runs whose report the coordinator has never been shown. The
     /// bulk clear still removes them (the operator asked), but it says how
     /// many unread reports go with it first.
     private var unreadTerminalCount: Int {
-        allRecords.filter { record in
-            guard record.status.isTerminal, !record.summaryRelayed else { return false }
+        clearableRuns.filter { record in
+            guard !record.summaryRelayed else { return false }
             // The relay's own fallback: a run with no report can still carry
             // the failure text the coordinator has never been shown.
             let summary = record.report?.summary ?? record.error ?? ""
@@ -489,8 +511,12 @@ struct SubagentInspectorView: View {
     /// coordinator. `Clear Finished` no longer runs unconfirmed: a terminal
     /// record and its report are durable data, not a view filter.
     private var clearFinishedMessage: String {
-        let count = terminalRuns.count
+        let count = clearableRuns.count
         var text = "This deletes \(count) finished run\(count == 1 ? "" : "s") and their reports from this conversation. It cannot be undone."
+        let keptForWorktree = terminalRuns.count - count
+        if keptForWorktree > 0 {
+            text += " \(keptForWorktree) more hold an unapplied worktree and stay until you keep or clear each one."
+        }
         if unreadTerminalCount > 0 {
             text = "\(unreadTerminalCount) of them still \(unreadTerminalCount == 1 ? "has" : "have") a report the coordinator has not seen. " + text
         }
@@ -729,7 +755,11 @@ private struct SubagentRunDetailView: View {
     private var canApplyChanges: Bool {
         appliedHereAt == nil && SubagentApplyControl.canApply(
             record,
-            executionStillUnwinding: !(SubagentManager.shared.getSubagent(byId: record.id)?.isExecutionUnwound ?? true)
+            executionStillUnwinding: !(SubagentManager.shared.getSubagent(byId: record.id)?.isExecutionUnwound ?? true),
+            // `apply` refuses while any checkout is mid-apply, so the button
+            // has to read the same rule instead of answering with a refusal.
+            otherApplyInFlight: SubagentApplyService.hasAnyRepositoryInFlight
+                || SubagentApplyService.isRunInFlight(record.id)
         )
     }
 
@@ -1418,6 +1448,7 @@ struct SubagentInlineRunCard: View {
     /// never re-fired: an applied or deleted record kept whatever the first
     /// read returned (a stale summary, or a row the operator had deleted).
     @State private var storeRevision = 0
+    @State private var storeReload: Task<Void, Never>?
 
     var body: some View {
         // The task is attached HERE, not to the card: when neither a live
@@ -1444,6 +1475,22 @@ struct SubagentInlineRunCard: View {
             storedRecord = record
         }
         .onReceive(NotificationCenter.default.publisher(for: AgentRunStore.recordsDidChangeNotification)) { _ in
+            scheduleStoreReload()
+        }
+    }
+
+    /// Coalesces store notifications.
+    ///
+    /// A single apply, a conversation delete or a bulk clear lands several
+    /// writes, and bumping the revision on each one started a detached
+    /// `loadAny` per write — the card is in the transcript, so its cost is paid
+    /// for every visible spawn row. The inspector's pane debounces the same
+    /// notifications the same way.
+    private func scheduleStoreReload() {
+        storeReload?.cancel()
+        storeReload = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard !Task.isCancelled else { return }
             storeRevision &+= 1
         }
     }

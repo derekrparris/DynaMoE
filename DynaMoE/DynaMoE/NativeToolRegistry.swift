@@ -164,8 +164,27 @@ public final class ControlledProcessRunner {
     /// identity, a temp directory and a locale. Making that allowlist the
     /// default broke ordinary `shell_run` for anyone with an SSH-agent or a
     /// proxy.
+    ///
+    /// `unreviewed` is the OTHER half of the same trade and the reason the
+    /// interactive branch is not simply "the operator's environment". A child
+    /// whose call raised no card — Turbo Mode bypassed the approval, or the
+    /// run's policy auto-approved it — is choosing its own command with nobody
+    /// looking, exactly like a subagent child, so it gets the allowlist too.
+    /// That matters because `shell_run` is `state-changing` and Turbo is its
+    /// only bypass: before this, a prompt-injected command under Turbo read
+    /// `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN` and `SSH_AUTH_SOCK` with no card.
+    ///
+    /// A REVIEWED interactive child still never receives a credential-shaped
+    /// variable. The card shows the command, not what the command will do with
+    /// the operator's cloud credentials, and `npm test` in a repository the
+    /// model just read is the ordinary shape of that leak. Names are matched,
+    /// not values, because a value the app cannot recognise is still a secret;
+    /// the toolchain variables a real command needs (`SSH_AUTH_SOCK`, proxies,
+    /// `SDKROOT`, `KUBECONFIG`, `VIRTUAL_ENV`) are not credential-shaped and
+    /// stay.
     nonisolated public static func toolEnvironment(
         scoped: Bool = false,
+        unreviewed: Bool = false,
         inherited: [String: String] = ProcessInfo.processInfo.environment,
         userHome: String = FileManager.default.homeDirectoryForCurrentUser.path
     ) -> [String: String] {
@@ -179,7 +198,7 @@ public final class ControlledProcessRunner {
             "\(userHome)/.local/bin"
         ]
         var env: [String: String]
-        if scoped {
+        if scoped || unreviewed {
             env = [:]
             for key in [
                 "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
@@ -192,12 +211,13 @@ public final class ControlledProcessRunner {
                 if let value = inherited[key] { env[key] = value }
             }
         } else {
-            env = inherited
             // The app's own credential is never handed to ANY child, scoped or
             // not: `subq_decide` accepts it from the app's environment, and a
             // model can ask a plain `shell_run` to print it. Everything else a
             // real command needs (SSH agent, proxies, toolchains) is the
-            // operator's own.
+            // operator's own — except credentials, which a reviewed command is
+            // still not entitled to read.
+            env = inherited.filter { !isCredentialShaped($0.key) }
             env.removeValue(forKey: SubQDecisionKeySource.environmentName)
         }
         env["PATH"] = (extraPaths + [currentPath]).joined(separator: ":")
@@ -211,6 +231,33 @@ public final class ControlledProcessRunner {
         env["NONINTERACTIVE"] = "1"
         env["DEBIAN_FRONTEND"] = "noninteractive"
         return env
+    }
+
+    /// Whether a variable NAME names a credential.
+    ///
+    /// The app cannot recognise a secret by its VALUE — a token it has never
+    /// seen is still a token — so the rule is over the name, and it is
+    /// deliberately generous: a false positive costs a command one environment
+    /// variable it can be given another way, and a false negative hands the
+    /// operator's cloud credential to a model-chosen command. `SSH_AUTH_SOCK`
+    /// is a socket path rather than a secret and is left alone, which is what
+    /// keeps `git push` working; the `GIT_AUTHOR_*` identity variables carry no
+    /// secret either.
+    nonisolated public static func isCredentialShaped(_ name: String) -> Bool {
+        let upper = name.uppercased()
+        // Substring markers cover the spellings the toolchains actually use:
+        // AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN, NPM_TOKEN, OPENAI_API_KEY,
+        // AZURE_CLIENT_SECRET, GOOGLE_APPLICATION_CREDENTIALS,
+        // DATABASE_PASSWORD, *_PRIVATE_KEY, *_SESSION_KEY.
+        let markers = [
+            "SECRET", "TOKEN", "PASSWORD", "PASSWD", "CREDENTIAL",
+            "API_KEY", "APIKEY", "ACCESS_KEY", "ACCESS_TOKEN",
+            "PRIVATE_KEY", "SESSION_KEY", "AUTH_TOKEN", "AUTH_KEY",
+            "CLIENT_KEY", "SIGNING_KEY", "ENCRYPTION_KEY"
+        ]
+        if markers.contains(where: { upper.contains($0) }) { return true }
+        // A personal access token spelled as an abbreviation.
+        return upper.hasSuffix("_PAT")
     }
 
     public func runCommand(

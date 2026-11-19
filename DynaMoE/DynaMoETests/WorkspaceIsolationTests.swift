@@ -1898,6 +1898,32 @@ final class WorkspaceIsolationTests: XCTestCase {
         }
     }
 
+    /// The mirror claim: a DISCARD owns the record and its tree for the length
+    /// of the tree's removal (an `await`), so an Apply clicking into that
+    /// window used to land a patch in a directory being deleted and then stamp
+    /// `appliedAt` on a record the discard tombstones.
+    func testAnApplyDuringADiscardIsRefused() async {
+        let runId = UUID()
+        XCTAssertTrue(SubagentApplyService.beginDiscard(runId))
+        defer { SubagentApplyService.endDiscard(runId) }
+
+        do {
+            _ = try await SubagentApplyService.apply(runId: runId)
+            XCTFail("an apply during a discard of the same run must be refused")
+        } catch let error as SubagentApplyError {
+            guard case .beingDiscarded = error else {
+                return XCTFail("expected beingDiscarded, got \(error)")
+            }
+        } catch {
+            XCTFail("unexpected error type: \(error)")
+        }
+
+        // One claim at a time: a second discard of the same run gets "not now"
+        // rather than removing the tree twice.
+        XCTAssertFalse(SubagentApplyService.beginDiscard(runId), "a second discard of one run is refused")
+        XCTAssertTrue(SubagentApplyService.isBeingDiscarded(runId))
+    }
+
     /// The repository claim serializes applies of two DIFFERENT runs of one
     /// checkout. Their `git apply --check` calls otherwise interleave with each
     /// other's writes, so one lands against a tree the other has already

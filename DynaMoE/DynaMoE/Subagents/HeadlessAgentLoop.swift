@@ -860,8 +860,21 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             case .assistant(let text, let thinking, let calls):
                 let shortText = Self.folded(text, to: hardTrimTextLimit)
                 let shortThinking = Self.folded(thinking, to: hardTrimTextLimit)
-                total -= (text.count - shortText.count) + (thinking.count - shortThinking.count)
-                trimmed.append(.assistant(text: shortText, thinking: shortThinking, calls: calls))
+                // Tool-call ARGUMENTS are counted against the budget
+                // (`contextCharacterCount` says why: a `file_write` body can be
+                // the largest thing a turn carries) but used to be passed
+                // through untouched, so a run over budget on one call's
+                // arguments came back over budget and the engine refused the
+                // turn this pass exists to fit.
+                let shortCalls = Self.folded(calls, to: hardTrimTextLimit)
+                let replacement = AgentBackendMessage.assistant(
+                    text: shortText,
+                    thinking: shortThinking,
+                    calls: shortCalls
+                )
+                total -= Self.contextCharacterCount(of: message)
+                    - Self.contextCharacterCount(of: replacement)
+                trimmed.append(replacement)
             case .toolResult(let callId, let name, let content, let isError):
                 let shortContent = Self.folded(content, to: hardTrimTextLimit)
                 total -= content.count - shortContent.count
@@ -893,6 +906,51 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
         let marker = "… [compacted: \(text.count) chars]"
         guard marker.count < limit else { return String(text.prefix(limit)) }
         return String(text.prefix(limit - marker.count)) + marker
+    }
+
+    /// Folds one assistant turn's tool-call arguments into the same ceiling.
+    ///
+    /// The paired half of `contextCharacterCount`: that function bills a turn
+    /// for its arguments (the `rawArguments` JSON when the wire carried one,
+    /// otherwise the rendered `key=value` form), so the hard trim has to be
+    /// able to shrink that same text or the budget it enforces is not one.
+    /// Folding `rawArguments` keeps the call structurally intact and leaves the
+    /// arguments dictionary alone, which is what a rebuilt history renders.
+    static func folded(_ calls: [AgentToolCall], to limit: Int) -> [AgentToolCall] {
+        calls.map { call in
+            if !call.rawArguments.isEmpty {
+                guard call.rawArguments.count > limit else { return call }
+                return AgentToolCall(
+                    id: call.id,
+                    name: call.name,
+                    arguments: call.arguments,
+                    rawArguments: folded(call.rawArguments, to: limit),
+                    rawText: call.rawText,
+                    argumentsMalformed: call.argumentsMalformed
+                )
+            }
+            // No wire JSON means the counted form is the rendered dictionary,
+            // so the STRING values are what has to shrink.
+            var shortened: [String: Any] = [:]
+            var changed = false
+            for (key, value) in call.arguments {
+                if let text = value as? String, text.count > limit {
+                    shortened[key] = folded(text, to: limit)
+                    changed = true
+                } else {
+                    shortened[key] = value
+                }
+            }
+            guard changed else { return call }
+            return AgentToolCall(
+                id: call.id,
+                name: call.name,
+                arguments: shortened,
+                rawArguments: call.rawArguments,
+                rawText: call.rawText,
+                argumentsMalformed: call.argumentsMalformed
+            )
+        }
     }
 
     /// A tool catalogue's contribution to the prompt, in characters. The

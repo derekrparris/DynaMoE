@@ -259,6 +259,40 @@ final class AgentRunStoreTests: XCTestCase {
         XCTAssertEqual(store.load(sessionId: sessionId).count, 1)
     }
 
+    /// The clamp is the only thing standing between a hand-edited defaults
+    /// value and "keep forever", which is the one direction the bound exists to
+    /// prevent. Nothing pinned it, so a change from `min(max(…))` to a plain
+    /// read would have compiled and shipped.
+    func testConfiguredRetentionClampsToItsBounds() throws {
+        let suiteName = "dynamoe-retention-\(UUID().uuidString)"
+        let suite = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { suite.removePersistentDomain(forName: suiteName) }
+
+        let standard = AgentRunStore.RetentionPolicy.standard
+        let policy = AgentRunStore.configuredPolicy(defaults: suite)
+        XCTAssertEqual(policy.keepDays, standard.keepDays)
+        XCTAssertEqual(policy.keepNewest, standard.keepNewest)
+
+        suite.set(10_000.0, forKey: "dynamoe_subagent_retention_days")
+        suite.set(1_000_000, forKey: "dynamoe_subagent_retention_runs")
+        let high = AgentRunStore.configuredPolicy(defaults: suite)
+        XCTAssertEqual(high.keepDays, 365, "a huge day window is capped instead of meaning 'forever'")
+        XCTAssertEqual(high.keepNewest, 2_000)
+
+        suite.set(0.01, forKey: "dynamoe_subagent_retention_days")
+        suite.set(1, forKey: "dynamoe_subagent_retention_runs")
+        let low = AgentRunStore.configuredPolicy(defaults: suite)
+        XCTAssertEqual(low.keepDays, 1, "a sub-day window is raised to one day")
+        XCTAssertEqual(low.keepNewest, 20, "a tiny run count is raised to the floor")
+
+        // A non-positive value is not a policy at all: it keeps the default.
+        suite.set(0.0, forKey: "dynamoe_subagent_retention_days")
+        suite.set(-5, forKey: "dynamoe_subagent_retention_runs")
+        let zero = AgentRunStore.configuredPolicy(defaults: suite)
+        XCTAssertEqual(zero.keepDays, standard.keepDays)
+        XCTAssertEqual(zero.keepNewest, standard.keepNewest)
+    }
+
     func testRetentionNeverDeletesAnUnappliedIsolatedRunsRecord() throws {
         let store = makeStore()
         let sessionId = UUID()

@@ -147,7 +147,11 @@ final class SubagentApprovalCenter: ObservableObject {
         return AgentHarness.turboModeMayBypassApproval(
             toolName: request.toolName,
             arguments: request.arguments,
-            mode: .code
+            mode: .code,
+            // `request.arguments` is the card's STRING copy, where an
+            // `images` array is a description; the wire form is what lets the
+            // upload card stay up.
+            rawArguments: request.rawArguments
         )
     }
 

@@ -2285,6 +2285,85 @@ final class SkillsProcessEnvironmentTests: XCTestCase {
         )
     }
 
+    /// A reviewed command is still not entitled to the operator's credentials.
+    /// The card shows the command, not what the command will do with an
+    /// `AWS_SECRET_ACCESS_KEY`, and `npm test` in a repository the model just
+    /// read is the ordinary shape of that leak.
+    func testAnInteractiveToolChildLosesCredentialShapedVariables() {
+        let inherited = [
+            "HOME": "/Users/operator",
+            "PATH": "/usr/bin:/bin",
+            "AWS_SECRET_ACCESS_KEY": "aws-secret",
+            "AWS_ACCESS_KEY_ID": "aws-key-id",
+            "AWS_REGION": "us-east-1",
+            "GITHUB_TOKEN": "gh-token",
+            "GH_TOKEN": "gh-token-2",
+            "OPENAI_API_KEY": "sk-openai",
+            "NPM_TOKEN": "npm-token",
+            "DATABASE_PASSWORD": "hunter2",
+            "GOOGLE_APPLICATION_CREDENTIALS": "/tmp/gcp.json",
+            "SOME_PAT": "pat-value",
+            "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock",
+            "HTTPS_PROXY": "http://proxy.local:8080",
+            "KUBECONFIG": "/Users/operator/.kube/config",
+            "LANG": "en_US.UTF-8"
+        ]
+        let environment = ControlledProcessRunner.toolEnvironment(
+            inherited: inherited,
+            userHome: "/Users/operator"
+        )
+        for name in [
+            "AWS_SECRET_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "GITHUB_TOKEN", "GH_TOKEN",
+            "OPENAI_API_KEY", "NPM_TOKEN", "DATABASE_PASSWORD",
+            "GOOGLE_APPLICATION_CREDENTIALS", "SOME_PAT"
+        ] {
+            XCTAssertNil(environment[name], "\(name) is a credential and must not reach a child")
+        }
+        // The toolchain variables a real command needs are not credentials.
+        XCTAssertEqual(environment["SSH_AUTH_SOCK"], "/tmp/ssh-agent.sock")
+        XCTAssertEqual(environment["HTTPS_PROXY"], "http://proxy.local:8080")
+        XCTAssertEqual(environment["KUBECONFIG"], "/Users/operator/.kube/config")
+        XCTAssertEqual(environment["AWS_REGION"], "us-east-1")
+        XCTAssertEqual(environment["LANG"], "en_US.UTF-8")
+    }
+
+    /// A command nobody reviewed — Turbo Mode bypassed its card — chooses its
+    /// own work with no human looking, so it gets the subagent allowlist rather
+    /// than the operator's environment.
+    func testAnUnreviewedToolChildGetsTheAllowlist() {
+        let inherited = [
+            "HOME": "/Users/operator",
+            "PATH": "/usr/bin:/bin",
+            "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock",
+            "HTTPS_PROXY": "http://proxy.local:8080",
+            "LANG": "en_US.UTF-8"
+        ]
+        let environment = ControlledProcessRunner.toolEnvironment(
+            unreviewed: true,
+            inherited: inherited,
+            userHome: "/Users/operator"
+        )
+        XCTAssertEqual(environment["HOME"], "/Users/operator")
+        XCTAssertEqual(environment["LANG"], "en_US.UTF-8")
+        XCTAssertNil(environment["SSH_AUTH_SOCK"])
+        XCTAssertNil(environment["HTTPS_PROXY"])
+    }
+
+    func testCredentialShapedNamesAreRecognised() {
+        for name in [
+            "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "db_password", "MY_API_KEY",
+            "X_API_KEY", "SOME_PAT", "AWS_ACCESS_KEY_ID", "GCP_CREDENTIALS"
+        ] {
+            XCTAssertTrue(ControlledProcessRunner.isCredentialShaped(name), name)
+        }
+        for name in [
+            "SSH_AUTH_SOCK", "HTTPS_PROXY", "KUBECONFIG", "PATH", "HOME",
+            "AWS_REGION", "GIT_AUTHOR_EMAIL", "PWD", "TERM"
+        ] {
+            XCTAssertFalse(ControlledProcessRunner.isCredentialShaped(name), name)
+        }
+    }
+
     /// A subagent chooses its own command inside a sandbox, so its children
     /// get the allowlist: no agent socket, no proxy credential, no toolchain
     /// variable that could carry a token.

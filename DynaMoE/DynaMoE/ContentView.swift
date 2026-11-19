@@ -6595,17 +6595,18 @@ struct ContentView: View {
             // guards the SubQ key: a `defaults write` earlier in the same
             // assistant message could otherwise aim `subq_decide` off-host
             // with no card shown at all.
+            let turboBypasses = isTurbo && AgentHarness.turboModeMayBypassApproval(
+                toolName: call.name,
+                arguments: parsedCall.arguments,
+                mode: mode,
+                subQEndpoint: subQEndpoint
+            )
             if AgentHarness.requiresApproval(
                 toolName: call.name,
                 arguments: parsedCall.arguments,
                 mode: mode,
                 subQEndpoint: subQEndpoint
-            ), !(isTurbo && AgentHarness.turboModeMayBypassApproval(
-                toolName: call.name,
-                arguments: parsedCall.arguments,
-                mode: mode,
-                subQEndpoint: subQEndpoint
-            )) {
+            ), !turboBypasses {
                 updateRecord(record.id) { rec in
                     rec.status = .awaitingApproval
                     if let subQEndpoint { rec.pinnedEndpoint = subQEndpoint.absoluteString }
@@ -6649,7 +6650,10 @@ struct ContentView: View {
                 mode: mode,
                 turnId: turnId,
                 sessionId: sessionId,
-                approvedSubQEndpoint: subQEndpoint
+                approvedSubQEndpoint: subQEndpoint,
+                // A bypassed card is not a reviewed command: this call's
+                // children get the allowlist, not the operator's credentials.
+                unreviewed: turboBypasses
             )
             agent.recordToolCallOutcome(
                 toolName: call.name,
@@ -6895,12 +6899,23 @@ struct ContentView: View {
                 // the API server's turn, a model load — destroys work and
                 // still does not free the engine, so the send gives up with a
                 // message instead.
-                guard CompletionEngine.shared.hasActiveBackgroundTurn else {
+                guard let backgroundTurn = CompletionEngine.shared.activeBackgroundTurnToken else {
                     self.showStatus("⏳ The engine is still busy with a turn this send cannot stop, so it was not sent. Try again once it finishes.")
                     return
                 }
                 await AgentScheduler.shared.preemptLocalRuns()
-                CompletionEngine.shared.cancelBackgroundTurn()
+                // By TOKEN, not by priority: `preemptLocalRuns` above is an
+                // `await`, and the run it just stopped can unwind into a slot
+                // that a DIFFERENT background turn has already claimed. A
+                // priority-scoped cancel at that point would stop the
+                // successor instead of the turn this branch looked at.
+                if !CompletionEngine.shared.cancelBackgroundTurn(token: backgroundTurn),
+                   let current = CompletionEngine.shared.activeBackgroundTurnToken {
+                    // The holder changed under the await. That new holder is
+                    // still a background turn, which is the class a fresh send
+                    // may preempt, so stop exactly IT and nothing else.
+                    _ = CompletionEngine.shared.cancelBackgroundTurn(token: current)
+                }
                 // Bounded: cancellation is cooperative and a run's preparation
                 // (the DeepSeek runtime, an image span) can take seconds, but a
                 // wait that never returns leaves every composer locked behind a
@@ -7114,14 +7129,19 @@ struct ContentView: View {
                     // The predicate is re-read here for the reason the
                     // immediate branch documents: the holder can change while
                     // this task waits, and only a background turn may be
-                    // cancelled from here.
-                    guard CompletionEngine.shared.hasActiveBackgroundTurn else {
+                    // cancelled from here. The TOKEN is captured now and spent
+                    // after the await, so a successor cannot be stopped in the
+                    // place of the turn this branch looked at.
+                    guard let backgroundTurn = CompletionEngine.shared.activeBackgroundTurnToken else {
                         self.showStatus("⏳ The engine is still busy with a turn this send cannot stop, so it was not sent. Try again once it finishes.")
                         return
                     }
                     self.showStatus("⏸ Stopping a background subagent so this turn can run…")
                     await AgentScheduler.shared.preemptLocalRuns()
-                    CompletionEngine.shared.cancelBackgroundTurn()
+                    if !CompletionEngine.shared.cancelBackgroundTurn(token: backgroundTurn),
+                       let current = CompletionEngine.shared.activeBackgroundTurnToken {
+                        _ = CompletionEngine.shared.cancelBackgroundTurn(token: current)
+                    }
                     guard await CompletionEngine.shared.awaitIdle(boundedBy: 60) else {
                         self.showStatus("⏳ The engine did not come free in time, so this message was not sent. Try again once the current turn finishes.")
                         return
@@ -8008,7 +8028,9 @@ struct ContentView: View {
                             mode: turnMode,
                             turnId: agentTurnId,
                             sessionId: sessionId,
-                            approvedSubQEndpoint: subQEndpoint
+                            approvedSubQEndpoint: subQEndpoint,
+                            // See the local path: a Turbo bypass is not a review.
+                            unreviewed: turboBypasses
                         )
                         responseSlots[actionableCallIndices[idx]] = execResult.resultJSON
                         AgentHarness.shared.recordToolCallOutcome(
@@ -8570,7 +8592,24 @@ struct ContentView: View {
         }
         // The engine's compute task can outlive the consumer relay task while
         // it unwinds cooperatively at a layer boundary; loads must wait it out.
-        await CompletionEngine.shared.awaitIdle()
+        //
+        // Bounded, and with a background holder stopped rather than waited on:
+        // a subagent step is allowed 600 s, so an operator who switched models
+        // could sit behind a spinner for ten minutes with nothing to click. A
+        // load is an operator action and a background turn is the one class it
+        // may preempt, so: a short wait for a turn that will finish on its own
+        // (a chat step, a server request), then a BY-TOKEN stop of a background
+        // one, then a bounded drain. If something unpreemptable still holds the
+        // slot, `reserveTurnSlot` below answers "engine busy" and the load
+        // refuses with a message instead of hanging.
+        if !(await CompletionEngine.shared.awaitIdle(boundedBy: 10)) {
+            if let backgroundTurn = CompletionEngine.shared.activeBackgroundTurnToken {
+                metalStatus = "⏸ Stopping a background subagent so the model can load…"
+                await AgentScheduler.shared.preemptLocalRuns()
+                _ = CompletionEngine.shared.cancelBackgroundTurn(token: backgroundTurn)
+            }
+            _ = await CompletionEngine.shared.awaitIdle(boundedBy: 60)
+        }
         if let teardown = generationTeardownTask {
             await teardown.value
             // A generation may have started while we waited: stop it and wait for

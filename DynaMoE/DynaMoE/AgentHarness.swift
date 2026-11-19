@@ -658,17 +658,32 @@ public final class FindFilesTool: AgentTool {
         }
 
         let maxDepth = (arguments["max_depth"] as? Int) ?? 5
-        let escapedPattern = pattern.replacingOccurrences(of: "'", with: "\\'")
-        let cmd = "find . -maxdepth \(maxDepth) -iname '\(escapedPattern)' -not -path '*/.*' | head -n 50"
-
+        // argv, never a shell. The pattern is model text, and the old
+        // `zsh -c "find … -iname '\(pattern)'"` escaped a quote as `\'`, which
+        // does not escape inside a zsh single-quoted word: a pattern of
+        // `a' ; rm -rf ~/Documents ; #` closed the quote and ran the rest as
+        // commands, cardlessly, because find_files is a read-only tool that no
+        // policy treats as state-changing. `-maxdepth` is clamped because find
+        // treats a negative value as an error and a huge one as a walk of the
+        // whole disk.
+        let depthLimit = min(max(1, maxDepth), 64)
         let (_, stdout, _) = try await AgentHarness.runProcess(
-            executableURL: URL(fileURLWithPath: "/bin/zsh"),
-            arguments: ["-c", cmd],
+            executableURL: URL(fileURLWithPath: "/usr/bin/find"),
+            arguments: [
+                ".", "-maxdepth", "\(depthLimit)",
+                "-iname", pattern,
+                "-not", "-path", "*/.*"
+            ],
             currentDirectory: baseDir,
             timeoutSeconds: 30
         )
 
-        let matches = stdout.components(separatedBy: "\n").filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        // Truncated here rather than by `head -n 50` in a pipeline, so the
+        // child writes nothing it does not need to and no SIGPIPE is possible.
+        let matches = stdout.components(separatedBy: "\n")
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .prefix(50)
+            .map { $0 }
         let res = AgentHarness.toolSuccessJSON(tool: "find_files", data: [
             "search_path": baseDir.path,
             "pattern": pattern,
@@ -2525,8 +2540,10 @@ public final class SpawnSubagentTool: AgentTool {
                 // worktree was created for a run that will not start, so it is
                 // removed with it.
                 guard !Task.isCancelled else {
-                    await SubagentInstance.discardWorktree(plan: plan)
-                    return Self.stoppedBeforeStartResult()
+                    // A tree that survived removal has no record yet (nothing
+                    // was spawned), so nothing else will ever name it: say so.
+                    let removed = await SubagentInstance.discardWorktree(plan: plan)
+                    return Self.stoppedBeforeStartResult(keptWorktree: removed ? nil : plan.worktreePath)
                 }
                 let subagent = SubagentManager.shared.spawnModelBacked(
                     plan,
@@ -2580,8 +2597,8 @@ public final class SpawnSubagentTool: AgentTool {
                         sessionId: runId
                     )
                     guard !Task.isCancelled else {
-                        await SubagentInstance.discardWorktree(plan: plan)
-                        return Self.stoppedBeforeStartResult()
+                        let removed = await SubagentInstance.discardWorktree(plan: plan)
+                        return Self.stoppedBeforeStartResult(keptWorktree: removed ? nil : plan.worktreePath)
                     }
                     let subagent = SubagentManager.shared.spawnModelBacked(
                         plan,
@@ -2649,7 +2666,17 @@ public final class SpawnSubagentTool: AgentTool {
     }
 
     private static func stoppedBeforeStartResult() -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
-        let text = "The coordinator turn was stopped before the subagent run could start."
+        stoppedBeforeStartResult(keptWorktree: nil)
+    }
+
+    private static func stoppedBeforeStartResult(
+        keptWorktree: String?
+    ) -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        let base = "The coordinator turn was stopped before the subagent run could start."
+        guard let keptWorktree else {
+            return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: base), nil, base, false)
+        }
+        let text = base + " Its unused worktree at \(keptWorktree) could not be removed, so it is still on disk with its branch; no run exists to apply or discard it, so remove that directory (and the branch, if you want it gone) by hand."
         return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: text), nil, text, false)
     }
 
@@ -4158,7 +4185,11 @@ public final class AgentHarness {
     /// Tools that read a path the caller names. `codebase_search` is absent on
     /// purpose: it searches the workspace index and takes no path.
     static let pathReadToolNames: Set<String> = [
-        "file_read", "find_files", "grep_search", "find_symbol_definition", "find_references"
+        "file_read", "find_files", "grep_search", "find_symbol_definition", "find_references",
+        // Same `path` argument and the same `resolvePath` call as `file_read`:
+        // it opens the file it names and returns its contents in diagnostics,
+        // so leaving it out of this set was a cardless read of any path.
+        "lint_diagnostics"
     ]
     /// Tools whose purpose is to send bytes off this Mac. `subq_decide` uploads
     /// its `state` (and any image bytes) to the decisions API.
@@ -4589,7 +4620,8 @@ public final class AgentHarness {
         toolName: String,
         arguments: [String: Any],
         mode: AgentMode,
-        subQEndpoint: URL? = nil
+        subQEndpoint: URL? = nil,
+        rawArguments: String? = nil
     ) -> Bool {
         if isStateChanging(toolName: toolName) {
             return !PlanModePolicy.withholds(toolName, in: mode)
@@ -4603,7 +4635,8 @@ public final class AgentHarness {
         if toolName == "subq_decide" {
             return subqDecideRequiresApproval(
                 arguments: arguments,
-                endpoint: subQEndpoint ?? SubQDecisionSettings.endpoint()
+                endpoint: subQEndpoint ?? SubQDecisionSettings.endpoint(),
+                rawArguments: rawArguments
             )
         }
         return false
@@ -4722,13 +4755,15 @@ public final class AgentHarness {
     /// https://attacker` followed by `subq_decide` in the same assistant
     /// message sent the key off-host with no card at all, because the pin only
     /// preserved the destination the card *would* have shown. A `subq_decide`
-    /// aimed anywhere but SubQ's own origin is therefore never bypassable;
-    /// every other tool keeps the old behaviour.
+    /// aimed anywhere but SubQ's own origin is therefore never bypassable, and
+    /// neither is one that uploads image bytes — the card exists because files
+    /// leave this Mac. Every other tool keeps the old behaviour.
     public static func turboModeMayBypassApproval(
         toolName: String,
         arguments: [String: Any],
         mode: AgentMode,
         subQEndpoint: URL? = nil,
+        rawArguments: String? = nil,
         defaults: UserDefaults = .standard
     ) -> Bool {
         // Landing isolated work is the one write the contract reserves for its
@@ -4750,7 +4785,8 @@ public final class AgentHarness {
             toolName: toolName,
             arguments: arguments,
             mode: mode,
-            subQEndpoint: subQEndpoint
+            subQEndpoint: subQEndpoint,
+            rawArguments: rawArguments
         ) else { return true }
         // A call that rewrites THIS app's preferences is the one class of state
         // change Turbo must never wave through: the switch itself lives in the
@@ -4760,8 +4796,25 @@ public final class AgentHarness {
         // operator still sees the command and may say yes.
         if targetsApplicationPreferences(toolName: toolName, arguments: arguments) { return false }
         guard toolName == "subq_decide" else { return true }
+        // Uploading local image bytes is the same class as a spawn that forces
+        // work off-device: the card exists because files LEAVE this Mac, and
+        // Turbo is a switch over routine writes. It used to be bypassable
+        // whenever the endpoint was SubQ's own, which made the upload card
+        // unreachable in the configuration where it is the only disclosure.
+        if Self.subqDecideCarriesImages(arguments: arguments, rawArguments: rawArguments) { return false }
         let endpoint = subQEndpoint ?? SubQDecisionSettings.endpoint()
         return SubQDecisionSettings.origin(endpoint) == SubQDecisionSettings.officialOrigin
+    }
+
+    /// Whether this call carries at least one image, from either the decoded
+    /// arguments or the wire form (the approval center only keeps the
+    /// stringified copy, where an array is a description).
+    static func subqDecideCarriesImages(
+        arguments: [String: Any],
+        rawArguments: String? = nil
+    ) -> Bool {
+        if let images = arguments["images"] as? [Any], !images.isEmpty { return true }
+        return SubQDecideTool.uploadsImages(rawArguments: rawArguments)
     }
 
     // MARK: - App-preference protection
@@ -4835,11 +4888,19 @@ public final class AgentHarness {
 
     /// True when a `subq_decide` call sends local file bytes or would send the
     /// state to an origin other than SubQ's own.
+    ///
+    /// `rawArguments` is the WIRE form and is consulted as well as the decoded
+    /// dictionary: the approval plumbing stores a `[String: String]` display
+    /// copy, where `images` is a Swift array DESCRIPTION rather than an array,
+    /// so a Turbo decision made from that copy saw no images and waved through
+    /// the one card whose whole purpose is the upload.
     public static func subqDecideRequiresApproval(
         arguments: [String: Any],
-        endpoint: URL
+        endpoint: URL,
+        rawArguments: String? = nil
     ) -> Bool {
         if let images = arguments["images"] as? [Any], !images.isEmpty { return true }
+        if SubQDecideTool.uploadsImages(rawArguments: rawArguments) { return true }
         // Origin, not host: `https://api.subq.ai:8443` is a different service
         // and must not ride in on the official host's approval.
         return SubQDecisionSettings.origin(endpoint) != SubQDecisionSettings.officialOrigin
@@ -4889,6 +4950,17 @@ public final class AgentHarness {
     /// `AgentHarness.shared.currentTurnId` would stamp it with whichever
     /// operator turn happens to be current.
     @TaskLocal static var executingInRunScope = false
+
+    /// True while the tool being executed ran WITHOUT a human decision.
+    ///
+    /// The approval sites (the local turn, the cloud turn) know this and pass
+    /// it to `executeTool`; nothing downstream can reconstruct it, because a
+    /// bypassed card and an approved one leave the same state behind. It
+    /// selects the run-scoped ALLOWLIST for any child the call spawns
+    /// (`shell_run`, `find_files`, git), so a command that was never reviewed
+    /// cannot read the operator's `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN` or
+    /// `SSH_AUTH_SOCK` just because Turbo Mode is on.
+    @TaskLocal static var executingUnreviewedToolCall = false
 
     /// Definitions currently exposed to the model for the turn in flight.
     /// The explicit `availableToolDefinitions(mode:)` is what a caller uses
@@ -6213,7 +6285,13 @@ public final class AgentHarness {
     /// `currentSessionId` are process-global and another turn can move them
     /// while this call is still awaiting; nil keeps the historical behaviour
     /// of reading the global.
-    public func executeTool(call: ParsedToolCall, workingDirectory: URL? = nil, maxOutputLength: Int? = nil, mode: AgentMode? = nil, turnId: UUID? = nil, sessionId: UUID? = nil, approvedSubQEndpoint: URL? = nil) async -> (resultJSON: String, record: ToolCallRecord, isCompleted: Bool) {
+    ///
+    /// `unreviewed` is the APPROVAL's answer, not the tool's: the caller that
+    /// decided no card was needed (or that Turbo bypassed one) passes true, and
+    /// every child this call spawns then gets the allowlist instead of the
+    /// operator's environment. It defaults to false because a caller that does
+    /// not know is a caller that showed the card.
+    public func executeTool(call: ParsedToolCall, workingDirectory: URL? = nil, maxOutputLength: Int? = nil, mode: AgentMode? = nil, turnId: UUID? = nil, sessionId: UUID? = nil, approvedSubQEndpoint: URL? = nil, unreviewed: Bool = false) async -> (resultJSON: String, record: ToolCallRecord, isCompleted: Bool) {
         // A tool runs between steps, with the engine idle. That is the one
         // moment a registry rebuild deferred during a generation can land.
         flushDeferredGrammarSync()
@@ -6233,13 +6311,15 @@ public final class AgentHarness {
             await AgentHarness.$executingTurnId.withValue(turnId ?? AgentHarness.executingTurnId) {
                 await AgentHarness.$executingSessionId.withValue(sessionId ?? AgentHarness.executingSessionId) {
                     await AgentHarness.$executingInRunScope.withValue(isRunScoped) {
-                        await SubQDecideTool.$pinnedEndpoint.withValue(approvedSubQEndpoint) {
-                            await self.runToolInTurn(
-                                call: call,
-                                workingDirectory: workingDirectory,
-                                maxOutputLength: maxOutputLength,
-                                effectiveMode: effectiveMode
-                            )
+                        await AgentHarness.$executingUnreviewedToolCall.withValue(unreviewed) {
+                            await SubQDecideTool.$pinnedEndpoint.withValue(approvedSubQEndpoint) {
+                                await self.runToolInTurn(
+                                    call: call,
+                                    workingDirectory: workingDirectory,
+                                    maxOutputLength: maxOutputLength,
+                                    effectiveMode: effectiveMode
+                                )
+                            }
                         }
                     }
                 }
@@ -6439,7 +6519,11 @@ public final class AgentHarness {
                 arguments: strArgs,
                 workingDirectory: workingDirectory?.path,
                 reason: reason,
-                containmentEscape: containmentEscape
+                containmentEscape: containmentEscape,
+                // The display copy above loses every type, so the Turbo verdict
+                // gets the wire form too; otherwise it cannot see an `images`
+                // array and waves the upload card through.
+                rawArguments: call.rawArguments
             ))
         }
         // The READ half of containment, decided before the policy switch
@@ -6456,13 +6540,22 @@ public final class AgentHarness {
             // key is not an approved upload of it. Every later egress call in
             // this run is carded from here on.
             runReadOutsideWorkspace = true
-            return ask("it reads outside the run's work files (\(escape))")
+            // Both halves of containment are `containmentEscape`, so Turbo Mode
+            // cannot wave either through: a blank card is the same leak as no
+            // card, and the setting exists to skip ROUTINE writes.
+            return ask(
+                "it reads outside the run's work files (\(escape))",
+                containmentEscape: true
+            )
         }
         // A secret committed inside the workspace is readable cardlessly, so
         // containment alone does not stop the leak: once anything outside the
         // workspace has been read, egress is the other half and gets a card.
         if runReadOutsideWorkspace, Self.egressToolNames.contains(call.name) {
-            return ask("this run has read content from outside its workspace, and this call sends data off this Mac")
+            return ask(
+                "this run has read content from outside its workspace, and this call sends data off this Mac",
+                containmentEscape: true
+            )
         }
         switch runApprovalPolicy {
         case .deny, .auto:
@@ -7778,10 +7871,13 @@ public final class AgentHarness {
         //    injection plus non-interactive flags (see toolEnvironment()). A
         //    caller that needs a scrubbed child (git must not inherit GIT_DIR)
         //    passes its own instead. A child spawned while a SUBAGENT run is
-        //    executing gets the scoped allowlist; the operator's own turn keeps
-        //    the environment every real command needs (SSH agent, proxies).
+        //    executing — or while a call nobody reviewed is executing (Turbo
+        //    Mode bypassed its card) — gets the scoped allowlist. A reviewed
+        //    call keeps the toolchain (SSH agent, proxies) and loses only the
+        //    credential-shaped variables.
         let env = environment ?? ControlledProcessRunner.toolEnvironment(
-            scoped: AgentHarness.executingInRunScope
+            scoped: AgentHarness.executingInRunScope,
+            unreviewed: AgentHarness.executingUnreviewedToolCall
         )
 
         process.environment = env

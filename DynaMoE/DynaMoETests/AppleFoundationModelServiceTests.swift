@@ -99,6 +99,17 @@ final class AppleFoundationModelServiceTests: XCTestCase {
             AppleFoundationModelService.transcriptDeliversRelay(dropped, reports: [report]),
             "a transcript without the directive did not deliver the report"
         )
+        // The guard this pins is the CONTAINS check, not the empty-reports
+        // early exit: `reports: []` answers false whatever the transcript is,
+        // so asserting it proved nothing about delivery.
+        XCTAssertFalse(
+            AppleFoundationModelService.transcriptDeliversRelay("User: hello", reports: [report]),
+            "a transcript that does not carry the directive is not a delivery"
+        )
+        XCTAssertFalse(
+            AppleFoundationModelService.transcriptDeliversRelay("", reports: [report]),
+            "an empty transcript cannot carry the directive"
+        )
         XCTAssertFalse(AppleFoundationModelService.transcriptDeliversRelay("", reports: []))
     }
 

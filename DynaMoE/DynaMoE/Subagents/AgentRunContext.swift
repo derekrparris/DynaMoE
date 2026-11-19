@@ -116,7 +116,12 @@ final class AgentRunContext {
                 name: call.name,
                 arguments: call.arguments.mapValues { String(describing: $0) },
                 rawArguments: call.rawArguments,
-                status: .rejected,
+                // WITHHELD, not `.rejected`: nothing ran and the user declined
+                // nothing. `.rejected` counts as a failure AND still runs
+                // `recordToolCallFingerprint`, which CLEARS the repeat counts of
+                // every mutating tool — so a Stop landing here reset the
+                // repeated-call guard on the way out.
+                status: .withheld,
                 output: AgentHarness.renderToolResultForModel(json),
                 error: error
             )

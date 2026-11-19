@@ -21,6 +21,7 @@ nonisolated enum SubagentApplyError: LocalizedError, Equatable {
     case notIsolated(String)
     case stillRunning(String)
     case alreadyApplying(String)
+    case beingDiscarded(String)
     case repositoryBusy(String)
     case worktreeGone(String)
 
@@ -34,6 +35,8 @@ nonisolated enum SubagentApplyError: LocalizedError, Equatable {
             return "'\(role)' is still running. Wait for it to finish, then apply its changes."
         case .alreadyApplying(let role):
             return "'\(role)' is already being applied. Wait for that apply to finish."
+        case .beingDiscarded(let role):
+            return "'\(role)' is being discarded, so there is nothing left to apply. Its changes were only in the worktree the discard is removing."
         case .repositoryBusy(let role):
             return "Another run from the same repository is being applied while '\(role)' is ready to land. Applying two patches to one tree at once can leave a mixed result; wait for that apply to finish."
         case .worktreeGone(let detail):
@@ -95,6 +98,31 @@ enum SubagentApplyService {
         !repositoriesInFlight.isEmpty
     }
 
+    /// Runs whose record and worktree a discard currently owns.
+    ///
+    /// `discard` removes the TREE before the record, and that removal is an
+    /// `await`. Without this claim, an Apply click landing inside it resolved
+    /// the record, ran `git apply` into a directory being deleted, and then
+    /// wrote `appliedAt` onto a record the discard tombstoned — landed changes
+    /// nothing names, on a row that no longer exists. Both sides take the claim
+    /// synchronously on the MainActor, so neither can start inside the other.
+    private static var discardsInFlight: Set<UUID> = []
+
+    /// Takes the discard claim for one run. False when another discard already
+    /// holds it, which is the "not now" answer a second click gets.
+    @discardableResult
+    static func beginDiscard(_ runId: UUID) -> Bool {
+        discardsInFlight.insert(runId).inserted
+    }
+
+    static func endDiscard(_ runId: UUID) {
+        discardsInFlight.remove(runId)
+    }
+
+    static func isBeingDiscarded(_ runId: UUID) -> Bool {
+        discardsInFlight.contains(runId)
+    }
+
     /// The key one checkout is claimed under. Symlinks are resolved, so two
     /// spellings of it (a repo reached through /tmp against /private/tmp) claim
     /// the SAME entry instead of letting two applies interleave their writes in
@@ -128,6 +156,12 @@ enum SubagentApplyService {
 #endif
 
     static func apply(runId: UUID) async throws -> SubagentApplyOutcome {
+        // A discard owns this run's tree for the length of its removal, so there
+        // is nothing to land and no tree to land it into.
+        guard !discardsInFlight.contains(runId) else {
+            let role = SubagentManager.shared.getSubagent(byId: runId)?.role ?? "This run"
+            throw SubagentApplyError.beingDiscarded(role)
+        }
         guard !inFlight.contains(runId) else {
             let role = SubagentManager.shared.getSubagent(byId: runId)?.role ?? "This run"
             throw SubagentApplyError.alreadyApplying(role)
@@ -398,10 +432,16 @@ enum SubagentApplyControl {
     ///
     /// `executionStillUnwinding` keeps the button dark for the short window
     /// after a Stop in which the run's task is still killing a child process or
-    /// writing its last tool result. The apply service refuses the same case;
-    /// this only avoids offering a button that would answer with a refusal.
-    static func canApply(_ record: AgentRunRecord, executionStillUnwinding: Bool = false) -> Bool {
-        guard !executionStillUnwinding else { return false }
+    /// writing its last tool result. `otherApplyInFlight` is the same courtesy
+    /// for an apply already running against THIS checkout: `apply` refuses it
+    /// with `repositoryBusy`, and offering a button whose only answer is a
+    /// refusal reads as a broken control.
+    static func canApply(
+        _ record: AgentRunRecord,
+        executionStillUnwinding: Bool = false,
+        otherApplyInFlight: Bool = false
+    ) -> Bool {
+        guard !executionStillUnwinding, !otherApplyInFlight else { return false }
         guard case .worktree(let path, _) = record.isolation else { return false }
         guard record.status.isTerminal, record.appliedAt == nil else { return false }
         return FileManager.default.fileExists(atPath: path)

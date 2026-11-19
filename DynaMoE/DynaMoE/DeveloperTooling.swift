@@ -61,11 +61,20 @@ public final class GitController {
     /// path already strips them; the commit tool did not, so a cardless
     /// `git_commit` inside a run's sandbox could stage and commit into the
     /// operator's checkout. Every git child this controller spawns gets this.
+    /// `GIT_AUTHOR_*` / `GIT_COMMITTER_*` are not a redirection and are
+    /// deliberately supplied by the run-scoped environment, so a run's commit
+    /// carries the operator's identity instead of failing with none. Stripping
+    /// them here undid that on every call.
     static func gitEnvironment() -> [String: String] {
+        let identityKeys: Set<String> = [
+            "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"
+        ]
         var environment = ControlledProcessRunner.toolEnvironment(
-            scoped: AgentHarness.executingInRunScope
+            scoped: AgentHarness.executingInRunScope,
+            unreviewed: AgentHarness.executingUnreviewedToolCall
         )
-        for key in environment.keys where key.hasPrefix("GIT_") {
+        for key in environment.keys where key.hasPrefix("GIT_") && !identityKeys.contains(key) {
             environment.removeValue(forKey: key)
         }
         // A cardless `git_status` / `git_diff` must not take the index lock to

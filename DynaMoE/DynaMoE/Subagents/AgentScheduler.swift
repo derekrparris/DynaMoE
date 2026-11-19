@@ -65,9 +65,14 @@ nonisolated struct AgentSchedulerLimits: Equatable, Sendable {
     /// raise it. A spawn that overrides its wall-clock budget past this floor
     /// can still outlive a waiter; that is the operator's explicit choice and
     /// the queue says which class it waited on.
-    func queueTimeout(for schedulingClass: AgentSchedulingClass) -> TimeInterval {
-        _ = schedulingClass
-        return max(queueTimeoutSeconds, Self.standardRunLifetimeWithApproval)
+    /// The waiting class is deliberately not consulted: every class holds its
+    /// ticket for the run's whole life, so a class-specific floor would let one
+    /// class's waiters time out on another's legitimate work. The parameter
+    /// stays because admission asks BY class (and reports the class it waited
+    /// on); `for _:` says the answer does not depend on it rather than reading
+    /// as an input that was forgotten.
+    func queueTimeout(for _: AgentSchedulingClass) -> TimeInterval {
+        max(queueTimeoutSeconds, Self.standardRunLifetimeWithApproval)
     }
 
     /// `AgentBudget.standard.maxWallClockSeconds` (600) plus the default

@@ -569,6 +569,14 @@ nonisolated public struct AgentApprovalRequest: Sendable {
     /// the configuration presented as safe is not routine, and the approval
     /// center never bypasses a card marked here.
     var containmentEscape: Bool = false
+    /// The call's wire arguments, kept beside the display copy above.
+    ///
+    /// `arguments` is `[String: String]` because that is what the card renders,
+    /// and that stringification destroys types: an `images` array becomes a
+    /// described array, so a decision made from the display copy cannot see
+    /// that `subq_decide` is about to upload bytes. The Turbo verdict reads
+    /// this instead.
+    var rawArguments: String? = nil
 }
 
 nonisolated public enum AgentRunScopeError: LocalizedError {
