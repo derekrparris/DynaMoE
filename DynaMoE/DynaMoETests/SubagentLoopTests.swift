@@ -111,6 +111,33 @@ final class SubagentLoopTests: XCTestCase {
         return url
     }
 
+    /// A cancelled run's `shell_run` used to keep writing for up to its 120 s
+    /// timeout: `ControlledProcessRunner.runCommand` had no cancellation
+    /// handler and no `terminate()`. The tool now spawns through
+    /// `AgentHarness.runProcess`, which kills the process tree on cancellation.
+    func testAShellCommandStopsWhenItsRunIsCancelled() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let tool = ShellRunTool()
+        let start = Date()
+        let call = Task {
+            try await tool.execute(
+                arguments: ["command": "sleep 5"],
+                workingDirectory: workspace,
+                maxOutputLength: 4_000
+            )
+        }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        call.cancel()
+        _ = try? await call.value
+        let elapsed = Date().timeIntervalSince(start)
+        XCTAssertLessThan(
+            elapsed,
+            3.0,
+            "the child must be terminated at the Stop, not left to its own timeout"
+        )
+    }
+
     private func makeContext(
         workspace: URL,
         tools: [String],
@@ -547,7 +574,12 @@ final class SubagentLoopTests: XCTestCase {
         let counter = Counter()
 
         let backend = ScriptedBackend(turns: [
-            .init(text: "changing prefs", calls: [AgentToolCall(name: "shell_run", arguments: ["command": "defaults write DRP.DynaMoE dynamoe_agent_turbo_mode -bool NO"])]),
+            // The `false &&` keeps the command harmless if an approval-gate
+            // regression ever lets it run: a test must not be able to rewrite
+            // the developer's real Turbo setting. The classifier still sees
+            // the `defaults write` on the app's domain, which is what the card
+            // is testing.
+            .init(text: "changing prefs", calls: [AgentToolCall(name: "shell_run", arguments: ["command": "false && defaults write DRP.DynaMoE dynamoe_agent_turbo_mode -bool NO"])]),
             .init(text: "done", calls: [completeCall("Declined.")])
         ])
         let context = try makeContext(
@@ -1345,6 +1377,63 @@ final class SubagentLoopTests: XCTestCase {
         XCTAssertTrue(
             sameMessages(compacted, messages),
             "two recent turns are inside the kept window and must not change"
+        )
+    }
+
+    /// The budget covers the whole prompt. A history just under it plus a
+    /// large system block / tool catalogue used to overflow the engine AFTER
+    /// the spend, because only the message texts were counted.
+    func testCompactionCountsTheSystemBlockAndTheToolSchemas() {
+        var messages: [AgentBackendMessage] = [.user("Do the task.")]
+        for step in 0..<6 {
+            messages.append(contentsOf: assistantBlock(
+                text: "step \(step)",
+                thinking: "",
+                toolResults: ["result \(step)"]
+            ))
+        }
+        XCTAssertTrue(
+            sameMessages(
+                HeadlessAgentLoop.compactContextIfNeeded(messages),
+                messages
+            ),
+            "control: under the budget the history is untouched"
+        )
+        let compacted = HeadlessAgentLoop.compactContextIfNeeded(
+            messages,
+            overheadCharacters: HeadlessAgentLoop.contextCharacterBudget
+        )
+        XCTAssertFalse(
+            sameMessages(compacted, messages),
+            "the overhead alone must be enough to trigger folding"
+        )
+    }
+
+    /// A `file_write` body is the largest thing a tool call can carry, and it
+    /// is part of the prompt. It was not counted, so arguments alone could
+    /// cross the budget after the spend.
+    func testCompactionCountsToolCallArguments() {
+        let hugeArgument = String(repeating: "x", count: HeadlessAgentLoop.contextCharacterBudget)
+        var messages: [AgentBackendMessage] = [.user("Do the task.")]
+        messages.append(.assistant(
+            text: "writing",
+            thinking: "",
+            calls: [
+                AgentToolCall(
+                    id: "c1",
+                    name: "file_write",
+                    arguments: ["content": hugeArgument],
+                    rawArguments: hugeArgument,
+                    rawText: ""
+                )
+            ]
+        ))
+        for step in 0..<3 {
+            messages.append(contentsOf: assistantBlock(text: "step \(step)", toolResults: ["r\(step)"]))
+        }
+        XCTAssertFalse(
+            sameMessages(HeadlessAgentLoop.compactContextIfNeeded(messages), messages),
+            "the argument alone exceeds the budget, so the history must fold"
         )
     }
 

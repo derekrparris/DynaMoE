@@ -343,6 +343,15 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
     ) async throws -> AgentBackendTurn {
         var emittedText = ""
         var emittedThinking = ""
+        // A Stop can land after part of the answer streamed. The loop appends
+        // whatever a cancelled turn produced, so the text travels with the
+        // error instead of being discarded with it.
+        func cancellationError() -> AgentBackendError {
+            if emittedText.isEmpty && emittedThinking.isEmpty {
+                return .cancelled
+            }
+            return .cancelledAfterPartial(text: emittedText, thinking: emittedThinking)
+        }
         for await event in launch.stream {
             // The run's task is cancelled from outside this loop. The stream
             // itself may already have ended, so the check has to come before
@@ -350,7 +359,7 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
             // response, which reads as the model breaking rather than a Stop.
             if Task.isCancelled {
                 await stop(launch)
-                throw AgentBackendError.cancelled
+                throw cancellationError()
             }
             switch event {
             case .started, .priming, .prefillProgress:
@@ -367,7 +376,7 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
             case .failedTurn(let failure):
                 if failure.cancelled || Task.isCancelled {
                     await launch.handle.task.value
-                    throw AgentBackendError.cancelled
+                    throw cancellationError()
                 }
                 // The task is awaited on EVERY exit from this loop, not just
                 // the success and cancellation ones: `withTurnToolMask`
@@ -394,7 +403,7 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
         }
         if Task.isCancelled {
             await stop(launch)
-            throw AgentBackendError.cancelled
+            throw cancellationError()
         }
         // The stream only ends without a result when the engine's task is gone,
         // so awaiting it is immediate here and guarantees no turn outlives the
@@ -423,6 +432,15 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
         if current.hasPrefix(previous) {
             return String(current.dropFirst(previous.count))
         }
+        // A SHRINK is a reclassification, not new text: a late think-close
+        // moves part of the answer into the reasoning channel, so the response
+        // snapshot gets shorter. Emitting the whole shorter string appended a
+        // duplicate of the answer to the live transcript.
+        if previous.hasPrefix(current) {
+            return ""
+        }
+        // A rewritten prefix (a repaired UTF-8 boundary) is emitted whole
+        // rather than dropped.
         return current
     }
 
@@ -443,8 +461,18 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
         usage.promptTokens = result.promptTokenIds.count
         usage.completionTokens = result.generatedTokenIds.count
         usage.cachedTokens = result.prefixTokensReused
+        // `responseText` is the raw response channel, which still contains a
+        // call's markup when the model emitted one. The markup is an
+        // instruction, not prose: the report builder reads this text for
+        // findings and the summary, and was quoting `<parameter=content>` as
+        // an assertion the run made. The calls themselves travel separately.
+        var visibleText = result.responseText
+        for call in result.parsedToolCalls where !call.rawText.isEmpty {
+            visibleText = visibleText.replacingOccurrences(of: call.rawText, with: "")
+        }
+        visibleText = visibleText.trimmingCharacters(in: .whitespacesAndNewlines)
         return AgentBackendTurn(
-            text: result.responseText,
+            text: visibleText,
             thinking: result.thinkingText,
             calls: calls,
             rawText: result.rawDecodedText,
@@ -567,17 +595,27 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
     /// The run's tool schemas, as the grammar sampler's mask vocabulary. Empty
     /// when the run was given no tools, which leaves the sampler's registry
     /// untouched (see `GrammarConstrainedSampler.withTurnToolMask`).
+    ///
+    /// A schema that cannot be encoded returns NO mask at all. Installing a
+    /// schema-less entry told the sampler the tool existed but constrains
+    /// nothing about its arguments, so generation could produce a call the
+    /// tool then refuses — a mask that looks active and is not.
     @MainActor
     static func maskSchemas(for tools: [ToolDefinition]) -> [GrammarToolSchema] {
-        tools.map { tool in
+        var schemas: [GrammarToolSchema] = []
+        schemas.reserveCapacity(tools.count)
+        for tool in tools {
             // Encode the PARAMETERS DICTIONARY, not a wrapper around it: each
             // value is already an `AnyCodable`, and wrapping the dictionary in a
             // second one gives it no encoding of its own (every branch in
             // `AnyCodable.encode` misses), so the schema would decode as an empty
             // object and the mask would constrain nothing.
-            let schemaData = try? JSONEncoder().encode(tool.function.parameters)
-            return GrammarToolSchema(name: tool.function.name, schemaJSON: schemaData)
+            guard let schemaData = try? JSONEncoder().encode(tool.function.parameters) else {
+                return []
+            }
+            schemas.append(GrammarToolSchema(name: tool.function.name, schemaJSON: schemaData))
         }
+        return schemas
     }
 
     /// The worker prompt with the family's own tool-call syntax. The spawn path

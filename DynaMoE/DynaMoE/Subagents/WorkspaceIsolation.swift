@@ -309,9 +309,23 @@ nonisolated enum WorkspaceIsolation {
             throw WorkspaceIsolationError.worktreeMissing(path)
         }
         var repositoryRoot: URL?
-        if let recordedRoot, await isMainWorktree(recordedRoot, owning: worktreeURL) {
+        if let recordedRoot {
+            // A RECORDED root outranks the pointer. The worktree's `.git` is a
+            // writable file inside the sandbox, so deriving the root from it
+            // is what let a retargeted pointer hand the operator's tree to the
+            // apply path. The record is the only answer this worktree was
+            // created with; when it no longer owns the worktree, refuse rather
+            // than follow wherever the pointer says.
+            guard await isMainWorktree(recordedRoot, owning: worktreeURL) else {
+                throw WorkspaceIsolationError.worktreeLinkageCompromised(
+                    "the worktree no longer belongs to the recorded repository at '\(recordedRoot.path)'"
+                )
+            }
             repositoryRoot = recordedRoot
         } else {
+            // An older record with no stored root, or the launch sweep, which
+            // has only the path. The linkage/HEAD checks below still gate what
+            // it is used for.
             repositoryRoot = await owningRepository(for: worktreeURL)
         }
         guard let repositoryRoot else {
@@ -392,11 +406,35 @@ nonisolated enum WorkspaceIsolation {
     /// per-worktree admin directory's own back-pointer, which lives in the
     /// main repository's `.git` where the run cannot write it.
     static func worktreeLinkageProblem(_ worktree: AgentWorktree) async -> String? {
+        switch await worktreeLinkageState(worktree) {
+        case .ok: return nil
+        case .repairable(let problem), .compromised(let problem): return problem
+        }
+    }
+
+    /// Whether the linkage can be restored without touching another worktree.
+    ///
+    /// `repairable` is a MISSING or unreadable pointer: git's own admin record
+    /// still describes this worktree, so `worktree repair <path>` can put the
+    /// pointer back. `compromised` is a pointer that RESOLVES somewhere else —
+    /// another repository, or a sibling worktree's admin directory. Repairing
+    /// that case is not scoped by the path argument: git rewrites the admin
+    /// file's back-pointer, which belongs to the sibling, so the check must
+    /// refuse without calling repair at all.
+    private enum WorktreeLinkageState {
+        case ok
+        case repairable(String)
+        case compromised(String)
+    }
+
+    private static func worktreeLinkageState(_ worktree: AgentWorktree) async -> WorktreeLinkageState {
         guard let (rootCode, rootOut, _) = try? await git(
             ["rev-parse", "--path-format=absolute", "--git-common-dir"],
             in: worktree.repositoryRoot
         ), rootCode == 0 else {
-            return "the recorded repository at '\(worktree.repositoryRoot.path)' could not be read"
+            // Without the recorded repository's own record there is nothing
+            // authoritative to repair towards.
+            return .compromised("the recorded repository at '\(worktree.repositoryRoot.path)' could not be read")
         }
         let commonPath = URL(fileURLWithPath: rootOut.trimmingCharacters(in: .whitespacesAndNewlines), isDirectory: true)
             .standardizedFileURL.resolvingSymlinksInPath().path
@@ -404,16 +442,19 @@ nonisolated enum WorkspaceIsolation {
             ["rev-parse", "--path-format=absolute", "--git-dir"],
             in: worktree.path
         ), gitDirCode == 0 else {
-            return "its .git linkage cannot be resolved, so git does not treat '\(worktree.path.path)' as a working tree"
+            return .repairable("its .git linkage cannot be resolved, so git does not treat '\(worktree.path.path)' as a working tree")
         }
         let gitDir = URL(fileURLWithPath: gitDirOut.trimmingCharacters(in: .whitespacesAndNewlines), isDirectory: true)
             .standardizedFileURL.resolvingSymlinksInPath()
         let worktreesRoot = commonPath.hasSuffix("/") ? commonPath + "worktrees/" : commonPath + "/worktrees/"
         guard gitDir.path.hasPrefix(worktreesRoot) else {
-            return "its .git file points at '\(gitDir.path)', which is not a linked-worktree git directory of the repository at '\(worktree.repositoryRoot.path)'"
+            return .compromised("its .git file points at '\(gitDir.path)', which is not a linked-worktree git directory of the repository at '\(worktree.repositoryRoot.path)'")
         }
         guard let pointer = try? String(contentsOf: gitDir.appendingPathComponent("gitdir"), encoding: .utf8) else {
-            return "the repository's worktree record for '\(worktree.path.lastPathComponent)' could not be read"
+            // The admin directory exists but its back-pointer is gone: git's
+            // own record of the worktree is incomplete, and repair restores it
+            // from the path given.
+            return .repairable("the repository's worktree record for '\(worktree.path.lastPathComponent)' could not be read")
         }
         let recordedBack = URL(fileURLWithPath: pointer.trimmingCharacters(in: .whitespacesAndNewlines))
             .standardizedFileURL.resolvingSymlinksInPath().path
@@ -421,26 +462,36 @@ nonisolated enum WorkspaceIsolation {
             .appendingPathComponent(".git")
             .standardizedFileURL.resolvingSymlinksInPath().path
         guard recordedBack == expectedBack else {
-            return "the repository's worktree record points at '\(recordedBack)' instead of this worktree"
+            return .compromised("the repository's worktree record points at '\(recordedBack)' instead of this worktree")
         }
-        return nil
+        return .ok
     }
 
     /// Refuses to trust a worktree whose `.git` linkage moved, after one
-    /// repair attempt.
+    /// repair attempt FOR A MISSING POINTER ONLY.
     ///
     /// `git worktree repair` restores the pointer from the repository's own
-    /// admin files, which live OUTSIDE the sandbox the run can write, so the
-    /// repair can only ever put the ORIGINAL linkage back: a deliberately
-    /// retargeted pointer is repaired (when the repo's records are intact) or
-    /// refused — never followed.
+    /// admin files, which live OUTSIDE the sandbox the run can write. That is
+    /// safe while the admin file still describes THIS worktree; a pointer
+    /// retargeted at another worktree's admin directory makes repair rewrite
+    /// that sibling's record (git resolves the path through the pointer, so
+    /// the path argument does not scope it). A retargeted pointer is therefore
+    /// refused without repair, and never followed.
     static func verifyWorktreeLinkage(_ worktree: AgentWorktree) async throws {
-        if await worktreeLinkageProblem(worktree) == nil {
+        switch await worktreeLinkageState(worktree) {
+        case .ok:
             try await verifyWorktreeHead(worktree)
             return
+        case .compromised(let problem):
+            throw WorkspaceIsolationError.worktreeLinkageCompromised(problem)
+        case .repairable:
+            break
         }
         _ = try? await git(["worktree", "repair", worktree.path.path], in: worktree.repositoryRoot)
-        if let problem = await worktreeLinkageProblem(worktree) {
+        switch await worktreeLinkageState(worktree) {
+        case .ok:
+            break
+        case .repairable(let problem), .compromised(let problem):
             throw WorkspaceIsolationError.worktreeLinkageCompromised(problem)
         }
         try await verifyWorktreeHead(worktree)

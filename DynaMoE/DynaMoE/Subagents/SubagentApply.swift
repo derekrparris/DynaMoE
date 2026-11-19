@@ -132,7 +132,12 @@ enum SubagentApplyService {
         defer { inFlight.remove(runId) }
 
         let live = SubagentManager.shared.getSubagent(byId: runId)
-        if let live, !live.status.isTerminal {
+        // A Stop marks the record terminal at once, but the execution task may
+        // still be unwinding — killing a `shell_run` child (up to its SIGKILL
+        // grace) or writing one last tool result. Applying in that window
+        // landed a worktree a live child was still editing, and the cleanup
+        // that follows removed it under that child.
+        if let live, !live.status.isTerminal || !live.isExecutionUnwound {
             throw SubagentApplyError.stillRunning(live.role)
         }
         let record = live?.snapshotRecord() ?? AgentRunStore.shared.loadAny(runId: runId)
@@ -245,13 +250,13 @@ enum SubagentApplyService {
         let appliedAt = Date()
         let recordUpdated: Bool
         if let live {
-            recordUpdated = live.markApplied(at: appliedAt, files: files, appliedTo: destinationBranch)
+            recordUpdated = await live.markApplied(at: appliedAt, files: files, appliedTo: destinationBranch)
         } else {
             // Mutated against the CURRENT record on the store's IO queue, not
             // restored from the copy this apply loaded seconds ago: a
             // `summaryRelayed` write landing mid-apply would otherwise be
             // reverted here and the report injected a second time.
-            recordUpdated = AgentRunStore.shared.mutate(runId: runId, sessionId: record.parentSessionId) { current in
+            recordUpdated = await AgentRunStore.shared.mutateAsync(runId: runId, sessionId: record.parentSessionId) { current in
                 current.appliedAt = appliedAt
                 current.appliedToBranch = destinationBranch
                 if var report = current.report, !files.isEmpty {
@@ -281,15 +286,19 @@ enum SubagentApplyService {
             await WorkspaceIsolation.cleanup(worktree, deleteBranch: !keptBranch)
         } else {
             let named = keptIgnoredFiles.joined(separator: ", ")
+            // Captured immutable: the mutation closure runs on the store's
+            // queue, and the local array must not be read from there while
+            // this function could still change it.
+            let keptNames = keptIgnoredFiles
             // The record must say why an applied run still has a worktree, or
             // the inspector's Apply reads as unfinished business.
             if let live {
-                live.noteKeptIgnoredFiles(keptIgnoredFiles)
+                await live.noteKeptIgnoredFiles(keptNames)
             } else {
-                AgentRunStore.shared.mutate(runId: runId, sessionId: record.parentSessionId) { current in
+                await AgentRunStore.shared.mutateAsync(runId: runId, sessionId: record.parentSessionId) { current in
                     current.appliedAt = appliedAt
                     current.appliedToBranch = destinationBranch
-                    current.keptIgnoredFiles = keptIgnoredFiles
+                    current.keptIgnoredFiles = keptNames
                     // A record without a report (an interrupted run, an older
                     // schema) still deserves the kept-worktree explanation.
                     if current.report == nil {
@@ -319,9 +328,9 @@ enum SubagentApplyService {
         if keptBranch {
             let note = "The patch was applied, but branch '\(branch)' was kept because it holds commits a patch cannot carry. Merge or delete it manually when you are done."
             if let live {
-                live.noteKeptBranch(branch)
+                await live.noteKeptBranch(branch)
             } else {
-                AgentRunStore.shared.mutate(runId: runId, sessionId: record.parentSessionId) { current in
+                await AgentRunStore.shared.mutateAsync(runId: runId, sessionId: record.parentSessionId) { current in
                     if var report = current.report {
                         report.openQuestions.append(note)
                         current.report = report
@@ -374,7 +383,13 @@ enum SubagentApplyControl {
 
     /// Whether the detail pane should offer Apply at all: an isolated run that
     /// has stopped, has not landed yet, and still has its worktree on disk.
-    static func canApply(_ record: AgentRunRecord) -> Bool {
+    ///
+    /// `executionStillUnwinding` keeps the button dark for the short window
+    /// after a Stop in which the run's task is still killing a child process or
+    /// writing its last tool result. The apply service refuses the same case;
+    /// this only avoids offering a button that would answer with a refusal.
+    static func canApply(_ record: AgentRunRecord, executionStillUnwinding: Bool = false) -> Bool {
+        guard !executionStillUnwinding else { return false }
         guard case .worktree(let path, _) = record.isolation else { return false }
         guard record.status.isTerminal, record.appliedAt == nil else { return false }
         return FileManager.default.fileExists(atPath: path)

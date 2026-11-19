@@ -132,7 +132,11 @@ final class SubagentApprovalCenter: ObservableObject {
             toolName: request.toolName,
             arguments: request.arguments,
             targetSummary: request.reason,
-            destinationSummary: request.workingDirectory,
+            destinationSummary: AgentHarness.approvalDestination(
+                toolName: request.toolName,
+                arguments: request.arguments,
+                workingDirectory: request.workingDirectory
+            ),
             commandPreview: request.arguments["command"]
         )
     }

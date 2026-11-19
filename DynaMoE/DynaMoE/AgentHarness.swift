@@ -206,9 +206,10 @@ public final class ShellRunTool: AgentTool {
             targetDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         }
 
-        let (stdout, stderr, exitCode) = try await ControlledProcessRunner.shared.runCommand(
-            command: command,
-            workingDirectory: targetDir,
+        let (exitCode, stdout, stderr) = try await AgentHarness.runProcess(
+            executableURL: URL(fileURLWithPath: "/bin/zsh"),
+            arguments: ["-c", command],
+            currentDirectory: targetDir,
             timeoutSeconds: 120.0
         )
 
@@ -4587,7 +4588,8 @@ public final class AgentHarness {
         toolName: String,
         arguments: [String: Any],
         mode: AgentMode,
-        subQEndpoint: URL? = nil
+        subQEndpoint: URL? = nil,
+        defaults: UserDefaults = .standard
     ) -> Bool {
         // Landing isolated work is the one write the contract reserves for its
         // own card: Turbo is a blanket switch over ROUTINE writes, and a patch
@@ -4595,6 +4597,15 @@ public final class AgentHarness {
         // before `requiresApproval` so plan mode's withholding cannot turn this
         // into a bypass either.
         if toolName == "apply_subagent_changes" { return false }
+        // A spawn that forces work off-device is the same class: its card
+        // exists precisely because repository content leaves the machine, and
+        // Turbo is a switch over ROUTINE writes. The stored Settings choice is
+        // the operator's standing decision, so only a `backend` argument that
+        // overrides it keeps the card under Turbo.
+        if toolName == "spawn_subagent",
+           spawnsWorkOffDevice(arguments: arguments, defaults: defaults) {
+            return false
+        }
         guard requiresApproval(
             toolName: toolName,
             arguments: arguments,
@@ -6130,8 +6141,12 @@ public final class AgentHarness {
             guard !pathTouchesGitMetadata(resolved) else { return false }
             return contains(resolved, in: workspace)
         case "git_commit":
-            guard let workingDirectory else { return false }
-            return contains(workingDirectory, in: workspace)
+            // The tool takes only a message: no path, no `cwd`. The repository
+            // it can write is the one containing the run's fixed working
+            // directory, so the write surface IS the workspace by construction.
+            // The guard that matters — and the one a `.git` rewrite attacks —
+            // is the linkage/HEAD re-check `runToolInTurn` performs first.
+            return workingDirectory != nil
         default:
             return false
         }
@@ -6878,6 +6893,35 @@ public final class AgentHarness {
             return wd.appendingPathComponent(expanded)
         }
         return URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(expanded)
+    }
+
+    /// Where an approval card should say this call will act.
+    ///
+    /// The run's working directory is the DEFAULT, not the answer: a
+    /// `file_write` names its own destination and a `shell_run` may carry a
+    /// `cwd`, and a containment card exists precisely so the operator can see
+    /// where a call leaves the sandbox. Rendering the sandbox for an absolute
+    /// path outside it told the operator the opposite of what is at stake.
+    public static func approvalDestination(
+        toolName: String,
+        arguments: [String: String],
+        workingDirectory: String?
+    ) -> String? {
+        let base = workingDirectory.map { URL(fileURLWithPath: $0, isDirectory: true) }
+        switch toolName {
+        case "file_write", "file_edit":
+            guard let path = arguments["path"], !path.isEmpty else {
+                return workingDirectory
+            }
+            return resolvePath(path, workingDirectory: base).path
+        case "shell_run":
+            guard let cwd = arguments["cwd"], !cwd.isEmpty else {
+                return workingDirectory
+            }
+            return (cwd as NSString).expandingTildeInPath
+        default:
+            return workingDirectory
+        }
     }
 
     /// Identifies files that cannot be meaningfully rendered as text, so tools can return

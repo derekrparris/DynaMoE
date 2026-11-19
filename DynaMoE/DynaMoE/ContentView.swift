@@ -904,6 +904,13 @@ struct ContentView: View {
     /// The non-suspending half of a model switch. Runs only once no cancelled
     /// generation is still using the shared engine and buffers, and returns the
     /// load task so a caller can wait for that specific model to be ready.
+    ///
+    /// The state below is published OPTIMISTICALLY, before the load has an
+    /// engine to install. A load can still be refused after that (the swap
+    /// claim, or a newer request superseding this one), and leaving the state
+    /// pointed at the model that was refused made the conversation render B and
+    /// sample with B's profile while the engine kept serving A. The refusal path
+    /// is handed the state this switch replaced so it can put it back.
     @discardableResult
     private func completeModelSwitch(to model: DiscoveredModel, sessionId targetSessionId: UUID?) -> Task<Void, Never> {
         if model.isCloudModel {
@@ -912,8 +919,21 @@ struct ContentView: View {
         if model.isAppleFoundationModel {
             return coordinateAppleFoundationModelActivation(of: model, sessionId: targetSessionId)
         }
+        // Captured before anything below changes it.
+        let previousPath = activeLoadedModelPath
+        let previousLastUsedId = localModelManager.lastUsedModelId
+        let previousProfile = activeProfile
+        let previousProfileKey = previousPath.flatMap {
+            localModelManager.getModel(byId: $0)?.id ?? $0
+        }
+        let previousSessionModel: (id: String?, name: String?, path: String?)? = {
+            guard let sid = targetSessionId,
+                  let idx = sessions.firstIndex(where: { $0.id == sid }) else { return nil }
+            let session = sessions[idx]
+            return (session.selectedModelId, session.selectedModelName, session.selectedModelPath)
+        }()
+
         PrefixCacheManager.shared.invalidate()
-        let loadTask = loadAndBridgeToMetal(filePath: model.snapshotPath)
         activeLoadedModelPath = model.snapshotPath
         localModelManager.setLastUsedModel(id: model.id)
         if let sid = targetSessionId,
@@ -924,6 +944,24 @@ struct ContentView: View {
         }
         let preferredProfile = ModelProfileManager.shared.getActiveProfile(for: model.id)
         applyProfile(preferredProfile, for: model.id)
+        let loadTask = loadAndBridgeToMetal(filePath: model.snapshotPath) { [previousPath, previousLastUsedId, previousProfile, previousProfileKey, previousSessionModel, targetSessionId] in
+            // A newer switch (or an explicit selection) owns the state now.
+            guard self.activeLoadedModelPath == model.snapshotPath else { return }
+            self.activeLoadedModelPath = previousPath
+            self.localModelManager.lastUsedModelId = previousLastUsedId
+            if let key = previousProfileKey {
+                self.applyProfile(previousProfile, for: key)
+            } else {
+                self.applyProfile(previousProfile)
+            }
+            if let sid = targetSessionId,
+               let idx = self.sessions.firstIndex(where: { $0.id == sid }),
+               let previousSessionModel {
+                self.sessions[idx].selectedModelId = previousSessionModel.id
+                self.sessions[idx].selectedModelName = previousSessionModel.name
+                self.sessions[idx].selectedModelPath = previousSessionModel.path
+            }
+        }
         return loadTask
     }
 
@@ -2476,9 +2514,13 @@ struct ContentView: View {
         return UUID(uuidString: String(tail))
     }
 
-    /// Waits until every running/pending subagent for the session reaches a terminal state
+    /// Waits until every active subagent for the session reaches a terminal state
     /// or the timeout elapses. Awaited at agent-run teardown so the coordinator's run can
     /// pick up results it would otherwise drop.
+    ///
+    /// `waitingForApproval` counts as active: a run parked on a card has not
+    /// reported yet and still holds the engine, so ending the turn there would
+    /// drop the result it is about to produce.
     ///
     /// Suspends between polls instead of sleeping: the harness state it reads is main-actor
     /// state, and the weights and cloud teardowns both reach this from a background turn.
@@ -2486,7 +2528,7 @@ struct ContentView: View {
         guard let sessionId else { return }
         await SubagentRelayWait.wait(sessionId: sessionId, timeout: timeout) { id in
             SubagentManager.shared.allSubagents.contains {
-                $0.parentSessionId == id && ($0.status == .running || $0.status == .pending)
+                $0.parentSessionId == id && !$0.status.isTerminal
             }
         }
     }
@@ -6649,6 +6691,12 @@ struct ContentView: View {
                     self.deferredRelaunchSessions[relaunchKey] = nil
                     self.releaseQueuedGenerationFlags(ifOwnedBy: sessionId)
                 }
+                // A Stop can land between the task being created and this
+                // line. Cancellation does not abort a `Task` body on its own,
+                // so without this check the preemption below would still
+                // cancel runs — and discard their worktrees — for a send the
+                // operator had already abandoned.
+                guard !Task.isCancelled else { return }
                 await AgentScheduler.shared.preemptLocalRuns()
                 CompletionEngine.shared.cancelBackgroundTurn()
                 await CompletionEngine.shared.awaitIdle()
@@ -6795,6 +6843,15 @@ struct ContentView: View {
                 var held: TurnSlotClaim?
                 let deadline = Date().addingTimeInterval(120)
                 while held == nil, Date() < deadline {
+                    // A Stop cancels exactly this task, and a cancelled
+                    // `Task.sleep` throws immediately. `try?` then swallowed
+                    // it, so the loop ran at full speed on the main actor,
+                    // taking the slot ledger's lock, until the holder drained
+                    // or the deadline expired. Bail before sleeping again.
+                    if Task.isCancelled {
+                        held?.release()
+                        return
+                    }
                     held = CompletionEngine.shared.reserveTurnSlot()
                     if held == nil {
                         try? await Task.sleep(nanoseconds: 100_000_000)
@@ -6828,6 +6885,9 @@ struct ContentView: View {
                     // Same notice the immediate preemption shows: the runs about
                     // to be stopped belong to a background agent, and a kill
                     // with no explanation reads as a crash.
+                    // As in the branch above: a task cancelled before it began
+                    // executing must not destroy another conversation's work.
+                    guard !Task.isCancelled else { return }
                     self.showStatus("⏸ Stopping a background subagent so this turn can \(isFreshOperatorSend ? "run" : "continue")…")
                     await AgentScheduler.shared.preemptLocalRuns()
                     CompletionEngine.shared.cancelBackgroundTurn()
@@ -8263,7 +8323,10 @@ struct ContentView: View {
     /// load task so callers that must run against the new model can await the
     /// specific load instead of racing it; UI callers ignore the result.
     @discardableResult
-    private func loadAndBridgeToMetal(filePath: String) -> Task<Void, Never> {
+    private func loadAndBridgeToMetal(
+        filePath: String,
+        onRefusal: (@MainActor () -> Void)? = nil
+    ) -> Task<Void, Never> {
         // A load request for the system-model sentinel (a session restore racing
         // the registry scan, or a raw path hand-off) must not attempt to mmap a
         // fake path: activate the on-device backend directly instead.
@@ -8325,6 +8388,11 @@ struct ContentView: View {
                     guard self.modelLoadToken == token else { return }
                     self.metalStatus = "⚠️ Engine busy: a turn or subagent run is using it. Load the model again once it finishes."
                     self.isLoadingModel = false
+                    // The switch published this model's identity before the
+                    // load had an engine. A refusal must not leave the
+                    // conversation rendering (and sampling with) a model the
+                    // engine is not serving.
+                    onRefusal?()
                 }
                 return
             }

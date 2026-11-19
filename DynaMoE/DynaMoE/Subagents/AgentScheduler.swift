@@ -145,6 +145,11 @@ actor AgentScheduler {
 
     private var tickets: [AgentSchedulingClass: Set<UUID>] = [:]
     private var ticketClasses: [UUID: AgentSchedulingClass] = [:]
+    /// Which run each granted ticket belongs to. Preemption needs to know who
+    /// HOLDS the class, not who is queued for it: with local capacity 1 every
+    /// other local run is a waiter, and cancelling those destroyed work that
+    /// was not blocking anything.
+    private var ticketRunIds: [UUID: UUID] = [:]
     private var waiters: [UUID: Waiter] = [:]
     private var nextSequence: UInt64 = 0
     private var cancelledRunIds: Set<UUID> = []
@@ -216,6 +221,7 @@ actor AgentScheduler {
             if canGrant(schedulingClass), isHeadWaiter(ticket) {
                 tickets[schedulingClass, default: []].insert(ticket)
                 ticketClasses[ticket] = schedulingClass
+                ticketRunIds[ticket] = runId
                 return ticket
             }
             if Date() >= deadline {
@@ -229,6 +235,7 @@ actor AgentScheduler {
     func release(_ ticket: UUID) {
         guard let schedulingClass = ticketClasses.removeValue(forKey: ticket) else { return }
         tickets[schedulingClass]?.remove(ticket)
+        ticketRunIds.removeValue(forKey: ticket)
     }
 
     // MARK: - Cancellation tree
@@ -288,13 +295,20 @@ actor AgentScheduler {
         }
     }
 
-    /// Interactive work outranks background work: a local run is cancelled at
-    /// its next boundary rather than allowed to hold the engine indefinitely.
-    /// Returns how many local runs were asked to stop.
+    /// Interactive work outranks background work: the LOCAL ticket holder is
+    /// cancelled at its next boundary rather than allowed to hold the engine
+    /// indefinitely. Returns how many runs were asked to stop.
+    ///
+    /// Only the ticket HOLDER is stopped. This used to cancel every
+    /// non-interactive local registration, which with local capacity 1 included
+    /// every other conversation's QUEUED run: one chat send destroyed work that
+    /// was not using the engine at all, and discarded its worktree with it. A
+    /// waiter loses nothing by staying queued — it starts when the slot frees.
     @discardableResult
     func preemptLocalRuns(reason: String = "An interactive turn needed the engine.") -> Int {
+        let localHolders = tickets[.local, default: []].compactMap { ticketRunIds[$0] }
         let localRuns = registry.filter { runId, registration in
-            registration.priority != .interactive && isLocalRun(runId)
+            registration.priority != .interactive && localHolders.contains(runId)
         }
         for (runId, _) in localRuns {
             cancelSubtree(runId: runId, reason: reason)
@@ -341,13 +355,6 @@ actor AgentScheduler {
     }
 
     // MARK: - Internals
-
-    private func isLocalRun(_ runId: UUID) -> Bool {
-        if let registration = registry[runId] {
-            return registration.schedulingClass == .local
-        }
-        return waiters.values.contains { $0.runId == runId && $0.schedulingClass == .local }
-    }
 
     private func cancelSubtree(runId: UUID, reason: String) {
         let children = registry.filter { $0.value.parentRunId == runId }.map(\.key)

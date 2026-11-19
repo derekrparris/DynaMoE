@@ -111,6 +111,44 @@ final class SubagentRecordProjectionTests: XCTestCase {
         XCTAssertNotNil(record.completedAt)
     }
 
+    /// A run refused before its loop discards its freshly created worktree.
+    /// The record used to keep claiming `isolation: .worktree` with no
+    /// `appliedAt`, which made `holdsWorktreeWork` true forever: prune,
+    /// clearCompleted and the launch sweep skipped it and Apply failed
+    /// `worktreeGone`.
+    func testADiscardedWorktreeStopsPinningTheRecord() {
+        let plan = AgentSpawnPlan(
+            role: "Implementer",
+            taskDescription: "Edit a file.",
+            contextSummary: nil,
+            preset: .implementer,
+            backendDescriptor: .scripted,
+            schedulingClass: .local,
+            backend: ScriptedBackend(turns: []),
+            toolNames: ["complete"],
+            budget: .standard,
+            approvalPolicy: .deny,
+            isolation: .worktree(path: "/tmp/dynamoe-discarded", branch: "dynamoe/agent/test"),
+            thinking: false,
+            sampling: .default,
+            priority: .userRequested,
+            parentSessionId: nil,
+            parentTurnId: nil,
+            workingDirectory: URL(fileURLWithPath: "/tmp"),
+            repositoryRoot: URL(fileURLWithPath: "/tmp"),
+            baseCommit: "abc123"
+        )
+        let instance = SubagentInstance(id: UUID(), plan: plan)
+        XCTAssertTrue(instance.snapshotRecord().holdsWorktreeWork)
+
+        instance.forgetDiscardedWorktree()
+        let record = instance.snapshotRecord()
+        XCTAssertEqual(record.isolation, .none)
+        XCTAssertFalse(record.holdsWorktreeWork)
+        XCTAssertNil(record.repositoryRoot)
+        XCTAssertNil(record.baseCommit)
+    }
+
     func testTheUsageTokenCountIsContextNotTheBilledSum() throws {
         var usage = AgentUsage()
         usage.steps = 2

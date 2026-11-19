@@ -90,6 +90,27 @@ nonisolated enum AgentBackendError: LocalizedError, Equatable {
     case transport(String)
     case malformedResponse(String)
     case cancelled
+    /// A Stop that arrived after the model had already streamed part of its
+    /// answer. The partial text is the run's work; dropping it lost the
+    /// transcript entry (and the report fell back to an earlier step) even
+    /// though the operator had watched it stream.
+    case cancelledAfterPartial(text: String, thinking: String)
+
+    /// Whether this error means "the run was stopped", with or without a
+    /// partial turn. Comparisons against `.cancelled` alone miss the partial
+    /// case and reported it as a failure.
+    var isCancellation: Bool {
+        switch self {
+        case .cancelled, .cancelledAfterPartial: return true
+        default: return false
+        }
+    }
+
+    /// What the model managed to say before the Stop, when there is any.
+    var partialTurn: (text: String, thinking: String)? {
+        guard case .cancelledAfterPartial(let text, let thinking) = self else { return nil }
+        return (text, thinking)
+    }
 
     var errorDescription: String? {
         switch self {
@@ -97,7 +118,7 @@ nonisolated enum AgentBackendError: LocalizedError, Equatable {
         case .refused(let message): return message
         case .transport(let message): return message
         case .malformedResponse(let message): return message
-        case .cancelled: return "The subagent run was cancelled."
+        case .cancelled, .cancelledAfterPartial: return "The subagent run was cancelled."
         }
     }
 }

@@ -602,7 +602,10 @@ private struct SubagentRunDetailView: View {
     private var appliedAt: Date? { appliedHereAt ?? record.appliedAt }
 
     private var canApplyChanges: Bool {
-        appliedHereAt == nil && SubagentApplyControl.canApply(record)
+        appliedHereAt == nil && SubagentApplyControl.canApply(
+            record,
+            executionStillUnwinding: !(SubagentManager.shared.getSubagent(byId: record.id)?.isExecutionUnwound ?? true)
+        )
     }
 
     /// Only a finished, still-unapplied isolated run needs a per-run discard:

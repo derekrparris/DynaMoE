@@ -66,6 +66,11 @@ public final class GitController {
         for key in environment.keys where key.hasPrefix("GIT_") {
             environment.removeValue(forKey: key)
         }
+        // A cardless `git_status` / `git_diff` must not take the index lock to
+        // refresh stat data. Optional locks exist to speed up the NEXT git
+        // command, and a read tool in a background run has no business making
+        // the operator's own git invocations wait on that rewrite.
+        environment["GIT_OPTIONAL_LOCKS"] = "0"
         return environment
     }
 

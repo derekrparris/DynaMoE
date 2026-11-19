@@ -286,6 +286,41 @@ final class AgentSpawnPolicyTests: XCTestCase {
         )
     }
 
+    func testATurboSpawnThatForcesCloudKeepsItsOffDeviceCard() {
+        let suiteName = "AgentSpawnPolicyTests-turbo-cloud-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set("local", forKey: SubagentBackendSettings.backendKey)
+
+        XCTAssertFalse(
+            AgentHarness.turboModeMayBypassApproval(
+                toolName: "spawn_subagent",
+                arguments: [
+                    "role": "Codebase Researcher",
+                    "task_description": "read only",
+                    "allowed_tools": ["file_read", "grep_search"],
+                    "backend": "cloud"
+                ],
+                mode: .code,
+                defaults: defaults
+            ),
+            "Turbo must not skip the one card that says repository content leaves the machine"
+        )
+        XCTAssertTrue(
+            AgentHarness.turboModeMayBypassApproval(
+                toolName: "spawn_subagent",
+                arguments: [
+                    "role": "Codebase Researcher",
+                    "task_description": "read only",
+                    "allowed_tools": ["file_read", "grep_search"]
+                ],
+                mode: .code,
+                defaults: defaults
+            ),
+            "a read-only LOCAL spawn follows the stored Settings choice and stays routine"
+        )
+    }
+
     func testARunScopedCatalogIsTheBuiltinInstallAndStillForbidsDelegation() {
         let names = AgentHarness.runScopedToolNames()
         XCTAssertTrue(names.contains("file_read"))

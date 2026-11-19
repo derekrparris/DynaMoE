@@ -1156,6 +1156,10 @@ final class WorkspaceIsolationTests: XCTestCase {
         )
 
         XCTAssertTrue(SubagentApplyControl.canApply(record))
+        XCTAssertFalse(
+            SubagentApplyControl.canApply(record, executionStillUnwinding: true),
+            "a Stop marks the record terminal while its task may still be killing a child; apply must wait for the unwind"
+        )
         let request = SubagentApplyControl.applyRequest(for: record)
         XCTAssertEqual(request?.runId, runId)
         XCTAssertEqual(request?.toolName, "apply_subagent_changes")
@@ -1368,7 +1372,7 @@ final class WorkspaceIsolationTests: XCTestCase {
     /// sandbox — and the snapshot then reads the run's work against the base
     /// commit it was created from, with the operator's shared index never
     /// touched by the tampered pointer.
-    func testARetargetedGitPointerIsRepairedBeforeTheSnapshotReadsAnything() async throws {
+    func testARetargetedGitPointerIsRefusedRatherThanRepaired() async throws {
         let worktree = try await WorkspaceIsolation.createWorktree(
             repositoryRoot: repository,
             runId: UUID(),
@@ -1379,21 +1383,31 @@ final class WorkspaceIsolationTests: XCTestCase {
 
         // The exploit shape: the pointer now names the repository's own .git,
         // so a plain `git add -A` in the worktree would stage the OPERATOR's
-        // tree into their shared index.
-        try "gitdir: \(repository.appendingPathComponent(".git").path)\n".write(
+        // tree into their shared index. `git worktree repair <path>` resolves
+        // the path THROUGH that pointer, so repairing it here rewrote the
+        // main repository's admin file instead of this worktree's — the
+        // refusal must come without repair at all.
+        let retargeted = "gitdir: \(repository.appendingPathComponent(".git").path)\n"
+        try retargeted.write(
             to: worktree.path.appendingPathComponent(".git"),
             atomically: true,
             encoding: .utf8
         )
 
-        let changes = try await WorkspaceIsolation.snapshot(worktree, diffLimit: nil)
+        do {
+            _ = try await WorkspaceIsolation.snapshot(worktree, diffLimit: nil)
+            XCTFail("a pointer aimed at another repository's git directory must be refused")
+        } catch let error as WorkspaceIsolationError {
+            guard case .worktreeLinkageCompromised = error else {
+                XCTFail("expected a linkage refusal, got \(error)")
+                return
+            }
+        }
 
-        XCTAssertEqual(changes.changedFiles, ["README.md"], "the repaired snapshot reads the run's own work")
         XCTAssertEqual(
-            try String(contentsOf: worktree.path.appendingPathComponent(".git"), encoding: .utf8)
-                .contains("/worktrees/"),
-            true,
-            "the repair must restore the per-worktree pointer"
+            try String(contentsOf: worktree.path.appendingPathComponent(".git"), encoding: .utf8),
+            retargeted,
+            "the refusal must not call repair, which would follow the pointer and rewrite another worktree's record"
         )
         let status = try await git(["status", "--porcelain"], in: repository)
         XCTAssertEqual(status.1, "", "the operator's tree must never be staged by the snapshot")

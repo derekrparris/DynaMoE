@@ -112,13 +112,21 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     private var deletedRunOrder: [UUID] = []
     private var deletedSessionIds: Set<UUID> = []
     private var deletedSessionOrder: [UUID] = []
-    private let maximumTombstones = 512
+    /// Bounded because only the most recent deletions can still have an
+    /// in-flight save behind them. Sized so one bulk clear (a conversation's
+    /// whole run history) cannot evict its OWN earliest tombstones while the
+    /// saves captured before it are still queued; a UUID apiece is cheap.
+    private let maximumTombstones = 10_000
     /// Terminal records whose report has not been relayed, keyed by session
     /// bucket. Built once from disk (off the main actor at launch) and kept
     /// current by `writeNow`/`delete`. The report relay asks this instead of
     /// decoding every record in a conversation on each send.
     private var unrelayedBySession: [String: Set<UUID>] = [:]
     private var relayIndexBuilt = false
+    /// Runs that became relayed while the initial off-lock scan was reading
+    /// them. Publishing the scan cannot resurrect one: `markRelayed` lands
+    /// from the relay path, which is not on the store's IO queue.
+    private var relaySettledDuringBuild: Set<UUID> = []
 
     init(
         rootURL: URL = AgentRunStore.defaultRootURL,
@@ -168,9 +176,12 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     /// stall the execution that produced it.
     func save(_ record: AgentRunRecord) {
         let url = fileURL(runId: record.id, sessionId: record.parentSessionId)
-        let bounded = Self.bounded(record)
+        // Bound on the store's queue, not the caller's. `snapshotRecord` runs
+        // on the main actor, and truncating a transcript (string slicing and
+        // allocation over every entry) there charged the UI for work that is
+        // only needed at write time.
         ioQueue.async { [self] in
-            writeNow(bounded, to: url)
+            writeNow(Self.bounded(record), to: url)
         }
     }
 
@@ -212,14 +223,46 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     @discardableResult
     func mutate(runId: UUID, sessionId: UUID?, _ change: (inout AgentRunRecord) -> Void) -> AgentRunRecord? {
         return onQueue { [self] in
-            let preferred = fileURL(runId: runId, sessionId: sessionId)
-            let url = existingRecordURL(runId: runId, preferredSession: sessionId) ?? preferred
-            guard var current = decodeRecord(at: url) else { return nil }
-            change(&current)
-            let bounded = Self.bounded(current)
-            guard writeNow(bounded, to: url) else { return nil }
-            return bounded
+            mutateOnQueue(runId: runId, sessionId: sessionId, change)
         }
+    }
+
+    /// The same mutation without blocking the caller's actor.
+    ///
+    /// The apply path runs on the main actor and needs the written record back
+    /// before it can continue. `mutate` reaches that answer through
+    /// `ioQueue.sync`, which parks the UI for a decode, a full encode, an
+    /// fsync and a rename. Awaiting the same work keeps the ordering (the IO
+    /// queue is serial) without holding the main thread.
+    @discardableResult
+    func mutateAsync(
+        runId: UUID,
+        sessionId: UUID?,
+        _ change: @escaping @Sendable (inout AgentRunRecord) -> Void
+    ) async -> AgentRunRecord? {
+        await withCheckedContinuation { continuation in
+            ioQueue.async { [self] in
+                continuation.resume(
+                    returning: mutateOnQueue(runId: runId, sessionId: sessionId, change)
+                )
+            }
+        }
+    }
+
+    /// Caller is on the IO queue. Locates the record the way `mutate` documents
+    /// and answers the bounded record it wrote, or nil when it could not.
+    private func mutateOnQueue(
+        runId: UUID,
+        sessionId: UUID?,
+        _ change: (inout AgentRunRecord) -> Void
+    ) -> AgentRunRecord? {
+        let preferred = fileURL(runId: runId, sessionId: sessionId)
+        let url = existingRecordURL(runId: runId, preferredSession: sessionId) ?? preferred
+        guard var current = decodeRecord(at: url) else { return nil }
+        change(&current)
+        let bounded = Self.bounded(current)
+        guard writeNow(bounded, to: url) else { return nil }
+        return bounded
     }
 
     /// Marks a report delivered: the relay index learns it NOW, the durable
@@ -232,6 +275,11 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     func markRelayed(runId: UUID, sessionId: UUID?) {
         signatureLock.lock()
         removeRelayEverywhereLocked(runId: runId)
+        if !relayIndexBuilt {
+            // The initial scan runs without the lock. Remember the settled id
+            // so publishing its (stale) disk snapshot cannot re-offer it.
+            relaySettledDuringBuild.insert(runId)
+        }
         signatureLock.unlock()
         mutateLater(runId: runId, sessionId: sessionId) { current in
             current.summaryRelayed = true
@@ -390,13 +438,23 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
                 break
             }
         }
-        _ = fsync(descriptor)
-        close(descriptor)
-        if writeErrno != 0 {
+        // Both of these are part of the durability claim above, not cleanup:
+        // `fsync` reports ENOSPC/IO errors precisely because the data is not
+        // on disk yet, and `close` can be the call that surfaces a deferred
+        // write error. Ignoring them renamed an unflushed temp file over the
+        // previous good record and cached its digest, so the next save of the
+        // same bytes was skipped.
+        let syncResult = fsync(descriptor)
+        let syncErrno = syncResult == 0 ? 0 : errno
+        let closeResult = close(descriptor)
+        let closeErrno = closeResult == 0 ? 0 : errno
+        let durabilityErrno: Int32 = writeErrno != 0 ? writeErrno
+            : (syncErrno != 0 ? syncErrno : closeErrno)
+        if durabilityErrno != 0 {
             try? FileManager.default.removeItem(at: temporary)
             throw NSError(
                 domain: NSPOSIXErrorDomain,
-                code: Int(writeErrno),
+                code: Int(durabilityErrno),
                 userInfo: [NSFilePathErrorKey: temporary.path]
             )
         }
@@ -423,9 +481,12 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     /// first call: the index is built once and maintained by this store.
     func unrelayedRunIds(sessionId: UUID?) -> Set<UUID> {
         // Steady state: the launch prewarm has finished, so answering is one
-        // lock and a set lookup. The scan below is the first-send fallback for
-        // a launch that has not finished preparing the index; it runs on the
-        // IO queue, never on the caller's (usually main) thread.
+        // lock and a set lookup. Before that, a caller on the MAIN THREAD is
+        // answered from what the index has learned so far and the scan is
+        // started in the background: this is called while a send is being
+        // prepared, and a few hundred JSON decodes there blocked the first
+        // frame. A record missed on this one send is still unrelayed, so the
+        // next send injects it — the report is never dropped, only delayed.
         signatureLock.lock()
         if relayIndexBuilt {
             let ids = unrelayedBySession[Self.relayBucket(sessionId)] ?? []
@@ -433,10 +494,16 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
             return ids
         }
         signatureLock.unlock()
-        return onQueue { [self] in
+        if Thread.isMainThread {
+            prepareRelayIndex()
             signatureLock.lock()
             defer { signatureLock.unlock() }
-            ensureRelayIndexLocked()
+            return unrelayedBySession[Self.relayBucket(sessionId)] ?? []
+        }
+        return onQueue { [self] in
+            buildRelayIndexIfNeeded()
+            signatureLock.lock()
+            defer { signatureLock.unlock() }
             return unrelayedBySession[Self.relayBucket(sessionId)] ?? []
         }
     }
@@ -444,14 +511,12 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     /// Builds the index OFF the caller's thread. The scan decodes every record
     /// in the store; it used to run synchronously wherever the caller happened
     /// to be, so a first send's lookup could pay the whole scan on the main
-    /// thread under the relay lock before the first prompt rendered. The IO
-    /// queue is the write path's own queue, so a save landing mid-scan waits
-    /// for it rather than being missed by the scan's snapshot.
+    /// thread before the first prompt rendered. The IO queue is the write
+    /// path's own queue, so a save landing mid-scan waits for it rather than
+    /// being missed by the scan's snapshot.
     func prepareRelayIndex() {
         ioQueue.async { [self] in
-            signatureLock.lock()
-            defer { signatureLock.unlock() }
-            ensureRelayIndexLocked()
+            buildRelayIndexIfNeeded()
         }
     }
 
@@ -459,10 +524,32 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         sessionId?.uuidString ?? unscopedSessionDirectory
     }
 
-    private func ensureRelayIndexLocked() {
-        guard !relayIndexBuilt else { return }
-        relayIndexBuilt = true
-        guard let directories = try? fileManager.contentsOfDirectory(atPath: rootURL.path) else { return }
+    /// Scans the store and publishes what it found, in two phases.
+    ///
+    /// The decode used to happen while holding `signatureLock`, so every
+    /// writer — and a first send's caller — waited behind a few hundred JSON
+    /// decodes. The scan now runs with no lock; only the merge at the end
+    /// takes it. A run relayed during the scan is remembered in
+    /// `relaySettledDuringBuild` so publishing cannot resurrect it.
+    ///
+    /// Runs on the IO queue (`prepareRelayIndex` / `unrelayedRunIds`), so
+    /// saves and deletes cannot interleave with the scan.
+    private func buildRelayIndexIfNeeded() {
+        signatureLock.lock()
+        let alreadyBuilt = relayIndexBuilt
+        signatureLock.unlock()
+        guard !alreadyBuilt else { return }
+        let candidates = scanRelayCandidates()
+        signatureLock.lock()
+        publishRelayIndexLocked(candidates)
+        signatureLock.unlock()
+    }
+
+    /// Every terminal, unrelayed record on disk, grouped by session bucket.
+    /// No lock is held while this reads.
+    private func scanRelayCandidates() -> [String: Set<UUID>] {
+        var found: [String: Set<UUID>] = [:]
+        guard let directories = try? fileManager.contentsOfDirectory(atPath: rootURL.path) else { return found }
         for name in directories {
             let directory = rootURL.appendingPathComponent(name, isDirectory: true)
             var isDirectory: ObjCBool = false
@@ -475,9 +562,21 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
                       record.schemaVersion <= AgentRunRecord.currentSchemaVersion,
                       record.status.isTerminal,
                       !record.summaryRelayed else { continue }
-                addRelayLocked(record)
+                found[Self.relayBucket(record.parentSessionId), default: []].insert(record.id)
             }
         }
+        return found
+    }
+
+    private func publishRelayIndexLocked(_ candidates: [String: Set<UUID>]) {
+        guard !relayIndexBuilt else { return }
+        for (bucket, ids) in candidates {
+            for id in ids where !relaySettledDuringBuild.contains(id) {
+                unrelayedBySession[bucket, default: []].insert(id)
+            }
+        }
+        relaySettledDuringBuild.removeAll()
+        relayIndexBuilt = true
     }
 
     private func addRelayLocked(_ record: AgentRunRecord) {
@@ -556,17 +655,28 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     func loadAny(runId: UUID) -> AgentRunRecord? {
         onQueue { [self] in
             let name = "\(runId.uuidString).json"
-            if let direct = try? fileManager.contentsOfDirectory(atPath: rootURL.path) {
-                for directoryName in direct {
-                    let candidate = rootURL
-                        .appendingPathComponent(directoryName, isDirectory: true)
-                        .appendingPathComponent(name, isDirectory: false)
-                    if fileManager.fileExists(atPath: candidate.path) {
-                        return decodeRecord(at: candidate)
-                    }
+            guard let direct = try? fileManager.contentsOfDirectory(atPath: rootURL.path) else {
+                return nil
+            }
+            // A conversation delete re-scopes a run by writing the new copy
+            // before removing the old one, so a crash between the two leaves
+            // BOTH files. Returning whichever directory the listing named
+            // first was a coin flip; the newer file is the copy that carries
+            // the re-scope (and any write after it).
+            var newest: (date: Date, record: AgentRunRecord)?
+            for directoryName in direct {
+                let candidate = rootURL
+                    .appendingPathComponent(directoryName, isDirectory: true)
+                    .appendingPathComponent(name, isDirectory: false)
+                guard fileManager.fileExists(atPath: candidate.path),
+                      let record = decodeRecord(at: candidate) else { continue }
+                let modified = (try? candidate.resourceValues(forKeys: [.contentModificationDateKey]))?
+                    .contentModificationDate ?? .distantPast
+                if newest == nil || modified > newest!.date {
+                    newest = (modified, record)
                 }
             }
-            return nil
+            return newest?.record
         }
     }
 
@@ -668,7 +778,16 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         // left a record on disk that every later write refused to update: an
         // immortal, invisible run. The queue is serial, so a save enqueued
         // after this still sees the tombstone before it writes.
-        guard (try? fileManager.removeItem(at: url)) != nil else { return }
+        //
+        // An ABSENT file is the one case that still deserves the tombstone:
+        // the record was already gone, and a save captured before this delete
+        // is queued behind it. Skipping the tombstone here let that save
+        // recreate a run the operator had deleted.
+        var isDirectory: ObjCBool = false
+        let exists = fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory)
+        if exists {
+            guard (try? fileManager.removeItem(at: url)) != nil else { return }
+        }
         noteDeletedRun(runId)
         signatureLock.lock()
         writtenSignatures[url.path] = nil

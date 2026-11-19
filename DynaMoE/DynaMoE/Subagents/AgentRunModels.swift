@@ -206,7 +206,14 @@ nonisolated struct AgentUsage: Codable, Equatable, Sendable {
         cachedTokens += other.cachedTokens
         costUSD += other.costUSD
         costIsUnpriced = costIsUnpriced || other.costIsUnpriced
-        if costUnpricedReason == nil { costUnpricedReason = other.costUnpricedReason }
+        // `noPriceRecorded` is the ACTIONABLE cause (recording a price fixes
+        // it) and a provider that omitted usage is a different fact, so it
+        // wins over `providerOmittedUsage` regardless of which step reported
+        // first. Previously the first cause won for the life of the run.
+        if costUnpricedReason == nil
+            || costUnpricedReason == .providerOmittedUsage && other.costUnpricedReason == .noPriceRecorded {
+            costUnpricedReason = other.costUnpricedReason
+        }
         wallClockSeconds += other.wallClockSeconds
         toolCalls += other.toolCalls
         backendRequests += other.backendRequests

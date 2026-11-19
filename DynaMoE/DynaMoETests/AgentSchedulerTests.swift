@@ -42,6 +42,20 @@ final class AgentSchedulerTests: XCTestCase {
         XCTAssertEqual(snapshot.totalTickets, 0)
     }
 
+    /// A local run holds the one ticket for its whole life — including an
+    /// approval card — so its admission wait has to cover the default budget
+    /// and not refuse the next local spawn after two minutes.
+    func testLocalAdmissionCoversTheHoldersWholeBudget() {
+        var limits = AgentSchedulerLimits.default
+        limits.queueTimeoutSeconds = 120
+        XCTAssertEqual(limits.queueTimeout(for: .local), 900)
+        XCTAssertEqual(
+            limits.queueTimeout(for: .cloud(providerId: "p")),
+            120,
+            "cloud capacity is not held for a run's lifetime, so the configured wait applies"
+        )
+    }
+
     func testPriorityOrdersTheQueue() async throws {
         var limits = AgentSchedulerLimits.default
         limits.local = 1
@@ -188,11 +202,14 @@ final class AgentSchedulerTests: XCTestCase {
         await scheduler.release(blocking)
     }
 
-    func testPreemptionStopsOnlyBackgroundLocalRuns() async {
+    func testPreemptionStopsOnlyBackgroundLocalRuns() async throws {
         let scheduler = makeScheduler(.default)
         let recorder = CancellationRecorder()
         let localRun = UUID()
         let cloudRun = UUID()
+        // Preemption follows the LEASE holder: a registered run that holds no
+        // local ticket is not blocking an interactive turn.
+        let ticket = try await scheduler.acquire(.local, priority: .userRequested, runId: localRun)
         await scheduler.register(
             runId: localRun, parentRunId: nil, parentSessionId: nil,
             schedulingClass: .local, priority: .userRequested,
@@ -208,6 +225,42 @@ final class AgentSchedulerTests: XCTestCase {
         XCTAssertEqual(preempted, 1)
         XCTAssertEqual(recorder.names, ["local"])
         XCTAssertEqual(recorder.reasons, ["an interactive turn went first"])
+        await scheduler.release(ticket)
+    }
+
+    /// With local capacity 1 every other local run is a WAITER, not a holder.
+    /// Cancelling those destroyed work that was not using the engine at all —
+    /// and, for an isolated writer, discarded its worktree with it.
+    func testPreemptionLeavesQueuedLocalRunsAlone() async throws {
+        let scheduler = makeScheduler(.default)
+        let recorder = CancellationRecorder()
+        let holder = UUID()
+        let queued = UUID()
+        let ticket = try await scheduler.acquire(.local, priority: .userRequested, runId: holder)
+        await scheduler.register(
+            runId: holder, parentRunId: nil, parentSessionId: nil,
+            schedulingClass: .local, priority: .userRequested,
+            cancel: { recorder.record("holder", $0) }
+        )
+        await scheduler.register(
+            runId: queued, parentRunId: nil, parentSessionId: nil,
+            schedulingClass: .local, priority: .userRequested,
+            cancel: { recorder.record("queued", $0) }
+        )
+        let waiter = Task {
+            try await scheduler.acquire(.local, priority: .userRequested, runId: queued, timeout: 5)
+        }
+        try await waitForWaiters(scheduler, 1)
+
+        let preempted = await scheduler.preemptLocalRuns()
+        XCTAssertEqual(preempted, 1)
+        XCTAssertEqual(recorder.names, ["holder"], "the queued run is next in line, not in the way")
+        let queuedCancelled = await scheduler.isCancelled(runId: queued)
+        XCTAssertFalse(queuedCancelled, "a queued run must survive an interactive preemption")
+
+        await scheduler.release(ticket)
+        let queuedTicket = try await waiter.value
+        await scheduler.release(queuedTicket)
     }
 
     func testCancellingASessionStopsItsRunsOnly() async {

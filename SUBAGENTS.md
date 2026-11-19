@@ -353,6 +353,11 @@ struct AgentBackendTurn {
 - Uses `CloudChatClient.streamTurn`; maps `CloudTurnEvent` deltas to
   `assistantDelta`.
 - Tool calls arrive natively; assemble fragmented arguments before executing.
+- The cloud request carries temperature, top-p, max tokens and the native tool
+  declarations. `thinking` and `stopSequences` are LOCAL-TEMPLATE fields and are
+  not mapped onto provider fields: the spawn path passes an empty stop list, and
+  the reasoning channel is the local families' own convention. A future cloud
+  reasoning switch belongs here, not in the request struct.
 - Cost from `CloudCostModel`; persisted per run.
 - **No engine lease.** Parallel-safe. Default pool size 3 per provider, global
   fan-out 6.
@@ -531,12 +536,16 @@ from a child is refused by name.
   speculative), and priority ordering is per CLASS, so one class's head cannot
   starve a class that still has capacity. A queued run can be cancelled while
   waiting, and the wait is bounded by `dynamoe_subagent_queue_timeout`
-  (default 120 s); a timeout is a refusal that names the class.
+  (default 120 s; a LOCAL admission wait is floored at 900 s because the one
+  local ticket is held for a run's whole life); a timeout is a refusal that
+  names the class.
 - **Cancellation tree:** `register(runId:parentRunId:parentSessionId:cancel:)`
-  records how to stop a run. `cancel(runId:)` walks descendants,
-  `cancelRuns(parentSessionId:)` is what the Stop button and
-  `SubagentManager.cancelSession` call, and application termination cancels
-  every run and every pending approval.
+  records how to stop a run. `cancel(runId:)` walks descendants.
+  `cancelTurnRuns(parentTurnId:)` is what the Stop button calls, so a Stop
+  reaches exactly what the current turn spawned (continuations carry the same
+  id); `cancelSession(sessionId:)` / `cancelRuns(parentSessionId:)` is the
+  session-wide fallback for a path that never minted a turn id.
+  Application termination cancels every run and every pending approval.
 - **Budgets** are enforced by the loop, not the scheduler; the scheduler enforces
   concurrency and queue timeouts.
 
@@ -901,9 +910,10 @@ Implemented, with the decisions worth carrying:
   writer produces. `createWorktree` records the base commit; an `AgentIsolation`
   restored from disk derives it as `git merge-base <branch> HEAD` in the main
   repository, which is the fork point even after the main tree advances.
-- **`git add -A` before every snapshot, and the untracked files are included.**
-  Staging is safe because the worktree is disposable and the index is not part
-  of what is applied. `--name-status -z` separates the STATUS from its path with
+- **`git add -N` before every snapshot, so untracked files are included.**
+  Intent-to-add records the PATHS without writing their contents into the
+  operator's shared object store, which `add -A` did for every file a run
+  touched. The index is not part of what is applied. `--name-status -z` separates the STATUS from its path with
   NUL as well as entries from each other (`A\0path\0`, `R100\0old\0new\0`); a
   tab-only parser silently reports no files, which is how the first cut passed
   every apply case while listing nothing in the inspector.
@@ -968,8 +978,8 @@ Implemented, with the decisions worth carrying:
       inspector's button cannot race
 - [x] Opt-in real-model writer + operator apply case
       (`DeepSeekV41PublishedTurnTests.testARealLocalWriterLandsItsWorkFromTheWorktree`)
-- [ ] Discard Worktree control (not built: the 14-day sweep and Reveal
-      Worktree cover cleanup for now, §16)
+- [x] Discard Run control (`SubagentManager.discard`), which resolves the
+      record's worktree and clears it under the same guards as Apply
 
 **Exit criteria met at the logic seam:** a stopped isolated run can be landed
 from the inspector without terminal git, and the card it raises is the same
@@ -1062,6 +1072,7 @@ Append one line per session so the next session knows where work stopped.
 
 | Date | Session | Result |
 |---|---|---|
+| 2026-11-18 | PR #104 review round 7 | The three merge-gating findings plus the majors. (1) A Stop during a queued send no longer spins the MainActor: the slot wait checks `Task.isCancelled` before sleeping again (`try?` swallowed the thrown sleep, so the loop ran at full speed holding the ledger lock), and both deferred-relaunch tasks check cancellation BEFORE preempting, so a Stop during the task hop cannot destroy another conversation's runs. (2) A cancelled run's `shell_run` child is killed: `ShellRunTool` spawns through `AgentHarness.runProcess`, whose cancellation handler SIGTERMs the process tree and SIGKILLs after 500 ms, and `SubagentInstance.isExecutionUnwound` (cleared where the execution body returns, which is the same actor turn that resumes `waitForCompletion`) makes the apply path refuse a terminal record whose task is still unwinding. (3) Turbo keeps the forced-cloud spawn card (`turboModeMayBypassApproval` consults `spawnsWorkOffDevice`; the Settings choice is still routine). Majors: preemption now cancels only the LOCAL TICKET HOLDER, not every queued local run (`ticketRunIds`); a refused model load rolls the conversation back to the previous model/profile/last-used id instead of leaving it rendering B while the engine serves A; `writeOwnerOnlyAtomically` checks `fsync`/`close`; the relay index builds OFF `signatureLock` and publishes with a settled-id guard; a pre-loop refusal that discards its worktree clears the record's isolation (`forgetDiscardedWorktree`), so `holdsWorktreeWork` no longer pins it forever; the containment card names the call's real destination (`approvalDestination`: a write's path, a shell's `cwd`); `.waitingForApproval` counts as active for the relay wait and the active counts; a cancelled turn keeps its partial text (`AgentBackendError.cancelledAfterPartial`, appended by the loop) and its spend is written for any terminal unwind, not only `.cancelled`; in-loop compaction counts tool-call arguments and the system block/tool schemas. Minors: `git worktree repair` runs only for a MISSING pointer (a retargeted one is refused without repair, which git applies through the pointer and would rewrite a sibling's record), a recorded repository root outranks the pointer in `open`, git reads run with `GIT_OPTIONAL_LOCKS=0`, `save()` bounds on the IO queue, an absent-file delete still tombstones, the tombstone bound covers a bulk clear, apply/cancel record writes await `mutateAsync` instead of blocking the main actor, `suffixDelta` drops a shrink instead of duplicating the answer, tool-call markup is stripped from the turn's prose, a usage-less turn no longer resets `latestPromptTokens`, `CloudTurnFailure` maps to an honest error type, `noPriceRecorded` wins the unpriced-cause merge, and a schema encode failure installs no mask. Docs: Stop is turn-scoped, local admission is 900 s, `add -N` not `add -A`, Discard Run exists. Tests: queued-writer preemption (the queued run survives), the forced-cloud Turbo card, the absent-file tombstone, the discarded-worktree record, compaction counting arguments/overhead, markup-free turn text, the shrink delta, the apply button's unwind gate, and a real `sleep 5` shell killed at a Stop in 0.3 s. `WorkspaceIsolationTests`' retarget test now expects the refusal (and asserts the pointer was not rewritten). 350 executed across the touched suites, 2 opt-in skips, 0 failures. |
 | 2026-11-18 | PR #104 review round 6 | Four must-fixes and the should-fixes closed. (1) `withTurnToolMask` no longer snapshots before its lock or restores unconditionally: scoped masks are tracked by identity on a stack, and an exit rebuilds the registry from the base snapshot plus every scope STILL live, so a run whose mask outlives its engine task and a server turn that installs in the freed-slot window cannot leave either vocabulary installed for later turns (`testTheScopeThatEndsFirstDoesNotRestoreOverTheOneStillInstalled`). (2) `WorkspaceIsolation.diffStat` verifies the worktree's linkage and HEAD before its `git add -N .`, so merely opening the apply card cannot write intent-to-add entries into the operator's index through a retargeted pointer. (3) A queued send now publishes BOTH `isGeneratingText` and `generatingSessionId` when it takes over an idle flag, and a release transfers ownership to any remaining queued send instead of clearing the flag out from under it — the "composer refuses sends forever after a completed turn in another conversation" wedge. (4) A cancelled run's interrupted step is not lost: when the loop unwinds after `cancel` persisted the record, the model-backed path writes `outcome.usage` (including the ledger's billed-but-no-turn attempt) back to the record (`testACancelledRunsInFlightSpendReachesItsRecord`). Should-fixes: a worktree whose HEAD moved off its recorded branch is refused by the same guard as the linkage (`verifyWorktreeHead`, also checked by the cardless `git_commit` through a run-scoped `workspaceBranch`); an empty-change apply refuses when the branch holds commits a patch cannot carry, and a non-empty apply keeps the branch when its commit count cannot be proven empty; `deleteSession` moves undecodable record files to the unscoped bucket (so the sweep still protects their trees) and tombstones only after a successful removal; local admission covers the holder's 900 s default and names strict seriality; the local cost override approves the estimate the card showed and refuses when the pin/rate moved; an EMPTY Cloud model setting now refuses instead of falling back to a provider the operator never named; compaction skips prompt-only relay directives; a Stop landing in the hop into `launchTurn` is checked inside the hop; `max_cost_usd: 0` and non-finite ceilings are refused at the card; a billed attempt with no usage block says the provider withheld usage rather than "no price is recorded". Minors: `allowed_tools: []` is refused by name (the tool no longer collapses it to "omitted"); a local dollar ceiling gets a local-specific refusal; the Cloud model field documents the two accepted spellings; 429 honours a clamped `Retry-After` carried on the receipt; the event pump gates `.toolFinished`/`.completed` on `isFinished`; `contextTokens` adds only the LAST step's completion; `safeURL` resolves the existing ancestor and leaf so a symlink cannot leave the tree; `GitController` spawns every git child with `GIT_*` stripped; the chat apply card names the branch, destination and files. Tests: the interleaved mask scope, clearCompleted sparing an unapplied isolated run, `deleteClearableRecords`, `safeURL` traversal/leaf-directory symlinks, `invalidateIfNotPreserved`, `onCacheWillChange` (fires only past every refusal gate and before reset), a real partial `git apply` rollback (the first file is created, the second fails, the tree returns clean), claim release after a real and a failed apply, the detached-HEAD refusal, the cancelled-spend record, the stale-estimate refusal, the empty-tool-list refusal, Retry-After parsing/clamping, and the new last-step context arithmetic. 248 executed across the touched suites, 2 opt-in skips, 0 failures. |
 | 2026-11-18 | PR #104 review round 5 | Eight merge blockers closed. (1) A queued relaunch clears the generating state it published in its own `defer` (guarded on session ownership, `generationTask` and other queued tasks), and `cancelDeferredRelaunches(sessionId:)` clears it immediately, so deleting a conversation during the preemption drain cannot leave every composer refusing sends. (2) `deleteSession` honours the rescue write: a failed write leaves the original record (and the whole session directory, untombstoned) in place. (3) A failed rollback keeps its snapshot directory and names the path in the error. (4) `AgentRunRecord.keptIgnoredFiles`/`holdsWorktreeWork` protect an APPLIED worktree kept for git-ignored files from the 14-day sweep, `prune`, `clearCompleted` and `deleteSession`; `noteKeptIgnoredFiles` persists it on both the live and restored paths, and the sweep keeps a UUID-named tree whose record file exists but cannot be decoded (newer schema/corrupt). (5) `pruneStaleWorktrees` probes for the record FILE before treating a tree as orphaned. (6) `.everyStateChange` marks out-of-workspace `file_write`/`file_edit`/`git_commit` as containment escapes, so Turbo cannot bypass them for an unisolated run. (7) The relay line puts `id=` first, parses only that trailer, validates the UUID, and sanitizes the model-supplied role to one line with brackets neutralized and an 80-character bound. (8) Discard is refused in `SubagentManager.discard` while the run or its repository is claimed by an apply, and the inspector disables the button and its confirmation. Majors: the apply card shows `git diff --stat` and the git-resolved destination; `WorkspaceIsolation.git` passes `-c diff.noprefix=false` and a `GIT_*`-scrubbed environment; a cancelled run persists its reason (`lastError`, surfaced as `error` for `.cancelled`); the headless loop resolves tool definitions EVERY step so `tools_load` reaches later requests; `complete` without a summary completes the run and calls after it are recorded as abandoned. Minors: legacy `spawn` honours `notifiesOnFinish`; "Clear Finished" reaches unscoped terminal instances; `replaceItemAt` re-asserts 0600; delete/prune tombstone only after a successful removal; `markRelayed` updates the relay index before the queued write (`mutateLater` alone left a duplicate-relay window); a deferred grammar rebuild is applied at turn start (holding the slot); steering that lands after the final step is recorded; unparseable cloud arguments no longer invent `_raw_arguments`; instance observers are cancelled when trimmed; §6 no longer describes the dead 5xx retry. Tests: 4 new sweep/discard cases, 2 relay-line cases, an out-of-workspace Turbo case, and the no-summary `complete` case — 220 executed, 2 opt-in skips, 0 failures. |
 | 2026-11-18 | PR #104 review round 4 | (1) BLOCKER: containment resolved `..` lexically before following symlinks, so `<worktree>/link/../x` read as inside while the write landed outside; `resolvedForContainment` now walks the components in order, resolving each existing one before applying the next `..` (a DANGLING symlink is resolved from `destinationOfSymbolicLink`, because Foundation reports it as absent while an O_CREAT write still follows it), and `testASymlinkFollowedByDotDotEscapesTheWorkspace` plus `testADanglingSymlinkEscapeNeedsTheCard` pin both cases. (2) An unapplied isolated run can be DISCARDED per run from its pane (confirmed destructive action), which deletes the record and cleans the worktree and branch; before this, no path could ever remove one. (3) Plan mode no longer exempts a spawn that resolves to Cloud: its read tools still upload repository content, so `spawnResolvesToCloud` decides the card (including the Settings-resolved backend). (4) Turn identity is a task-local bound by `executeTool` from the value each turn knows, so a tool still running when the operator sends again stamps its run with its OWN turn and Stop cancels the right runs. (5) A spawn checks `Task.isCancelled` after every resolve/approval await and discards the plan's fresh worktree instead of starting a run stamped with a stopped turn. (6) `syncGrammar` refuses to rebuild the shared registry while a scoped mask owns it or a generation is reading it, and defers the rebuild to the next tool boundary; `LocalAgentBackend.collect` now awaits the engine task on the failed-turn path too. (7) `runTool` unwraps BOTH optionals, so a deadline that wins still collects a tool's completed result. Minors: role text is sanitized in both worker prompts; the dead 5xx retry arm is removed (the transport records `spent: true` for every 5xx); the measured prefill rate resets with the checkpoint; the detail pane is keyed by run id; relay marking and the clear-finished scan moved off the main actor (store reads are queue-ordered behind deletes); "Clear Finished" warns when it would discard unread reports; the legacy spawn path names an ignored `isolation: worktree`; the pane reloads on status changes, not only counts. |
@@ -1099,9 +1110,12 @@ Append one line per session so the next session knows where work stopped.
 - Cooperative cancellation boundaries: `runTurn` and `runTool` use
   `withTaskGroup`, which always awaits its children after `cancelAll()`. A
   backend stream or tool that ignores cancellation therefore keeps the run,
-  and its scheduler ticket, alive past Stop and the wall clock. Every backend
-  and tool in this app honours cancellation; a hard-abandonment path is not
-  built.
+  and its scheduler ticket, alive past Stop and the wall clock. The model
+  backends are cancellation-aware, `shell_run` spawns through
+  `AgentHarness.runProcess` (SIGTERM to the process tree, SIGKILL after
+  500 ms), and `git` children run under the same helper. A tool that holds a
+  child process of its own must use that helper; a hard-abandonment path is
+  not built.
 - Model-backed default: decided in Phase 3 — it stays an explicit Settings
   choice. The picker offers "Role pipelines (no model)", "Local model" and
   "Cloud model"; an unset value keeps the legacy pipelines. Sending work to a
@@ -1128,7 +1142,7 @@ Append one line per session so the next session knows where work stopped.
   run store is the record; the log is for the model-serving wire.)
 - Operator-initiated apply: decided and shipped in Phase 5. The inspector's
   Apply Changes button raises the same `SubagentApprovalCenter` request a tool
-  call would and delegates to `SubagentApplyService`. Deliberately NOT built:
-  an inspector Discard Worktree control. The 14-day sweep and Reveal Worktree
-  cover cleanup for now, and a discard would need its own recorded outcome so
-  the inspector could distinguish "thrown away" from "never existed".
+  call would and delegates to `SubagentApplyService`. Also shipped: the
+  inspector's Discard Run control (`SubagentManager.discard`), which removes an
+  isolated run's worktree under the same single-flight/apply guards and then
+  deletes its record, so the list cannot offer a run whose tree is gone.

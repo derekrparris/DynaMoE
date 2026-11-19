@@ -567,6 +567,24 @@ final class AgentRunStoreTests: XCTestCase {
         )
     }
 
+    /// A delete for a run that left no file still has to be final: the file
+    /// may be absent because the record was already removed, while a save
+    /// captured before the delete is still queued behind it.
+    func testADeleteWithNoFileStillStopsAQueuedSave() throws {
+        let store = makeStore()
+        let sessionId = UUID()
+        let run = record(sessionId: sessionId)
+
+        store.delete(runId: run.id, sessionId: sessionId)
+        store.save(run)
+        store.flush()
+
+        XCTAssertNil(
+            store.load(runId: run.id, sessionId: sessionId),
+            "an absent file is not permission for a queued save to create it"
+        )
+    }
+
     /// Retention's clock starts at a run's start, so an old record can still be
     /// live. Pruning it deletes the file out from under its own instance.
     func testRetentionNeverPrunesALiveRecord() throws {
@@ -602,8 +620,13 @@ final class AgentRunStoreTests: XCTestCase {
         store.saveImmediately(pending)
         store.saveImmediately(delivered)
 
-        // A fresh store answers from disk, which is the relaunch case.
+        // A fresh store answers from disk, which is the relaunch case. The
+        // launch prewarm is what builds that index off the main thread; a main
+        // -thread lookup before it finishes answers from what is built and the
+        // next send picks the record up, so the test prewarms explicitly.
         let restored = AgentRunStore(rootURL: root)
+        restored.prepareRelayIndex()
+        restored.flush()
         XCTAssertEqual(restored.unrelayedRunIds(sessionId: sessionId), [pending.id])
 
         var marked = pending
@@ -614,6 +637,27 @@ final class AgentRunStoreTests: XCTestCase {
         store.delete(runId: delivered.id, sessionId: sessionId)
         store.flush()
         XCTAssertFalse(store.unrelayedRunIds(sessionId: sessionId).contains(delivered.id))
+    }
+
+    /// `markRelayed` must update the index BEFORE its durable write lands.
+    /// The relay asks the fast path on the next send, and a write still behind
+    /// the IO queue left the run listed as owed — its report injected twice.
+    func testMarkingRelayedIsVisibleBeforeItsWriteLands() throws {
+        let store = makeStore()
+        let sessionId = UUID()
+        let run = record(sessionId: sessionId)
+        store.saveImmediately(run)
+        // Build the index so the answer comes from the in-memory fast path.
+        store.prepareRelayIndex()
+        XCTAssertTrue(store.unrelayedRunIds(sessionId: sessionId).contains(run.id))
+
+        store.markRelayed(runId: run.id, sessionId: sessionId)
+        XCTAssertFalse(
+            store.unrelayedRunIds(sessionId: sessionId).contains(run.id),
+            "the relay index must learn a delivery before the queued write drains"
+        )
+        store.flush()
+        XCTAssertFalse(store.unrelayedRunIds(sessionId: sessionId).contains(run.id))
     }
 
     // MARK: - Mutate

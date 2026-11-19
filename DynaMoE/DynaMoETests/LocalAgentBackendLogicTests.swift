@@ -178,6 +178,34 @@ final class LocalAgentBackendLogicTests: XCTestCase {
             "abcé",
             "a repaired UTF-8 boundary is re-emitted rather than dropped"
         )
+        XCTAssertEqual(
+            LocalAgentBackend.suffixDelta(from: "The answer is 42.", to: "The answer"),
+            "",
+            "a SHRINK is a reclassification (a late think-close), not new text; re-emitting it duplicated the answer"
+        )
+    }
+
+    func testACallBlockIsNotPartOfTheTurnsProse() {
+        let block = "<tool_call><function=file_read><parameter=path>a.swift</parameter></function></tool_call>"
+        let result = makeResult(
+            parsedCalls: [
+                ParsedToolCall(
+                    name: "file_read",
+                    arguments: ["path": "a.swift"],
+                    rawArguments: "{\"path\":\"a.swift\"}",
+                    rawText: block
+                )
+            ],
+            actionable: [0],
+            text: "I will read it.\n\(block)"
+        )
+        let turn = LocalAgentBackend.turn(from: result)
+        XCTAssertEqual(turn.text, "I will read it.")
+        XCTAssertEqual(turn.calls.count, 1)
+        XCTAssertFalse(
+            turn.text.contains("<parameter="),
+            "the report builder reads turn.text for findings and the summary"
+        )
     }
 
     func testOnlyActionableCallsReachTheLoop() {
@@ -451,7 +479,8 @@ final class LocalAgentBackendLogicTests: XCTestCase {
         actionable: [Int] = [],
         promptTokens: Int = 0,
         generated: [UInt32] = [],
-        reused: Int = 0
+        reused: Int = 0,
+        text: String = "answer"
     ) -> TurnResult {
         TurnResult(
             finishReason: finish,
@@ -460,7 +489,7 @@ final class LocalAgentBackendLogicTests: XCTestCase {
             generatedTokenIds: generated,
             rawDecodedText: "raw",
             thinkingText: "",
-            responseText: "answer",
+            responseText: text,
             tokensGenerated: generated.count,
             elapsedMs: 1,
             tokensPerSecond: 1,

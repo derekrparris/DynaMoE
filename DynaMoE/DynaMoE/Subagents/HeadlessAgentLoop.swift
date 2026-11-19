@@ -165,6 +165,12 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 }
             }
 
+            // Resolved EVERY step, not once per run: a `tools_load` inside the
+            // loop changes the loaded set, and a step that still advertised
+            // step 0's array never told the model the tool it had just asked
+            // for was available.
+            let toolDefinitions = await context.toolDefinitions()
+
             // The in-loop context is BOUNDED here. Every step appends its full
             // thinking text and every tool result verbatim, and the implementer
             // preset's budgets (40 steps x 2,048-token turns x 4,000-token
@@ -177,13 +183,16 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             // step (see `compactContextIfNeeded`). The transcript and the
             // report keep everything — only what the MODEL re-reads each step
             // shrinks.
-            messages = Self.compactContextIfNeeded(messages)
-
-            // Resolved EVERY step, not once per run: a `tools_load` inside the
-            // loop changes the loaded set, and a step that still advertised
-            // step 0's array never told the model the tool it had just asked
-            // for was available.
-            let toolDefinitions = await context.toolDefinitions()
+            //
+            // The budget covers the WHOLE prompt, so the system block and the
+            // tool schemas count against it. They were invisible here, which
+            // let a run whose history was just under the cap still overflow on
+            // a large tool catalogue after the spend.
+            messages = Self.compactContextIfNeeded(
+                messages,
+                overheadCharacters: input.systemPrompt.count
+                    + Self.toolSchemaCharacterCount(toolDefinitions)
+            )
 
             let deltaTextId = UUID()
             let deltaThinkingId = UUID()
@@ -218,7 +227,21 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 break
             } catch {
                 usage.merge(usageLedger.drain())
-                if Task.isCancelled || (error as? AgentBackendError) == .cancelled {
+                // A Stop that arrived mid-turn still produced whatever the
+                // model had streamed. The backend reports it with the error so
+                // the transcript (and the partial report) keeps that work
+                // instead of falling back to an earlier step.
+                if let partial = (error as? AgentBackendError)?.partialTurn {
+                    if !partial.thinking.isEmpty {
+                        append(kind: .assistantThinking, step: step, text: partial.thinking, id: deltaThinkingId)
+                    }
+                    if !partial.text.isEmpty {
+                        append(kind: .assistantText, step: step, text: partial.text, id: deltaTextId)
+                        finalText = partial.text
+                    }
+                    emit(.usage(usage))
+                }
+                if Task.isCancelled || (error as? AgentBackendError)?.isCancellation == true {
                     status = .cancelled
                     failure = "The run was cancelled."
                 } else {
@@ -238,8 +261,15 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             // A step's prompt size is the run's "last ingested prompt" for the
             // context count; `merge` cannot infer it because backends report
             // only the billed sum, and the sum is not what the drawer shows.
-            usage.latestPromptTokens = turn.usage.promptTokens
-            usage.latestCompletionTokens = turn.usage.completionTokens
+            // A usage-less turn (a provider that omitted the block) reports
+            // zero, which is ABSENCE, not a prompt of no tokens: overwriting
+            // with 0 reset the drawer's count to nothing on every such turn.
+            if turn.usage.promptTokens > 0 {
+                usage.latestPromptTokens = turn.usage.promptTokens
+            }
+            if turn.usage.completionTokens > 0 {
+                usage.latestCompletionTokens = turn.usage.completionTokens
+            }
             usage.wallClockSeconds = CFAbsoluteTimeGetCurrent() - start
 
             // The text lands first even when the turn then fails a budget or a
@@ -601,8 +631,11 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
     /// pure extensions and the pin holds; folding runs only when the budget
     /// demands it, one deliberate re-prefill per fold cycle instead of one per
     /// step.
-    static func compactContextIfNeeded(_ messages: [AgentBackendMessage]) -> [AgentBackendMessage] {
-        let rawTotal = messages.reduce(0) { $0 + Self.contextCharacterCount(of: $1) }
+    static func compactContextIfNeeded(
+        _ messages: [AgentBackendMessage],
+        overheadCharacters: Int = 0
+    ) -> [AgentBackendMessage] {
+        let rawTotal = overheadCharacters + messages.reduce(0) { $0 + Self.contextCharacterCount(of: $1) }
         guard rawTotal > contextCharacterBudget else { return messages }
 
         let blockStarts = messages.indices.filter {
@@ -647,7 +680,7 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             }
         }
 
-        var total = folded.reduce(0) { $0 + Self.contextCharacterCount(of: $1) }
+        var total = overheadCharacters + folded.reduce(0) { $0 + Self.contextCharacterCount(of: $1) }
         guard total > contextCharacterBudget else { return folded }
 
         // Folding alone did not fit (many steps, or very large recent turns).
@@ -690,10 +723,39 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
         return text.prefix(limit) + "… [compacted: \(text.count - limit) characters omitted]"
     }
 
+    /// A tool catalogue's contribution to the prompt, in characters. The
+    /// schemas are rendered into the system block every step, so a large
+    /// loaded set consumes the same context a history entry does.
+    static func toolSchemaCharacterCount(_ tools: [ToolDefinition]) -> Int {
+        tools.reduce(0) { total, tool in
+            let schema: String
+            if let data = try? JSONEncoder().encode(tool.function.parameters),
+               let text = String(data: data, encoding: .utf8) {
+                schema = text
+            } else {
+                schema = ""
+            }
+            return total + tool.function.name.count + tool.function.description.count + schema.count
+        }
+    }
+
     private static func contextCharacterCount(of message: AgentBackendMessage) -> Int {
         switch message {
         case .user(let text): return text.count
-        case .assistant(let text, let thinking, _): return text.count + thinking.count
+        case .assistant(let text, let thinking, let calls):
+            // Tool-call ARGUMENTS are part of the prompt, and a `file_write`
+            // body can be the largest single thing a turn carries. Counting
+            // only text and thinking let a run cross the budget on arguments
+            // alone, after the spend.
+            let callCost = calls.reduce(0) { total, call in
+                let arguments = call.rawArguments.isEmpty
+                    ? call.arguments.keys.sorted()
+                        .map { "\($0)=\(String(describing: call.arguments[$0] ?? ""))" }
+                        .joined(separator: "&")
+                    : call.rawArguments
+                return total + call.name.count + arguments.count
+            }
+            return text.count + thinking.count + callCost
         case .toolResult(_, _, let content, _): return content.count
         }
     }

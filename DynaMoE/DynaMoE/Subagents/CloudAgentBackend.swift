@@ -87,11 +87,28 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
                 continue
             } catch let failure as CloudTurnFailure {
                 Self.recordSpentUsage(receipt, pricing: pricing, into: request.usageLedger)
-                throw AgentBackendError.transport(failure.errorDescription ?? "The cloud request failed.")
+                throw Self.agentError(from: failure)
             } catch {
                 Self.recordSpentUsage(receipt, pricing: pricing, into: request.usageLedger)
                 throw error
             }
+        }
+    }
+
+    /// The run-facing error for a provider failure.
+    ///
+    /// Every `CloudTurnFailure` used to be wrapped as `AgentBackendError
+    /// .transport`, so a missing key, an unreadable credential and an
+    /// unimplemented flavor all read as a network fault and sent the operator
+    /// looking at the wrong end of the connection. The message was always the
+    /// failure's own; the TYPE now says what kind of failure it was too.
+    static func agentError(from failure: CloudTurnFailure) -> AgentBackendError {
+        let message = failure.errorDescription ?? "The cloud request failed."
+        switch failure {
+        case .missingAPIKey, .credentialAccessDenied, .credentialNeedsImport, .unsupportedFlavor:
+            return .unavailable(message)
+        case .httpStatus, .transport, .invalidResponse:
+            return .transport(message)
         }
     }
 
@@ -117,13 +134,17 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
 
         var result: CloudTurnResult?
         var failure: CloudTurnFailure?
+        var streamedText = ""
+        var streamedThinking = ""
         for await event in stream {
             switch event {
             case .started:
                 break
             case .thinkingDelta(let text):
+                streamedThinking += text
                 request.onDelta?(text, true)
             case .contentDelta(let text):
+                streamedText += text
                 request.onDelta?(text, false)
             case .finished(let finished):
                 result = finished
@@ -132,7 +153,15 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
             }
         }
 
-        if Task.isCancelled { throw AgentBackendError.cancelled }
+        if Task.isCancelled {
+            if streamedText.isEmpty && streamedThinking.isEmpty {
+                throw AgentBackendError.cancelled
+            }
+            throw AgentBackendError.cancelledAfterPartial(
+                text: streamedText,
+                thinking: streamedThinking
+            )
+        }
         if let failure { throw failure }
         guard let result else {
             throw AgentBackendError.malformedResponse("The provider closed the stream without a terminal event.")

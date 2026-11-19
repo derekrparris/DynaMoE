@@ -253,6 +253,17 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     private var messageStore: [SubagentMessage] = []
     private var consumedMessageIds: Set<UUID> = []
     private var isFinished: Bool = false
+    /// False from `startExecution` until the execution task has actually
+    /// unwound. A Stop latches `status`/`isFinished` immediately, but the task
+    /// may still be killing a child process or writing its last tool result;
+    /// the apply path reads this so it cannot land a worktree a live child is
+    /// still editing.
+    private var executionUnwound: Bool = true
+    /// The isolation this run must PERSIST. Normally the plan's, but a run that
+    /// never reached its loop discards its worktree and clears this: the
+    /// record then no longer claims an unapplied tree, which is what kept
+    /// `prune`, `clearCompleted` and the launch sweep away from it forever.
+    private var recordedIsolation: AgentIsolation?
     private let lock = NSLock()
 
     public init(
@@ -279,6 +290,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         self.parentTurnId = parentTurnId
         self.workingDirectory = workingDirectory
         self.modelPlan = nil
+        self.recordedIsolation = AgentIsolation.none
         self.createdAt = Date()
     }
 
@@ -297,6 +309,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         self.parentTurnId = plan.parentTurnId
         self.workingDirectory = plan.workingDirectory
         self.modelPlan = plan
+        self.recordedIsolation = plan.isolation
         self.backendDescriptor = plan.backendDescriptor
         self.createdAt = Date()
     }
@@ -405,7 +418,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             contextSummary: contextSummary,
             backend: descriptor,
             workingDirectory: workingPath,
-            isolation: plan?.isolation ?? .none,
+            isolation: recordedIsolation ?? .none,
             allowedTools: allowedTools,
             budget: plan?.budget ?? .standard,
             status: Self.agentRunStatus(for: status),
@@ -429,9 +442,22 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             appliedAt: appliedAt,
             appliedToBranch: appliedToBranch,
             keptIgnoredFiles: keptIgnoredFiles.isEmpty ? nil : keptIgnoredFiles,
-            repositoryRoot: plan?.repositoryRoot?.path,
-            baseCommit: plan?.baseCommit
+            repositoryRoot: (recordedIsolation ?? .none).isIsolated ? plan?.repositoryRoot?.path : nil,
+            baseCommit: (recordedIsolation ?? .none).isIsolated ? plan?.baseCommit : nil
         )
+    }
+
+    /// The worktree this run was going to use has been removed, so the record
+    /// must stop claiming it.
+    ///
+    /// The pre-loop refusals (a scheduler timeout, an unusable context) create
+    /// a worktree during the spawn and then discard it. Persisting
+    /// `isolation: .worktree` with `appliedAt == nil` from that point made
+    /// `holdsWorktreeWork` permanently true, so `prune`, `clearCompleted` and
+    /// the launch sweep skipped the record forever and Apply always failed
+    /// `worktreeGone`. `finishRun` writes the record this feeds.
+    func forgetDiscardedWorktree() {
+        recordedIsolation = AgentIsolation.none
     }
 
     /// Records that this run's worktree landed on the main tree. The store is
@@ -448,14 +474,14 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     /// record still said unapplied. `mutate` locates the record by id for
     /// exactly that case.
     @discardableResult
-    func markApplied(at date: Date, files: [String], appliedTo: String? = nil) -> Bool {
+    func markApplied(at date: Date, files: [String], appliedTo: String? = nil) async -> Bool {
         appliedAt = date
         appliedToBranch = appliedTo
         if var report, !files.isEmpty {
             report.changedFiles = files
             self.report = report
         }
-        let written = AgentRunStore.shared.mutate(runId: id, sessionId: parentSessionId) { current in
+        let written = await AgentRunStore.shared.mutateAsync(runId: id, sessionId: parentSessionId) { current in
             current.appliedAt = date
             current.appliedToBranch = appliedTo
             if !files.isEmpty, var report = current.report {
@@ -473,7 +499,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     /// holds ignored files a patch cannot carry, so the inspector's Apply
     /// does not read as unfinished business without a reason — and so the
     /// launch sweep keeps the tree instead of deleting the only copy of them.
-    func noteKeptIgnoredFiles(_ files: [String]) {
+    func noteKeptIgnoredFiles(_ files: [String]) async {
         guard !files.isEmpty else { return }
         keptIgnoredFiles = files
         let note = "The tracked patch was applied, but the worktree was kept: it also holds files a patch cannot carry (\(files.joined(separator: ", "))). Retrieve them manually before clearing the run."
@@ -481,7 +507,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             current.openQuestions.append(note)
             report = current
         }
-        AgentRunStore.shared.mutate(runId: id, sessionId: parentSessionId) { current in
+        await AgentRunStore.shared.mutateAsync(runId: id, sessionId: parentSessionId) { current in
             current.keptIgnoredFiles = files
             if var report = current.report {
                 report.openQuestions.append(note)
@@ -495,13 +521,13 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     /// patch cannot carry. The worktree may be gone, but the branch is the
     /// only copy of that committed work and the operator has to land or delete
     /// it themselves.
-    func noteKeptBranch(_ branch: String) {
+    func noteKeptBranch(_ branch: String) async {
         let note = "The patch was applied, but branch '\(branch)' was kept because it holds commits a patch cannot carry. Merge or delete it manually when you are done."
         if var current = report {
             current.openQuestions.append(note)
             report = current
         }
-        AgentRunStore.shared.mutate(runId: id, sessionId: parentSessionId) { current in
+        await AgentRunStore.shared.mutateAsync(runId: id, sessionId: parentSessionId) { current in
             if var report = current.report {
                 report.openQuestions.append(note)
                 current.report = report
@@ -596,6 +622,22 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         return isFinished
     }
 
+    /// Whether the execution task is still unwinding. A Stop marks the run
+    /// terminal immediately, but the task may still be killing a child process
+    /// or writing one last tool result; the apply path must not land a worktree
+    /// while that is true.
+    var isExecutionUnwound: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return executionUnwound
+    }
+
+    private func markExecutionUnwound() {
+        lock.lock()
+        executionUnwound = true
+        lock.unlock()
+    }
+
     public func startExecution() {
         guard status == .pending else { return }
 
@@ -604,6 +646,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
 
         lock.lock()
         let plan = modelPlan
+        executionUnwound = false
         executionTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self = self else { return }
             if let plan {
@@ -617,6 +660,11 @@ public final class SubagentInstance: Identifiable, ObservableObject {
 
     private func runAutonomousPipeline() async {
         let startTime = CFAbsoluteTimeGetCurrent()
+        // The run stops being "executing" the moment this body returns, on the
+        // same actor turn that resumed its completion waiters. A hop later was
+        // too late: an apply that followed `waitForCompletion` saw a terminal
+        // record with the flag still clear and refused with "still running".
+        defer { markExecutionUnwound() }
 
         await MainActor.run {
             guard !self.hasFinished() else { return }
@@ -663,6 +711,9 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     private func runModelBackedExecution(_ plan: AgentSpawnPlan) async {
         let startTime = CFAbsoluteTimeGetCurrent()
         liveStatusText = "Preparing \(plan.role)…"
+        // See `runAutonomousPipeline`: the flag must clear in the same actor
+        // turn that resumes the completion waiters.
+        defer { markExecutionUnwound() }
 
         let scheduler = AgentScheduler.shared
         let cancellation = InstanceCancellationBox(self)
@@ -686,6 +737,9 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         } catch {
             await scheduler.finish(runId: id)
             await Self.discardWorktree(plan: plan)
+            // The tree is gone; the record must not keep claiming it as
+            // unapplied work nothing may clear.
+            forgetDiscardedWorktree()
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             let cancelled = (error as? AgentSchedulerError) == .cancelled || Task.isCancelled
             finishRun(
@@ -742,6 +796,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             )
         } catch {
             await Self.discardWorktree(plan: plan)
+            forgetDiscardedWorktree()
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             finishRun(
                 summary: message,
@@ -831,9 +886,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         // sit OUTSIDE that guard, so without this check a cancelled run's live
         // object ended up carrying a completed report the store never accepted —
         // the drawer disagreed with the record on relaunch.
-        lock.lock()
-        let alreadyFinished = isFinished
-        lock.unlock()
+        let alreadyFinished = hasFinished()
         if alreadyFinished {
             // A Stop owns the terminal record, but the spend of the step it
             // interrupted is only known once the loop unwinds: a cloud request
@@ -841,12 +894,14 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             // into the outcome by the ledger, and `cancel` persisted the
             // record before that happened. Without this write the inspector
             // reported $0 for a run the operator actually paid for. Only the
-            // usage is updated; the Stop's summary, status and worktree stay
-            // exactly as its own transition wrote them.
-            if status == .cancelled {
-                usage = outcome.usage
-                persistRecord()
-            }
+            // usage is updated; the terminal transition's summary, status and
+            // worktree stay exactly as it wrote them.
+            //
+            // Written for ANY terminal state, not just `.cancelled`: a Stop
+            // that unrolls through a `.failed` budget/teardown path otherwise
+            // dropped the last step's validated spend the same way.
+            usage = outcome.usage
+            persistRecord()
             return
         }
         report = finalReport
@@ -1861,16 +1916,20 @@ public final class SubagentManager: ObservableObject {
     public var activeSubagentsCount: Int {
         lock.lock()
         defer { lock.unlock() }
-        return subagentsOrder.filter { $0.status == .running || $0.status == .pending }.count
+        // `waitingForApproval` is ACTIVE: a run parked on a card still holds
+        // the engine and its scheduler ticket. Asking only about running and
+        // pending made the coordinator end its turn exactly when a run was
+        // waiting on a decision.
+        return subagentsOrder.filter { !$0.status.isTerminal }.count
     }
 
-    /// Count of running/pending subagents belonging to a specific chat session.
+    /// Count of active subagents belonging to a specific chat session.
     public func activeSubagentsCount(forSession sessionId: UUID?) -> Int {
         guard let sessionId else { return 0 }
         lock.lock()
         defer { lock.unlock() }
         return subagentsOrder.filter {
-            $0.parentSessionId == sessionId && ($0.status == .running || $0.status == .pending)
+            $0.parentSessionId == sessionId && !$0.status.isTerminal
         }.count
     }
 
