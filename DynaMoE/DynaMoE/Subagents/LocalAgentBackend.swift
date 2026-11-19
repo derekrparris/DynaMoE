@@ -217,12 +217,21 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
         return try await withStepClaim(
             acquire: { try await waitForEngineSlot(engine) },
             prepare: { claim in
-                try prepare(
+                // Re-read the loaded model snapshot after acquiring the slot so
+                // a model switch or unload while waiting does not render with a
+                // stale checkpoint.
+                guard let currentInfo = engine.loadedModelInfo,
+                      let currentConfig = engine.promptModelConfig else {
+                    throw AgentBackendError.unavailable(
+                        "A local subagent run needs a loaded model. Load a checkpoint in Settings first."
+                    )
+                }
+                return try prepare(
                     request,
                     thinkingEnabled: thinkingEnabled,
                     engine: engine,
-                    info: info,
-                    config: config,
+                    info: currentInfo,
+                    config: currentConfig,
                     claim: claim
                 )
             }

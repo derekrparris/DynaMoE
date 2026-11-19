@@ -4629,10 +4629,16 @@ struct ContentView: View {
             }
             generationTeardownTask = teardown
         }
+        let hadActiveGenerationTask = generationTask != nil
         isGeneratingText = false
-        // Cancel the engine's compute task too: the consumer task only relays
-        // events, the Metal/KV work lives in CompletionEngine's detached turn.
-        CompletionEngine.shared.cancelActiveTurn()
+        // Cancel the engine's compute task only when chat owns it: a queued
+        // deferred relaunch publishes `isGeneratingText = true` with
+        // `generationTask == nil` while a server turn or background subagent
+        // holds the slot, and cancelling unconditionally would abort that
+        // unrelated caller's work.
+        if hadActiveGenerationTask {
+            CompletionEngine.shared.cancelActiveTurn()
+        }
         generationTask?.cancel()
         generationTask = nil
         // A send queued behind a cancellation or a busy slot is still THIS
@@ -4645,9 +4651,11 @@ struct ContentView: View {
         activeTurnMode = nil
         ActionApprovalManager.shared.cancelAll()
         // Delegation is part of the turn: a Stop must not leave a child working
-        // on work the operator has abandoned. This covers both the runs this
-        // turn spawned and anything they queued behind the scheduler.
-        if let generatingSessionId {
+        // on work the operator has abandoned. Skip when no live turn was
+        // running (e.g. a queued fresh send aborted before launching), so Stop
+        // does not cancel an earlier turn's subagents or fall back to
+        // session-wide cancellation.
+        if hadActiveGenerationTask, let generatingSessionId {
             // Cancellation is scoped to the TURN. The session-wide form reaches
             // runs spawned by EARLIER turns of the same conversation, and a
             // cancelled run's worktree is the only full copy of its work — a

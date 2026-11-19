@@ -741,4 +741,12 @@ final class CloudAgentBackendLogicTests: XCTestCase {
         XCTAssertEqual(backend.descriptor.displayName, "Test Model")
         XCTAssertTrue(backend.descriptor.isRemote)
     }
+
+    func testRedactedErrorSummaryRedactsKeyStraddlingTruncationBoundary() {
+        let apiKey = "sk-secret-boundary-token-9876543210"
+        let prefix = String(repeating: "x", count: 390)
+        let body = "\(prefix) \(apiKey) trailing details"
+        let summary = CloudChatClient.redactedErrorSummary(body, apiKey: apiKey)
+        XCTAssertFalse(summary.contains("sk-secret"), "API key prefix straddling 400-char cap must be redacted: \(summary)")
+    }
 }

@@ -82,13 +82,17 @@ struct SubagentInspectorView: View {
                     approvals: approvalCenter.pending.filter { $0.request.runId == detail.record.id },
                     onApprove: { approvalCenter.approve($0) },
                     onReject: { approvalCenter.reject($0) },
-                    onBack: { withAnimation(.easeInOut(duration: 0.15)) { self.selectedRunId = nil } },
+                    onBack: {
+                        manager.selectedSubagentId = nil
+                        withAnimation(.easeInOut(duration: 0.15)) { self.selectedRunId = nil }
+                    },
                     onClose: onClose,
                     onRecordChanged: reloadStored,
                     onDiscard: {
-                        SubagentManager.shared.discard(runId: detail.record.id, sessionId: sessionId)
-                        withAnimation(.easeInOut(duration: 0.15)) { self.selectedRunId = nil }
-                        reloadStored()
+                        if SubagentManager.shared.discard(runId: detail.record.id, sessionId: sessionId) {
+                            withAnimation(.easeInOut(duration: 0.15)) { self.selectedRunId = nil }
+                            reloadStored()
+                        }
                     }
                 )
                 // A run's pane is reused when the selection moves, and every
@@ -145,6 +149,12 @@ struct SubagentInspectorView: View {
 
     private func consumeManagerSelection() {
         guard let id = manager.selectedSubagentId else { return }
+        // Only consume and clear `manager.selectedSubagentId` once the target
+        // run is actually visible in the active session. When a notification
+        // triggers a cross-session switch (or `reloadStored` is still in
+        // flight), clearing immediately lets `onChange(of: sessionId)` wipe
+        // `selectedRunId` with the manager's selection already gone.
+        guard detailRecord(for: id) != nil else { return }
         selectedRunId = id
         manager.selectedSubagentId = nil
     }
@@ -361,6 +371,7 @@ struct SubagentInspectorView: View {
 
     private func row(for record: AgentRunRecord) -> some View {
         Button(action: {
+            manager.selectedSubagentId = nil
             withAnimation(.easeInOut(duration: 0.15)) { selectedRunId = record.id }
         }) {
             SubagentRunRow(record: record, isLive: liveInstance(record.id) != nil)
@@ -448,6 +459,7 @@ struct SubagentInspectorView: View {
             }.value
             guard generation == self.reloadGeneration else { return }
             self.stored = records
+            self.consumeManagerSelection()
         }
     }
 }
@@ -457,6 +469,12 @@ struct SubagentInspectorView: View {
 private struct SubagentRunRow: View {
     let record: AgentRunRecord
     let isLive: Bool
+
+    private var hasUnreadReport: Bool {
+        guard record.status.isTerminal, !record.summaryRelayed else { return false }
+        let summary = record.report?.summary ?? record.error ?? ""
+        return !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -472,7 +490,7 @@ private struct SubagentRunRow: View {
 
                 Spacer()
 
-                if record.status == .completed && !record.summaryRelayed {
+                if hasUnreadReport {
                     Text("UNREAD")
                         .font(.system(size: 8, weight: .bold))
                         .padding(.horizontal, 4)

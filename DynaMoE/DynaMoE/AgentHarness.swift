@@ -3578,8 +3578,12 @@ extension ToolExecutionStatus {
     /// run-ending decision reads this rather than testing the name itself, which
     /// is what keeps the two turn loops from disagreeing about it again.
     nonisolated func endsAgentRun(toolName: String, isCompleted: Bool) -> Bool {
-        guard self != .withheld else { return false }
-        return isCompleted || toolName == "complete"
+        switch self {
+        case .withheld, .rejected, .error:
+            return false
+        case .success, .running, .awaitingApproval:
+            return isCompleted || toolName == "complete"
+        }
     }
 }
 
@@ -3760,9 +3764,13 @@ public final class AgentHarness {
     /// True only when EVERY required argument is missing or whitespace-empty —
     /// i.e. the call is an empty scaffold. Partially-filled calls pass through so
     /// each tool's own validation stays in charge.
-    public static func hasEmptyRequiredArguments(toolName: String, arguments: [String: Any]) -> Bool {
+    public static func hasEmptyRequiredArguments(
+        toolName: String,
+        arguments: [String: Any],
+        harness: AgentHarness = .shared
+    ) -> Bool {
         let required = requiredValueArgumentKeys[toolName]
-            ?? AgentHarness.shared.requiredArgumentsFromSchema(toolName: toolName)
+            ?? harness.requiredArgumentsFromSchema(toolName: toolName)
         guard !required.isEmpty else { return false }
         for key in required {
             if let v = arguments[key] as? String {
@@ -4565,7 +4573,9 @@ public final class AgentHarness {
             role: arguments["role"] as? String ?? ""
         )
         let definition = AgentRolePresetCatalog.definition(for: preset)
-        let explicit = (arguments["allowed_tools"] as? [String]) ?? []
+        let explicit = ((arguments["allowed_tools"] as? [String]) ?? [])
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
         let intended = explicit.isEmpty ? definition.toolNames : explicit
         return !Set(intended).isDisjoint(with: AgentToolSurface.writeCapable)
     }
@@ -6278,10 +6288,12 @@ public final class AgentHarness {
                     resolved = next.resolvingSymlinksInPath()
                 } else if remainingSymlinkHops > 0,
                           let destination = try? fileManager.destinationOfSymbolicLink(atPath: next.path) {
-                    let target = URL(
-                        fileURLWithPath: destination,
-                        relativeTo: next.deletingLastPathComponent()
-                    ).standardizedFileURL
+                    // Build `target` without `relativeTo:` or `.standardizedFileURL`
+                    // so lexical `..` segments are not collapsed before the
+                    // recursive walk resolves intermediate symlinks.
+                    let target: URL = destination.hasPrefix("/")
+                        ? URL(fileURLWithPath: destination)
+                        : next.deletingLastPathComponent().appendingPathComponent(destination)
                     resolved = resolvedForContainment(
                         target,
                         remainingSymlinkHops: remainingSymlinkHops - 1
@@ -6306,6 +6318,12 @@ public final class AgentHarness {
 
     private func runScopeDecision(for call: ParsedToolCall, workingDirectory: URL?) -> RunScopeDecision {
         guard isRunScoped else { return .allow }
+        if Self.runScopedForbiddenToolNames.contains(call.name) {
+            return .deny("'\(call.name)' is not available inside a subagent run")
+        }
+        if loadedTools[call.name] == nil {
+            return .deny("'\(call.name)' is not in this run's allowed tools")
+        }
         let stateChanging = Self.isStateChanging(toolName: call.name)
         let appPreferences = Self.targetsApplicationPreferences(toolName: call.name, arguments: call.arguments)
         let subQNeedsApproval = call.name == "subq_decide" && Self.requiresApproval(

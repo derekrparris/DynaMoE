@@ -657,6 +657,11 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         lock.lock()
         executionUnwound = true
         lock.unlock()
+        // `canApplyChanges` and `canDiscard` in the inspector read
+        // `isExecutionUnwound`, which is not `@Published`. Notify observers on
+        // the MainActor so the Apply / Discard buttons appear as soon as a
+        // stopped run finishes unwinding.
+        objectWillChange.send()
     }
 
     public func startExecution() {
@@ -782,7 +787,21 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         // this MainActor continuation. The `defer` above still releases the
         // ticket, but publishing `.running` here would overwrite the cancelled
         // record and leave `clearCompleted` counting it as active forever.
-        guard !hasFinished(), !Task.isCancelled else { return }
+        // Clean up the unused worktree too so the cancelled record does not
+        // strand it or stay retention-exempt.
+        guard !hasFinished(), !Task.isCancelled else {
+            await Self.discardWorktree(plan: plan)
+            forgetDiscardedWorktree()
+            if !hasFinished() {
+                finishRun(
+                    summary: "The run was cancelled.",
+                    status: .cancelled,
+                    duration: CFAbsoluteTimeGetCurrent() - startTime,
+                    liveStatus: "Cancelled"
+                )
+            }
+            return
+        }
         status = .running
         liveStatusText = "Working on \(plan.role)…"
 
@@ -2303,7 +2322,8 @@ public final class SubagentManager: ObservableObject {
     /// decided not to land was permanent: on disk, in every inspector, and
     /// protected from retention forever. The discard is explicit and
     /// destructive, and its card says so.
-    public func discard(runId: UUID, sessionId: UUID? = nil) {
+    @discardableResult
+    public func discard(runId: UUID, sessionId: UUID? = nil) -> Bool {
         lock.lock()
         let instance = subagentsById[runId]
         lock.unlock()
@@ -2311,20 +2331,20 @@ public final class SubagentManager: ObservableObject {
         // it would drop its terminal write and leave an unstoppable worker.
         // Also wait until execution has unwound (the same gate Apply uses) so
         // Stop→Discard cannot `git worktree remove` under a still-exiting child.
-        guard instance == nil || (instance?.status.isTerminal == true && instance?.isExecutionUnwound == true) else { return }
+        guard instance == nil || (instance?.status.isTerminal == true && instance?.isExecutionUnwound == true) else { return false }
         // An apply owns the record and the worktree while it runs. Discarding
         // mid-apply could delete the record after the patch landed (changes
         // with nothing naming them) or race cleanup against git.
-        guard !SubagentApplyService.isRunInFlight(runId) else { return }
+        guard !SubagentApplyService.isRunInFlight(runId) else { return false }
         guard let record = instance?.snapshotRecord()
             ?? AgentRunStore.shared.load(runId: runId, sessionId: sessionId)
             ?? AgentRunStore.shared.loadAny(runId: runId),
-            record.status.isTerminal else { return }
+            record.status.isTerminal else { return false }
         // A discard is rare and a wrong race loses landed work, so while ANY
         // checkout is mid-apply the answer is "not now": a record's stored
         // `repositoryRoot` can be stale, which is exactly when a narrower check
         // would miss the claim it was meant to find.
-        guard !SubagentApplyService.hasAnyRepositoryInFlight else { return }
+        guard !SubagentApplyService.hasAnyRepositoryInFlight else { return false }
 
         lock.lock()
         subagentsById.removeValue(forKey: runId)
@@ -2345,17 +2365,35 @@ public final class SubagentManager: ObservableObject {
             let repositoryRoot = record.repositoryRoot.map { URL(fileURLWithPath: $0) }
             let baseCommit = record.baseCommit ?? ""
             Task.detached(priority: .utility) {
-                guard let worktree = try? await WorkspaceIsolation.open(
+                let worktree: AgentWorktree
+                if let opened = try? await WorkspaceIsolation.open(
                     path: path,
                     branch: branch,
                     repositoryRoot: repositoryRoot,
                     baseCommit: baseCommit
-                ) else { return }
+                ) {
+                    worktree = opened
+                } else if let repositoryRoot {
+                    // Fall back to the recorded metadata when `open` refuses a
+                    // missing or compromised `.git` pointer so discarding the
+                    // run still cleans up the directory and branch instead of
+                    // stranding them until the 14-day prune.
+                    worktree = AgentWorktree(
+                        runId: runId,
+                        repositoryRoot: repositoryRoot,
+                        path: URL(fileURLWithPath: path, isDirectory: true),
+                        branch: branch,
+                        baseCommit: baseCommit
+                    )
+                } else {
+                    return
+                }
                 await WorkspaceIsolation.cleanup(worktree)
             }
         }
 
         AgentRunStore.shared.deleteImmediately(runId: runId, sessionId: record.parentSessionId)
+        return true
     }
 
     public func sendMessage(toSubagentId id: UUID, sender: String = "user", content: String) {

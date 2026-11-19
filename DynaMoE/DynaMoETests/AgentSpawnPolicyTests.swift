@@ -786,4 +786,25 @@ final class AgentSpawnPolicyTests: XCTestCase {
             sendResult.resultJSON
         )
     }
+
+    func testWhitespacePaddedWriteToolStillRequiresSpawnApproval() {
+        let suiteName = "AgentSpawnPolicyTests-Whitespace-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        XCTAssertTrue(
+            AgentHarness.spawnSubagentRequiresApproval(
+                arguments: [
+                    "role": "Codebase Researcher",
+                    "preset": "explore",
+                    "backend": "local",
+                    "isolation": "worktree",
+                    "allowed_tools": [" file_write ", "\n"]
+                ],
+                mode: .code,
+                defaults: defaults
+            ),
+            "Whitespace-padded write-capable tools must not bypass spawn_subagent approval"
+        )
+    }
 }

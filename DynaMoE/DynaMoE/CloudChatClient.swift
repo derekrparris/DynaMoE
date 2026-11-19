@@ -691,8 +691,16 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                                 }
                             } catch let failure as CloudTurnFailure {
                                 sawFailure = true
-                                receipt?.record(failure: failure)
-                                continuation.yield(.failed(failure))
+                                let sanitized: CloudTurnFailure
+                                if case .invalidResponse(let detail) = failure {
+                                    sanitized = .invalidResponse(
+                                        CloudChatClient.redactedErrorSummary(detail, apiKey: self.apiKey)
+                                    )
+                                } else {
+                                    sanitized = failure
+                                }
+                                receipt?.record(failure: sanitized)
+                                continuation.yield(.failed(sanitized))
                                 return false
                             } catch {
                                 sawFailure = true
@@ -1197,14 +1205,15 @@ public nonisolated final class CloudChatClient: @unchecked Sendable {
     /// A proxy that echoes `Authorization: Bearer …` in a 400/5xx body must
     /// never leak the API key into durable state or `[SUBAGENT_RESULT]`.
     public static func redactedErrorSummary(_ rawBody: String, apiKey: String) -> String {
-        let summarized = MCPHTTPTransport.summarizeErrorBody(rawBody)
-        var cleaned = SubQDecisionClient.redactedErrorDetail(summarized, apiKey: apiKey)
+        // Redact BEFORE truncating so a credential straddling the summary
+        // boundary cannot leak its prefix.
+        var cleaned = SubQDecisionClient.redactedErrorDetail(rawBody, apiKey: apiKey)
         cleaned = cleaned.replacingOccurrences(
             of: #"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{6,}"#,
             with: "Bearer [redacted]",
             options: .regularExpression
         )
-        return cleaned
+        return MCPHTTPTransport.summarizeErrorBody(cleaned)
     }
     /// Idle (between-bytes) timeout for a chat turn. Generous on purpose: a
     /// large prompt or a reasoning model can take longer than half a minute to

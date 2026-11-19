@@ -314,17 +314,19 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     /// says a worktree belongs to unapplied work. Treating "cannot decode" as
     /// "no record" handed the tree to the 14-day clock.
     func hasRecordFile(runId: UUID) -> Bool {
-        let name = "\(runId.uuidString).json"
-        guard let directories = try? fileManager.contentsOfDirectory(atPath: rootURL.path) else {
+        onQueue {
+            let name = "\(runId.uuidString).json"
+            guard let directories = try? fileManager.contentsOfDirectory(atPath: rootURL.path) else {
+                return false
+            }
+            for directory in directories {
+                let candidate = rootURL
+                    .appendingPathComponent(directory, isDirectory: true)
+                    .appendingPathComponent(name, isDirectory: false)
+                if fileManager.fileExists(atPath: candidate.path) { return true }
+            }
             return false
         }
-        for directory in directories {
-            let candidate = rootURL
-                .appendingPathComponent(directory, isDirectory: true)
-                .appendingPathComponent(name, isDirectory: false)
-            if fileManager.fileExists(atPath: candidate.path) { return true }
-        }
-        return false
     }
 
     /// The record's actual file when the preferred bucket no longer holds it.
@@ -899,7 +901,12 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
                     guard let runId = UUID(uuidString: file.deletingPathExtension().lastPathComponent),
                           !decodableIds.contains(runId) else { continue }
                     do {
-                        try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
+                        try fileManager.createDirectory(
+                            at: destination,
+                            withIntermediateDirectories: true,
+                            attributes: [.posixPermissions: 0o700]
+                        )
+                        try? fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: destination.path)
                         try fileManager.moveItem(
                             at: file,
                             to: destination.appendingPathComponent(file.lastPathComponent)

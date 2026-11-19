@@ -176,9 +176,10 @@ nonisolated enum AgentReportBuilder {
         while digitCount < scalars.count, scalars[digitCount].isNumber {
             digitCount += 1
         }
-        if digitCount >= 1, digitCount < scalars.count,
-           scalars[digitCount] == "." || scalars[digitCount] == ")" {
-            return String(line.dropFirst(digitCount + 1)).trimmingCharacters(in: .whitespaces)
+        if digitCount >= 1, digitCount + 1 < scalars.count,
+           (scalars[digitCount] == "." || scalars[digitCount] == ")"),
+           scalars[digitCount + 1].isWhitespace {
+            return String(line.dropFirst(digitCount + 2)).trimmingCharacters(in: .whitespaces)
         }
         return line
     }

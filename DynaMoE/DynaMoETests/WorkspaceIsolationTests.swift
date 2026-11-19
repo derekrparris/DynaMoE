@@ -2142,4 +2142,63 @@ final class WorkspaceIsolationTests: XCTestCase {
         XCTAssertEqual(stored.isolation, .none, "Persisted record must clear isolation after queued worktree discard")
         XCTAssertFalse(stored.holdsWorktreeWork)
     }
+
+    func testDanglingSymlinkWithParentTraversalThroughRealSymlinkEscapesContainment() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ContainmentDangling_\(UUID().uuidString)", isDirectory: true)
+        let workspace = root.appendingPathComponent("ws", isDirectory: true)
+        let outside = root.appendingPathComponent("outside/dir", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // /ws/realLink -> /outside/dir, and /ws/dangling -> realLink/../pwned.txt
+        let realLink = workspace.appendingPathComponent("realLink")
+        try FileManager.default.createSymbolicLink(atPath: realLink.path, withDestinationPath: outside.path)
+        let dangling = workspace.appendingPathComponent("dangling")
+        try FileManager.default.createSymbolicLink(atPath: dangling.path, withDestinationPath: "realLink/../pwned.txt")
+
+        let resolved = AgentHarness.resolvedForContainment(dangling).path
+        let expectedOutside = outside.deletingLastPathComponent()
+            .resolvingSymlinksInPath()
+            .appendingPathComponent("pwned.txt").path
+        let resolvedWorkspace = AgentHarness.resolvedForContainment(workspace).path
+        XCTAssertEqual(
+            resolved,
+            expectedOutside,
+            "Dangling symlink traversing `realLink/..` must resolve `realLink` before applying `..`"
+        )
+        XCTAssertFalse(
+            resolved.hasPrefix(resolvedWorkspace + "/"),
+            "Resolved path must not appear inside the workspace: \(resolved)"
+        )
+    }
+
+    func testOpenAllowsRepairableMissingGitPointerForRecordedRoot() async throws {
+        let runId = UUID()
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: runId,
+            root: worktreeRoot
+        )
+        defer { Task { await WorkspaceIsolation.cleanup(worktree) } }
+
+        // Delete the worktree's `.git` pointer file inside the sandbox.
+        let dotGit = worktree.path.appendingPathComponent(".git")
+        try FileManager.default.removeItem(at: dotGit)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dotGit.path))
+
+        // Production callers call `open` with `recordedRoot` before `verifyWorktreeLinkage`.
+        let reopened = try await WorkspaceIsolation.open(
+            path: worktree.path.path,
+            branch: worktree.branch,
+            repositoryRoot: repository,
+            baseCommit: worktree.baseCommit
+        )
+        try await WorkspaceIsolation.verifyWorktreeLinkage(reopened)
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: dotGit.path),
+            "verifyWorktreeLinkage must restore the missing `.git` pointer after `open`"
+        )
+    }
 }

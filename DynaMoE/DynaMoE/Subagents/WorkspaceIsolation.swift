@@ -208,19 +208,51 @@ nonisolated enum WorkspaceIsolation {
         guard URL(fileURLWithPath: top).resolvingSymlinksInPath().standardizedFileURL
             == candidate.resolvingSymlinksInPath().standardizedFileURL else { return false }
 
-        guard let (worktreeCode, worktreeOut, _) = try? await git(
-            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-            in: worktree
-        ), worktreeCode == 0,
-        let (candidateCode, candidateOut, _) = try? await git(
+        guard let (candidateCode, candidateOut, _) = try? await git(
             ["rev-parse", "--path-format=absolute", "--git-common-dir"],
             in: candidate
         ), candidateCode == 0 else { return false }
-        let a = URL(fileURLWithPath: worktreeOut.trimmingCharacters(in: .whitespacesAndNewlines))
-            .resolvingSymlinksInPath().standardizedFileURL
         let b = URL(fileURLWithPath: candidateOut.trimmingCharacters(in: .whitespacesAndNewlines))
             .resolvingSymlinksInPath().standardizedFileURL
-        return a == b
+
+        if let (worktreeCode, worktreeOut, _) = try? await git(
+            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            in: worktree
+        ), worktreeCode == 0 {
+            let a = URL(fileURLWithPath: worktreeOut.trimmingCharacters(in: .whitespacesAndNewlines))
+                .resolvingSymlinksInPath().standardizedFileURL
+            return a == b
+        }
+
+        // When the sandbox deleted the worktree's `.git` pointer, `git` inside
+        // `worktree` cannot answer, but the main repository's own admin
+        // directory (outside the sandbox) still holds a back-pointer to
+        // `worktree/.git`. Resolve symlinks on the existing worktree directory
+        // (not the deleted `.git` leaf, which `resolvingSymlinksInPath()` may
+        // not canonicalize across `/var` -> `/private/var`).
+        let expectedWorktreeDir = worktree
+            .resolvingSymlinksInPath().standardizedFileURL.path
+        let adminRoot = b.appendingPathComponent("worktrees", isDirectory: true)
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: adminRoot,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return false }
+        for entry in entries {
+            guard let pointer = try? String(
+                contentsOf: entry.appendingPathComponent("gitdir"),
+                encoding: .utf8
+            ) else { continue }
+            let recordedURL = URL(fileURLWithPath: pointer.trimmingCharacters(in: .whitespacesAndNewlines))
+            guard recordedURL.lastPathComponent == ".git" else { continue }
+            let recordedWorktreeDir = recordedURL
+                .deletingLastPathComponent()
+                .resolvingSymlinksInPath().standardizedFileURL.path
+            if recordedWorktreeDir == expectedWorktreeDir {
+                return true
+            }
+        }
+        return false
     }
 
     // MARK: Creating

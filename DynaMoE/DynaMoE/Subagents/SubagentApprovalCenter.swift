@@ -86,11 +86,6 @@ final class SubagentApprovalCenter: ObservableObject {
             group.cancelAll()
             return first
         }
-        if !approved {
-            // Resolve the card even when the timeout won, so a late click
-            // cannot leave a decision for an id nobody is waiting on.
-            ActionApprovalManager.shared.reject(id: entry.id)
-        }
         return approved
     }
 

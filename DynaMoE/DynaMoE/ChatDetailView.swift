@@ -6057,6 +6057,7 @@ struct ToolCallCardView: View {
                     if call.name == "spawn_subagent" {
                         if let runId = SubagentRunLink.runId(from: call) {
                             SubagentInlineRunCard(runId: runId, onOpenInspector: {
+                                SubagentManager.shared.selectedSubagentId = runId
                                 withAnimation(.easeInOut(duration: 0.2)) {
                                     SubagentManager.shared.isDrawerOpen = true
                                 }

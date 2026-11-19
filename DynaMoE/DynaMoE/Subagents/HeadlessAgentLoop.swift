@@ -420,12 +420,35 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                     }
                     continue
                 }
-                if await AgentHarness.hasEmptyRequiredArguments(toolName: call.name, arguments: call.arguments) {
+                if await AgentHarness.hasEmptyRequiredArguments(
+                    toolName: call.name,
+                    arguments: call.arguments,
+                    harness: context.harness
+                ) {
                     let error = "Missing or empty required arguments for '\(call.name)' — this call was not executed."
                     if await rejectCall(call, offset: offset, recordStatus: .error, error: error) {
                         break
                     }
                     continue
+                }
+
+                // The wall-clock budget is a promise about the whole run, not
+                // just its model turns. Check before launching each call so
+                // subsequent calls in `turn.calls` do not start after the
+                // deadline has already passed.
+                let remainingBeforeTool = Double(input.budget.maxWallClockSeconds)
+                    - (CFAbsoluteTimeGetCurrent() - start)
+                if remainingBeforeTool <= 0 {
+                    status = .failed
+                    failure = "The run exceeded its \(input.budget.maxWallClockSeconds)-second wall-clock budget before '\(call.name)' could run."
+                    append(kind: .status, step: step, text: failure)
+                    recordAbandoned(
+                        turn.calls[offset...],
+                        reason: failure ?? "the run's wall-clock budget ran out.",
+                        recordStatus: .error
+                    )
+                    finishedRun = true
+                    break
                 }
 
                 let running = ToolCallRecord(
@@ -436,12 +459,6 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 )
                 emit(.toolStarted(running))
 
-                // The wall-clock budget is a promise about the whole run, not
-                // just its model turns. A shell command may take up to two
-                // minutes, so a single call could outlive the budget that the
-                // next top-of-loop check would then report.
-                let remainingBeforeTool = Double(input.budget.maxWallClockSeconds)
-                    - (CFAbsoluteTimeGetCurrent() - start)
                 let raced = await Self.runTool(
                     context,
                     call,
@@ -454,8 +471,8 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 // outcome, and a tool that managed to return before the Stop
                 // keeps its record in the transcript.
                 if Task.isCancelled {
-                    if let raced {
-                        var record = raced.record
+                    if let settled = raced.value {
+                        var record = settled.record
                         record.id = running.id
                         usage.toolCalls += 1
                         await context.noteToolOutcome(record, call: call)
@@ -473,12 +490,24 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                     finishedRun = true
                     break
                 }
-                guard let execution = raced else {
+                let execution: (resultJSON: String, record: ToolCallRecord, isCompleted: Bool)
+                if case .completed(let finishedExecution) = raced {
+                    execution = finishedExecution
+                } else {
+                    let settled = raced.value
+                    if let settled {
+                        var record = settled.record
+                        record.id = running.id
+                        usage.toolCalls += 1
+                        await context.noteToolOutcome(record, call: call)
+                        append(kind: .toolResult, step: step, record: record)
+                        emit(.toolFinished(record))
+                    }
                     status = .failed
                     failure = "The run exceeded its \(input.budget.maxWallClockSeconds)-second wall-clock budget while '\(call.name)' was running."
                     append(kind: .status, step: step, text: failure)
                     recordAbandoned(
-                        turn.calls[offset...],
+                        turn.calls[(settled == nil ? offset : offset + 1)...],
                         reason: failure ?? "the run's wall-clock budget ran out.",
                         recordStatus: .error
                     )
@@ -599,19 +628,28 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
         _ request: AgentBackendRequest,
         remainingSeconds: TimeInterval
     ) async throws -> AgentBackendTurn {
-        try await withThrowingTaskGroup(of: AgentBackendTurn.self) { group in
+        try await withThrowingTaskGroup(of: AgentBackendTurn?.self) { group in
             group.addTask { try await backend.runTurn(request) }
             group.addTask {
-                try await Task.sleep(
-                    nanoseconds: Self.deadlineNanoseconds(remainingSeconds)
-                )
+                do {
+                    try await Task.sleep(
+                        nanoseconds: Self.deadlineNanoseconds(remainingSeconds)
+                    )
+                } catch is CancellationError {
+                    // Parent cancellation (Stop) must let `backend.runTurn`
+                    // finish unwinding so its `cancelledAfterPartial` error is
+                    // collected rather than raced out by the timer.
+                    return nil
+                }
                 throw AgentLoopError.wallClockExceeded
             }
             defer { group.cancelAll() }
-            guard let first = try await group.next() else {
-                throw AgentBackendError.malformedResponse("The backend produced no turn.")
+            while let next = try await group.next() {
+                if let turn = next {
+                    return turn
+                }
             }
-            return first
+            throw AgentBackendError.malformedResponse("The backend produced no turn.")
         }
     }
 
@@ -794,11 +832,23 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
     /// the deadline won; the tool's task is cancelled and the group waits for
     /// it to stop (a `shell_run` child is killed by `runProcess`'s own
     /// cancellation handler).
+    enum RacedResult<T: Sendable>: Sendable {
+        case completed(T)
+        case timedOut(T?)
+
+        var value: T? {
+            switch self {
+            case .completed(let value): return value
+            case .timedOut(let value): return value
+            }
+        }
+    }
+
     private static func runTool(
         _ context: AgentRunContext,
         _ call: AgentToolCall,
         remainingSeconds: TimeInterval
-    ) async -> (resultJSON: String, record: ToolCallRecord, isCompleted: Bool)? {
+    ) async -> RacedResult<(resultJSON: String, record: ToolCallRecord, isCompleted: Bool)> {
         await firstResult(
             deadlineNanoseconds: Self.deadlineNanoseconds(remainingSeconds)
         ) {
@@ -806,23 +856,17 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
         }
     }
 
-    /// Runs `work` against a deadline and returns whichever finishes first.
-    ///
-    /// The group's element is optional (the deadline arm returns nil), so
-    /// `next()` is `T??`. Unwrapping only the OUTER optional treats "the
-    /// deadline won" as a result and returns nil before the work's answer is
-    /// collected. A tool that finished at the boundary was reported as a
-    /// wall-clock failure and its record (including a `complete` or a write)
-    /// vanished from the transcript. Unwrap both: a value means the work
-    /// finished first; a nil element means the deadline won, so cancel the
-    /// work and wait for whatever it returns.
+    /// Runs `work` against a deadline and tags whether `work` finished first
+    /// (`.completed`) or the deadline expired first (`.timedOut`, carrying
+    /// whatever `work` returned after being cancelled so its transcript record
+    /// is never silently dropped).
     ///
     /// Internal rather than private so the deadline race can be tested without
     /// a model or a real tool.
     static func firstResult<T: Sendable>(
         deadlineNanoseconds: UInt64,
         _ work: @escaping @Sendable () async -> T
-    ) async -> T? {
+    ) async -> RacedResult<T> {
         await withTaskGroup(of: T?.self) { group in
             group.addTask { await work() }
             group.addTask {
@@ -832,16 +876,11 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             let first = await group.next()
             if let answer = first ?? nil {
                 group.cancelAll()
-                return Optional(answer)
+                return .completed(answer)
             }
             group.cancelAll()
-            // The deadline arm won; the work child is still in the group. Its
-            // own `nil` cannot happen, but the element is optional in the type
-            // whether or not the task has finished, so unwrap it honestly.
-            if let remaining = await group.next() {
-                return remaining
-            }
-            return nil
+            let remaining = (await group.next()) ?? nil
+            return .timedOut(remaining)
         }
     }
 
@@ -880,6 +919,9 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             if usage.costUSD > maxCost {
                 return "The run spent \(currency(usage.costUSD)), over its \(currency(maxCost)) cost budget."
             }
+        }
+        if usage.completionTokens > input.budget.maxCompletionTokens {
+            return "The run exhausted its \(input.budget.maxCompletionTokens)-token completion budget."
         }
         return nil
     }

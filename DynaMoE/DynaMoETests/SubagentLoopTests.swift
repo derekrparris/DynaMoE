@@ -400,16 +400,24 @@ final class SubagentLoopTests: XCTestCase {
     /// from the transcript. The deadline here is short enough to win; the work
     /// is cancelled by the collect path and its value must still come back.
     func testADeadlineThatWinsStillCollectsTheCompletedResult() async {
-        let value = await HeadlessAgentLoop.firstResult(deadlineNanoseconds: 2_000_000) {
+        let timedOut = await HeadlessAgentLoop.firstResult(deadlineNanoseconds: 2_000_000) {
             try? await Task.sleep(nanoseconds: 40_000_000)
             return 42
         }
-        XCTAssertEqual(value, 42, "the cancelled tool's own answer is the result")
+        if case .timedOut(let settled) = timedOut {
+            XCTAssertEqual(settled, 42, "the cancelled tool's own answer is preserved on timeout")
+        } else {
+            XCTFail("expected .timedOut when deadline expires first, got \(timedOut)")
+        }
 
         let fast = await HeadlessAgentLoop.firstResult(deadlineNanoseconds: 1_000_000_000) {
             return 7
         }
-        XCTAssertEqual(fast, 7, "work that finishes first is returned unchanged")
+        if case .completed(let value) = fast {
+            XCTAssertEqual(value, 7, "work that finishes first is tagged .completed")
+        } else {
+            XCTFail("expected .completed when work finishes first, got \(fast)")
+        }
     }
 
     func testAStopRacingAToolIsCancelledNotAWallClockFailureAndItsApprovalDoesNotExecute() async throws {
@@ -2037,6 +2045,106 @@ final class SubagentLoopTests: XCTestCase {
         )
         XCTAssertTrue(record.usage.costIsUnpriced)
         XCTAssertEqual(record.usage.costUnpricedReason, .providerOmittedUsage)
+    }
+
+    func testEndsAgentRunRejectsFailedAndRejectedCompleteCalls() {
+        XCTAssertFalse(ToolExecutionStatus.rejected.endsAgentRun(toolName: "complete", isCompleted: false))
+        XCTAssertFalse(ToolExecutionStatus.rejected.endsAgentRun(toolName: "complete", isCompleted: true))
+        XCTAssertFalse(ToolExecutionStatus.error.endsAgentRun(toolName: "complete", isCompleted: false))
+        XCTAssertFalse(ToolExecutionStatus.error.endsAgentRun(toolName: "complete", isCompleted: true))
+        XCTAssertTrue(ToolExecutionStatus.success.endsAgentRun(toolName: "complete", isCompleted: false))
+    }
+
+    func testStopDuringTurnPreservesCancelledAfterPartial() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+
+        final class PartialOnCancelBackend: AgentModelBackend, @unchecked Sendable {
+            let descriptor = AgentBackendDescriptor.scripted
+            let started = AsyncStream<Void>.makeStream()
+
+            func runTurn(_ request: AgentBackendRequest) async throws -> AgentBackendTurn {
+                started.continuation.yield(())
+                do {
+                    try await Task.sleep(nanoseconds: 10_000_000_000)
+                } catch is CancellationError {
+                    // Simulate backend unwinding after cancellation and throwing
+                    // its partial output.
+                    try? await Task.sleep(nanoseconds: 20_000_000)
+                    throw AgentBackendError.cancelledAfterPartial(
+                        text: "partial findings before stop",
+                        thinking: "partial reasoning"
+                    )
+                }
+                return AgentBackendTurn(text: "unreachable", finishReason: "stop")
+            }
+        }
+
+        let backend = PartialOnCancelBackend()
+        let context = try makeContext(workspace: workspace, tools: ["file_read"], policy: .deny)
+        let loopInput = input(
+            task: "Investigate",
+            budget: AgentBudget(maxSteps: 3, maxCompletionTokens: 1_000, maxWallClockSeconds: 30, maxCostUSD: nil),
+            role: "Researcher"
+        )
+
+        let task = Task {
+            await HeadlessAgentLoop().run(input: loopInput, backend: backend, context: context) { _ in }
+        }
+        for await _ in backend.started.stream { break }
+        task.cancel()
+        let outcome = await task.value
+
+        XCTAssertEqual(outcome.status, .cancelled)
+        let assistantTexts = outcome.transcript.filter { $0.kind == .assistantText }.compactMap(\.text)
+        XCTAssertTrue(
+            assistantTexts.contains(where: { $0.contains("partial findings before stop") }),
+            "Stop must preserve cancelledAfterPartial text instead of racing Task.sleep's CancellationError: \(assistantTexts)"
+        )
+    }
+
+    func testPostTurnBudgetEnforcesMaxCompletionTokensOnFinalTurn() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+
+        var turnUsage = AgentUsage()
+        turnUsage.promptTokens = 10
+        turnUsage.completionTokens = 250
+        turnUsage.backendRequests = 1
+        let backend = ScriptedBackend(turns: [
+            .init(text: "Done", usage: turnUsage)
+        ])
+        let context = try makeContext(workspace: workspace, tools: ["file_read"], policy: .deny)
+        let loopInput = input(
+            task: "Investigate",
+            budget: AgentBudget(maxSteps: 3, maxCompletionTokens: 100, maxWallClockSeconds: 30, maxCostUSD: nil),
+            role: "Researcher"
+        )
+
+        let outcome = await HeadlessAgentLoop().run(input: loopInput, backend: backend, context: context) { _ in }
+        XCTAssertEqual(outcome.status, .failed)
+        XCTAssertTrue(outcome.error?.contains("100-token completion budget") == true, outcome.error ?? "")
+    }
+
+    func testReportBuilderPreservesLeadingVersionNumbers() {
+        let entry = AgentTranscriptEntry(
+            index: 0,
+            stepIndex: 1,
+            kind: .assistantText,
+            text: """
+            26.0 is the minimum macOS deployment target required by this project build.
+            1. Actual numbered bullet claim that is long enough to be extracted as a finding.
+            """
+        )
+        let findings = AgentReportBuilder.findings(from: [entry])
+        XCTAssertTrue(
+            findings.contains(where: { $0.claim.hasPrefix("26.0 is the minimum") }),
+            "\(findings)"
+        )
+        XCTAssertTrue(
+            findings.contains(where: { $0.claim.hasPrefix("Actual numbered bullet claim") }),
+            "\(findings)"
+        )
     }
 }
 
