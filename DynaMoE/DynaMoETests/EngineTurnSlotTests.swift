@@ -17,7 +17,7 @@ final class EngineTurnSlotTests: XCTestCase {
     /// The smallest request the engine will look at. Every field is read only
     /// after the slot is taken, so the values never matter: a launch in this file
     /// is refused for its claim or for the missing model.
-    private func makeRequest() -> CompletionTurnRequest {
+    private func makeRequest(priority: TurnPriority = .interactive) -> CompletionTurnRequest {
         CompletionTurnRequest(
             promptTokenIds: [1, 2, 3],
             formattedPrompt: "hi",
@@ -42,7 +42,8 @@ final class EngineTurnSlotTests: XCTestCase {
             isSplicedContinuation: false,
             stopSequences: [],
             asOfDate: nil,
-            images: []
+            images: [],
+            turnPriority: priority
         )
     }
 
@@ -90,6 +91,40 @@ final class EngineTurnSlotTests: XCTestCase {
         XCTAssertTrue(ledger.isClaimed)
 
         live.release()
+        XCTAssertFalse(ledger.isClaimed)
+    }
+
+    /// The three callers that compete for the one slot — chat, the API
+    /// server's queue and a subagent run's step — reserving from their own
+    /// concurrent tasks. The sequential cases above could not see a ledger that
+    /// let two of them in at once.
+    func testConcurrentReservationsFromEveryCallerGrantExactlyOneHolder() async {
+        let ledger = TurnSlotLedger()
+        let counter = HeldClaimCounter()
+        let priorities: [TurnPriority] = [.interactive, .interactive, .background]
+        await withTaskGroup(of: Void.self) { group in
+            for priority in priorities {
+                for _ in 0..<32 {
+                    group.addTask {
+                        for _ in 0..<20 {
+                            guard let claim = ledger.tryClaim(priority: priority) else {
+                                await Task.yield()
+                                continue
+                            }
+                            counter.enter()
+                            // Hold ACROSS a suspension point: that is exactly
+                            // the window in which a second caller must be
+                            // refused.
+                            await Task.yield()
+                            counter.leave()
+                            claim.release()
+                        }
+                    }
+                }
+            }
+        }
+        XCTAssertGreaterThan(counter.granted, 0, "the race must actually grant claims, or it proves nothing")
+        XCTAssertEqual(counter.peak, 1, "two callers must never believe they hold the single slot")
         XCTAssertFalse(ledger.isClaimed)
     }
 
@@ -259,5 +294,89 @@ final class EngineTurnSlotTests: XCTestCase {
         )
         XCTAssertTrue(preparing.isHeld, "the preparing turn's claim survives a stale cancel")
         XCTAssertTrue(engine.isActive, "and the engine still reads busy to every prober")
+    }
+
+    /// `hasActiveBackgroundTurn` counts a turn being PREPARED (a claim, no
+    /// task), so a cancel that only looked at `currentGenerationTask` was
+    /// inert in exactly the window the prober had just called cancellable.
+    @MainActor
+    func testAPreparationClaimIsStoppableOnlyWhenItIsBackground() throws {
+        let engine = CompletionEngine.shared
+        XCTAssertFalse(engine.isActive, "the slot must be free at the start of the case")
+
+        let background = try XCTUnwrap(engine.reserveTurnSlot(priority: .background))
+        XCTAssertTrue(engine.hasActiveBackgroundTurn, "a background preparation is a background turn")
+        XCTAssertTrue(engine.cancelBackgroundTurn(), "and it can be stopped without a task to cancel")
+        XCTAssertFalse(background.isHeld, "its launch is refused because the claim was given back")
+        XCTAssertFalse(engine.isActive)
+        XCTAssertThrowsError(try engine.launchTurn(makeRequest(priority: .background), claim: background)) { error in
+            XCTAssertTrue(
+                message(error).contains("reservation"),
+                "a turn stopped during preparation must refuse for its claim: \(message(error))"
+            )
+        }
+
+        let interactive = try XCTUnwrap(engine.reserveTurnSlot(priority: .interactive))
+        defer { interactive.release() }
+        XCTAssertFalse(engine.hasActiveBackgroundTurn)
+        XCTAssertFalse(
+            engine.cancelBackgroundTurn(),
+            "a chat/server/model-load preparation is never cancelled to make room"
+        )
+        XCTAssertTrue(interactive.isHeld)
+    }
+
+    /// The claim's priority is what every other prober reads to decide whether
+    /// the slot may be preempted; a claim taken for one priority and launched
+    /// as the other would lie about that for the turn's whole length.
+    @MainActor
+    func testAClaimTakenForOnePriorityCannotLaunchTheOther() throws {
+        let engine = CompletionEngine.shared
+        XCTAssertFalse(engine.isActive, "the slot must be free at the start of the case")
+
+        let claim = try XCTUnwrap(engine.reserveTurnSlot(priority: .interactive))
+        XCTAssertThrowsError(try engine.launchTurn(makeRequest(priority: .background), claim: claim)) { error in
+            XCTAssertTrue(
+                message(error).contains("priority"),
+                "the refusal must name the priority mismatch: \(message(error))"
+            )
+        }
+        XCTAssertFalse(claim.isHeld, "the launch released the claim it refused")
+        XCTAssertFalse(engine.isActive, "and nothing is left occupying the slot")
+    }
+}
+
+/// Counts how many claims are held at once, so the concurrency case can prove
+/// the ledger never looked free to two callers.
+private final class HeldClaimCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current = 0
+    private var peakValue = 0
+    private var grantedValue = 0
+
+    func enter() {
+        lock.lock()
+        current += 1
+        peakValue = max(peakValue, current)
+        grantedValue += 1
+        lock.unlock()
+    }
+
+    func leave() {
+        lock.lock()
+        current -= 1
+        lock.unlock()
+    }
+
+    var peak: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return peakValue
+    }
+
+    var granted: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return grantedValue
     }
 }

@@ -237,15 +237,8 @@ nonisolated public final class GrammarConstrainedSampler {
     /// registry, exactly like `registerTools`; callers that must not disturb the
     /// in-app registry should snapshot it first and restore it afterwards.
     public func registerToolSchemas(_ schemas: [GrammarToolSchema]) {
-        var names = Set<String>()
-        var parameterKeys: [String: Set<String>] = [:]
-        var requiredKeys: [String: Set<String>] = [:]
-        for schema in schemas {
-            names.insert(schema.name)
-            parameterKeys[schema.name] = schema.parameterKeys
-            requiredKeys[schema.name] = schema.requiredKeys
-        }
-        applyRegistry(names: names, parameterKeys: parameterKeys, requiredKeys: requiredKeys)
+        let maps = Self.registryMaps(for: schemas)
+        applyRegistry(names: maps.names, parameterKeys: maps.parameterKeys, requiredKeys: maps.requiredKeys)
     }
 
     /// Snapshot of the current registry, for callers that install temporary
@@ -319,12 +312,31 @@ nonisolated public final class GrammarConstrainedSampler {
 
     /// Rebuilds the registry from the base snapshot plus every live scope, in
     /// install order. Caller holds `scopedMaskLock`.
+    ///
+    /// `registrationLock` is held across the WHOLE rebuild. Each replacement
+    /// is a multi-field write and a token's mask read takes the same lock, so
+    /// rebuilding one scope at a time exposed the intermediate registry (the
+    /// base alone, or the base plus some scopes) to a token drawn in the
+    /// overlap window. A token masked against the wrong vocabulary can emit a
+    /// call the registry would have withheld; the lock makes the swap a
+    /// single step.
     nonisolated private static func scopedMaskRebuildLocked() {
         guard let base = scopedMaskBase else { return }
-        shared.restoreRegistry(base)
+        shared.registrationLock.lock()
+        shared.replaceRegistryLocked(
+            names: base.names,
+            parameterKeys: base.parameterKeys,
+            requiredKeys: base.requiredKeys
+        )
         for entry in scopedMaskStack {
-            shared.registerToolSchemas(entry.schemas)
+            let maps = Self.registryMaps(for: entry.schemas)
+            shared.replaceRegistryLocked(
+                names: maps.names,
+                parameterKeys: maps.parameterKeys,
+                requiredKeys: maps.requiredKeys
+            )
         }
+        shared.registrationLock.unlock()
         if scopedMaskStack.isEmpty {
             scopedMaskBase = nil
         }
@@ -366,8 +378,8 @@ nonisolated public final class GrammarConstrainedSampler {
     /// leave its own vocabulary behind.
     nonisolated(unsafe) private static var scopedMaskBase: GrammarToolRegistry?
 
-    private func applyRegistry(names: Set<String>, parameterKeys: [String: Set<String>], requiredKeys: [String: Set<String>]) {
-        registrationLock.lock()
+    /// Replaces the registry. Caller holds `registrationLock`.
+    private func replaceRegistryLocked(names: Set<String>, parameterKeys: [String: Set<String>], requiredKeys: [String: Set<String>]) {
         registeredToolNames = names
         toolParameterKeys = parameterKeys
         toolRequiredKeys = requiredKeys
@@ -375,7 +387,28 @@ nonisolated public final class GrammarConstrainedSampler {
         for name in names {
             toolTrie.insert(word: name)
         }
-        registrationLock.unlock()
+    }
+
+    private func applyRegistry(names: Set<String>, parameterKeys: [String: Set<String>], requiredKeys: [String: Set<String>]) {
+        registrationLock.lock()
+        defer { registrationLock.unlock() }
+        replaceRegistryLocked(names: names, parameterKeys: parameterKeys, requiredKeys: requiredKeys)
+    }
+
+    /// The registry a schema list installs. Pure, so a scoped rebuild can
+    /// compose several without taking the registration lock per scope.
+    nonisolated private static func registryMaps(
+        for schemas: [GrammarToolSchema]
+    ) -> (names: Set<String>, parameterKeys: [String: Set<String>], requiredKeys: [String: Set<String>]) {
+        var names = Set<String>()
+        var parameterKeys: [String: Set<String>] = [:]
+        var requiredKeys: [String: Set<String>] = [:]
+        for schema in schemas {
+            names.insert(schema.name)
+            parameterKeys[schema.name] = schema.parameterKeys
+            requiredKeys[schema.name] = schema.requiredKeys
+        }
+        return (names, parameterKeys, requiredKeys)
     }
 
     /// Starts a generation: clears the live context and returns the token that

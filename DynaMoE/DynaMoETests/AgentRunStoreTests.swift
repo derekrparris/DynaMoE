@@ -793,4 +793,78 @@ final class AgentRunStoreTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: freshTemp.path), "an in-flight temp is never touched")
         XCTAssertNotNil(store.load(runId: saved.id, sessionId: sessionId), "records are never swept")
     }
+
+    // MARK: - Durability under an injected fault
+
+    /// Every failure point in the durable write either keeps the PREVIOUS
+    /// record intact or leaves nothing behind; a retry after the fault clears
+    /// must land, and the digest cache must not have recorded the failed bytes
+    /// as already written.
+    func testAWriteThatFailsAtEachStageKeepsThePriorRecordAndARetryLands() throws {
+        for fault in [AgentRunStore.StoreWriteFault.write, .fsync, .rename] {
+            let store = makeStore()
+            let sessionId = UUID()
+            var saved = record(sessionId: sessionId)
+            saved.task = "the first version"
+            XCTAssertTrue(store.saveImmediately(saved))
+
+            var updated = saved
+            updated.task = "the second version"
+            store.injectWriteFaultForTesting { fault }
+            XCTAssertFalse(store.saveImmediately(updated), "\(fault) must be reported as a failed write")
+            XCTAssertEqual(
+                store.load(runId: saved.id, sessionId: sessionId)?.task,
+                "the first version",
+                "\(fault) must not damage the record that was already durable"
+            )
+            // A stale temp must not be left behind either: it is what a later
+            // sweep has to clean up and what a confused writer could reuse.
+            let directory = root.appendingPathComponent(sessionId.uuidString, isDirectory: true)
+            let leftovers = (try? FileManager.default.contentsOfDirectory(atPath: directory.path))?
+                .filter { $0.hasPrefix(".\(saved.id.uuidString).json.new-") } ?? []
+            XCTAssertTrue(leftovers.isEmpty, "\(fault) left a temp file behind: \(leftovers)")
+
+            store.injectWriteFaultForTesting(nil)
+            XCTAssertTrue(store.saveImmediately(updated), "the retry must land once the fault is gone")
+            XCTAssertEqual(
+                store.load(runId: saved.id, sessionId: sessionId)?.task,
+                "the second version",
+                "the retry must actually write, not be skipped by the digest cache"
+            )
+            store.flush()
+        }
+    }
+
+    // MARK: - Duplicate copies after a crashed conversation delete
+
+    /// A conversation delete writes the rescued copy BEFORE removing the old
+    /// one, so a crash in between leaves the same run in two buckets. Deleting
+    /// one copy and tombstoning the id used to leave the other on disk: after a
+    /// relaunch the tombstone was gone and the stale record resurfaced. A
+    /// delete must remove the RECORD, not one file of it.
+    func testDeletingARunRemovesEveryDuplicateCopy() throws {
+        let store = makeStore()
+        let sessionId = UUID()
+        var saved = record(sessionId: sessionId)
+        saved.isolation = .worktree(path: "/tmp/gone", branch: "dynamoe/agent/dup")
+        saved.status = .cancelled
+        XCTAssertTrue(store.saveImmediately(saved))
+
+        // The crash window: the re-scoped copy exists in the unscoped bucket
+        // while the original is still in its conversation's bucket.
+        var rescued = saved
+        rescued.parentSessionId = nil
+        XCTAssertTrue(store.saveImmediately(rescued))
+        XCTAssertNotNil(store.loadAny(runId: saved.id))
+
+        store.deleteImmediately(runId: saved.id, sessionId: sessionId)
+
+        XCTAssertNil(store.loadAny(runId: saved.id), "no bucket may hold the deleted run")
+        XCTAssertNil(store.load(runId: saved.id, sessionId: sessionId))
+        XCTAssertNil(store.load(runId: saved.id, sessionId: nil))
+        XCTAssertFalse(
+            store.hasRecordFile(runId: saved.id),
+            "the launch sweep must not see a file for a deleted run"
+        )
+    }
 }

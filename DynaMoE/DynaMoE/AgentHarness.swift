@@ -2693,7 +2693,17 @@ public final class SpawnSubagentTool: AgentTool {
         }
         // Synchronous delegation: wait for subagent to finish
         let summary = await subagent.waitForCompletion()
-        await MainActor.run { subagent.isSummaryRelayed = true }
+        // A STOP resumes this wait with the stop reason, before the loop's own
+        // unwind has written the partial report (that write is what carries
+        // everything the run managed to do). Marking the report delivered here
+        // unconditionally consumed that richer report unseen: the relay skips a
+        // run marked relayed, so the partial was never delivered, this turn or
+        // any later one. A cancelled run stays unread; `SubagentManager` also
+        // re-opens a report that lands after its terminal write, and the
+        // relay's own rule never re-injects a bare stop reason.
+        if subagent.status != .cancelled {
+            await MainActor.run { subagent.isSummaryRelayed = true }
+        }
         // The operator can land an isolated run from the inspector while this
         // call is waiting; the result must not tell the coordinator to apply
         // work that is already in the main tree.
@@ -2847,8 +2857,11 @@ public final class GetSubagentStatusTool: AgentTool {
             let timeout = min(max(requestedTimeout, 1.0), 300.0)
             let deadline = Date().addingTimeInterval(timeout)
             while !Task.isCancelled {
-                let s = subagent.status
-                if s == .completed || s == .failed || s == .cancelled { break }
+                // `isTerminal`, not three hand-listed cases: `blocked` is a
+                // terminal outcome (a loop guard stopped the run), and a
+                // waiter that omitted it polled a finished run to the full
+                // timeout before reporting it.
+                if subagent.status.isTerminal { break }
                 if Date() >= deadline { break }
                 try? await Task.sleep(nanoseconds: 500_000_000)
             }
@@ -2858,7 +2871,7 @@ public final class GetSubagentStatusTool: AgentTool {
             "Call \($0.stepIndex): \($0.actionName) (\(String(format: "%.2f", $0.durationSeconds))s)"
         }.joined(separator: "\n")
 
-        let isTerminal = subagent.status == .completed || subagent.status == .failed || subagent.status == .cancelled
+        let isTerminal = subagent.status.isTerminal
         var readable = "Subagent: \(subagent.role) [\(subagent.status.displayName)]\n"
         readable += "Status: \(subagent.liveStatusText)\n"
         // ONE definition of "steps" everywhere a run is described: the model

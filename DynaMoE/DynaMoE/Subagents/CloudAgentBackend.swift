@@ -116,6 +116,11 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
         _ request: AgentBackendRequest,
         receipt: CloudTurnReceipt
     ) async throws -> AgentBackendTurn {
+        // A Stop between two steps cancels the run's task; without this the
+        // turn still built and ISSUED the request, billing the operator for an
+        // answer nothing would read. The retry loop checks before a retry for
+        // the same reason.
+        if Task.isCancelled { throw AgentBackendError.cancelled }
         let messages = Self.wireMessages(systemPrompt: request.systemPrompt, messages: request.messages)
         let params = CloudChatGenerationParams(
             temperature: request.sampling.temperature,
@@ -370,6 +375,56 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
 nonisolated enum SubagentBackendSettings {
     static let cloudModelKey = "dynamoe_subagent_cloud_model"
     static let backendKey = "dynamoe_subagent_backend"
+    /// The operator's standing dollar ceiling for a cloud run. Applied by
+    /// `AgentSpawnResolver` to every cloud spawn that did not set its own
+    /// `max_cost_usd`, which is what makes a model-authored budget bounded by
+    /// something the operator can see before the run exists: presets carry no
+    /// ceiling and a read-only cloud spawn raises no card of its own.
+    static let cloudCostCeilingKey = "dynamoe_subagent_cloud_max_cost_usd"
+    /// A ceiling above this is refused by the setter rather than accepted: a
+    /// mistyped "10000" would otherwise read as a budget no run can exceed.
+    static let maximumCloudCostUSD: Double = 100
+    /// The cap a cloud run gets before the operator changes anything. A cap
+    /// that started at "none" would leave the default cloud configuration
+    /// exactly as unbounded as before the Setting existed; the local analogue
+    /// (`LocalSubagentCostEstimate.defaultLimitSeconds`) is a number out of the
+    /// box too. 0 in the field is how the operator clears it.
+    static let defaultCloudCostUSD: Double = 5
+
+    /// `nil` means "no operator ceiling". A stored 0, a negative or a
+    /// non-finite value are the same answer: a $0 ceiling fails every run at
+    /// step 0, which is never what an operator meant by clearing the field.
+    static func cloudCostCeiling(defaults: UserDefaults = .standard) -> Double? {
+        if let stored = defaults.object(forKey: cloudCostCeilingKey) as? NSNumber {
+            let ceiling = stored.doubleValue
+            guard ceiling.isFinite, ceiling > 0 else { return nil }
+            return min(ceiling, maximumCloudCostUSD)
+        }
+        return defaultCloudCostUSD
+    }
+
+    /// Stores the operator's ceiling, clamped to the bound the Setting shows.
+    /// Shared by the Settings field and any programmatic writer so a value
+    /// written past the bound cannot outlive the UI that named it. `nil`
+    /// restores the built-in default; 0 is the "no cap" value.
+    static func setCloudCostCeiling(_ value: Double?, defaults: UserDefaults = .standard) {
+        guard let value else {
+            defaults.removeObject(forKey: cloudCostCeilingKey)
+            return
+        }
+        guard value.isFinite, value > 0 else {
+            defaults.set(0, forKey: cloudCostCeilingKey)
+            return
+        }
+        defaults.set(min(value, maximumCloudCostUSD), forKey: cloudCostCeilingKey)
+    }
+
+    /// Folds a typed value onto the stored range: a negative field is "no
+    /// ceiling", an inflated one is the documented maximum.
+    static func clampedCloudCostCeiling(_ value: Double) -> Double {
+        guard value.isFinite, value > 0 else { return 0 }
+        return min(value, maximumCloudCostUSD)
+    }
 
     /// The outcome of resolving the subagent Cloud model setting.
     ///

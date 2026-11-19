@@ -56,6 +56,9 @@ struct SubagentInspectorView: View {
     /// not overwrite the new one's rows when it lands later.
     @State private var reloadGeneration: UInt64 = 0
     @State private var confirmClear = false
+    /// Coalesces store-change notifications. One apply or a bulk delete can
+    /// land several writes, and each one would otherwise start its own read.
+    @State private var pendingStoreReload: Task<Void, Never>?
 
     init(sessionId: UUID?, onClose: @escaping () -> Void) {
         self.sessionId = sessionId
@@ -130,6 +133,13 @@ struct SubagentInspectorView: View {
         // A notification click sets the manager's selection; the pane keeps its
         // own selection state, so it has to take the value and clear it.
         .onChange(of: manager.selectedSubagentId) { _, _ in consumeManagerSelection() }
+        // A store-only mutation changes no manager count or status: an apply
+        // that landed on a RESTORED run, a relayed flag, a conversation
+        // delete. Without this the pane kept drawing the pre-apply record
+        // (stale APPLY / UNREAD markers) until something unrelated published.
+        .onReceive(NotificationCenter.default.publisher(for: AgentRunStore.recordsDidChangeNotification)) { _ in
+            scheduleStoreReload()
+        }
         // "Clear Finished" is an explicit decision, but deleting a report the
         // coordinator has never seen is not one the operator gets to make by
         // accident: a run whose summary is still UNREAD asks first.
@@ -466,6 +476,18 @@ struct SubagentInspectorView: View {
             guard generation == self.reloadGeneration else { return }
             self.stored = records
             self.consumeManagerSelection()
+        }
+    }
+
+    /// Debounces a burst of store writes into one reload. A run finishing
+    /// writes several records within a few milliseconds, and an apply or a
+    /// bulk delete more.
+    private func scheduleStoreReload() {
+        pendingStoreReload?.cancel()
+        pendingStoreReload = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard !Task.isCancelled else { return }
+            reloadStored()
         }
     }
 }
@@ -1308,29 +1330,59 @@ struct SubagentInlineRunCard: View {
     var onOpenInspector: () -> Void
 
     @State private var storedRecord: AgentRunRecord?
+    /// Bumped by a store change so the load re-runs. `task(id: runId)` alone
+    /// never re-fired: an applied or deleted record kept whatever the first
+    /// read returned (a stale summary, or a row the operator had deleted).
+    @State private var storeRevision = 0
 
     var body: some View {
         // The task is attached HERE, not to the card: when neither a live
-        // instance nor a stored record is present the card branch is EmptyView,
-        // so a task inside it never ran and a restored run's spawn card stayed
-        // blank forever.
+        // instance nor a stored record is present the card branch renders the
+        // "not stored" row below, and a task inside the record branch never ran
+        // for a run whose record loaded after the first frame.
         Group {
             if let instance = manager.allSubagents.first(where: { $0.id == runId }) {
                 card(instance.snapshotRecord(), live: instance)
             } else if let record = storedRecord {
                 card(record, live: nil)
             } else {
-                EmptyView()
+                // The transcript keeps the card even after the run aged out of
+                // retention (or the manager pruned its instance). An empty view
+                // made a spawn call look like it produced nothing.
+                missingCard
             }
         }
-        .task(id: runId) {
-            guard storedRecord == nil,
-                  manager.allSubagents.first(where: { $0.id == runId }) == nil else { return }
+        .task(id: storeRevision) {
             let record = await Task.detached(priority: .utility) {
                 AgentRunStore.shared.loadAny(runId: runId)
             }.value
+            guard !Task.isCancelled else { return }
             storedRecord = record
         }
+        .onReceive(NotificationCenter.default.publisher(for: AgentRunStore.recordsDidChangeNotification)) { _ in
+            storeRevision &+= 1
+        }
+    }
+
+    /// What is left of a spawn whose run has no live instance and no stored
+    /// record: the transcript keeps a row, and it says why there is nothing
+    /// more to show.
+    private var missingCard: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "person.2.badge.gearshape")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.secondary)
+            Text("Subagent run \(runId.uuidString.prefix(8))")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.secondary)
+            Text("· details are no longer stored")
+                .font(.system(size: 9.5))
+                .foregroundColor(.secondary)
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.secondary.opacity(0.05))
+        .cornerRadius(6)
     }
 
     private func card(_ record: AgentRunRecord, live: SubagentInstance?) -> some View {

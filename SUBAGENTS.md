@@ -604,7 +604,14 @@ from a child is refused by name.
   session-wide fallback for a path that never minted a turn id.
   Application termination cancels every run and every pending approval.
 - **Budgets** are enforced by the loop, not the scheduler; the scheduler enforces
-  concurrency and queue timeouts.
+  concurrency and queue timeouts. A cloud run also carries the operator's
+  standing spend ceiling: `dynamoe_subagent_cloud_max_cost_usd` (Settings →
+  Agent & Tools → *Cloud spend cap*, default $5, 0 clears it) is applied by
+  `AgentSpawnResolver` to every cloud spawn that names no `max_cost_usd`, so a
+  preset's `nil` ceiling or a read-only spawn that raises no card still has a
+  bound the operator can see. A cap can only bind on a priced model, so while
+  one is set a cloud run on a model with no recorded price is refused by name
+  rather than run unbounded.
 
 Engine lease: the doc's original "hold a claim for the run's lifetime" was
 implemented as **per-step claims** instead (SubQ: 0.012 for the lifetime lease).
@@ -646,6 +653,11 @@ it.
 - `schemaVersion` on every file; unknown newer versions are ignored rather than
   decoded lossily.
 - Atomic writes (temp + rename), digest-based skip when unchanged.
+- A delete removes EVERY bucket copy of a run before tombstoning the id. A
+  conversation delete re-scopes an isolated survivor by writing the new copy
+  before removing the old one, so a crash between the two leaves the same run in
+  two buckets; deleting only the newest left the stale copy to resurface on the
+  next launch (retention-exempt whenever it claimed worktree work).
 - Transcript tool outputs are truncated to a per-entry budget before writing.
 - Retention: keep the newest 200 runs or 30 days, whichever is larger; never
   prune a run younger than 24 hours. Runs of a deleted session are pruned with
@@ -679,8 +691,13 @@ it.
   summary, link to the inspector.
 - **Notifications** for a finished background run; unread reports are injected
   at the start of the next coordinator turn on both paths (fixes the weights-path
-  orphan).
-- **Settings**: default backend, cloud model for subagents, local cost limit,
+  orphan). Restored reports relay oldest first, and deleting a run (clear,
+  discard, or a conversation delete) withdraws its delivered and pending banner
+  so a tap cannot select a run no row can show. A stopped synchronous spawn does
+  not consume its unread state: the partial report lands during the loop's
+  unwind and is relayed on the next turn.
+- **Settings**: default backend, cloud model for subagents, the cloud spend cap
+  (see §8), local cost limit,
   max concurrency (per provider and global), retention (runs and days),
   notifications, and the subagent approval timeout. The AGENT STEP CAP in the
   same tab is the coordinator's own loop budget (`AgentStepBudget`), not a
@@ -698,9 +715,10 @@ Pure-logic and fake-backend tests are the default; real-model tests are opt-in.
 |---|---|
 | `SubagentLoopTests` | step loop, tool execution, budget, cancellation, guard trips, report derivation, the per-run harness context, its guards, the READ containment rules and the egress taint |
 | `AgentSpawnPolicyTests` | spawn approval and backend policy, Turbo/app-preference/containment rules, cost and isolation refusals |
-| `AgentRunIntegrationTests` | the manager's run lifecycle end to end (spawn → events → terminal record) against fake backends |
+| `AgentRunIntegrationTests` | the manager's run lifecycle end to end (spawn → events → terminal record) against fake backends, including a run parked on an approval card across a conversation delete and a quit path |
 | `AgentSchedulerTests` | capacity, priority, cancel tree, queue timeout |
-| `AgentRunStoreTests` | round trip, retention, corrupt file, unknown schema, mutate vs stale-load |
+| `AgentRunStoreTests` | round trip, retention, corrupt file, unknown schema, mutate vs stale-load, fault-injected durability (write/fsync/rename) and the duplicate-copy delete after a crashed conversation delete |
+| `EngineTurnSlotTests` | the claim ledger under concurrent chat/server/subagent reservations, preparation-claim cancellation, and the priority match between a claim and its launch |
 | `CloudAgentBackendLogicTests` | event mapping, fragmented tool-call assembly, retry rules |
 | `LocalAgentBackendLogicTests` | prompt rendering, mask install/restore, cost estimate and refusal |
 | `SubagentApprovalCenterTests` | the Turbo bypass rules, timeout resolution, the request/approve round trip and the queue bound |

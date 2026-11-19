@@ -516,6 +516,19 @@ public final class CompletionEngine: @unchecked Sendable {
                 "❌ This turn's reservation on the generation slot was given back before it could start. Try again in a moment."
             )
         }
+        // The claim's priority is the ONLY thing that tells another prober
+        // whether this turn may be preempted, and the request's is what the
+        // engine records as the live turn's. A reservation taken for one and
+        // launched as the other would make an interactive turn look
+        // cancellable (or a background one uncancellable) for its whole
+        // length. Both are set by the same caller, so a mismatch is a bug
+        // worth a named refusal rather than a guess.
+        guard held.priority == request.turnPriority else {
+            stateLock.unlock()
+            throw CompletionLaunchError.engineNotReady(
+                "❌ This turn's reservation was taken for a different priority than the turn itself, so it will not start. Try again in a moment."
+            )
+        }
         if currentGenerationTask != nil {
             stateLock.unlock()
             throw CompletionLaunchError.engineNotReady("❌ A generation is already active; one turn may run at a time.")
@@ -11688,10 +11701,18 @@ if layer.attnGateProjTensor != nil,
     public func cancelBackgroundTurn() -> Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
-        guard currentGenerationTask != nil, activeTurnPriority == .background else { return false }
-        currentGenerationTask?.cancel()
-        activeTurnCancelled = true
-        return true
+        if let task = currentGenerationTask {
+            guard activeTurnPriority == .background else { return false }
+            task.cancel()
+            activeTurnCancelled = true
+            return true
+        }
+        // A background turn being PREPARED holds no task yet — only its claim —
+        // and `hasActiveBackgroundTurn` counts that window, so a cancel that
+        // only looked at the task was inert exactly when the caller had been
+        // told there was something to stop. Dropping the claim makes the
+        // pending launch refuse itself; the preparation finishes harmlessly.
+        return turnSlotLedger.cancelClaim(ifPriority: .background)
     }
 
     /// Cancels one specific turn, addressed by the generation id its launch

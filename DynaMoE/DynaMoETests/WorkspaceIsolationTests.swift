@@ -17,7 +17,13 @@ final class WorkspaceIsolationTests: XCTestCase {
 
     override func setUp() async throws {
         repository = try makeTemporaryDirectory("repo")
-        worktreeRoot = try makeTemporaryDirectory("worktrees")
+        // Under the process worktree root: `cleanup` refuses to delete a path
+        // outside it (a record's path is data), so a fixture that lived in a
+        // bare temp directory would no longer be cleaned up.
+        let root = WorkspaceIsolation.processRootURL
+            .appendingPathComponent("tests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        worktreeRoot = root
         try await git(["init", "-b", "main"], in: repository)
         try "line one\nline two\nline three\n".write(
             to: repository.appendingPathComponent("README.md"),
@@ -307,6 +313,37 @@ final class WorkspaceIsolationTests: XCTestCase {
         XCTAssertNil(
             WorkspaceIsolation.safeURL(for: "leaf.txt", in: root),
             "a write through a leaf symlink must not leave the tree"
+        )
+
+        // Repository METADATA is not content. A change set that names `.git/`
+        // would write executable hooks or config through a surface that is
+        // supposed to carry a file patch, and the default macOS filesystem is
+        // case-insensitive, so `.GIT` names the same place.
+        XCTAssertNil(WorkspaceIsolation.safeURL(for: ".git/hooks/post-commit", in: root))
+        XCTAssertNil(WorkspaceIsolation.safeURL(for: ".GIT/config", in: root))
+        XCTAssertNil(WorkspaceIsolation.safeURL(for: "sub/.git/config", in: root))
+        XCTAssertNotNil(
+            WorkspaceIsolation.safeURL(for: "src/.gitignore", in: root),
+            "a name that merely starts with .git is ordinary content"
+        )
+        XCTAssertNotNil(WorkspaceIsolation.safeURL(for: "nested/.gitattributes", in: root))
+    }
+
+    /// A C-quoted `diff --git` header is legal whenever a path holds a quote, a
+    /// backslash or a non-ASCII byte. Reading only the last ` b/` returned the
+    /// quotes and escapes as part of the path, so the nested-repository refusal
+    /// named a file git would never write.
+    func testAQuotedDiffHeaderStillResolvesItsDestination() {
+        let patch = #"""
+        diff --git "a/README \"notes\".md" "b/README \"notes\".md"
+        new file mode 160000
+        index 0000000..1111111
+        --- /dev/null
+        +++ "b/README \"notes\".md"
+        """#
+        XCTAssertEqual(
+            WorkspaceIsolation.nestedRepositoryPath(inPatch: patch),
+            "README \"notes\".md"
         )
     }
 
@@ -772,10 +809,17 @@ final class WorkspaceIsolationTests: XCTestCase {
             workingDirectory: worktree.path
         )
         let subagent = SubagentManager.shared.spawnModelBacked(plan, id: runId)
-        defer {
-            SubagentManager.shared.clearCompleted(sessionId: nil)
+        // Registered rather than a `defer` with an unawaited Task: a cleanup
+        // still running after the case returned raced the next case's fixture
+        // (both live in the same process-wide worktree root) and could delete
+        // a directory that case had just created. XCTest awaits this block.
+        addTeardownBlock {
+            await MainActor.run {
+                SubagentManager.shared.clearCompleted(sessionId: nil)
+            }
             AgentRunStore.shared.delete(runId: runId, sessionId: nil)
-            Task { await WorkspaceIsolation.cleanup(worktree) }
+            AgentRunStore.shared.flush()
+            await WorkspaceIsolation.cleanup(worktree)
         }
 
         // Wait until the run has actually produced its work before stopping it,

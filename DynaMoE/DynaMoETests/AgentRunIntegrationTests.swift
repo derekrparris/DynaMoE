@@ -13,25 +13,32 @@ import XCTest
 @MainActor
 final class AgentRunIntegrationTests: XCTestCase {
     private var workingDirectory: URL!
+    /// Turbo Mode is the operator's process-wide preference and this target is
+    /// hosted inside the app, so a developer who left it on would have the
+    /// per-change cards below bypassed. Saved and restored with the switch's
+    /// own API (it is the key's only owner).
+    private var savedTurbo: Any?
 
     override func setUp() async throws {
         try await super.setUp()
+        savedTurbo = TurboModeSettings.rawValue
+        TurboModeSettings.set(false, from: #function)
         workingDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("SubagentRunTest_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: workingDirectory, withIntermediateDirectories: true)
     }
 
     override func tearDown() async throws {
-        await MainActor.run {
-            SubagentManager.shared.cancelAll()
-            // `cancelAll` deliberately skips runs that already finished, so
-            // every instance a test completed stayed in the process-wide
-            // registry for the rest of the suite — a later case's
-            // `allSubagents` saw earlier cases' runs. The records go too,
-            // which is what a test wants: nothing here is operator data (the
-            // store redirects to a /tmp root under XCTest).
-            SubagentManager.shared.clearCompleted()
-        }
+        // AWAITED, not fire-and-forget. `cancelAll` and `clearCompleted` hand
+        // their work to tasks and to the store's IO queue; returning before
+        // they land let a later case see this one's runs still finishing (and
+        // wrote their records while the next fixture was already reading the
+        // process-wide registry).
+        SubagentManager.shared.cancelAll()
+        await AgentScheduler.shared.cancelAll(reason: "test teardown")
+        SubagentManager.shared.clearCompleted()
+        AgentRunStore.shared.flush()
+        TurboModeSettings.restore(savedTurbo, from: #function)
         if let workingDirectory {
             try? FileManager.default.removeItem(at: workingDirectory)
         }
@@ -41,7 +48,8 @@ final class AgentRunIntegrationTests: XCTestCase {
     private func plan(
         backend: ScriptedBackend,
         sessionId: UUID,
-        toolNames: [String] = ["file_read"]
+        toolNames: [String] = ["file_read"],
+        policy: AgentApprovalPolicy = .auto
     ) -> AgentSpawnPlan {
         AgentSpawnPlan(
             role: "Codebase Researcher",
@@ -58,7 +66,7 @@ final class AgentRunIntegrationTests: XCTestCase {
                 maxWallClockSeconds: 20,
                 maxCostUSD: nil
             ),
-            approvalPolicy: .auto,
+            approvalPolicy: policy,
             isolation: .none,
             thinking: false,
             sampling: .default,
@@ -299,5 +307,110 @@ final class AgentRunIntegrationTests: XCTestCase {
         } catch {
             XCTAssertEqual(error as? AgentSpawnError, .forbiddenTool("spawn_subagent"))
         }
+    }
+
+    // MARK: - Lifecycle with a parked approval
+
+    /// A run parked on an approval card is the one state in which a quit or a
+    /// conversation delete has a live task, a durable record AND an
+    /// outstanding continuation at the same time. Both transitions used to be
+    /// exercised only against running or finished runs.
+    private func parkedWriteRun(sessionId: UUID) -> SubagentInstance {
+        let backend = ScriptedBackend(turns: [
+            .init(
+                text: "writing the file",
+                calls: [AgentToolCall(name: "file_write", arguments: [
+                    "path": "parked.txt",
+                    "content": "parked\n"
+                ])]
+            )
+        ])
+        return SubagentManager.shared.spawnModelBacked(
+            plan(
+                backend: backend,
+                sessionId: sessionId,
+                toolNames: ["file_read", "file_write"],
+                policy: .everyStateChange
+            ),
+            id: UUID()
+        )
+    }
+
+    private func parkedCard(for runId: UUID) -> PendingSubagentApproval? {
+        SubagentApprovalCenter.shared.pending.first { $0.request.runId == runId }
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval,
+        _ condition: () -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(nanoseconds: 30_000_000)
+        }
+        return condition()
+    }
+
+    func testDeletingAConversationStopsAParkedRunAndRemovesItsRecord() async throws {
+        let session = UUID()
+        let subagent = parkedWriteRun(sessionId: session)
+        defer {
+            SubagentManager.shared.clearCompleted()
+            AgentRunStore.shared.flush()
+        }
+
+        let parked = await waitUntil(timeout: 10) { self.parkedCard(for: subagent.id) != nil }
+        XCTAssertTrue(parked, "the run must park on the write's card")
+        XCTAssertEqual(subagent.status, .waitingForApproval)
+
+        // What ContentView does for a conversation delete: cancel its runs,
+        // then delete their records.
+        SubagentManager.shared.cancelSession(sessionId: session)
+        AgentRunStore.shared.deleteSession(session)
+        // Release the parked continuation so the run's task can unwind; a
+        // deleted conversation cannot answer its card.
+        if let card = parkedCard(for: subagent.id) {
+            SubagentApprovalCenter.shared.reject(card.id)
+        }
+        AgentRunStore.shared.flush()
+
+        let stopped = await waitUntil(timeout: 10) { subagent.status.isTerminal }
+        XCTAssertTrue(stopped)
+        XCTAssertEqual(subagent.status, .cancelled)
+        let cleared = await waitUntil(timeout: 5) { self.parkedCard(for: subagent.id) == nil }
+        XCTAssertTrue(cleared)
+        XCTAssertNil(
+            AgentRunStore.shared.load(runId: subagent.id, sessionId: session),
+            "a deleted conversation must not leave its runs on disk"
+        )
+        XCTAssertNil(AgentRunStore.shared.loadAny(runId: subagent.id))
+    }
+
+    func testAQuitWithAParkedRunLeavesATerminalRecord() async throws {
+        let session = UUID()
+        let subagent = parkedWriteRun(sessionId: session)
+        defer {
+            SubagentManager.shared.clearCompleted()
+            AgentRunStore.shared.flush()
+        }
+
+        let parked = await waitUntil(timeout: 10) { self.parkedCard(for: subagent.id) != nil }
+        XCTAssertTrue(parked)
+
+        // `willTerminate` cancels every run and then flushes the store.
+        SubagentManager.shared.cancelAll()
+        if let card = parkedCard(for: subagent.id) {
+            SubagentApprovalCenter.shared.reject(card.id)
+        }
+        AgentRunStore.shared.flush()
+
+        let stopped = await waitUntil(timeout: 10) { subagent.status.isTerminal }
+        XCTAssertTrue(stopped)
+        XCTAssertEqual(subagent.status, .cancelled)
+        let record = AgentRunStore.shared.load(runId: subagent.id, sessionId: session)
+        XCTAssertEqual(record?.status, .cancelled, "the quit path must persist a terminal record")
+        XCTAssertTrue(record?.status.isTerminal == true)
+        AgentRunStore.shared.deleteImmediately(runId: subagent.id, sessionId: session)
     }
 }

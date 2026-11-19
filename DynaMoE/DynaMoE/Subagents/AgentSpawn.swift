@@ -23,6 +23,7 @@ nonisolated enum AgentSpawnError: LocalizedError, Equatable {
     case notAvailableToRuns(String)
     case costCeilingWithoutPricing(String)
     case costCeilingOnUnpricedBackend(String)
+    case operatorCostCeilingNeedsPricing(model: String, ceiling: Double)
     case invalidBudgetOverride(String)
 
     var errorDescription: String? {
@@ -43,6 +44,12 @@ nonisolated enum AgentSpawnError: LocalizedError, Equatable {
             return "This spawn sets a max_cost_usd ceiling, but no price is recorded for '\(model)', so the ceiling could never bind. Record the model's input and output prices in Settings under Cloud Providers, or clear the ceiling."
         case .costCeilingOnUnpricedBackend(let backend):
             return "This spawn sets a max_cost_usd ceiling, but '\(backend)' is not a cloud model: it bills no dollars, so the run would always report $0 spent and the ceiling could never bind. Clear the ceiling, or run this work on a cloud model with recorded prices."
+        case .operatorCostCeilingNeedsPricing(let model, let ceiling):
+            return String(
+                format: "The operator's default cloud spend cap is $%.2f per run, but no price is recorded for '%@', so the cap could not be enforced. Record the model's input and output prices in Settings under Cloud Providers, or clear the cap under Agent & Tools.",
+                ceiling,
+                model
+            )
         case .invalidBudgetOverride(let detail):
             return "The spawn's budget was refused: \(detail) The run was not started."
         }
@@ -182,7 +189,7 @@ enum AgentSpawnResolver {
                 )
             }
         }
-        let budget = AgentRolePresetCatalog.budget(for: definition, overrides: request.budgetOverrides)
+        var budget = AgentRolePresetCatalog.budget(for: definition, overrides: request.budgetOverrides)
 
         // Isolation is validated BEFORE the backend is resolved, so a spawn that
         // cannot have a worktree is refused for that reason rather than for
@@ -217,7 +224,27 @@ enum AgentSpawnResolver {
         // An unpriced cloud model reports `costUSD` 0 for every token it bills,
         // so the ceiling would never trip and the run would spend an amount the
         // spawn card could not name. Refuse before anything runs.
-        if let problem = Self.costCeilingProblem(budget: budget, descriptor: descriptor, defaults: defaults) {
+        //
+        // The operator's standing ceiling is applied HERE, after the backend is
+        // known and before that check: presets carry none, and a read-only
+        // cloud spawn raises no card, so without this a spawn that never named
+        // a budget had no operator-visible bound on what it could spend. It
+        // applies only where nothing was asked for — an explicit
+        // `max_cost_usd` is the caller's number, and a local run bills no
+        // dollars, so neither is replaced.
+        var usesOperatorCeiling = false
+        if descriptor.kind == .cloud,
+           budget.maxCostUSD == nil,
+           let operatorCeiling = SubagentBackendSettings.cloudCostCeiling(defaults: defaults) {
+            budget.maxCostUSD = operatorCeiling
+            usesOperatorCeiling = true
+        }
+        if let problem = Self.costCeilingProblem(
+            budget: budget,
+            descriptor: descriptor,
+            defaults: defaults,
+            ceilingIsOperatorDefault: usesOperatorCeiling
+        ) {
             throw problem
         }
 
@@ -340,7 +367,8 @@ enum AgentSpawnResolver {
     static func costCeilingProblem(
         budget: AgentBudget,
         descriptor: AgentBackendDescriptor,
-        defaults: UserDefaults = .standard
+        defaults: UserDefaults = .standard,
+        ceilingIsOperatorDefault: Bool = false
     ) -> AgentSpawnError? {
         guard let ceiling = budget.maxCostUSD, ceiling > 0 else { return nil }
         guard descriptor.kind == .cloud else {
@@ -352,6 +380,16 @@ enum AgentSpawnResolver {
         guard let providerId = descriptor.providerId,
               let modelId = descriptor.modelId,
               CloudPricingStore.pricing(forModel: modelId, providerId: providerId, defaults: defaults) != nil else {
+            // The operator's own cap is refused with its amount and where to
+            // change it: the spawn did not ask for this ceiling, so a message
+            // blaming the spawn's `max_cost_usd` would name a field the caller
+            // never sent.
+            if ceilingIsOperatorDefault {
+                return .operatorCostCeilingNeedsPricing(
+                    model: descriptor.displayName,
+                    ceiling: ceiling
+                )
+            }
             return .costCeilingWithoutPricing(descriptor.displayName)
         }
         return nil

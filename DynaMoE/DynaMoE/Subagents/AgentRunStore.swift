@@ -78,15 +78,20 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     /// The retention the app runs with, from the operator's Settings. A
     /// non-positive or malformed value keeps the default rather than disabling
     /// the only bound on the store.
+    ///
+    /// The upper bounds are enforced HERE and not only in the Stepper: a
+    /// defaults value written outside the UI (a script, a restored backup)
+    /// otherwise made "keep 30 days" mean "keep forever", which is the one
+    /// direction the bound exists to prevent.
     static func configuredPolicy(defaults: UserDefaults = .standard) -> RetentionPolicy {
         var policy = RetentionPolicy.standard
         if let days = defaults.object(forKey: "dynamoe_subagent_retention_days") as? NSNumber,
            days.doubleValue > 0 {
-            policy.keepDays = days.doubleValue
+            policy.keepDays = min(max(days.doubleValue, 1), 365)
         }
         if let runs = defaults.object(forKey: "dynamoe_subagent_retention_runs") as? NSNumber,
            runs.intValue > 0 {
-            policy.keepNewest = runs.intValue
+            policy.keepNewest = min(max(runs.intValue, 20), 2_000)
         }
         return policy
     }
@@ -127,6 +132,15 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     /// them. Publishing the scan cannot resurrect one: `markRelayed` lands
     /// from the relay path, which is not on the store's IO queue.
     private var relaySettledDuringBuild: Set<UUID> = []
+
+    /// Posted on the main queue after a record is written or deleted.
+    ///
+    /// The inspector reloads on `SubagentManager` changes, and a store-only
+    /// mutation has none: a coordinator-path apply on a restored run, a relay
+    /// flag, retention, a conversation delete. The pane then kept drawing the
+    /// pre-apply record (stale APPLY / UNREAD markers) until something else
+    /// published. One name, posted at the two places a record lands or leaves.
+    static let recordsDidChangeNotification = Notification.Name("dynamoe.agentRunStoreDidChange")
 
     init(
         rootURL: URL = AgentRunStore.defaultRootURL,
@@ -412,12 +426,13 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
             // write creates it 0644 and chmods afterwards, a window in which
             // the record is world-readable) and fsyncs before the rename, so a
             // crash cannot leave a truncated record either.
-            try Self.writeOwnerOnlyAtomically(data, to: url)
+            try Self.writeOwnerOnlyAtomically(data, to: url, fault: currentWriteFault())
             try? fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
             signatureLock.lock()
             writtenSignatures[key] = signature
             signatureLock.unlock()
             noteRelayMembership(record)
+            postRecordsDidChange()
             return true
         } catch {
             print("⚠️ [AgentRunStore] failed to write run \(record.id): \(error.localizedDescription)")
@@ -425,12 +440,56 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         }
     }
 
+    /// A failure a test can inject into the durable write, so the recovery
+    /// paths (a prior record surviving, a retry succeeding, the digest cache
+    /// refusing to skip) can be exercised without a full disk.
+    nonisolated enum StoreWriteFault: Sendable, Equatable {
+        case write
+        case fsync
+        case rename
+    }
+
+    private let faultLock = NSLock()
+    nonisolated(unsafe) private var injectedWriteFault: (@Sendable () -> StoreWriteFault?)?
+
+    /// Test-only. `nil` clears the injection.
+    func injectWriteFaultForTesting(_ provider: (@Sendable () -> StoreWriteFault?)?) {
+        faultLock.lock()
+        injectedWriteFault = provider
+        faultLock.unlock()
+    }
+
+    private func currentWriteFault() -> StoreWriteFault? {
+        faultLock.lock()
+        defer { faultLock.unlock() }
+        return injectedWriteFault?()
+    }
+
+    /// Callers run on the IO queue, so the post hops to the main queue where
+    /// the observers (the inspector, the inline run card) live.
+    private func postRecordsDidChange() {
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: Self.recordsDidChangeNotification, object: nil)
+        }
+    }
+
     /// Atomic, owner-only, durable write. The temp file is created 0600 and
     /// fsynced before the rename, so the record is never world-readable in
     /// flight and never truncated on disk after the call returns.
-    private nonisolated static func writeOwnerOnlyAtomically(_ data: Data, to url: URL) throws {
+    private nonisolated static func writeOwnerOnlyAtomically(
+        _ data: Data,
+        to url: URL,
+        fault: StoreWriteFault? = nil
+    ) throws {
         let temporary = url.deletingLastPathComponent()
             .appendingPathComponent(".\(url.lastPathComponent).new-\(UUID().uuidString)", isDirectory: false)
+        if fault == .write {
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(EIO),
+                userInfo: [NSFilePathErrorKey: temporary.path]
+            )
+        }
         let descriptor = open(temporary.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
         guard descriptor >= 0 else {
             throw NSError(
@@ -468,14 +527,23 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         let syncErrno = syncResult == 0 ? 0 : errno
         let closeResult = close(descriptor)
         let closeErrno = closeResult == 0 ? 0 : errno
-        let durabilityErrno: Int32 = writeErrno != 0 ? writeErrno
-            : (syncErrno != 0 ? syncErrno : closeErrno)
+        let durabilityErrno: Int32 = fault == .fsync ? EIO
+            : (writeErrno != 0 ? writeErrno
+                : (syncErrno != 0 ? syncErrno : closeErrno))
         if durabilityErrno != 0 {
             try? FileManager.default.removeItem(at: temporary)
             throw NSError(
                 domain: NSPOSIXErrorDomain,
                 code: Int(durabilityErrno),
                 userInfo: [NSFilePathErrorKey: temporary.path]
+            )
+        }
+        if fault == .rename {
+            try? FileManager.default.removeItem(at: temporary)
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(EIO),
+                userInfo: [NSFilePathErrorKey: url.path]
             )
         }
         do {
@@ -787,13 +855,41 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         }
     }
 
+    /// Every bucket that holds a file for this run, decodable or not.
+    ///
+    /// A conversation delete re-scopes a rescued run by writing the new copy
+    /// BEFORE removing the old one, so a crash between the two leaves the same
+    /// run in two buckets. Deleting only the newest copy then tombstoned the id
+    /// and left the stale one on disk; the tombstone is in memory, so after a
+    /// relaunch the stale record resurfaced — retention-exempt whenever it
+    /// still claimed worktree work, even after the operator had discarded the
+    /// tree. A delete has to remove the record, not one copy of it.
+    private func recordFileURLs(runId: UUID) -> [URL] {
+        let name = "\(runId.uuidString).json"
+        guard let directories = try? fileManager.contentsOfDirectory(atPath: rootURL.path) else {
+            let direct = fileURL(runId: runId, sessionId: nil)
+            return fileManager.fileExists(atPath: direct.path) ? [direct] : []
+        }
+        var urls: [URL] = []
+        for directory in directories {
+            let candidate = rootURL
+                .appendingPathComponent(directory, isDirectory: true)
+                .appendingPathComponent(name, isDirectory: false)
+            if fileManager.fileExists(atPath: candidate.path) {
+                urls.append(candidate)
+            }
+        }
+        return urls
+    }
+
     /// Deletes a record and locates it the way `mutate` does, so a run
     /// re-scoped to the unscoped bucket is removed from where it actually
     /// lives rather than from a path the tombstone refuses to touch.
     private func deleteLocked(runId: UUID, sessionId: UUID?) {
         let preferred = fileURL(runId: runId, sessionId: sessionId)
-        let url = existingRecordURL(runId: runId, preferredSession: sessionId) ?? preferred
-        // Tombstone AFTER the removal succeeds. A tombstone written first is
+        let candidates = recordFileURLs(runId: runId)
+        let urls = candidates.isEmpty ? [preferred] : candidates
+        // Tombstone AFTER the removals succeed. A tombstone written first is
         // never lifted, so a removal that failed (permissions, a locked file)
         // left a record on disk that every later write refused to update: an
         // immortal, invisible run. The queue is serial, so a save enqueued
@@ -803,16 +899,20 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         // the record was already gone, and a save captured before this delete
         // is queued behind it. Skipping the tombstone here let that save
         // recreate a run the operator had deleted.
-        var isDirectory: ObjCBool = false
-        let exists = fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory)
-        if exists {
+        for url in urls {
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) else { continue }
             guard (try? fileManager.removeItem(at: url)) != nil else { return }
         }
         noteDeletedRun(runId)
         signatureLock.lock()
-        writtenSignatures[url.path] = nil
+        for url in urls {
+            writtenSignatures[url.path] = nil
+        }
         removeRelayEverywhereLocked(runId: runId)
         signatureLock.unlock()
+        SubagentNotifier.withdraw(runId: runId)
+        postRecordsDidChange()
     }
 
     /// Deletes every record `clearable` accepts, scanning on the IO queue.
@@ -900,6 +1000,20 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
                 signatureLock.lock()
                 writtenSignatures[original.path] = nil
                 signatureLock.unlock()
+                // A PREVIOUS delete that crashed between its two writes (or a
+                // save that landed in the unscoped bucket) can leave another
+                // copy of this run behind. The rescue copy just written is the
+                // current one; every other file for this id is stale and must
+                // not outlive the record it duplicates, or the next launch
+                // reads work the operator just deleted. The keep copy lives in
+                // the unscoped bucket, so it is named explicitly.
+                let survivor = fileURL(runId: record.id, sessionId: nil)
+                for stale in recordFileURLs(runId: record.id) where stale.path != survivor.path {
+                    try? fileManager.removeItem(at: stale)
+                    signatureLock.lock()
+                    writtenSignatures[stale.path] = nil
+                    signatureLock.unlock()
+                }
             }
             guard !rescueFailed else { return }
             // A record this build cannot decode is kept, not deleted with the
@@ -953,6 +1067,13 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
             }
             unrelayedBySession.removeValue(forKey: Self.relayBucket(sessionId))
             signatureLock.unlock()
+            // A delivered banner for a run whose conversation is gone is a tap
+            // that lands on nothing (the inspector cannot show the run and the
+            // selection pins an id with no row).
+            for record in decoded {
+                SubagentNotifier.withdraw(runId: record.id)
+            }
+            postRecordsDidChange()
         }
     }
 
@@ -1015,15 +1136,32 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
                 // conversation history; that work is the operator's to clear
                 // or apply, never the clock's.
                 if record.holdsWorktreeWork { continue }
-                let url = fileURL(runId: record.id, sessionId: record.parentSessionId)
-                // Tombstone only once the file is gone; see `deleteLocked`.
-                guard (try? fileManager.removeItem(at: url)) != nil else { continue }
+                // Every bucket copy goes, for the same reason `deleteLocked`
+                // removes them all: one copy surviving a tombstoned id is a
+                // record no later write can repair and the next launch reads
+                // as history the operator had pruned.
+                let urls = recordFileURLs(runId: record.id)
+                guard !urls.isEmpty else { continue }
+                var removalFailed = false
+                for url in urls {
+                    var isDirectory: ObjCBool = false
+                    guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) else { continue }
+                    guard (try? fileManager.removeItem(at: url)) != nil else {
+                        removalFailed = true
+                        break
+                    }
+                }
+                // Tombstone only once every copy is gone; see `deleteLocked`.
+                guard !removalFailed else { continue }
                 noteDeletedRun(record.id)
                 removed.append(record.id)
                 signatureLock.lock()
-                writtenSignatures[url.path] = nil
+                for url in urls {
+                    writtenSignatures[url.path] = nil
+                }
                 removeRelayEverywhereLocked(runId: record.id)
                 signatureLock.unlock()
+                SubagentNotifier.withdraw(runId: record.id)
             }
             return removed
         }

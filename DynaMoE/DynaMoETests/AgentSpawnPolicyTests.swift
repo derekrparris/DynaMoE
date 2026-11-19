@@ -657,6 +657,95 @@ final class AgentSpawnPolicyTests: XCTestCase {
         )
     }
 
+    /// The operator's standing cap is what bounds a cloud spawn that names no
+    /// budget of its own: presets carry none, and a read-only cloud spawn
+    /// raises no card. It is read from the same defaults domain Settings
+    /// writes, folded onto the range the field shows, and refused (rather than
+    /// silently inert) when the model has no recorded price.
+    func testTheOperatorCloudSpendCapIsBoundedAndAppliedToACloudRun() {
+        let suiteName = "AgentSpawnPolicyTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        // A fresh domain gets the built-in default, so a cloud run is bounded
+        // before the operator has changed anything.
+        XCTAssertEqual(
+            SubagentBackendSettings.cloudCostCeiling(defaults: defaults),
+            SubagentBackendSettings.defaultCloudCostUSD
+        )
+
+        SubagentBackendSettings.setCloudCostCeiling(2.5, defaults: defaults)
+        XCTAssertEqual(SubagentBackendSettings.cloudCostCeiling(defaults: defaults), 2.5)
+
+        // A value written past the bound (a script, a restored backup) is
+        // clamped by the reader too, not only by the Settings field.
+        defaults.set(10_000, forKey: SubagentBackendSettings.cloudCostCeilingKey)
+        XCTAssertEqual(
+            SubagentBackendSettings.cloudCostCeiling(defaults: defaults),
+            SubagentBackendSettings.maximumCloudCostUSD
+        )
+
+        // A cleared or nonsense value is "no cap", not a $0 ceiling that fails
+        // every run at step 0.
+        for cleared in [0.0, -3.0] as [Double] {
+            SubagentBackendSettings.setCloudCostCeiling(cleared, defaults: defaults)
+            XCTAssertNil(SubagentBackendSettings.cloudCostCeiling(defaults: defaults))
+        }
+        defaults.set(Double.nan, forKey: SubagentBackendSettings.cloudCostCeilingKey)
+        XCTAssertNil(SubagentBackendSettings.cloudCostCeiling(defaults: defaults))
+
+        // Removing the stored value restores the built-in default rather than
+        // leaving the app unbounded.
+        SubagentBackendSettings.setCloudCostCeiling(nil, defaults: defaults)
+        XCTAssertEqual(
+            SubagentBackendSettings.cloudCostCeiling(defaults: defaults),
+            SubagentBackendSettings.defaultCloudCostUSD
+        )
+
+        let descriptor = AgentBackendDescriptor(
+            kind: .cloud,
+            providerId: "synthetic",
+            modelId: "syn:large:text",
+            displayName: "Syn Large"
+        )
+        var budget = AgentBudget.standard
+        budget.maxCostUSD = SubagentBackendSettings.maximumCloudCostUSD
+        XCTAssertEqual(
+            AgentSpawnResolver.costCeilingProblem(
+                budget: budget,
+                descriptor: descriptor,
+                defaults: defaults,
+                ceilingIsOperatorDefault: true
+            ),
+            .operatorCostCeilingNeedsPricing(
+                model: "Syn Large",
+                ceiling: SubagentBackendSettings.maximumCloudCostUSD
+            ),
+            "an unpriced model under the operator's cap is refused, naming the cap and the model"
+        )
+        XCTAssertTrue(
+            (AgentSpawnError.operatorCostCeilingNeedsPricing(
+                model: "Syn Large",
+                ceiling: SubagentBackendSettings.maximumCloudCostUSD
+            ).errorDescription ?? "").contains("default cloud spend cap"),
+            "the refusal must say the cap is the operator's, not the spawn's"
+        )
+
+        CloudPricingStore.setPricing(
+            ["syn:large:text": CloudPricing(input: 1, output: 2)],
+            for: "synthetic",
+            defaults: defaults
+        )
+        XCTAssertNil(
+            AgentSpawnResolver.costCeilingProblem(
+                budget: budget,
+                descriptor: descriptor,
+                defaults: defaults,
+                ceilingIsOperatorDefault: true
+            )
+        )
+    }
+
     // MARK: - Tool schema
 
     func testSpawnSchemaCarriesBackendPresetBudgetAndIsolation() throws {

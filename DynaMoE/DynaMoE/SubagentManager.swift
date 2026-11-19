@@ -968,6 +968,19 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             // the relay would otherwise have lost.
             if let finalReport {
                 report = finalReport
+                // A terminal transition that had already been delivered
+                // relayed the STOP REASON, not this report: `cancel` writes the
+                // reason as the summary and resumes the waiter at once, while
+                // this write only lands after the loop unwinds. Leaving the
+                // unread flag set meant the richer partial report was never
+                // relayed. Re-open it when there is something new to say; the
+                // relay's cancelled rule still refuses to re-inject a bare stop
+                // reason, so this cannot duplicate a delivery.
+                let partial = finalReport.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+                let delivered = finalSummary.trimmingCharacters(in: .whitespacesAndNewlines)
+                if isSummaryRelayed, !partial.isEmpty, partial != delivered {
+                    isSummaryRelayed = false
+                }
             }
             persistRecord()
             return
@@ -1208,11 +1221,17 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         // transition. `send_subagent_message` reported it delivered, so it must
         // not vanish: record the fact that it arrived too late to be consumed.
         for note in drainUnconsumedMessages() {
-            let text = "Steering from \(note.sender) arrived after the run's final step, too late to be incorporated: \(note.content)"
+            // The note is coordinator- or operator-authored text that lands in
+            // a prompt-shaped transcript. It is appended RAW here while every
+            // other inbound string goes through the marker pass, so a chat
+            // template marker in it could forge a boundary the run reads back.
+            let sender = AgentHarness.truncateText(AgentHarness.sanitizeText(note.sender), limit: 80)
+            let content = AgentHarness.truncateText(AgentHarness.sanitizeText(note.content), limit: 2_000)
+            let text = "Steering from \(sender) arrived after the run's final step, too late to be incorporated: \(content)"
             transcript.append(SubagentStepRecord(
                 stepIndex: currentStepIndex,
                 actionName: "steering",
-                arguments: ["sender": note.sender],
+                arguments: ["sender": sender],
                 output: text,
                 isError: true
             ))

@@ -204,6 +204,15 @@ nonisolated public final class PrefixCacheManager: @unchecked Sendable {
         return activeSessionId
     }
 
+    /// The pinned ids. A caller that has to put the process-wide pin back the
+    /// way it found it (a test teardown, a diagnostic capture) reads this
+    /// beside `currentPinnedSession`.
+    public var pinnedTokens: [UInt32] {
+        lock.lock()
+        defer { lock.unlock() }
+        return pinnedTokenIds
+    }
+
     /// Resets/invalidates the pinned prefix (e.g. on new chat or context clearance).
     public func invalidate(sessionId: UUID? = nil) {
         lock.lock()

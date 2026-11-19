@@ -187,6 +187,10 @@ struct TimelineStepCardView: View {
 
     @State private var isExpanded: Bool = false
     @State private var isCopied: Bool = false
+    /// Loaded off the main actor when this card is an apply card. Reading the
+    /// run's record is a synchronous store read, and a view body is the one
+    /// place that must not wait on the store's write queue.
+    @State private var applyDestinationSummary: String?
 
     private var iconName: String {
         switch call.name {
@@ -308,12 +312,14 @@ struct TimelineStepCardView: View {
                 endpointString: call.pinnedEndpoint
             )
         }
-        if call.name == "apply_subagent_changes",
-           let raw = call.arguments["subagent_id"] ?? call.arguments["run_id"],
-           let id = UUID(uuidString: raw) {
-            return SubagentApplyControl.approvalSummary(forRunId: id)
-        }
-        return nil
+        return applyDestinationSummary
+    }
+
+    /// The run this card would apply, when it is one.
+    private var applyRunId: UUID? {
+        guard call.name == "apply_subagent_changes",
+              let raw = call.arguments["subagent_id"] ?? call.arguments["run_id"] else { return nil }
+        return UUID(uuidString: raw)
     }
 
     /// The expanded arguments. Each value is chunked rather than drawn as one
@@ -547,6 +553,27 @@ struct TimelineStepCardView: View {
                 }
                 .padding(.horizontal, 4)
             }
+        }
+        // The apply card names where the patch lands, and that answer lives in
+        // the run's record. The read is a synchronous store access, so it runs
+        // off the main actor; the card draws the note when it lands rather
+        // than parking the frame behind the store's write queue.
+        .task(id: applyRunId) {
+            guard let runId = applyRunId else {
+                applyDestinationSummary = nil
+                return
+            }
+            let summary = await Task.detached(priority: .utility) { () -> String? in
+                guard let record = AgentRunStore.shared.loadAny(runId: runId) else { return nil }
+                // A dirty destination is the usual reason an apply conflicts,
+                // and this is the last moment the operator can stash. The note
+                // reads only the RECORDED root; a legacy record's `.git`
+                // pointer is sandbox-writable and is not a destination.
+                let note = await SubagentApplyControl.destinationNote(for: record.repositoryRoot)
+                return SubagentApplyControl.approvalSummary(for: record, destinationNote: note)
+            }.value
+            guard !Task.isCancelled else { return }
+            applyDestinationSummary = summary
         }
     }
 }

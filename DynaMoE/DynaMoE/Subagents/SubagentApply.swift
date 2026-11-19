@@ -401,7 +401,8 @@ enum SubagentApplyControl {
     static func applyRequest(
         for record: AgentRunRecord,
         destination: String? = nil,
-        diffStat: String? = nil
+        diffStat: String? = nil,
+        destinationNote: String? = nil
     ) -> AgentApprovalRequest? {
         guard canApply(record),
               case .worktree(let path, let branch) = record.isolation else { return nil }
@@ -418,10 +419,16 @@ enum SubagentApplyControl {
         // so naming it on the card keeps the approval attached to that tree.
         let destinationText = destination ?? "the main working tree (resolved when the apply runs)"
         var reason = "Apply \(summary) from \(branch) to \(destinationText). Changes land unstaged."
+        if let destinationNote, !destinationNote.isEmpty {
+            reason += "\n\n" + destinationNote
+        }
         if let diffStat, !diffStat.isEmpty {
             reason += "\n\n" + diffStat
         } else if let files = record.report?.changedFiles, !files.isEmpty {
-            let named = files.prefix(10).joined(separator: "\n")
+            // A changed-file list comes out of the RUN's report: the run chose
+            // those names, so each is rendered on one line with this app's
+            // markers neutralized before it reaches an operator-facing card.
+            let named = files.prefix(10).map { Self.displayPath($0) }.joined(separator: "\n")
             let more = files.count > 10 ? "\n… and \(files.count - 10) more" : ""
             reason += "\n\n" + named + more
         }
@@ -438,6 +445,30 @@ enum SubagentApplyControl {
         )
     }
 
+    /// One record-supplied path, safe to draw on a card: no newline can forge
+    /// an extra line, a marker cannot reshape the surrounding text, and the
+    /// length is bounded.
+    nonisolated static func displayPath(_ path: String, limit: Int = 200) -> String {
+        let singleLine = path
+            .replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+        let clean = AgentHarness.sanitizeText(singleLine)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return clean.count > limit ? String(clean.prefix(limit)) + "…" : clean
+    }
+
+    /// A line naming uncommitted destination work, or nil when the destination
+    /// is clean or git cannot say (a note that may be wrong is worse than
+    /// none). A dirty destination is the usual reason an apply conflicts, and
+    /// the card is where the operator can still stash or commit first.
+    nonisolated static func destinationNote(for destination: String?) async -> String? {
+        guard let destination else { return nil }
+        guard let count = await WorkspaceIsolation.uncommittedFileCount(
+            in: URL(fileURLWithPath: destination, isDirectory: true)
+        ), count > 0 else { return nil }
+        return "The destination has \(count) uncommitted file\(count == 1 ? "" : "s"); the patch lands on top of that work."
+    }
+
     /// A destination summary for the CHAT approval card, resolved without
     /// touching git.
     ///
@@ -450,9 +481,20 @@ enum SubagentApplyControl {
     static func approvalSummary(forRunId runId: UUID) -> String? {
         let record = SubagentManager.shared.getSubagent(byId: runId)?.snapshotRecord()
             ?? AgentRunStore.shared.loadAny(runId: runId)
-        guard let record,
-              case .worktree(let path, let branch) = record.isolation else { return nil }
-        let destination = record.repositoryRoot ?? path
+        guard let record else { return nil }
+        return approvalSummary(for: record)
+    }
+
+    /// The pure form, so a card can build it from a record it read OFF the
+    /// main actor. `loadAny` is a synchronous `ioQueue.sync`, so calling it in
+    /// a view body parked the UI behind every queued run write.
+    nonisolated static func approvalSummary(for record: AgentRunRecord, destinationNote: String? = nil) -> String? {
+        guard case .worktree(_, let branch) = record.isolation else { return nil }
+        // A record with no stored root has no destination that can be named
+        // without following the sandbox-writable `.git` pointer, which is the
+        // one thing the apply path refuses to trust: say so rather than
+        // naming the WORKTREE as if it were the tree the patch lands in.
+        let destination = record.repositoryRoot ?? "the main working tree (resolved when the apply runs)"
         let files = record.report?.changedFiles ?? []
         let count: String
         switch files.count {
@@ -461,8 +503,13 @@ enum SubagentApplyControl {
         default: count = "\(files.count) changed files"
         }
         var summary = "Applies \(count) from \(branch) to \(destination). Changes land unstaged."
+        if let destinationNote, !destinationNote.isEmpty {
+            summary += "\n" + destinationNote
+        }
         if !files.isEmpty {
-            summary += "\n" + files.prefix(8).joined(separator: ", ")
+            // The run supplies these names; the card draws them, so each goes
+            // through the same one-line sanitization as the inspector's.
+            summary += "\n" + files.prefix(8).map { Self.displayPath($0) }.joined(separator: ", ")
             if files.count > 8 { summary += ", …" }
         }
         return summary
@@ -511,7 +558,17 @@ enum SubagentApplyControl {
                 baseCommit: record.baseCommit ?? ""
             )
         )
-        guard let request = applyRequest(for: record, destination: destination, diffStat: stat) else {
+        // The patch lands on whatever the destination has checked out, and a
+        // dirty destination is the usual reason an apply conflicts. Saying so
+        // on the card is what lets the operator stash or commit first instead
+        // of approving an apply that cannot land.
+        let destinationNote = await Self.destinationNote(for: destination)
+        guard let request = applyRequest(
+            for: record,
+            destination: destination,
+            diffStat: stat,
+            destinationNote: destinationNote
+        ) else {
             throw SubagentApplyControlError.nothingToApply(record.role)
         }
 

@@ -14,16 +14,32 @@ import XCTest
 final class LocalAgentBackendLogicTests: XCTestCase {
 
     private var savedRegistry: GrammarToolRegistry!
+    /// The shared prefix pin and measured rate belong to the PROCESS, not to
+    /// this case. Clearing them on the way out left later suites (and this
+    /// one, in full-suite order) reading a state no test had set.
+    private var savedPinnedTokens: [UInt32] = []
+    private var savedPinnedSession: UUID?
+    private var savedTokensPerSecond: Double?
 
     override func setUp() {
         super.setUp()
         savedRegistry = GrammarConstrainedSampler.shared.snapshotRegistry()
+        savedPinnedTokens = PrefixCacheManager.shared.pinnedTokens
+        savedPinnedSession = PrefixCacheManager.shared.currentPinnedSession
+        savedTokensPerSecond = PrefillThroughput.recentTokensPerSecond
     }
 
     override func tearDown() {
         GrammarConstrainedSampler.shared.restoreRegistry(savedRegistry)
-        PrefixCacheManager.shared.updatePinnedTokens(tokens: [], sessionId: nil)
-        PrefillThroughput.resetForTesting()
+        PrefixCacheManager.shared.updatePinnedTokens(
+            tokens: savedPinnedTokens,
+            sessionId: savedPinnedSession
+        )
+        if let savedTokensPerSecond {
+            PrefillThroughput.note(tokensPerSecond: savedTokensPerSecond)
+        } else {
+            PrefillThroughput.resetForTesting()
+        }
         super.tearDown()
     }
 

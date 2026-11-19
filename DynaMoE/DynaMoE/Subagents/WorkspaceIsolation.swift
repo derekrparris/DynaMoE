@@ -215,6 +215,18 @@ nonisolated enum WorkspaceIsolation {
         let b = URL(fileURLWithPath: candidateOut.trimmingCharacters(in: .whitespacesAndNewlines))
             .resolvingSymlinksInPath().standardizedFileURL
 
+        // The repository's OWN admin directory must name this worktree, and
+        // this check runs even when `git` inside the worktree can answer.
+        //
+        // `.git` inside the sandbox is a POINTER a run can rewrite. A pointer
+        // retargeted at another repository makes every git answer inside the
+        // worktree agree with it — including `--git-common-dir`, which is what
+        // the comparison below reads — so the sandbox-side comparison alone
+        // accepted a destination the worktree was never created from. The
+        // admin back-pointer lives outside the sandbox and is written by
+        // `git worktree add`, so a legitimate worktree always has it.
+        guard adminDirectory(b, references: worktree) else { return false }
+
         if let (worktreeCode, worktreeOut, _) = try? await git(
             ["rev-parse", "--path-format=absolute", "--git-common-dir"],
             in: worktree
@@ -223,16 +235,22 @@ nonisolated enum WorkspaceIsolation {
                 .resolvingSymlinksInPath().standardizedFileURL
             return a == b
         }
+        // The worktree's `.git` is gone (or unreadable), so git inside it
+        // cannot answer; the back-pointer above is the only remaining link and
+        // it already matched.
+        return true
+    }
 
-        // When the sandbox deleted the worktree's `.git` pointer, `git` inside
-        // `worktree` cannot answer, but the main repository's own admin
-        // directory (outside the sandbox) still holds a back-pointer to
-        // `worktree/.git`. Resolve symlinks on the existing worktree directory
-        // (not the deleted `.git` leaf, which `resolvingSymlinksInPath()` may
-        // not canonicalize across `/var` -> `/private/var`).
+    /// True when `commonDir` (a repository's git directory) holds a
+    /// `worktrees/*/gitdir` back-pointer naming `worktree`.
+    ///
+    /// Resolves symlinks on the existing worktree directory (not the deleted
+    /// `.git` leaf, which `resolvingSymlinksInPath()` may not canonicalize
+    /// across `/var` -> `/private/var`).
+    private static func adminDirectory(_ commonDir: URL, references worktree: URL) -> Bool {
         let expectedWorktreeDir = worktree
             .resolvingSymlinksInPath().standardizedFileURL.path
-        let adminRoot = b.appendingPathComponent("worktrees", isDirectory: true)
+        let adminRoot = commonDir.appendingPathComponent("worktrees", isDirectory: true)
         guard let entries = try? FileManager.default.contentsOfDirectory(
             at: adminRoot,
             includingPropertiesForKeys: nil,
@@ -698,13 +716,92 @@ nonisolated enum WorkspaceIsolation {
     }
 
     /// The destination path of a `diff --git a/<a> b/<b>` header, or nil.
+    ///
+    /// Git C-quotes a path containing a quote, a backslash or a non-ASCII byte,
+    /// so `diff --git "a/README \"notes\".md" "b/README \"notes\".md"` is a
+    /// legal header. Reading only the last `" b/"` then returned
+    /// `README \"notes\".md"` — quotes and escapes included — which is not the
+    /// path git would write. The b/ side is the LAST token, quoted or not.
     private static func diffDestination(of header: Substring) -> String? {
         let payload = String(header.dropFirst("diff --git ".count))
-        // The b/ side is after the last " b/"; a quoted path with spaces still
-        // leaves this delimiter intact on the common spellings we can read.
+        if payload.hasSuffix("\"") {
+            // Find the last two UNESCAPED quotes: the a/ side may be quoted
+            // too, and a `\"` inside either path is not a delimiter.
+            var quotes: [String.Index] = []
+            var backslashes = 0
+            var cursor = payload.startIndex
+            while cursor < payload.endIndex {
+                let character = payload[cursor]
+                if character == "\\" {
+                    backslashes += 1
+                } else {
+                    if character == "\"", backslashes % 2 == 0 {
+                        quotes.append(cursor)
+                    }
+                    backslashes = 0
+                }
+                cursor = payload.index(after: cursor)
+            }
+            guard quotes.count >= 2 else { return nil }
+            let open = quotes[quotes.count - 2]
+            let close = quotes[quotes.count - 1]
+            let inner = payload[payload.index(after: open)..<close]
+            guard let unquoted = unquoteGitPath(inner), unquoted.hasPrefix("b/") else { return nil }
+            let path = String(unquoted.dropFirst(2))
+            return path.isEmpty ? nil : path
+        }
         guard let separator = payload.range(of: " b/", options: .backwards) else { return nil }
         let path = payload[separator.upperBound...]
         return path.isEmpty ? nil : String(path)
+    }
+
+    /// The bytes a git C-quoted path names. Octal escapes are how git spells a
+    /// non-UTF-8 byte, so the result is assembled as bytes and decoded once.
+    private static func unquoteGitPath(_ quoted: Substring) -> String? {
+        var bytes: [UInt8] = []
+        var cursor = quoted.startIndex
+        while cursor < quoted.endIndex {
+            let character = quoted[cursor]
+            guard character == "\\" else {
+                bytes.append(contentsOf: String(character).utf8)
+                cursor = quoted.index(after: cursor)
+                continue
+            }
+            cursor = quoted.index(after: cursor)
+            guard cursor < quoted.endIndex else { return nil }
+            let escape = quoted[cursor]
+            switch escape {
+            case "\\": bytes.append(0x5C)
+            case "\"": bytes.append(0x22)
+            case "t": bytes.append(0x09)
+            case "n": bytes.append(0x0A)
+            case "r": bytes.append(0x0D)
+            case "a": bytes.append(0x07)
+            case "b": bytes.append(0x08)
+            case "f": bytes.append(0x0C)
+            case "v": bytes.append(0x0B)
+            default:
+                guard let first = escape.wholeNumberValue, first < 8 else {
+                    bytes.append(contentsOf: String(escape).utf8)
+                    cursor = quoted.index(after: cursor)
+                    continue
+                }
+                var value = first
+                var digits = 1
+                while digits < 3 {
+                    let next = quoted.index(after: cursor)
+                    guard next < quoted.endIndex,
+                          let digit = quoted[next].wholeNumberValue,
+                          digit < 8 else { break }
+                    value = value * 8 + digit
+                    cursor = next
+                    digits += 1
+                }
+                bytes.append(UInt8(value & 0xFF))
+            }
+            cursor = quoted.index(after: cursor)
+        }
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     /// The first file in a patch that git can only express as a gitlink
@@ -911,6 +1008,12 @@ nonisolated enum WorkspaceIsolation {
         guard !path.isEmpty, !path.hasPrefix("/") else { return nil }
         let components = path.split(separator: "/", omittingEmptySubsequences: false)
         guard !components.contains(".."), !components.contains("") else { return nil }
+        // A git directory is repository METADATA, not content: a change set
+        // that names `.git/...` (a hook, a config, an object) would write
+        // executable code or repository state through what is supposed to be a
+        // file patch. Case-folded because the default macOS filesystem is
+        // case-insensitive, so `.GIT/hooks/post-commit` names the same place.
+        guard !components.contains(where: { $0.lowercased() == ".git" }) else { return nil }
         let url = root.appendingPathComponent(path)
         // Compare the RAW spellings. `standardizedFileURL` and
         // `resolvingSymlinksInPath` both rewrite `/private/var/...` to
@@ -1005,7 +1108,14 @@ nonisolated enum WorkspaceIsolation {
         let directory = fileManager.temporaryDirectory
             .appendingPathComponent("dynamoe-rollback-\(UUID().uuidString)", isDirectory: true)
         do {
-            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+            // The snapshot holds the main tree's bytes for the files a patch
+            // can touch, so its directory gets the same owner-only floor as a
+            // run record. `createDirectory` otherwise makes it 0755.
+            try fileManager.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
         } catch {
             throw WorkspaceIsolationError.applyFailed(
                 "could not prepare a rollback snapshot: \(error.localizedDescription)"
@@ -1082,25 +1192,35 @@ nonisolated enum WorkspaceIsolation {
     ///
     /// A path and branch restored from disk are treated as untrusted: the branch
     /// is deleted only when it carries this app's prefix, and the directory is
-    /// removed by hand only when it is under this process's worktree root. A
-    /// `git worktree remove` naming something else fails harmlessly; the manual
-    /// fallback would not.
+    /// removed by hand only when it is under this process's worktree root. The
+    /// CONTAINMENT CHECK runs before the first git command, not only before the
+    /// manual removal: `git worktree remove --force` names the record's path
+    /// too, so a tampered or stale record could otherwise hand git a path
+    /// outside this app's root to delete. `root` is a parameter so the launch
+    /// sweep, which iterates a root of its own, applies the same gate.
     @discardableResult
     static func cleanup(
         _ worktree: AgentWorktree,
-        deleteBranch: Bool = true
+        deleteBranch: Bool = true,
+        root: URL = WorkspaceIsolation.processRootURL
     ) async -> Bool {
         let fileManager = FileManager.default
-        _ = try? await git(
-            ["worktree", "remove", "--force", worktree.path.path],
-            in: worktree.repositoryRoot
-        )
-        _ = try? await git(["worktree", "prune"], in: worktree.repositoryRoot)
-        if fileManager.fileExists(atPath: worktree.path.path),
-           isInsideProcessWorktreeRoot(worktree.path) {
+        let contained = isInsideRoot(worktree.path, root: root)
+        if contained {
+            _ = try? await git(
+                ["worktree", "remove", "--force", worktree.path.path],
+                in: worktree.repositoryRoot
+            )
+            _ = try? await git(["worktree", "prune"], in: worktree.repositoryRoot)
+        }
+        if fileManager.fileExists(atPath: worktree.path.path), contained {
             try? fileManager.removeItem(at: worktree.path)
         }
-        if deleteBranch,
+        // The branch command runs in the RECORD's repository too. A path that
+        // is not this process's worktree is a record that cannot be trusted
+        // about its repository either, so nothing is deleted on its word.
+        if contained,
+           deleteBranch,
            worktree.branch != "HEAD",
            worktree.branch.hasPrefix(branchPrefix) {
             _ = try? await git(["branch", "-D", worktree.branch], in: worktree.repositoryRoot)
@@ -1111,7 +1231,11 @@ nonisolated enum WorkspaceIsolation {
     /// Whether a path may be deleted by the launch sweep or an apply. Only this
     /// process's own worktree root qualifies; a record's path is data.
     static func isInsideProcessWorktreeRoot(_ url: URL) -> Bool {
-        let root = processRootURL.standardizedFileURL.resolvingSymlinksInPath().path
+        isInsideRoot(url, root: processRootURL)
+    }
+
+    static func isInsideRoot(_ url: URL, root: URL) -> Bool {
+        let root = root.standardizedFileURL.resolvingSymlinksInPath().path
         let path = url.standardizedFileURL.resolvingSymlinksInPath().path
         guard !root.isEmpty else { return false }
         return path.hasPrefix(root.hasSuffix("/") ? root : root + "/")
@@ -1239,7 +1363,7 @@ nonisolated enum WorkspaceIsolation {
                         branch: branch,
                         baseCommit: ""
                     )
-                    _ = await cleanup(worktree)
+                    _ = await cleanup(worktree, root: root)
                 } else {
                     _ = try? await git(["worktree", "remove", "--force", path.path], in: repositoryRoot)
                     _ = try? await git(["worktree", "prune"], in: repositoryRoot)
@@ -1294,6 +1418,14 @@ nonisolated enum WorkspaceIsolation {
         if lines.count <= lineLimit { return lines.joined(separator: "\n") }
         let kept = lines.prefix(lineLimit).joined(separator: "\n")
         return kept + "\n… and \(lines.count - lineLimit) more line(s)"
+    }
+
+    /// How many entries the destination has uncommitted, or nil when git
+    /// cannot say. Read-only, so it is safe to ask before anything is written.
+    static func uncommittedFileCount(in root: URL) async -> Int? {
+        guard let (code, out, _) = try? await git(["status", "--porcelain", "-z"], in: root),
+              code == 0 else { return nil }
+        return out.split(separator: "\0", omittingEmptySubsequences: true).count
     }
 
     private static func git(

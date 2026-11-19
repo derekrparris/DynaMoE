@@ -1057,7 +1057,13 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             // operator (and the persisted report) that a file had been edited
             // when the call had been rejected or had errored out.
             guard record.status == .success else { continue }
-            guard let path = record.arguments["path"], !path.isEmpty else { continue }
+            guard let rawPath = record.arguments["path"], !rawPath.isEmpty else { continue }
+            // The path is model-supplied text that lands in the persisted
+            // report and on the apply card. One line, no template markers, and
+            // bounded, exactly like every other model-authored string that
+            // reaches the operator.
+            let path = Self.bounded(rawPath, limit: 300)
+            guard !path.isEmpty else { continue }
             if seen.insert(path).inserted {
                 files.append(path)
             }
@@ -1087,7 +1093,10 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             let output = record.output ?? record.error ?? ""
             let exitCode: Int32 = record.status == .success ? 0 : 1
             outcomes.append(AgentTestOutcome(
-                command: command,
+                // The command is model-authored and is persisted with the
+                // report; the same one-line + marker pass as every other
+                // model string keeps it from reshaping what it sits beside.
+                command: Self.bounded(command, limit: 512),
                 exitCode: exitCode,
                 passed: Self.count("passed", in: output),
                 failed: Self.count("failed", in: output),

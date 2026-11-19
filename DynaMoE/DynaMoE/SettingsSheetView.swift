@@ -193,6 +193,7 @@ struct SettingsSheetView: View {
     // work to a model the operator did not pick.
     @AppStorage(SubagentBackendSettings.backendKey) private var subagentBackend: String = ""
     @AppStorage(SubagentBackendSettings.cloudModelKey) private var subagentCloudModel: String = ""
+    @AppStorage(SubagentBackendSettings.cloudCostCeilingKey) private var subagentCloudCostCeiling: Double = SubagentBackendSettings.defaultCloudCostUSD
     @AppStorage(LocalSubagentCostEstimate.limitDefaultsKey) private var subagentLocalCostLimit: Double = LocalSubagentCostEstimate.defaultLimitSeconds
     @AppStorage("dynamoe_subagent_notifications") private var subagentNotifications: Bool = false
     @AppStorage("dynamoe_subagent_cloud_per_provider") private var subagentCloudPerProvider: Int = 3
@@ -270,6 +271,24 @@ struct SettingsSheetView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            subagentSettingRow("Cloud spend cap") {
+                TextField("none", value: $subagentCloudCostCeiling, format: .number.precision(.fractionLength(0...2)))
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11, design: .monospaced))
+                    .frame(maxWidth: 90)
+                    // The Stepper is what documents the bound; this is what
+                    // ENFORCES it, so a typed or pasted value cannot outlive
+                    // the range the field shows.
+                    .onChange(of: subagentCloudCostCeiling) { _, value in
+                        let clamped = SubagentBackendSettings.clampedCloudCostCeiling(value)
+                        if clamped != value { subagentCloudCostCeiling = clamped }
+                    }
+                Text("USD per cloud run, applied whenever a spawn does not set max_cost_usd. 0 means no cap. While a cap is set, a cloud run on a model with no recorded price is refused rather than run unbounded.")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             subagentSettingRow("Local cost limit") {
                 Stepper(value: $subagentLocalCostLimit, in: 10...1800, step: 10) {
                     Text(String(format: "%.0f s", subagentLocalCostLimit))
@@ -305,7 +324,7 @@ struct SettingsSheetView: View {
                     .font(.system(size: 11))
             }
 
-            Text("A local run holds the engine one step at a time, so the coordinator re-prefills after it. The cost limit is how long that wait may be before the spawn card asks first. Runs are listed in the Subagent Inspector and survive relaunch; a concurrency change applies to the next spawn.")
+            Text("A local run holds the engine one step at a time, so the coordinator re-prefills after it. The cost limit is how long that wait may be before the spawn card asks first. The cloud spend cap is the one ceiling every cloud run gets even when the spawn names none. Runs are listed in the Subagent Inspector and survive relaunch; a concurrency change applies to the next spawn.")
                 .font(.system(size: 10))
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

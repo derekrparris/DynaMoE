@@ -68,9 +68,14 @@ enum SubagentNotifier {
         guard isInactive, isEnabled, !isRunningTests, Bundle.main.bundleIdentifier != nil else { return }
 
         let content = UNMutableNotificationContent()
+        // The role is model-supplied text on a surface outside the app. A
+        // newline would break the one-line title and let a report-shaped
+        // string render as a title; the marker pass and the bounds keep it a
+        // label.
+        let label = Self.roleLabel(role)
         content.title = status == .completed
-            ? "\(role) finished"
-            : "\(role) failed"
+            ? "\(label) finished"
+            : "\(label) failed"
         content.body = status == .completed
             ? "Open DynaMoE to read the report."
             : "Open DynaMoE to see what went wrong."
@@ -140,6 +145,30 @@ enum SubagentNotifier {
             || ProcessInfo.processInfo.environment["XCTestBundlePath"] != nil
     }
 
+    /// One bounded line, so a model-authored role cannot shape the banner.
+    nonisolated static func roleLabel(_ role: String) -> String {
+        let singleLine = role
+            .replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+        let cleaned = AgentHarness.sanitizeText(singleLine)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? "Subagent run" : String(cleaned.prefix(80))
+    }
+
+    /// Withdraws a run's delivered and pending banners.
+    ///
+    /// A notice outlives the record it names: `clearCompleted`, a discard and a
+    /// conversation delete all remove the run while its banner sits in
+    /// Notification Centre, and the tap then selects a run no inspector row
+    /// can show. Nonisolated because the store's delete path runs on its IO
+    /// queue, and the notification centre's own API is thread-safe.
+    nonisolated static func withdraw(runId: UUID) {
+        let identifier = "dynamoe.subagent.\(runId.uuidString)"
+        let center = UNUserNotificationCenter.current()
+        center.removeDeliveredNotifications(withIdentifiers: [identifier])
+        center.removePendingNotificationRequests(withIdentifiers: [identifier])
+    }
+
 }
 
 /// Makes a banner click mean something. Without a delegate, macOS delivers the
@@ -173,6 +202,16 @@ final class SubagentNotificationDelegate: NSObject, UNUserNotificationCenterDele
                 .flatMap(UUID.init(uuidString:))
             Task { @MainActor in
                 NSApp.activate(ignoringOtherApps: true)
+                // The banner is only cancelled when its run is DELETED, so a
+                // notice already sitting in Notification Centre (delivered
+                // before an update, or while the app was closed) can outlive
+                // the record. Pinning the selection to an id with no row left
+                // the inspector on a dead tap that never cleared.
+                guard SubagentManager.shared.getSubagent(byId: runId) != nil
+                    || AgentRunStore.shared.hasRecordFile(runId: runId) else {
+                    SubagentNotifier.withdraw(runId: runId)
+                    return
+                }
                 SubagentManager.shared.selectedSubagentId = runId
                 SubagentManager.shared.isDrawerOpen = true
                 // The inspector renders the CURRENT conversation's runs, so a

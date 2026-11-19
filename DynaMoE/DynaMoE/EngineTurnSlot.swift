@@ -119,6 +119,24 @@ nonisolated final class TurnSlotLedger: @unchecked Sendable {
         outstandingPriority = .interactive
     }
 
+    /// Drops the outstanding claim when it belongs to `priority`.
+    ///
+    /// A claim is the only handle a turn in PREPARATION leaves, so this is how
+    /// an operator's send stops one: the holder still runs its preparation, but
+    /// `launchTurn` refuses a claim that is no longer held rather than running a
+    /// turn nobody is waiting for. Only a background claim can be dropped here;
+    /// an interactive one (chat, the API server, a model load) is never
+    /// cancelled to make room.
+    @discardableResult
+    func cancelClaim(ifPriority priority: TurnPriority) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard outstanding != 0, outstandingPriority == priority else { return false }
+        outstanding = 0
+        outstandingPriority = .interactive
+        return true
+    }
+
     func holds(_ ticket: UInt64) -> Bool {
         lock.lock()
         defer { lock.unlock() }
