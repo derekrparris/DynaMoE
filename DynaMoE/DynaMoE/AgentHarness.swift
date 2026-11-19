@@ -2849,6 +2849,16 @@ public final class GetSubagentStatusTool: AgentTool {
             let err = "Subagent with ID '\(idStr)' not found."
             return (AgentHarness.toolErrorJSON(tool: "get_subagent_status", error: err), nil, err, false)
         }
+        // A run belongs to the conversation that spawned it. Answering another
+        // chat's id leaked its findings and worktree directives into this
+        // turn, and marking it relayed here suppressed the owning chat's own
+        // delivery. "Not found" is the honest answer: it is not found in THIS
+        // conversation, and naming it would confirm a run this caller must not
+        // know about.
+        guard subagent.parentSessionId == AgentHarness.executingSessionId else {
+            let err = "Subagent with ID '\(idStr)' not found."
+            return (AgentHarness.toolErrorJSON(tool: "get_subagent_status", error: err), nil, err, false)
+        }
 
         // Optional blocking wait for terminal state (used for background subagents).
         let shouldWait = (arguments["wait"] as? Bool) ?? false
@@ -2942,11 +2952,22 @@ public final class GetSubagentStatusTool: AgentTool {
         if isTerminal {
             if let worktree = AgentHarness.worktreeDescription(of: subagent) {
                 if subagent.appliedAt != nil {
-                    // The worktree and its branch are gone; naming a path that
-                    // no longer exists would send the coordinator looking for it.
+                    // The record says the patch landed; the DISK says whether
+                    // cleanup could remove the tree. Reporting a removal that
+                    // did not happen sends the coordinator looking for a
+                    // worktree it was told was gone (or, worse, leaves the
+                    // operator believing the only copy of ignored work is
+                    // disposable).
+                    let treeGone = !FileManager.default.fileExists(atPath: worktree.path)
                     data["isolation"] = "worktree"
                     data["applied"] = true
-                    readable += "\nChanges: this run's isolated changes have already been applied to the main tree; the worktree has been removed.\n"
+                    data["worktree_removed"] = treeGone
+                    if treeGone {
+                        readable += "\nChanges: this run's isolated changes have already been applied to the main tree; the worktree has been removed.\n"
+                    } else {
+                        data["worktree"] = worktree.path
+                        readable += "\nChanges: this run's isolated changes have already been applied to the main tree, but its worktree is STILL on disk at \(worktree.path) (removal failed). Clear it once the files are no longer needed.\n"
+                    }
                 } else {
                     data["isolation"] = "worktree"
                     data["worktree"] = worktree.path
@@ -3006,6 +3027,12 @@ public final class SendSubagentMessageTool: AgentTool {
             let err = "Subagent with ID '\(idStr)' not found."
             return (AgentHarness.toolErrorJSON(tool: "send_subagent_message", error: err), nil, err, false)
         }
+        // Same scope as the read tools: steering another conversation's run is
+        // a cross-session write, not a lookup this turn is entitled to.
+        guard subagent.parentSessionId == AgentHarness.executingSessionId else {
+            let err = "Subagent with ID '\(idStr)' not found."
+            return (AgentHarness.toolErrorJSON(tool: "send_subagent_message", error: err), nil, err, false)
+        }
 
         // A terminal run drains nothing: its channel is closed. Reporting a
         // message "delivered" there was a promise the run could never keep —
@@ -3059,7 +3086,13 @@ public final class ListSubagentsTool: AgentTool {
         maxOutputLength: Int
     ) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
         let filter = (arguments["status_filter"] as? String)?.lowercased() ?? "all"
-        let allSubagents = SubagentManager.shared.allSubagents
+        // Conversation-scoped. The registry is process-wide, so an unfiltered
+        // list answered with runs from every chat in the window (and every
+        // API turn), including their ids — which the status tool would then
+        // have read.
+        let allSubagents = SubagentManager.shared.runs(
+            ownedBySession: AgentHarness.executingSessionId
+        )
 
         let filtered = allSubagents.filter { s in
             if filter == "all" { return true }
@@ -3311,13 +3344,17 @@ public final class ApplySubagentChangesTool: AgentTool {
             if outcome.alreadyApplied {
                 message = "These changes were already applied on \(formatter.string(from: outcome.appliedAt)). Nothing was applied twice."
             } else if outcome.changedFiles.isEmpty {
-                message = "The run had no changes to apply. Its worktree has been removed."
+                message = outcome.worktreeRemoved
+                    ? "The run had no changes to apply. Its worktree has been removed."
+                    : "The run had no changes to apply, but its worktree could NOT be removed (a file in it may be locked). Clear the run from the inspector once it is gone."
             } else {
                 let count = outcome.changedFiles.count
                 let destination = outcome.destinationBranch.map { " branch '\($0)'" } ?? " the working tree"
                 var composed = "Applied \(count) file\(count == 1 ? "" : "s") from \(outcome.branch) onto\(destination). The changes are unstaged; review them and commit when ready."
                 if outcome.keptIgnoredFiles.isEmpty {
-                    composed += " The worktree has been removed."
+                    composed += outcome.worktreeRemoved
+                        ? " The worktree has been removed."
+                        : " The worktree could NOT be removed (a file in it may be locked); it is still on disk, and its branch was kept so the tree can be re-opened. Clear it manually when you are done."
                 } else {
                     composed += " The worktree was KEPT: it also holds git-ignored files a patch cannot carry (\(outcome.keptIgnoredFiles.joined(separator: ", "))). Retrieve them manually before the run is cleared."
                 }
@@ -3335,6 +3372,7 @@ public final class ApplySubagentChangesTool: AgentTool {
                 "applied_at": formatter.string(from: outcome.appliedAt),
                 "kept_ignored_files": outcome.keptIgnoredFiles,
                 "kept_branch": outcome.keptBranch,
+                "worktree_removed": outcome.worktreeRemoved,
                 "message": message
             ]
             if let destination = outcome.destinationBranch {
@@ -4077,11 +4115,10 @@ public final class AgentHarness {
 
     /// Tools a subagent run may never be given: they reach the coordinator's
     /// own tool registry or would let a run delegate again. Delegation is one
-    /// level, so a child has no subagent surface at all — including the
-    /// read-only-looking status tools, which operate PROCESS-WIDE
-    /// (`get_subagent_status` answers any run's summary and marks it relayed,
-    /// which suppresses that run's own report) and are not write-capable, so
-    /// without this entry a read-only spawn needed no card to reach them.
+    /// level, so a child has no subagent surface at all. The status tools are
+    /// conversation-scoped now, but a child still has no business reading or
+    /// steering its siblings, and a read-only spawn must not reach them
+    /// without a card.
     public static let runScopedForbiddenToolNames: Set<String> = [
         "tools_discover", "tools_load", "tools_unload", "spawn_subagent", "apply_subagent_changes",
         "get_subagent_status", "send_subagent_message", "list_subagents"
@@ -7740,8 +7777,12 @@ public final class AgentHarness {
         // 1. Curated environment shared with ControlledProcessRunner: GUI-app PATH
         //    injection plus non-interactive flags (see toolEnvironment()). A
         //    caller that needs a scrubbed child (git must not inherit GIT_DIR)
-        //    passes its own instead.
-        let env = environment ?? ControlledProcessRunner.toolEnvironment()
+        //    passes its own instead. A child spawned while a SUBAGENT run is
+        //    executing gets the scoped allowlist; the operator's own turn keeps
+        //    the environment every real command needs (SSH agent, proxies).
+        let env = environment ?? ControlledProcessRunner.toolEnvironment(
+            scoped: AgentHarness.executingInRunScope
+        )
 
         process.environment = env
         process.executableURL = executableURL

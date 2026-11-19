@@ -211,6 +211,9 @@ struct SettingsSheetView: View {
     @AppStorage("dynamoe_jetspec_expert_cap") private var jetSpecMaxExpertCap: Int = 8
     @ObservedObject private var indexer = CodebaseIndexer.shared
     @ObservedObject private var dogfoodRunner = ModelDogfoodBenchmarkRunner.shared
+    // Observed: this card's counts and Open/Close label read the manager, and
+    // an unobserved singleton never redrew when a run started or finished.
+    @ObservedObject private var subagentManager = SubagentManager.shared
     @ObservedObject private var updaterViewModel = UpdaterViewModel.shared
     @State private var showDogfoodReportModal: Bool = false
     /// A refused benchmark run has a reason the operator can act on (a live
@@ -2060,11 +2063,11 @@ struct SettingsSheetView: View {
                     Spacer()
 
                     Button(action: {
-                        SubagentManager.shared.isDrawerOpen.toggle()
+                        subagentManager.isDrawerOpen.toggle()
                     }) {
                         HStack(spacing: 4) {
                             Image(systemName: "sidebar.trailing")
-                            Text(SubagentManager.shared.isDrawerOpen ? "Close Inspector" : "Open Inspector")
+                            Text(subagentManager.isDrawerOpen ? "Close Inspector" : "Open Inspector")
                         }
                         .font(.system(size: 11, weight: .medium))
                     }
@@ -2078,9 +2081,9 @@ struct SettingsSheetView: View {
                 HStack(spacing: 12) {
                     HStack(spacing: 4) {
                         Circle()
-                            .fill(SubagentManager.shared.activeSubagentsCount > 0 ? Color.blue : Color.secondary.opacity(0.4))
+                            .fill(subagentManager.activeSubagentsCount > 0 ? Color.blue : Color.secondary.opacity(0.4))
                             .frame(width: 8, height: 8)
-                        Text("\(SubagentManager.shared.activeSubagentsCount) Active Subagents")
+                        Text("\(subagentManager.activeSubagentsCount) Active Subagents")
                             .font(.system(size: 11, weight: .medium))
                             .foregroundColor(.primary)
                     }
@@ -2088,7 +2091,7 @@ struct SettingsSheetView: View {
                     Text("•")
                         .foregroundColor(.secondary.opacity(0.5))
 
-                    Text("Total Spawned: \(SubagentManager.shared.subagents.count)")
+                    Text("Total Spawned: \(subagentManager.subagents.count)")
                         .font(.system(size: 11))
                         .foregroundColor(.secondary)
                 }

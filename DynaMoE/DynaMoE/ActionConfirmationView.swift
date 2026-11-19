@@ -12,6 +12,30 @@ import SwiftUI
 
 // MARK: - Action Approval Continuation Manager
 
+/// Who a parked decision belongs to, for a cancellation that must not reach
+/// another conversation's card.
+///
+/// A chat's Stop cancels the cards ITS turn raised, including the ones a
+/// background subagent it spawned is parked on. `cancelAll` is for a process
+/// shutdown, where every card really is going away.
+public struct ActionApprovalScope: Hashable, Sendable {
+    let rawValue: String
+
+    public static func session(_ id: UUID) -> ActionApprovalScope {
+        ActionApprovalScope(rawValue: "s:\(id.uuidString)")
+    }
+
+    public static func subagentRun(_ id: UUID) -> ActionApprovalScope {
+        ActionApprovalScope(rawValue: "r:\(id.uuidString)")
+    }
+
+    /// The operator's own Apply card. It names a run, but a Stop that owns that
+    /// run did not raise this card and must not answer it.
+    public static func operatorApply(_ id: UUID) -> ActionApprovalScope {
+        ActionApprovalScope(rawValue: "a:\(id.uuidString)")
+    }
+}
+
 /// The one place a human-in-the-loop decision is parked.
 ///
 /// `nonisolated` because a waiter is resumed from the tool loop, from a Stop,
@@ -33,11 +57,35 @@ public nonisolated final class ActionApprovalManager: @unchecked Sendable {
     /// the oldest entries are dead weight rather than a leak that grows.
     private var pendingDecisions: [UUID: Bool] = [:]
     private var pendingDecisionOrder: [UUID] = []
+    /// The scope each id belongs to, recorded when the CARD is rendered (before
+    /// the waiter registers) so a scoped cancel can find the click-before-wait
+    /// window too. Removed with the decision or by the waiter's own exit.
+    private var scopes: [UUID: ActionApprovalScope] = [:]
     private static let rememberedDecisionLimit = 8
 
     private init() {}
 
-    public func waitForApproval(id: UUID) async -> Bool {
+    /// Records who an id belongs to. Call before showing its card: the card is
+    /// visible (and clickable, and stoppable) before `waitForApproval` has
+    /// registered a continuation.
+    public func register(id: UUID, scope: ActionApprovalScope) {
+        lock.lock()
+        scopes[id] = scope
+        lock.unlock()
+    }
+
+    /// Drops a scope record for an id whose card went away without a waiter
+    /// ever registering.
+    public func unregister(id: UUID) {
+        lock.lock()
+        scopes.removeValue(forKey: id)
+        lock.unlock()
+    }
+
+    public func waitForApproval(
+        id: UUID,
+        scope: ActionApprovalScope? = nil
+    ) async -> Bool {
         // A pending prompt is part of a running agent operation even though
         // the engine is idle, so a config reload must wait for the decision.
         AgentActivity.shared.begin(.approval)
@@ -49,7 +97,11 @@ public nonisolated final class ActionApprovalManager: @unchecked Sendable {
             // here is what keeps this set bounded.
             lock.lock()
             cancelledWaits.remove(id)
+            scopes.removeValue(forKey: id)
             lock.unlock()
+        }
+        if let scope {
+            register(id: id, scope: scope)
         }
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
@@ -91,6 +143,30 @@ public nonisolated final class ActionApprovalManager: @unchecked Sendable {
         decide(id: id, approved: false)
     }
 
+    /// Declines every card in one scope and nothing else. A Stop in chat A
+    /// must not answer chat B's parked card, and it must still win over a
+    /// click that arrived before the waiter registered.
+    public func cancel(scope: ActionApprovalScope) {
+        lock.lock()
+        let ids = scopes.filter { $0.value == scope }.map(\.key)
+        var resumed: [CheckedContinuation<Bool, Never>] = []
+        for id in ids {
+            if let continuation = pendingContinuations.removeValue(forKey: id) {
+                resumed.append(continuation)
+            }
+            pendingDecisions.removeValue(forKey: id)
+            pendingDecisionOrder.removeAll { $0 == id }
+            // A card whose waiter has not registered yet must still resolve as
+            // declined; the waiter consumes this on arrival.
+            cancelledWaits.insert(id)
+            scopes.removeValue(forKey: id)
+        }
+        lock.unlock()
+        for continuation in resumed {
+            continuation.resume(returning: false)
+        }
+    }
+
     public func cancelAll() {
         lock.lock()
         let all = pendingContinuations
@@ -99,8 +175,12 @@ public nonisolated final class ActionApprovalManager: @unchecked Sendable {
         // turn being stopped: cancelling wins over a click that arrived first,
         // or a stopped turn would execute the call it was stopped for.
         cancelledWaits.formUnion(pendingDecisions.keys)
+        // A scoped card whose waiter has not registered yet is in the same
+        // window: it is about to be answered by a turn that is going away.
+        cancelledWaits.formUnion(scopes.keys)
         pendingDecisions.removeAll()
         pendingDecisionOrder.removeAll()
+        scopes.removeAll()
         lock.unlock()
         for (_, cont) in all {
             cont.resume(returning: false)
@@ -124,6 +204,7 @@ public nonisolated final class ActionApprovalManager: @unchecked Sendable {
             if pendingDecisionOrder.count > Self.rememberedDecisionLimit {
                 let oldest = pendingDecisionOrder.removeFirst()
                 pendingDecisions.removeValue(forKey: oldest)
+                scopes.removeValue(forKey: oldest)
             }
         }
         lock.unlock()
@@ -166,6 +247,10 @@ public struct ActionConfirmationView: View {
     public let confirmation: PendingActionConfirmation
     public let onApprove: () -> Void
     public let onReject: () -> Void
+    /// False while the card is still gathering the context the decision needs
+    /// (an apply card waits for its run's destination before it can be
+    /// approved). Reject stays available: the operator can always decline.
+    public var approveEnabled: Bool = true
 
     @AppStorage("dynamoe_agent_turbo_mode") private var isTurboModeEnabled: Bool = false
 
@@ -301,11 +386,13 @@ public struct ActionConfirmationView: View {
                     }
                     .padding(.horizontal, 10)
                     .padding(.vertical, 5)
-                    .background(Color.green.opacity(0.85))
+                    .background(Color.green.opacity(approveEnabled ? 0.85 : 0.3))
                     .foregroundColor(.white)
                     .cornerRadius(6)
                 }
                 .buttonStyle(.plain)
+                .disabled(!approveEnabled)
+                .help(approveEnabled ? "Run this action" : "Gathering the details this decision needs…")
 
                 Button(action: onReject) {
                     HStack(spacing: 5) {

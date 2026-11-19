@@ -42,18 +42,44 @@ final class AgentSchedulerTests: XCTestCase {
         XCTAssertEqual(snapshot.totalTickets, 0)
     }
 
-    /// A local run holds the one ticket for its whole life — including an
-    /// approval card — so its admission wait has to cover the default budget
-    /// and not refuse the next local spawn after two minutes.
-    func testLocalAdmissionCoversTheHoldersWholeBudget() {
+    /// Every class's ticket is held for its holder's WHOLE life (including an
+    /// approval card), so every class's admission wait has to cover a standard
+    /// run plus its approval park. The configured value can only raise it.
+    func testAdmissionCoversTheHoldersWholeBudgetForEveryClass() {
         var limits = AgentSchedulerLimits.default
         limits.queueTimeoutSeconds = 120
-        XCTAssertEqual(limits.queueTimeout(for: .local), 900)
+        XCTAssertEqual(limits.queueTimeout(for: .local), 1_200)
         XCTAssertEqual(
             limits.queueTimeout(for: .cloud(providerId: "p")),
-            120,
-            "cloud capacity is not held for a run's lifetime, so the configured wait applies"
+            1_200,
+            "cloud capacity is held for the run's life too, so the floor applies"
         )
+        limits.queueTimeoutSeconds = 2_400
+        XCTAssertEqual(limits.queueTimeout(for: .local), 2_400, "the configured value can raise the wait")
+    }
+
+    /// A released ticket is gone: the admission cap is what a later spawn
+    /// waits on, so a ticket that outlived its run would silently shrink the
+    /// class's capacity. Release is idempotent (a defer plus a cancel path can
+    /// both reach it).
+    func testAReleasedTicketIsGoneAndReleaseIsIdempotent() async throws {
+        let scheduler = makeScheduler(.default)
+        let ticket = try await scheduler.acquire(
+            .local,
+            priority: .userRequested,
+            runId: UUID(),
+            timeout: 1
+        )
+        var snapshot = await scheduler.snapshot()
+        XCTAssertEqual(snapshot.totalTickets, 1)
+
+        await scheduler.release(ticket)
+        snapshot = await scheduler.snapshot()
+        XCTAssertEqual(snapshot.totalTickets, 0)
+
+        await scheduler.release(ticket)
+        snapshot = await scheduler.snapshot()
+        XCTAssertEqual(snapshot.totalTickets, 0, "a second release must not free someone else's ticket")
     }
 
     func testPriorityOrdersTheQueue() async throws {

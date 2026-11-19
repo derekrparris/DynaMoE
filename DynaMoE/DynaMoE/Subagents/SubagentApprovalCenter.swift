@@ -64,7 +64,8 @@ final class SubagentApprovalCenter: ObservableObject {
     func request(
         _ request: AgentApprovalRequest,
         honorsTurbo: Bool = true,
-        timeout overrideTimeout: TimeInterval? = nil
+        timeout overrideTimeout: TimeInterval? = nil,
+        scope overrideScope: ActionApprovalScope? = nil
     ) async -> Bool {
         if Self.turboBypasses(
             request: request,
@@ -74,6 +75,12 @@ final class SubagentApprovalCenter: ObservableObject {
             return true
         }
         let entry = PendingSubagentApproval(id: UUID(), request: request)
+        // The card is visible before the waiter registers, so its scope is
+        // recorded here: a Stop that owns the RUN declines it, and a Stop in
+        // another conversation leaves it alone. An operator-initiated apply
+        // supplies its own scope because a Stop did not raise that card.
+        let scope = overrideScope ?? ActionApprovalScope.subagentRun(request.runId)
+        ActionApprovalManager.shared.register(id: entry.id, scope: scope)
         // Bounded, because nothing else bounds it. A model that loops on a
         // refused tool used to append a card per call for a run nobody is
         // reading; the list is the operator's queue and it is not infinite.
@@ -81,6 +88,7 @@ final class SubagentApprovalCenter: ObservableObject {
         // pane cannot show.
         guard !Self.refusesCard(pendingCount: pending.count) else {
             print("⚠️ [SubagentApproval] refusing a card from \(request.toolName): \(pending.count) already pending")
+            ActionApprovalManager.shared.unregister(id: entry.id)
             return false
         }
         pending.append(entry)
@@ -91,13 +99,14 @@ final class SubagentApprovalCenter: ObservableObject {
         SubagentManager.shared.noteApprovalWait(for: request)
         defer {
             pending.removeAll { $0.id == entry.id }
+            ActionApprovalManager.shared.unregister(id: entry.id)
             SubagentManager.shared.noteApprovalResolved(runId: request.runId)
         }
 
         let timeout = min(overrideTimeout ?? Self.resolvedApprovalTimeout(), 86_400)
         let approved = await withTaskGroup(of: Bool.self) { group in
             group.addTask {
-                await ActionApprovalManager.shared.waitForApproval(id: entry.id)
+                await ActionApprovalManager.shared.waitForApproval(id: entry.id, scope: scope)
             }
             group.addTask {
                 try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))

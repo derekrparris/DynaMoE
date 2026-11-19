@@ -151,9 +151,24 @@ public final class ControlledProcessRunner {
     /// `which brew` fails while `which ls` works. Prepend the standard user
     /// tool locations to whatever PATH the app inherited, and force
     /// non-interactive behaviour (no pagers, no prompts, no auto-update).
-    nonisolated public static func toolEnvironment() -> [String: String] {
-        let inherited = ProcessInfo.processInfo.environment
-        let userHome = FileManager.default.homeDirectoryForCurrentUser.path
+    ///
+    /// `scoped` is the SUBAGENT half of the same helper, and the distinction is
+    /// the whole point: an interactive child runs a command the operator
+    /// approved per call, so it keeps the operator's own environment —
+    /// `SSH_AUTH_SOCK` for `git push`, `HTTP(S)_PROXY`, `VIRTUAL_ENV`,
+    /// `SDKROOT`, `KUBECONFIG`. A run-scoped child chooses its command in a
+    /// sandbox, so it gets an ALLOWLIST instead: every variable it cannot use
+    /// is a secret not to hand over (a cloud provider's key, an SSH agent
+    /// socket, a proxy credential). Naming the secrets to strip is a losing
+    /// game; what a build or test command actually needs is HOME, a user
+    /// identity, a temp directory and a locale. Making that allowlist the
+    /// default broke ordinary `shell_run` for anyone with an SSH-agent or a
+    /// proxy.
+    nonisolated public static func toolEnvironment(
+        scoped: Bool = false,
+        inherited: [String: String] = ProcessInfo.processInfo.environment,
+        userHome: String = FileManager.default.homeDirectoryForCurrentUser.path
+    ) -> [String: String] {
         let currentPath = inherited["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
         let extraPaths = [
             "/opt/homebrew/bin",
@@ -163,16 +178,27 @@ public final class ControlledProcessRunner {
             "\(userHome)/.cargo/bin",
             "\(userHome)/.local/bin"
         ]
-        // An ALLOWLIST, not a copy of this process's environment. A subagent can
-        // CHOOSE the command, so every variable it cannot use is a secret not to
-        // hand over: a cloud provider's key, a token in some build tool's
-        // variable, an SSH agent socket, a proxy credential. Naming the secrets
-        // to strip is a losing game (this used to name only SUBQ_API_KEY); what
-        // a build or test command actually needs is HOME, a user identity, a
-        // temp directory and a locale.
-        var env: [String: String] = [:]
-        for key in ["HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"] {
-            if let value = inherited[key] { env[key] = value }
+        var env: [String: String]
+        if scoped {
+            env = [:]
+            for key in [
+                "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
+                // Identity, not a credential: a run's `git_commit` inside its
+                // worktree must produce the same author the operator's commits
+                // do when they rely on these instead of repo config.
+                "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+                "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"
+            ] {
+                if let value = inherited[key] { env[key] = value }
+            }
+        } else {
+            env = inherited
+            // The app's own credential is never handed to ANY child, scoped or
+            // not: `subq_decide` accepts it from the app's environment, and a
+            // model can ask a plain `shell_run` to print it. Everything else a
+            // real command needs (SSH agent, proxies, toolchains) is the
+            // operator's own.
+            env.removeValue(forKey: SubQDecisionKeySource.environmentName)
         }
         env["PATH"] = (extraPaths + [currentPath]).joined(separator: ":")
         env["HOMEBREW_NO_AUTO_UPDATE"] = "1"

@@ -2255,6 +2255,105 @@ final class SkillsProcessEnvironmentTests: XCTestCase {
         XCTAssertTrue(environment["PATH"]?.contains("/opt/homebrew/bin") == true)
         XCTAssertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
     }
+
+    /// An ordinary tool child runs a command the operator approved per call.
+    /// Taking the user's environment away broke `git push` over SSH, proxies,
+    /// virtualenvs and `SDKROOT` for every chat turn; the allowlist is for
+    /// run-scoped children only.
+    func testAnInteractiveToolChildKeepsTheUsersEnvironment() {
+        let inherited = [
+            "HOME": "/Users/operator",
+            "PATH": "/usr/bin:/bin",
+            "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock",
+            "HTTPS_PROXY": "http://proxy.local:8080",
+            "VIRTUAL_ENV": "/Users/operator/venv",
+            "SDKROOT": "/Applications/Xcode.app/SDKs/MacOSX.sdk",
+            "SUBQ_API_KEY": "should-not-leak"
+        ]
+        let environment = ControlledProcessRunner.toolEnvironment(
+            inherited: inherited,
+            userHome: "/Users/operator"
+        )
+        XCTAssertEqual(environment["SSH_AUTH_SOCK"], "/tmp/ssh-agent.sock")
+        XCTAssertEqual(environment["HTTPS_PROXY"], "http://proxy.local:8080")
+        XCTAssertEqual(environment["VIRTUAL_ENV"], "/Users/operator/venv")
+        XCTAssertEqual(environment["SDKROOT"], "/Applications/Xcode.app/SDKs/MacOSX.sdk")
+        XCTAssertNil(environment["SUBQ_API_KEY"], "the app's own credential is never handed over")
+        XCTAssertEqual(
+            environment["PATH"],
+            "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/Users/operator/.cargo/bin:/Users/operator/.local/bin:/usr/bin:/bin"
+        )
+    }
+
+    /// A subagent chooses its own command inside a sandbox, so its children
+    /// get the allowlist: no agent socket, no proxy credential, no toolchain
+    /// variable that could carry a token.
+    func testARunScopedToolChildGetsAnAllowlist() {
+        let inherited = [
+            "HOME": "/Users/operator",
+            "PATH": "/usr/bin:/bin",
+            "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock",
+            "HTTPS_PROXY": "http://proxy.local:8080",
+            "VIRTUAL_ENV": "/Users/operator/venv",
+            "SDKROOT": "/Applications/Xcode.app/SDKs/MacOSX.sdk",
+            "SUBQ_API_KEY": "should-not-leak",
+            "LANG": "en_US.UTF-8",
+            "GIT_AUTHOR_NAME": "Operator"
+        ]
+        let environment = ControlledProcessRunner.toolEnvironment(
+            scoped: true,
+            inherited: inherited,
+            userHome: "/Users/operator"
+        )
+        XCTAssertEqual(environment["HOME"], "/Users/operator")
+        XCTAssertEqual(environment["LANG"], "en_US.UTF-8")
+        XCTAssertEqual(
+            environment["GIT_AUTHOR_NAME"], "Operator",
+            "a run's commit keeps the operator's identity"
+        )
+        XCTAssertNil(environment["SSH_AUTH_SOCK"])
+        XCTAssertNil(environment["HTTPS_PROXY"])
+        XCTAssertNil(environment["VIRTUAL_ENV"])
+        XCTAssertNil(environment["SDKROOT"])
+        XCTAssertNil(environment["SUBQ_API_KEY"])
+        XCTAssertEqual(environment["PATH"]?.hasPrefix("/opt/homebrew/bin:") == true, true)
+    }
+
+    /// `runProcess` is the helper every tool child actually spawns through, so
+    /// the scoped decision has to be visible THERE, not only in the pure
+    /// environment builder.
+    @MainActor
+    func testRunProcessSwitchesToTheAllowlistInsideARunScope() async throws {
+        let directory = FileManager.default.temporaryDirectory
+        let probe = URL(fileURLWithPath: "/usr/bin/env")
+
+        let interactive = try await AgentHarness.runProcess(
+            executableURL: probe,
+            arguments: [],
+            currentDirectory: directory,
+            timeoutSeconds: 10
+        )
+        XCTAssertTrue(
+            interactive.stdout.contains("XCTestConfigurationFilePath=")
+                || interactive.stdout.contains("XCTestBundlePath="),
+            "the operator's turn keeps the environment it inherited"
+        )
+
+        let scoped = try await AgentHarness.$executingInRunScope.withValue(true) {
+            try await AgentHarness.runProcess(
+                executableURL: probe,
+                arguments: [],
+                currentDirectory: directory,
+                timeoutSeconds: 10
+            )
+        }
+        XCTAssertFalse(
+            scoped.stdout.contains("XCTestConfigurationFilePath=")
+                || scoped.stdout.contains("XCTestBundlePath="),
+            "a run-scoped child gets the allowlist, not the process environment"
+        )
+        XCTAssertTrue(scoped.stdout.contains("HOME="))
+    }
 }
 
 // MARK: - Review follow-ups

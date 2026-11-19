@@ -296,6 +296,37 @@ final class EngineTurnSlotTests: XCTestCase {
         XCTAssertTrue(engine.isActive, "and the engine still reads busy to every prober")
     }
 
+    /// The successor case the old version could not observe: a REGISTERED
+    /// turn exists (so `cancelTurn`'s second branch is reachable), and a stale
+    /// id must leave it running while its own id stops it. The test bundle has
+    /// no model, so the turn is installed through the DEBUG seam.
+    @MainActor
+    func testAStaleCancelIsANoOpOnARegisteredSuccessorTurn() async throws {
+        let engine = CompletionEngine.shared
+        XCTAssertFalse(engine.isActive, "the slot must be free at the start of the case")
+
+        let successorId: UInt64 = 4_242
+        let successor = Task<Void, Never> {
+            try? await Task.sleep(nanoseconds: 60_000_000_000)
+        }
+        engine.installTurnForTesting(id: successorId, task: successor)
+        defer {
+            engine.clearTurnForTesting()
+            successor.cancel()
+        }
+
+        XCTAssertTrue(engine.isActive, "the installed turn owns the slot")
+        XCTAssertFalse(
+            engine.cancelTurn(id: successorId &+ 1),
+            "a stale id must be a no-op even while a successor turn is registered"
+        )
+        XCTAssertFalse(successor.isCancelled, "the stale id must not stop the successor")
+        XCTAssertTrue(engine.isActive, "and the successor still owns the slot")
+
+        XCTAssertTrue(engine.cancelTurn(id: successorId), "the owning id does stop it")
+        XCTAssertTrue(successor.isCancelled)
+    }
+
     /// `hasActiveBackgroundTurn` counts a turn being PREPARED (a claim, no
     /// task), so a cancel that only looked at `currentGenerationTask` was
     /// inert in exactly the window the prober had just called cancellable.

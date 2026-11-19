@@ -639,6 +639,24 @@ public enum AppleFoundationModelService {
         return keptTurns.reversed().joined(separator: "\n\n")
     }
 
+    /// Whether the built transcript actually carries the subagent relay.
+    ///
+    /// A turn that started is not proof the model saw the reports: the
+    /// transcript keeps turns NEWEST-FIRST and drops one WHOLE when it would
+    /// cross the character budget, so the relay turn (older than the user's
+    /// message) can be absent from a small history. Marking it delivered there
+    /// consumed a report no model ever read.
+    nonisolated public static func transcriptDeliversRelay(
+        _ transcript: String,
+        reports: [String]
+    ) -> Bool {
+        guard !reports.isEmpty else { return false }
+        let directive = LocalSubagentRelay.directive(reports: reports)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !directive.isEmpty else { return false }
+        return transcript.contains(directive)
+    }
+
     /// Rough token estimate for UI stats. The macOS 26 streaming API does not
     /// report per-chunk token usage, so character count over four approximates
     /// the tokenizer well enough for tok/s displays.

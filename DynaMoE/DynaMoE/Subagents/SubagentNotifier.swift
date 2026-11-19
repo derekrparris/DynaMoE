@@ -55,7 +55,11 @@ enum SubagentNotifier {
         status: SubagentStatus,
         parentSessionId: UUID?
     ) {
-        guard status == .completed || status == .failed else { return }
+        // `.blocked` is a loop guard's terminal decision, not a crash: the run
+        // stopped because continuing would not help. It is exactly the outcome
+        // an operator away from the app needs told, and it used to end in
+        // silence (no banner, no Dock bounce).
+        guard status == .completed || status == .failed || status == .blocked else { return }
 
         let isInactive = !NSApp.isActive
         if isInactive {
@@ -73,12 +77,17 @@ enum SubagentNotifier {
         // string render as a title; the marker pass and the bounds keep it a
         // label.
         let label = Self.roleLabel(role)
-        content.title = status == .completed
-            ? "\(label) finished"
-            : "\(label) failed"
-        content.body = status == .completed
-            ? "Open DynaMoE to read the report."
-            : "Open DynaMoE to see what went wrong."
+        switch status {
+        case .completed:
+            content.title = "\(label) finished"
+            content.body = "Open DynaMoE to read the report."
+        case .blocked:
+            content.title = "\(label) was blocked"
+            content.body = "Open DynaMoE to see why its loop guard stopped it."
+        default:
+            content.title = "\(label) failed"
+            content.body = "Open DynaMoE to see what went wrong."
+        }
         content.sound = .default
         var info: [String: String] = ["runId": runId.uuidString]
         if let parentSessionId { info["sessionId"] = parentSessionId.uuidString }
@@ -167,6 +176,12 @@ enum SubagentNotifier {
         let center = UNUserNotificationCenter.current()
         center.removeDeliveredNotifications(withIdentifiers: [identifier])
         center.removePendingNotificationRequests(withIdentifiers: [identifier])
+        // The in-memory queue is the window between a finish and the
+        // authorization answer. A banner still queued there was posted after
+        // the record had already been deleted, and its tap selected a dead id.
+        Task { @MainActor in
+            pendingRequests.removeAll { $0.identifier == identifier }
+        }
     }
 
 }

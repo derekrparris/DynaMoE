@@ -2365,6 +2365,100 @@ final class SubagentLoopTests: XCTestCase {
         XCTAssertTrue(result.record.error?.contains("repository root is unknown") == true, result.record.error ?? "")
     }
 
+    /// A final turn that crosses a ceiling still emitted tool calls. They must
+    /// reach the transcript: the timeline is where the run is judged, and the
+    /// post-turn budget/truncation breaks used to `break` before the assistant
+    /// message and `recordAbandoned`, so a step that emitted
+    /// `[file_read, complete]` left neither call behind.
+    func testAFinalTurnsToolCallsSurviveThePostTurnBudgetBreak() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let file = workspace.appendingPathComponent("Budget.txt")
+        try "BUDGET_MARKER".write(to: file, atomically: true, encoding: .utf8)
+
+        var budget = AgentBudget.standard
+        budget.maxCompletionTokens = 10
+        var usage = AgentUsage()
+        usage.completionTokens = 500
+        let backend = ScriptedBackend(turns: [
+            .init(
+                text: "Reading, then finishing.",
+                calls: [readCall(file.path), completeCall("Read BUDGET_MARKER.")],
+                usage: usage
+            )
+        ])
+        let context = try makeContext(workspace: workspace, tools: ["file_read", "complete"])
+
+        let outcome = await HeadlessAgentLoop().run(
+            input: input(budget: budget),
+            backend: backend,
+            context: context,
+            emit: { _ in }
+        )
+
+        XCTAssertEqual(outcome.status, .failed)
+        XCTAssertTrue(outcome.error?.contains("completion budget") == true, outcome.error ?? "")
+        let results = outcome.transcript.compactMap(\.toolRecord)
+        XCTAssertTrue(
+            results.contains { $0.name == "file_read" && $0.status == .withheld },
+            "the read the turn emitted must be in the timeline, even though it never ran"
+        )
+        XCTAssertTrue(
+            results.contains { $0.name == "complete" && $0.status == .withheld },
+            "the complete the turn emitted must be in the timeline, even though it never ran"
+        )
+        XCTAssertFalse(
+            results.contains { $0.status == .success },
+            "nothing from the abandoned turn may look like it executed"
+        )
+    }
+
+    /// A first request that throws still spent a step. Reporting `steps: 0`
+    /// for a run that never got a turn is a usage block the operator cannot
+    /// act on.
+    func testAStepThatFailsIsStillCounted() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let backend = ScriptedBackend(turns: [
+            .init(
+                text: "",
+                finishReason: "error",
+                error: .malformedResponse("the provider returned nothing")
+            )
+        ])
+        let context = try makeContext(workspace: workspace, tools: ["file_read", "complete"])
+
+        let outcome = await HeadlessAgentLoop().run(
+            input: input(),
+            backend: backend,
+            context: context,
+            emit: { _ in }
+        )
+
+        XCTAssertEqual(outcome.status, .failed)
+        XCTAssertEqual(
+            outcome.usage.steps, 1,
+            "the failed attempt is still a step; a run with steps: 0 cannot be read"
+        )
+    }
+
+    /// Folding must never make a message longer: a 401-character message used
+    /// to come back with a marker appended AFTER the first 400 characters,
+    /// while the caller's running total was reduced as if it had shrunk.
+    func testFoldingNeverGrowsAMessage() {
+        let justOver = String(repeating: "x", count: HeadlessAgentLoop.hardTrimTextLimit + 1)
+        let folded = HeadlessAgentLoop.folded(justOver, to: HeadlessAgentLoop.hardTrimTextLimit)
+        XCTAssertLessThan(folded.count, justOver.count)
+        XCTAssertLessThanOrEqual(folded.count, HeadlessAgentLoop.hardTrimTextLimit)
+
+        let huge = String(repeating: "y", count: 10_000)
+        let foldedHuge = HeadlessAgentLoop.folded(huge, to: HeadlessAgentLoop.hardTrimTextLimit)
+        XCTAssertLessThanOrEqual(foldedHuge.count, HeadlessAgentLoop.hardTrimTextLimit)
+
+        let short = "short"
+        XCTAssertEqual(HeadlessAgentLoop.folded(short, to: HeadlessAgentLoop.hardTrimTextLimit), short)
+    }
+
     private func makeRunScopedHarness(
         tools: [String],
         workspace: URL,

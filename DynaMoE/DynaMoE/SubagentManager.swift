@@ -2066,6 +2066,19 @@ public final class SubagentManager: ObservableObject {
         return subagentsOrder
     }
 
+    /// The runs ONE conversation owns.
+    ///
+    /// The registry is process-wide, but the coordinator's status tools are
+    /// not: a chat that could list or read another chat's run learned its
+    /// findings and, worse, marked its report relayed — which suppresses the
+    /// owning conversation's own delivery. Nil is a session of its own (a run
+    /// started by an API/agent turn with no chat), not a wildcard.
+    public func runs(ownedBySession sessionId: UUID?) -> [SubagentInstance] {
+        lock.lock()
+        defer { lock.unlock() }
+        return subagentsOrder.filter { $0.parentSessionId == sessionId }
+    }
+
     private init() {
         // Retention runs once per process rather than on a timer: the store can
         // only grow while the app is running, and a launch sweep is the moment
@@ -2287,6 +2300,23 @@ public final class SubagentManager: ObservableObject {
         Task { await AgentScheduler.shared.cancelRuns(parentSessionId: sessionId, reason: reason) }
     }
 
+    /// Live runs a Stop is about to cancel.
+    ///
+    /// The approval store needs the ids BEFORE the run tasks are cancelled:
+    /// a card is resolved as declined in that step, instead of waiting for
+    /// task cancellation to propagate through the run's task group. `nil`
+    /// narrows nothing, which is only for a diagnostic caller.
+    public func liveRunIds(parentTurnId: UUID? = nil, sessionId: UUID? = nil) -> [UUID] {
+        lock.lock()
+        defer { lock.unlock() }
+        return subagentsOrder.filter { instance in
+            guard !instance.status.isTerminal else { return false }
+            if let parentTurnId { return instance.parentTurnId == parentTurnId }
+            if let sessionId { return instance.parentSessionId == sessionId }
+            return true
+        }.map(\.id)
+    }
+
     /// Stops only the runs the given coordinator TURN spawned.
     ///
     /// The session-wide cancel above reaches runs spawned by EARLIER turns of
@@ -2378,7 +2408,7 @@ public final class SubagentManager: ObservableObject {
     /// protected from retention forever. The discard is explicit and
     /// destructive, and its card says so.
     @discardableResult
-    public func discard(runId: UUID, sessionId: UUID? = nil) -> Bool {
+    public func discard(runId: UUID, sessionId: UUID? = nil) async -> Bool {
         lock.lock()
         let instance = subagentsById[runId]
         lock.unlock()
@@ -2401,25 +2431,17 @@ public final class SubagentManager: ObservableObject {
         // would miss the claim it was meant to find.
         guard !SubagentApplyService.hasAnyRepositoryInFlight else { return false }
 
-        lock.lock()
-        subagentsById.removeValue(forKey: runId)
-        instanceObservers.removeValue(forKey: runId)?.cancel()
-        subagentsOrder.removeAll { $0.id == runId }
-        lock.unlock()
-        subagents.removeAll { $0.id == runId }
-        if selectedSubagentId == runId {
-            selectedSubagentId = subagents.first?.id
-        }
-
-        // The worktree belongs to this run alone. Removing the record without
-        // it would motion the directory into the launch sweep; removing the
-        // directory after the record is gone is only safe because this call
-        // holds the path and branch from the record itself. Detached because
-        // git must not run inside a cancelled/main-actor context.
-        if case .worktree(let path, let branch) = record.isolation, record.holdsWorktreeWork {
+        // The worktree belongs to this run alone, and it is the only copy of
+        // work a patch cannot carry. Remove it BEFORE the record: if removal
+        // fails, the record must stay so the tree is still reachable and the
+        // next launch sweep still protects it, and the caller gets `false`
+        // instead of a row that silently vanished over a tree that did not.
+        if case .worktree(let path, let branch) = record.isolation,
+           record.holdsWorktreeWork,
+           FileManager.default.fileExists(atPath: path) {
             let repositoryRoot = record.repositoryRoot.map { URL(fileURLWithPath: $0) }
             let baseCommit = record.baseCommit ?? ""
-            Task.detached(priority: .utility) {
+            let removed = await Task.detached(priority: .utility) { () -> Bool in
                 let worktree: AgentWorktree
                 if let opened = try? await WorkspaceIsolation.open(
                     path: path,
@@ -2441,10 +2463,24 @@ public final class SubagentManager: ObservableObject {
                         baseCommit: baseCommit
                     )
                 } else {
-                    return
+                    return false
                 }
-                await WorkspaceIsolation.cleanup(worktree)
+                return await WorkspaceIsolation.cleanup(worktree)
+            }.value
+            guard removed else {
+                print("⚠️ [SubagentManager] kept run \(runId.uuidString): its worktree could not be removed")
+                return false
             }
+        }
+
+        lock.lock()
+        subagentsById.removeValue(forKey: runId)
+        instanceObservers.removeValue(forKey: runId)?.cancel()
+        subagentsOrder.removeAll { $0.id == runId }
+        lock.unlock()
+        subagents.removeAll { $0.id == runId }
+        if selectedSubagentId == runId {
+            selectedSubagentId = subagents.first?.id
         }
 
         AgentRunStore.shared.deleteImmediately(runId: runId, sessionId: record.parentSessionId)

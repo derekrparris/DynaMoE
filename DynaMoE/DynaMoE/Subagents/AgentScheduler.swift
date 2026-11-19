@@ -53,17 +53,27 @@ nonisolated struct AgentSchedulerLimits: Equatable, Sendable {
 
     static let `default` = AgentSchedulerLimits()
 
-    /// The admission wait for one class. A LOCAL run holds the only local
-    /// ticket for its whole life — including any approval card it parks on —
-    /// against a default 600 s wall-clock budget, so a two-minute wait refused
-    /// a second local spawn while the holder was still legally working. Local
-    /// admission therefore covers the default budget plus a margin; the other
-    /// classes keep the configured wait, because their capacity is not held for
-    /// a run's lifetime.
+    /// The admission wait for one class.
+    ///
+    /// A ticket is held for the run's WHOLE life for EVERY class — `acquire`
+    /// grants it once and `runModelBackedExecution` releases it when the run
+    /// ends, not per step. The comment here used to claim otherwise and gave
+    /// only local a floor, so a fourth spawn on one provider was refused after
+    /// the configured 120 s while three legitimate holders were still working
+    /// through a 600 s budget. The floor now covers a standard run plus the
+    /// longest approval card a run can park on. The configured value can only
+    /// raise it. A spawn that overrides its wall-clock budget past this floor
+    /// can still outlive a waiter; that is the operator's explicit choice and
+    /// the queue says which class it waited on.
     func queueTimeout(for schedulingClass: AgentSchedulingClass) -> TimeInterval {
-        guard case .local = schedulingClass else { return queueTimeoutSeconds }
-        return max(queueTimeoutSeconds, 900)
+        _ = schedulingClass
+        return max(queueTimeoutSeconds, Self.standardRunLifetimeWithApproval)
     }
+
+    /// `AgentBudget.standard.maxWallClockSeconds` (600) plus the default
+    /// approval park (600). Spelled out here because the scheduler is not
+    /// allowed to read the MainActor approval center's constants.
+    static let standardRunLifetimeWithApproval: TimeInterval = 1_200
 
     /// Debug/settings seams. Each falls back to the default when absent or not
     /// a positive number, because a capacity of zero would deadlock the queue.

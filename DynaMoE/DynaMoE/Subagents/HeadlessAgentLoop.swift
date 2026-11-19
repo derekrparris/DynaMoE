@@ -207,6 +207,13 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 usageLedger: usageLedger
             )
 
+            // Counted BEFORE the request: a first request that throws (a
+            // provider error, a cancelled turn) still spent a step, and a
+            // report saying `steps: 0` for a run that never got a turn is not
+            // a usage block an operator can act on. `backendRequests` is not
+            // counted here: it reports requests the backend BILLED, which the
+            // usage ledger already accounts for on the failure path.
+            usage.steps += 1
             let turn: AgentBackendTurn
             do {
                 // A step is bounded, not merely checked between steps: a
@@ -248,7 +255,6 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             }
 
             usage.backendRequests += 1
-            usage.steps += 1
             usage.merge(turn.usage)
             // Failed or cancelled attempts inside this same step (a retry that
             // never produced a turn) are billed too.
@@ -279,6 +285,33 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             }
             emit(.usage(usage))
 
+            // A turn that ends the run still emitted calls, and a call that
+            // never ran must appear in the transcript: the assistant text
+            // names it, the operator's timeline is where the run is judged,
+            // and a step that emitted `[file_write, complete]` and then
+            // crossed a ceiling used to leave neither call behind.
+            func recordAbandoned(
+                _ calls: ArraySlice<AgentToolCall>,
+                reason: String,
+                recordStatus: ToolExecutionStatus = .withheld
+            ) {
+                for call in calls {
+                    let message = "Not completed: \(reason)"
+                    let record = ToolCallRecord(
+                        name: call.name,
+                        arguments: call.arguments.mapValues { String(describing: $0) },
+                        rawArguments: call.rawArguments,
+                        status: recordStatus,
+                        output: AgentHarness.renderToolResultForModel(
+                            AgentHarness.toolErrorJSON(tool: call.name, error: message)
+                        ),
+                        error: message
+                    )
+                    append(kind: .toolResult, step: step, record: record)
+                    emit(.toolFinished(record))
+                }
+            }
+
             // The budget checks at the TOP of the loop only see what earlier
             // steps spent. A final turn that crosses a ceiling must not be
             // reported as a completion, and a truncated answer is not an answer.
@@ -290,6 +323,7 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 status = .failed
                 failure = problem
                 append(kind: .status, step: step, text: problem)
+                recordAbandoned(turn.calls[...], reason: problem)
                 break
             }
             let loweredReason = turn.finishReason.lowercased()
@@ -334,6 +368,10 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                     failure = "The backend stopped at its token limit (finish reason '\(turn.finishReason)') before the run finished, so its output is truncated rather than usable."
                 }
                 append(kind: .status, step: step, text: failure)
+                recordAbandoned(
+                    turn.calls[...],
+                    reason: failure ?? "the turn could not be used."
+                )
                 break
             }
 
@@ -352,32 +390,6 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             messages.append(.assistant(text: turn.text, thinking: turn.thinking, calls: turn.calls))
 
             var finishedRun = false
-            // A turn can emit several calls. When a cancellation or the
-            // wall-clock deadline stops the run mid-turn, every call that did
-            // not run still needs a result entry: the assistant text names
-            // them, and without a record the transcript showed calls that
-            // simply vanished.
-            func recordAbandoned(
-                _ calls: ArraySlice<AgentToolCall>,
-                reason: String,
-                recordStatus: ToolExecutionStatus = .withheld
-            ) {
-                for call in calls {
-                    let message = "Not completed: \(reason)"
-                    let record = ToolCallRecord(
-                        name: call.name,
-                        arguments: call.arguments.mapValues { String(describing: $0) },
-                        rawArguments: call.rawArguments,
-                        status: recordStatus,
-                        output: AgentHarness.renderToolResultForModel(
-                            AgentHarness.toolErrorJSON(tool: call.name, error: message)
-                        ),
-                        error: message
-                    )
-                    append(kind: .toolResult, step: step, record: record)
-                    emit(.toolFinished(record))
-                }
-            }
             func rejectCall(
                 _ call: AgentToolCall,
                 offset: Int,
@@ -867,11 +879,20 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
     /// The per-message ceiling the hard trim applies. Small enough that a
     /// handful of messages fit any budget this loop uses, large enough that the
     /// model still sees what each step did.
-    private static let hardTrimTextLimit = 400
+    static let hardTrimTextLimit = 400
 
-    private static func folded(_ text: String, to limit: Int) -> String {
+    /// Folds one message into the ceiling INCLUDING the marker.
+    ///
+    /// The old form appended the marker to `prefix(limit)`, so a message just
+    /// over the ceiling (401 characters) came back LONGER than it went in,
+    /// while the caller's running total was reduced as if it had shrunk. The
+    /// result is now exactly at most `limit` and strictly shorter than the
+    /// input whenever it folds.
+    static func folded(_ text: String, to limit: Int) -> String {
         guard text.count > limit else { return text }
-        return text.prefix(limit) + "… [compacted: \(text.count - limit) characters omitted]"
+        let marker = "… [compacted: \(text.count) chars]"
+        guard marker.count < limit else { return String(text.prefix(limit)) }
+        return String(text.prefix(limit - marker.count)) + marker
     }
 
     /// A tool catalogue's contribution to the prompt, in characters. The

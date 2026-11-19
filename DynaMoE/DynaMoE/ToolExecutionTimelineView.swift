@@ -191,6 +191,10 @@ struct TimelineStepCardView: View {
     /// run's record is a synchronous store read, and a view body is the one
     /// place that must not wait on the store's write queue.
     @State private var applyDestinationSummary: String?
+    /// The summary read has FINISHED (whatever it found). Approving an apply
+    /// card before the destination is known decided against an incomplete
+    /// card; the frames are few, but this is a write.
+    @State private var applyDestinationResolved = false
 
     private var iconName: String {
         switch call.name {
@@ -456,7 +460,8 @@ struct TimelineStepCardView: View {
                     onReject: {
                         ActionApprovalManager.shared.reject(id: call.id)
                         onReject?()
-                    }
+                    },
+                    approveEnabled: applyRunId == nil || applyDestinationResolved
                 )
                 .padding(.top, 2)
             }
@@ -559,8 +564,10 @@ struct TimelineStepCardView: View {
         // off the main actor; the card draws the note when it lands rather
         // than parking the frame behind the store's write queue.
         .task(id: applyRunId) {
+            applyDestinationResolved = false
             guard let runId = applyRunId else {
                 applyDestinationSummary = nil
+                applyDestinationResolved = true
                 return
             }
             let summary = await Task.detached(priority: .utility) { () -> String? in
@@ -574,6 +581,7 @@ struct TimelineStepCardView: View {
             }.value
             guard !Task.isCancelled else { return }
             applyDestinationSummary = summary
+            applyDestinationResolved = true
         }
     }
 }

@@ -62,7 +62,9 @@ public final class GitController {
     /// `git_commit` inside a run's sandbox could stage and commit into the
     /// operator's checkout. Every git child this controller spawns gets this.
     static func gitEnvironment() -> [String: String] {
-        var environment = ControlledProcessRunner.toolEnvironment()
+        var environment = ControlledProcessRunner.toolEnvironment(
+            scoped: AgentHarness.executingInRunScope
+        )
         for key in environment.keys where key.hasPrefix("GIT_") {
             environment.removeValue(forKey: key)
         }

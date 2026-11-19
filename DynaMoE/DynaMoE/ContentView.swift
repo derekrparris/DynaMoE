@@ -4063,11 +4063,15 @@ struct ContentView: View {
             // Delivered means a turn actually STARTED with the reports, and an
             // unavailable on-device model starts none: its failure is written
             // into the placeholder instead (`startAppleFoundationModelGeneration`
-            // returns false there). Marking unconditionally consumed the relay
-            // for a report no model ever saw — the next send would not offer it
-            // again and nothing showed it as unread. Same gate the local path
-            // applies after `launchTurn`.
-            if afmStarted {
+            // returns false there). A started turn is not enough either — the
+            // transcript drops the oldest turn whole when it does not fit, so
+            // the relay has to have survived the budget before its reports are
+            // consumed. Same gate the local path applies after `launchTurn`.
+            if afmStarted,
+               AppleFoundationModelService.transcriptDeliversRelay(
+                   historyTranscript,
+                   reports: pendingSubagentRelay
+               ) {
                 markSubagentSummariesRelayed(pendingSubagentRelay, sessionId: currentSessionId)
             }
             return true
@@ -4786,7 +4790,14 @@ struct ContentView: View {
         // The turn is over, so a continuation that somehow arrives afterwards
         // must not inherit its mode. The next send resolves a fresh one at step 0.
         activeTurnMode = nil
-        ActionApprovalManager.shared.cancelAll()
+        // Approvals are cancelled by SCOPE, never process-wide. The old
+        // `cancelAll()` declined every parked card in every conversation,
+        // including a background run this Stop is written to spare. The
+        // coordinator's own cards belong to this session; a child run's card
+        // belongs to the run, and is declined just before its task is stopped.
+        if hadActiveGenerationTask, let stoppedSessionId {
+            ActionApprovalManager.shared.cancel(scope: .session(stoppedSessionId))
+        }
         // Delegation is part of the turn: a Stop must not leave a child working
         // on work the operator has abandoned. Skip when no live turn was
         // running (e.g. a queued fresh send aborted before launching), so Stop
@@ -4801,8 +4812,16 @@ struct ContentView: View {
             // session-wide cancel stays as the fallback for paths that never
             // minted one.
             if let turnId = activeAgentTurnId, activeAgentTurnSessionId == stoppedSessionId {
+                let runIds = SubagentManager.shared.liveRunIds(parentTurnId: turnId)
+                for runId in runIds {
+                    ActionApprovalManager.shared.cancel(scope: .subagentRun(runId))
+                }
                 SubagentManager.shared.cancelTurnRuns(parentTurnId: turnId)
             } else {
+                let runIds = SubagentManager.shared.liveRunIds(sessionId: stoppedSessionId)
+                for runId in runIds {
+                    ActionApprovalManager.shared.cancel(scope: .subagentRun(runId))
+                }
                 SubagentManager.shared.cancelSession(sessionId: stoppedSessionId)
             }
         }
@@ -6592,7 +6611,13 @@ struct ContentView: View {
                     if let subQEndpoint { rec.pinnedEndpoint = subQEndpoint.absoluteString }
                 }
                 showStatus("🛡️ Action requires confirmation: \(call.name)")
-                let approved = await ActionApprovalManager.shared.waitForApproval(id: record.id)
+                // Registered before the card can be clicked, so a Stop in this
+                // conversation declines it and a Stop in another one does not.
+                ActionApprovalManager.shared.register(id: record.id, scope: .session(sessionId))
+                let approved = await ActionApprovalManager.shared.waitForApproval(
+                    id: record.id,
+                    scope: .session(sessionId)
+                )
                 if !approved {
                     let rejectJSON = AgentHarness.toolErrorJSON(tool: call.name, error: "Action rejected by user.")
                     agent.recordToolCallOutcome(toolName: call.name, outcome: .failed)
@@ -7931,7 +7956,16 @@ struct ContentView: View {
                                 }
                             }
 
-                            let approved = await ActionApprovalManager.shared.waitForApproval(id: recordId)
+                            // Same scope the card was rendered under: the Stop
+                            // that owns this turn declines it, and no other.
+                            let approvalScope = sessionId.map(ActionApprovalScope.session)
+                            if let approvalScope {
+                                ActionApprovalManager.shared.register(id: recordId, scope: approvalScope)
+                            }
+                            let approved = await ActionApprovalManager.shared.waitForApproval(
+                                id: recordId,
+                                scope: approvalScope
+                            )
                             if !approved {
                                 await MainActor.run {
                                     if let sId = sessionId, let mId = messageId,

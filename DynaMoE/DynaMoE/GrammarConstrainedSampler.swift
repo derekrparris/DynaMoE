@@ -299,7 +299,11 @@ nonisolated public final class GrammarConstrainedSampler {
             scopedMaskBase = shared.snapshotRegistry()
         }
         scopedMaskStack.append(ScopedMask(token: token, schemas: schemas))
-        shared.registerToolSchemas(schemas)
+        // INSTALL through the same composer the exit uses. Registering only
+        // this scope replaced the registry with its vocabulary, so while two
+        // turns overlapped the first scope's tools were callable only again
+        // after the second ended.
+        scopedMaskRebuildLocked()
         scopedMaskLock.unlock()
         defer {
             scopedMaskLock.lock()
@@ -310,32 +314,46 @@ nonisolated public final class GrammarConstrainedSampler {
         return try await body()
     }
 
-    /// Rebuilds the registry from the base snapshot plus every live scope, in
-    /// install order. Caller holds `scopedMaskLock`.
+    /// Rebuilds the registry from the live scopes, or restores the base once
+    /// none are left. Caller holds `scopedMaskLock`.
+    ///
+    /// While ANY scope is live the registry is the UNION OF THE SCOPES, not
+    /// the base plus them: a scoped turn replaces the app catalog (a server
+    /// turn must not be able to emit an in-app tool name). The base comes back
+    /// only when the last scope ends.
     ///
     /// `registrationLock` is held across the WHOLE rebuild. Each replacement
     /// is a multi-field write and a token's mask read takes the same lock, so
-    /// rebuilding one scope at a time exposed the intermediate registry (the
-    /// base alone, or the base plus some scopes) to a token drawn in the
-    /// overlap window. A token masked against the wrong vocabulary can emit a
-    /// call the registry would have withheld; the lock makes the swap a
-    /// single step.
+    /// rebuilding one scope at a time exposed the intermediate registry (one
+    /// scope alone, or a subset) to a token drawn in the overlap window. A
+    /// token masked against the wrong vocabulary can emit a call the registry
+    /// would have withheld; the lock makes the swap a single step.
     nonisolated private static func scopedMaskRebuildLocked() {
         guard let base = scopedMaskBase else { return }
-        shared.registrationLock.lock()
-        shared.replaceRegistryLocked(
-            names: base.names,
-            parameterKeys: base.parameterKeys,
-            requiredKeys: base.requiredKeys
-        )
+        var names: Set<String> = []
+        var parameterKeys: [String: Set<String>] = [:]
+        var requiredKeys: [String: Set<String>] = [:]
         for entry in scopedMaskStack {
             let maps = Self.registryMaps(for: entry.schemas)
-            shared.replaceRegistryLocked(
-                names: maps.names,
-                parameterKeys: maps.parameterKeys,
-                requiredKeys: maps.requiredKeys
-            )
+            names.formUnion(maps.names)
+            for (name, keys) in maps.parameterKeys {
+                parameterKeys[name] = keys
+            }
+            for (name, keys) in maps.requiredKeys {
+                requiredKeys[name] = keys
+            }
         }
+        if scopedMaskStack.isEmpty {
+            names = base.names
+            parameterKeys = base.parameterKeys
+            requiredKeys = base.requiredKeys
+        }
+        shared.registrationLock.lock()
+        shared.replaceRegistryLocked(
+            names: names,
+            parameterKeys: parameterKeys,
+            requiredKeys: requiredKeys
+        )
         shared.registrationLock.unlock()
         if scopedMaskStack.isEmpty {
             scopedMaskBase = nil

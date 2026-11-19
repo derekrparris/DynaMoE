@@ -11734,6 +11734,36 @@ if layer.attnGateProjTensor != nil,
         return true
     }
 
+#if DEBUG
+    /// Tests only: installs a turn the engine did not launch.
+    ///
+    /// Ownership-scoped cancellation has two branches — an id that matches a
+    /// registered turn, and one that does not. The test bundle has no model,
+    /// and `launchTurn` refuses before minting a task, so without this seam a
+    /// test can only reach "no task at all" and cannot observe the successor
+    /// case it documents.
+    func installTurnForTesting(
+        id: UInt64,
+        task: Task<Void, Never>,
+        priority: TurnPriority = .interactive
+    ) {
+        stateLock.lock()
+        currentGenerationId = id
+        currentGenerationTask = task
+        activeTurnPriority = priority
+        activeTurnCancelled = false
+        stateLock.unlock()
+    }
+
+    func clearTurnForTesting() {
+        stateLock.lock()
+        currentGenerationTask = nil
+        activeTurnPriority = .interactive
+        activeTurnCancelled = false
+        stateLock.unlock()
+    }
+#endif
+
     /// Suspends until no turn is active (model switch/load safety).
     ///
     /// "Active" is `isActive`, not just the registered task. A turn is UNREGISTERED
@@ -11766,6 +11796,14 @@ if layer.attnGateProjTensor != nil,
         let deadline = seconds.map { Date().addingTimeInterval($0) }
         while isActive {
             if let deadline, Date() >= deadline { return false }
+            // `Task.sleep` throws `CancellationError` WITHOUT suspending when
+            // the task is already cancelled, and `try?` swallows it — the loop
+            // then spins synchronously on the main actor until the deadline
+            // (60 s in the preemption path, unbounded for a teardown). A
+            // cancelled waiter has no reason to keep waiting: whatever it was
+            // waiting for is either the thing that cancelled it or work it can
+            // no longer influence.
+            if Task.isCancelled { return false }
             // Poll rather than awaiting the turn's task: the await is not
             // cancellation-aware, so a holder this caller cannot stop (the API
             // server's request) would park the wait past its own deadline.

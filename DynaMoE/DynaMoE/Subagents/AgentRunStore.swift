@@ -557,9 +557,36 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
                 [.posixPermissions: 0o600],
                 ofItemAtPath: url.path
             )
+            // The rename is not durable until the DIRECTORY is flushed: a
+            // power loss can lose a rename that was reported as a successful
+            // write, which is exactly what the header promises it cannot. The
+            // file's own fsync above covers its bytes; this covers the entry.
+            try Self.fsyncDirectory(url.deletingLastPathComponent())
         } catch {
             try? FileManager.default.removeItem(at: temporary)
             throw error
+        }
+    }
+
+    /// Flushes a directory entry so a completed rename survives a crash.
+    private static func fsyncDirectory(_ directory: URL) throws {
+        let descriptor = open(directory.path, O_RDONLY)
+        guard descriptor >= 0 else {
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(errno),
+                userInfo: [NSFilePathErrorKey: directory.path]
+            )
+        }
+        let result = fsync(descriptor)
+        let syncErrno = result == 0 ? 0 : errno
+        _ = close(descriptor)
+        guard syncErrno == 0 else {
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(syncErrno),
+                userInfo: [NSFilePathErrorKey: directory.path]
+            )
         }
     }
 

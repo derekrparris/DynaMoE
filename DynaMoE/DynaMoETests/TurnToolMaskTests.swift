@@ -146,6 +146,17 @@ final class TurnToolMaskTests: XCTestCase {
         let second = Task { await scope("second_only", installed: secondInstalledSink, release: secondRelease) }
         for await _ in secondInstalled { break }
 
+        // While BOTH are live the registry is their COMPOSITION, and the app
+        // catalog is still replaced. The rebuild used to install one scope's
+        // maps at a time, so the second scope silently erased the first one's
+        // vocabulary.
+        sampler.reset()
+        XCTAssertEqual(
+            masked("<tool_call><function=", tokens: ["first_only>", "second_only>", "app_tool>"]),
+            [false, false, true],
+            "two live scopes compose: both are callable and the app catalog is not"
+        )
+
         // The FIRST scope ends while the second is still live.
         firstReleaseSink.yield()
         await first.value

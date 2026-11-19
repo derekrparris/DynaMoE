@@ -105,6 +105,106 @@ final class AgentRunIntegrationTests: XCTestCase {
         XCTAssertFalse(subagent.isSummaryRelayed, "the manager never marks a run relayed on its own")
     }
 
+    /// The status tools read the conversation that is asking. The registry is
+    /// process-wide, and a second chat could previously read (and mark relayed)
+    /// the first chat's report — silently suppressing its own delivery.
+    func testTheStatusToolsOnlySeeTheCallersConversation() async throws {
+        let sessionA = UUID()
+        let sessionB = UUID()
+        let runA = SubagentManager.shared.spawnModelBacked(
+            plan(
+                backend: ScriptedBackend(turns: [.init(text: "finding from A")]),
+                sessionId: sessionA
+            ),
+            id: UUID()
+        )
+        _ = await runA.waitForCompletion()
+        let runB = SubagentManager.shared.spawnModelBacked(
+            plan(
+                backend: ScriptedBackend(turns: [.init(text: "finding from B")]),
+                sessionId: sessionB
+            ),
+            id: UUID()
+        )
+        _ = await runB.waitForCompletion()
+
+        let statusTool = GetSubagentStatusTool()
+        let foreign = try await AgentHarness.$executingSessionId.withValue(sessionA) {
+            try await statusTool.execute(
+                arguments: ["subagent_id": runB.id.uuidString],
+                workingDirectory: nil,
+                maxOutputLength: 4_000
+            )
+        }
+        XCTAssertTrue(foreign.resultJSON.contains("not found"))
+        XCTAssertFalse(
+            runB.isSummaryRelayed,
+            "a foreign read must not consume the owning conversation's relay"
+        )
+        XCTAssertFalse(foreign.resultJSON.contains("finding from B"))
+
+        let own = try await AgentHarness.$executingSessionId.withValue(sessionA) {
+            try await statusTool.execute(
+                arguments: ["subagent_id": runA.id.uuidString],
+                workingDirectory: nil,
+                maxOutputLength: 4_000
+            )
+        }
+        XCTAssertFalse(own.resultJSON.contains("not found"))
+        XCTAssertTrue(own.resultJSON.contains("finding from A"))
+
+        let listTool = ListSubagentsTool()
+        let listed = try await AgentHarness.$executingSessionId.withValue(sessionA) {
+            try await listTool.execute(
+                arguments: [:],
+                workingDirectory: nil,
+                maxOutputLength: 4_000
+            )
+        }
+        XCTAssertTrue(listed.resultJSON.contains(runA.id.uuidString))
+        XCTAssertFalse(
+            listed.resultJSON.contains(runB.id.uuidString),
+            "another conversation's run must not be listed"
+        )
+
+        let sendTool = SendSubagentMessageTool()
+        let steering = try await AgentHarness.$executingSessionId.withValue(sessionA) {
+            try await sendTool.execute(
+                arguments: ["subagent_id": runB.id.uuidString, "message": "keep going"],
+                workingDirectory: nil,
+                maxOutputLength: 4_000
+            )
+        }
+        XCTAssertTrue(
+            steering.resultJSON.contains("not found"),
+            "steering another conversation's run is a cross-session write"
+        )
+    }
+
+    /// A run holds its class's scheduler ticket for its whole life, so a
+    /// finished run that forgot to release would shrink the provider's (or the
+    /// engine's) capacity by one until relaunch. The release is handed to a
+    /// task from the run's `defer`, so poll rather than assume it lands inline.
+    func testAFinishedRunReleasesItsSchedulerTicket() async throws {
+        let subagent = SubagentManager.shared.spawnModelBacked(
+            plan(
+                backend: ScriptedBackend(turns: [.init(text: "done")]),
+                sessionId: UUID()
+            ),
+            id: UUID()
+        )
+        _ = await subagent.waitForCompletion()
+
+        var tickets = -1
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            tickets = await AgentScheduler.shared.snapshot().totalTickets
+            if tickets == 0 { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(tickets, 0, "the finished run must give its scheduler ticket back")
+    }
+
     /// A completion that stopped at the token limit is a fragment, not an
     /// answer. It used to be reported `.completed` because the loop never read
     /// the backend's finish reason.

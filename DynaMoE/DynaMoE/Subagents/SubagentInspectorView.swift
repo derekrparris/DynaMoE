@@ -56,6 +56,16 @@ struct SubagentInspectorView: View {
     /// not overwrite the new one's rows when it lands later.
     @State private var reloadGeneration: UInt64 = 0
     @State private var confirmClear = false
+    /// A discard that could not remove the worktree (a locked file, a git
+    /// failure) must say so. The old control closed the alert and left the row
+    /// in place with no message, so a confirmed Discard looked like a no-op.
+    @State private var discardFailure: String?
+    /// The pane defaults to THIS conversation. Runs of the others used to be
+    /// reachable through the process-wide drawer list, and deleting that list
+    /// left a run working in another chat with no surface that could show,
+    /// stop or clear it. This is the way back in, without re-mixing the
+    /// default list.
+    @State private var showsAllSessions = false
     /// Coalesces store-change notifications. One apply or a bulk delete can
     /// land several writes, and each one would otherwise start its own read.
     @State private var pendingStoreReload: Task<Void, Never>?
@@ -92,9 +102,14 @@ struct SubagentInspectorView: View {
                     onClose: onClose,
                     onRecordChanged: reloadStored,
                     onDiscard: {
-                        if SubagentManager.shared.discard(runId: detail.record.id, sessionId: sessionId) {
-                            withAnimation(.easeInOut(duration: 0.15)) { self.selectedRunId = nil }
-                            reloadStored()
+                        let runId = detail.record.id
+                        Task {
+                            if await SubagentManager.shared.discard(runId: runId, sessionId: sessionId) {
+                                withAnimation(.easeInOut(duration: 0.15)) { self.selectedRunId = nil }
+                                reloadStored()
+                            } else {
+                                discardFailure = "The run was not discarded. An apply may still own it, or its worktree could not be removed (a file in it may be locked, or git refused). Nothing was deleted."
+                            }
                         }
                     }
                 )
@@ -140,14 +155,25 @@ struct SubagentInspectorView: View {
         .onReceive(NotificationCenter.default.publisher(for: AgentRunStore.recordsDidChangeNotification)) { _ in
             scheduleStoreReload()
         }
-        // "Clear Finished" is an explicit decision, but deleting a report the
-        // coordinator has never seen is not one the operator gets to make by
-        // accident: a run whose summary is still UNREAD asks first.
-        .alert("Discard unread reports?", isPresented: $confirmClear) {
-            Button("Clear Anyway", role: .destructive) { clearFinished() }
+        // "Clear Finished" always asks: the row count is a destructive action
+        // even when every report is already read, and only an explicit
+        // confirmation should delete durable records.
+        .alert("Clear finished runs?", isPresented: $confirmClear) {
+            Button("Clear", role: .destructive) { clearFinished() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("\(unreadTerminalCount) finished run\(unreadTerminalCount == 1 ? "" : "s") still \(unreadTerminalCount == 1 ? "has" : "have") a report the coordinator has not seen. Clearing DELETES the record and its report; it does not just hide the row.")
+            Text(clearFinishedMessage)
+        }
+        .alert(
+            "Discard failed",
+            isPresented: Binding(
+                get: { discardFailure != nil },
+                set: { if !$0 { discardFailure = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) { discardFailure = nil }
+        } message: {
+            Text(discardFailure ?? "")
         }
     }
 
@@ -197,13 +223,30 @@ struct SubagentInspectorView: View {
 
             Spacer()
 
+            // The default list is this conversation's. Other chats' runs are
+            // reachable here rather than through a second, process-wide list:
+            // the rows are read-only except for Stop/Clear, and the border of
+            // the pane does not move when another run starts.
+            Button(action: {
+                showsAllSessions.toggle()
+                reloadStored()
+            }) {
+                HStack(spacing: 3) {
+                    Image(systemName: showsAllSessions ? "eye" : "eye.slash")
+                        .font(.system(size: 9))
+                    Text(showsAllSessions ? "All Runs" : "This Chat")
+                        .font(.system(size: 10, weight: .medium))
+                }
+                .foregroundColor(showsAllSessions ? .purple : .secondary)
+            }
+            .buttonStyle(.plain)
+            .help(showsAllSessions
+                ? "Showing runs from every conversation"
+                : "Show runs from every conversation (including API turns)")
+
             if !terminalRuns.isEmpty {
                 Button(action: {
-                    if unreadTerminalCount > 0 {
-                        confirmClear = true
-                    } else {
-                        clearFinished()
-                    }
+                    confirmClear = true
                 }) {
                     Text("Clear Finished")
                         .font(.system(size: 10, weight: .medium))
@@ -390,7 +433,11 @@ struct SubagentInspectorView: View {
             manager.selectedSubagentId = nil
             withAnimation(.easeInOut(duration: 0.15)) { selectedRunId = record.id }
         }) {
-            SubagentRunRow(record: record, isLive: liveInstance(record.id) != nil)
+            SubagentRunRow(
+                record: record,
+                isLive: liveInstance(record.id) != nil,
+                sessionLabel: showsAllSessions ? record.parentSessionId : nil
+            )
         }
         .buttonStyle(.plain)
     }
@@ -438,11 +485,27 @@ struct SubagentInspectorView: View {
         }
     }
 
+    /// The confirmation says exactly what goes and what is remembered by the
+    /// coordinator. `Clear Finished` no longer runs unconfirmed: a terminal
+    /// record and its report are durable data, not a view filter.
+    private var clearFinishedMessage: String {
+        let count = terminalRuns.count
+        var text = "This deletes \(count) finished run\(count == 1 ? "" : "s") and their reports from this conversation. It cannot be undone."
+        if unreadTerminalCount > 0 {
+            text = "\(unreadTerminalCount) of them still \(unreadTerminalCount == 1 ? "has" : "have") a report the coordinator has not seen. " + text
+        }
+        if showsAllSessions {
+            text += " Rows from other conversations are left alone."
+        }
+        return text
+    }
+
     /// Runs started outside a conversation (an API/agent turn with no chat
     /// session) have no bucket of their own, so they ride every inspector
     /// rather than becoming invisible in the one that happens to be open.
     private var liveInstances: [SubagentInstance] {
-        manager.allSubagents.filter {
+        if showsAllSessions { return manager.allSubagents }
+        return manager.allSubagents.filter {
             sessionId == nil || $0.parentSessionId == sessionId || $0.parentSessionId == nil
         }
     }
@@ -465,8 +528,12 @@ struct SubagentInspectorView: View {
         reloadGeneration &+= 1
         let generation = reloadGeneration
         let sessionId = sessionId
+        let allSessions = showsAllSessions
         Task {
             let records = await Task.detached(priority: .utility) {
+                if allSessions {
+                    return AgentRunStore.shared.loadAll()
+                }
                 var records = AgentRunStore.shared.load(sessionId: sessionId)
                 if sessionId != nil {
                     records += AgentRunStore.shared.load(sessionId: nil)
@@ -497,6 +564,8 @@ struct SubagentInspectorView: View {
 private struct SubagentRunRow: View {
     let record: AgentRunRecord
     let isLive: Bool
+    /// The owning conversation, shown only while the pane lists every one.
+    var sessionLabel: UUID? = nil
 
     private var hasUnreadReport: Bool {
         guard record.status.isTerminal, !record.summaryRelayed else { return false }
@@ -545,6 +614,11 @@ private struct SubagentRunRow: View {
                     Text("·")
                     Text(model)
                         .lineLimit(1)
+                }
+                if let sessionLabel {
+                    Text("·")
+                    Text(String(sessionLabel.uuidString.prefix(8)))
+                        .help("Conversation \(sessionLabel.uuidString)")
                 }
                 Spacer()
                 Text(durationText)
@@ -670,6 +744,10 @@ private struct SubagentRunDetailView: View {
             && (appliedAt == nil || hasKeptIgnoredFiles)
             && !isApplying
             && !SubagentApplyService.isRunInFlight(record.id)
+            // `discard` refuses while ANY checkout is mid-apply, because a
+            // record's recorded root can be stale. The button has to read the
+            // same rule or a confirmed discard silently does nothing.
+            && !SubagentApplyService.hasAnyRepositoryInFlight
             && (SubagentManager.shared.getSubagent(byId: record.id)?.isExecutionUnwound ?? true)
     }
 
@@ -700,7 +778,11 @@ private struct SubagentRunDetailView: View {
         }
         .alert("Discard this run?", isPresented: $confirmDiscard) {
             Button("Discard", role: .destructive) { onDiscard() }
-                .disabled(isApplying || SubagentApplyService.isRunInFlight(record.id))
+                .disabled(
+                    isApplying
+                        || SubagentApplyService.isRunInFlight(record.id)
+                        || SubagentApplyService.hasAnyRepositoryInFlight
+                )
             Button("Cancel", role: .cancel) {}
         } message: {
             if appliedAt != nil {
@@ -1020,7 +1102,9 @@ private struct SubagentRunDetailView: View {
 
             if !report.changedFiles.isEmpty {
                 reportHeading("Changed files")
-                ForEach(report.changedFiles, id: \.self) { file in
+                // Indexed, not `id: \.self`: a model-authored list can repeat a
+                // path, and duplicate ids make SwiftUI drop rows.
+                ForEach(Array(report.changedFiles.enumerated()), id: \.offset) { _, file in
                     HStack(spacing: 4) {
                         Image(systemName: "doc.text")
                             .font(.system(size: 9))
@@ -1057,7 +1141,7 @@ private struct SubagentRunDetailView: View {
 
             if !report.risks.isEmpty {
                 reportHeading("Risks")
-                ForEach(report.risks, id: \.self) { risk in
+                ForEach(Array(report.risks.enumerated()), id: \.offset) { _, risk in
                     Text("• " + risk)
                         .font(.system(size: 10))
                         .foregroundColor(.orange)
@@ -1066,7 +1150,7 @@ private struct SubagentRunDetailView: View {
 
             if !report.openQuestions.isEmpty {
                 reportHeading("Open questions")
-                ForEach(report.openQuestions, id: \.self) { question in
+                ForEach(Array(report.openQuestions.enumerated()), id: \.offset) { _, question in
                     Text("• " + question)
                         .font(.system(size: 10))
                         .foregroundColor(.secondary)

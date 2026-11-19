@@ -51,7 +51,7 @@ final class WorkspaceIsolationTests: XCTestCase {
 
         XCTAssertTrue(FileManager.default.fileExists(atPath: worktree.path.path))
         XCTAssertEqual(worktree.repositoryRoot.standardizedFileURL, repository.standardizedFileURL)
-        XCTAssertEqual(worktree.branch, WorkspaceIsolation.branchPrefix + String(runId.uuidString.prefix(8)).lowercased())
+        XCTAssertEqual(worktree.branch, WorkspaceIsolation.branchPrefix + String(runId.uuidString.prefix(12)).lowercased())
 
         let head = try await git(["rev-parse", "--abbrev-ref", "HEAD"], in: worktree.path)
         XCTAssertEqual(head.0, 0)
@@ -64,6 +64,81 @@ final class WorkspaceIsolationTests: XCTestCase {
         let removed = await WorkspaceIsolation.cleanup(worktree)
         XCTAssertTrue(removed)
         XCTAssertFalse(FileManager.default.fileExists(atPath: worktree.path.path))
+    }
+
+    /// A tree that survives both removals must NOT lose its branch.
+    ///
+    /// The branch is what `open` re-derives a worktree from; deleting it left a
+    /// surviving tree that no apply could read, with its commits reachable only
+    /// through the reflog. Cleanup also has to SAY the tree survived, because
+    /// the apply tool used to report "worktree removed" unconditionally.
+    func testCleanupKeepsTheBranchWhenTheWorktreeSurvives() async throws {
+        let runId = UUID()
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: runId,
+            root: worktreeRoot
+        )
+        // Deny the parent directory so the final unlink cannot happen, while
+        // git is still able to clear the tree's contents.
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o500],
+            ofItemAtPath: worktreeRoot.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: worktreeRoot.path
+            )
+            Task { await WorkspaceIsolation.cleanup(worktree) }
+        }
+
+        let removed = await WorkspaceIsolation.cleanup(worktree)
+        XCTAssertFalse(removed, "a tree that survived both removals must report false")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: worktree.path.path))
+
+        let branch = try await git(["rev-parse", "--verify", worktree.branch], in: repository)
+        XCTAssertEqual(
+            branch.0,
+            0,
+            "the branch must outlive a surviving tree so the worktree can be re-opened"
+        )
+    }
+
+    /// Build and test output is not the run's answer. Naming `.build/`,
+    /// `node_modules/` or a `.DS_Store` as "work a patch cannot carry" kept a
+    /// run's multi-GB worktree exempt from retention forever, with no clock.
+    func testOrdinaryBuildOutputIsNotKeptWork() {
+        for path in [
+            ".build",
+            ".build/debug/foo",
+            "Package/.build/repositories",
+            "node_modules",
+            "node_modules/left-pad/index.js",
+            "__pycache__",
+            "src/__pycache__/x.pyc",
+            ".DS_Store",
+            "sub/.DS_Store",
+            "DerivedData/Build",
+            ".pytest_cache/v/cache"
+        ] {
+            XCTAssertTrue(
+                WorkspaceIsolation.isDisposableBuildArtifact(path),
+                "\(path) is re-creatable output, not kept work"
+            )
+        }
+        for path in [
+            ".env.local",
+            "notes.txt",
+            "fixtures/data.json",
+            "config/production.yaml",
+            "build.log"
+        ] {
+            XCTAssertFalse(
+                WorkspaceIsolation.isDisposableBuildArtifact(path),
+                "\(path) may be the run's only copy"
+            )
+        }
     }
 
     func testCreatingTwiceAtTheSameRunIsRefused() async throws {
@@ -684,7 +759,7 @@ final class WorkspaceIsolationTests: XCTestCase {
         }
 
         SubagentApplyService.beginApplyForTesting(runId)
-        SubagentManager.shared.discard(runId: runId)
+        _ = await SubagentManager.shared.discard(runId: runId)
 
         XCTAssertNotNil(
             store.loadAny(runId: runId),
@@ -1009,16 +1084,14 @@ final class WorkspaceIsolationTests: XCTestCase {
             "clearCompleted must spare an unapplied isolated run"
         )
 
-        SubagentManager.shared.discard(runId: runId, sessionId: session)
+        // Discard removes the tree before the record, so both are gone by the
+        // time it returns; a failure would have kept the record and returned
+        // false, which the assertions below would catch.
+        let discarded = await SubagentManager.shared.discard(runId: runId, sessionId: session)
+        XCTAssertTrue(discarded, "the tree was removable, so the discard must report success")
 
         XCTAssertNil(SubagentManager.shared.getSubagent(byId: runId))
         XCTAssertNil(AgentRunStore.shared.load(runId: runId, sessionId: session))
-        // The worktree cleanup is detached so git is never spawned from the
-        // main actor; wait for it rather than assuming it finished inline.
-        let deadline = Date().addingTimeInterval(10)
-        while Date() < deadline, FileManager.default.fileExists(atPath: worktree.path.path) {
-            try await Task.sleep(nanoseconds: 50_000_000)
-        }
         XCTAssertFalse(
             FileManager.default.fileExists(atPath: worktree.path.path),
             "discarding the run must remove its only copy of the work"
@@ -1625,7 +1698,7 @@ final class WorkspaceIsolationTests: XCTestCase {
     /// call asked git to cut it from.
     func testAFailedCreateDoesNotDeleteABranchItDidNotOwn() async throws {
         let runId = UUID()
-        let branch = WorkspaceIsolation.branchPrefix + String(runId.uuidString.prefix(8)).lowercased()
+        let branch = WorkspaceIsolation.branchPrefix + String(runId.uuidString.prefix(12)).lowercased()
         // A pre-existing branch of the collision name, pointing at the
         // INITIAL commit while HEAD has moved one commit on: `worktree add -b`
         // fails because the name is taken, and the branch (which does not

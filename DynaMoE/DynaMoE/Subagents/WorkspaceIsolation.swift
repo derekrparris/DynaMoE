@@ -288,7 +288,10 @@ nonisolated enum WorkspaceIsolation {
             throw WorkspaceIsolationError.noCommits(rootPath.path)
         }
         let baseCommit = headOut.trimmingCharacters(in: .whitespacesAndNewlines)
-        let branch = branchPrefix + String(runId.uuidString.prefix(8)).lowercased()
+        // 48 bits, not 32: a branch name is the only handle `open` has on a
+        // worktree after a crash, and a same-named leftover from an earlier
+        // run is exactly the collision an 8-hex prefix hit in practice.
+        let branch = branchPrefix + String(runId.uuidString.prefix(12)).lowercased()
         let worktreeURL = root.appendingPathComponent(runId.uuidString, isDirectory: true)
 
         let fileManager = FileManager.default
@@ -1216,16 +1219,25 @@ nonisolated enum WorkspaceIsolation {
         if fileManager.fileExists(atPath: worktree.path.path), contained {
             try? fileManager.removeItem(at: worktree.path)
         }
+        // The branch is deleted only once the TREE is actually gone. A tree
+        // that survived both removals (an immutable file, a corrupt admin
+        // entry) is the only copy of the run's work, and `open` requires the
+        // branch to re-open it: deleting the branch here would leave commits
+        // reachable only through the reflog. The caller's `Bool` reports this,
+        // so an apply can say the worktree was kept instead of claiming it was
+        // removed.
+        let treeGone = !fileManager.fileExists(atPath: worktree.path.path)
         // The branch command runs in the RECORD's repository too. A path that
         // is not this process's worktree is a record that cannot be trusted
         // about its repository either, so nothing is deleted on its word.
         if contained,
+           treeGone,
            deleteBranch,
            worktree.branch != "HEAD",
            worktree.branch.hasPrefix(branchPrefix) {
             _ = try? await git(["branch", "-D", worktree.branch], in: worktree.repositoryRoot)
         }
-        return !fileManager.fileExists(atPath: worktree.path.path)
+        return treeGone
     }
 
     /// Whether a path may be deleted by the launch sweep or an apply. Only this
@@ -1288,8 +1300,41 @@ nonisolated enum WorkspaceIsolation {
             .split(separator: "\0", omittingEmptySubsequences: true)
             .compactMap { entry -> String? in
                 guard entry.hasPrefix("!! ") else { return nil }
-                return String(entry.dropFirst(3))
+                let path = String(entry.dropFirst(3))
+                // A run that built or tested leaves `.build/`, `node_modules/`
+                // and friends behind. Naming those as "work a patch cannot
+                // carry" kept the record and its multi-GB tree exempt from
+                // retention forever, with no clock and no path back; a stray
+                // `.DS_Store` was enough. They are re-creatable artifacts, not
+                // the run's answer.
+                return isDisposableBuildArtifact(path) ? nil : path
             }
+    }
+
+    /// The ignored entries a build or test run produces by itself.
+    ///
+    /// Deliberately a named list of TOOLCHAIN OUTPUT directories: a run-written
+    /// `.env.local`, fixture or data file is still reported and still keeps the
+    /// worktree. A component match, because `git status` names the directory
+    /// (`.build/`) rather than every file under it, and a nested
+    /// `Package/.build` is the same artifact.
+    static func isDisposableBuildArtifact(_ path: String) -> Bool {
+        let disposable: Set<String> = [
+            ".build",
+            ".swiftpm",
+            "DerivedData",
+            "xcuserdata",
+            "node_modules",
+            "__pycache__",
+            ".pytest_cache",
+            ".mypy_cache",
+            ".ruff_cache",
+            ".tox",
+            ".gradle",
+            ".dart_tool",
+            ".DS_Store"
+        ]
+        return path.split(separator: "/").contains { disposable.contains(String($0)) }
     }
 
     /// Whether git itself agrees the worktree has nothing to land.
@@ -1349,6 +1394,7 @@ nonisolated enum WorkspaceIsolation {
                 }
             }
 
+            var removedTree = false
             if let repositoryRoot = await owningRepository(for: path),
                let (branchCode, branchOut, _) = try? await git(
                    ["rev-parse", "--abbrev-ref", "HEAD"],
@@ -1363,16 +1409,22 @@ nonisolated enum WorkspaceIsolation {
                         branch: branch,
                         baseCommit: ""
                     )
-                    _ = await cleanup(worktree, root: root)
+                    removedTree = await cleanup(worktree, root: root)
                 } else {
                     _ = try? await git(["worktree", "remove", "--force", path.path], in: repositoryRoot)
                     _ = try? await git(["worktree", "prune"], in: repositoryRoot)
                     try? fileManager.removeItem(at: path)
+                    removedTree = !fileManager.fileExists(atPath: path.path)
                 }
             } else {
                 try? fileManager.removeItem(at: path)
+                removedTree = !fileManager.fileExists(atPath: path.path)
             }
-            removed.append(name)
+            // Reporting a tree that survived makes the sweep's log say work
+            // was destroyed when it is still on disk.
+            if removedTree {
+                removed.append(name)
+            }
         }
         return removed
     }
@@ -1437,7 +1489,9 @@ nonisolated enum WorkspaceIsolation {
         // refuses it with "header lacks filename information". An inherited
         // `GIT_DIR` / `GIT_WORK_TREE` can redirect the apply into another
         // repository entirely, so the child gets neither.
-        var environment = ControlledProcessRunner.toolEnvironment()
+        var environment = ControlledProcessRunner.toolEnvironment(
+            scoped: AgentHarness.executingInRunScope
+        )
         for key in environment.keys where key.hasPrefix("GIT_") {
             environment.removeValue(forKey: key)
         }

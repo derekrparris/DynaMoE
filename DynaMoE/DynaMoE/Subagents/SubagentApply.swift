@@ -60,6 +60,10 @@ nonisolated struct SubagentApplyOutcome: Sendable {
     /// it instead of deleting it. The worktree may still be removed; the
     /// branch is the preserved copy.
     var keptBranch: Bool = false
+    /// Whether cleanup proved the worktree directory is gone. False means the
+    /// tree survived (it is the only copy of ignored work), and the caller
+    /// must say so rather than reporting a removal that did not happen.
+    var worktreeRemoved: Bool = false
 }
 
 @MainActor
@@ -143,9 +147,13 @@ enum SubagentApplyService {
         let record = live?.snapshotRecord() ?? AgentRunStore.shared.loadAny(runId: runId)
         guard let record else { throw SubagentApplyError.runNotFound(runId) }
         // A RESTORED record has no live instance, so the check above cannot
-        // see it. A run that was interrupted (a crash between launch and its
-        // terminal write) is still working or still holds the tree; applying
-        // its half-written tree would land work the run never finished.
+        // see it. This is a belt-and-braces guard for a record the store could
+        // still report non-terminal: at launch `reconcileInterruptedRuns`
+        // rewrites an interrupted run as `.failed` (terminal) precisely so the
+        // inspector can clear it, so that case reaches the apply as FAILED and
+        // the operator's card is the decision. Nothing here can distinguish
+        // "half-written by a crash" from "failed after doing real work"; the
+        // card and the kept worktree are what make the choice explicit.
         guard record.status.isTerminal else {
             throw SubagentApplyError.stillRunning(record.role)
         }
@@ -279,11 +287,15 @@ enum SubagentApplyService {
         // outside `HEAD` (e.g. the run committed on its branch and then
         // switched away) or git could not prove it does not (`nil`).
         let keptBranch = await WorkspaceIsolation.commitsOnBranchOutsideHead(worktree) != 0
+        let worktreeRemoved: Bool
         if keptIgnoredFiles.isEmpty {
             // The branch is kept only if it still holds uncarried commits;
-            // otherwise both worktree and branch are removed cleanly.
-            await WorkspaceIsolation.cleanup(worktree, deleteBranch: !keptBranch)
+            // otherwise both worktree and branch are removed cleanly. The
+            // result is the tree's own answer, not a promise: a locked file
+            // leaves it in place and the tool says so.
+            worktreeRemoved = await WorkspaceIsolation.cleanup(worktree, deleteBranch: !keptBranch)
         } else {
+            worktreeRemoved = false
             let named = keptIgnoredFiles.joined(separator: ", ")
             // Captured immutable: the mutation closure runs on the store's
             // queue, and the local array must not be read from there while
@@ -347,7 +359,8 @@ enum SubagentApplyService {
             alreadyApplied: false,
             destinationBranch: destinationBranch,
             keptIgnoredFiles: keptIgnoredFiles,
-            keptBranch: keptBranch
+            keptBranch: keptBranch,
+            worktreeRemoved: worktreeRemoved
         )
     }
 }
@@ -574,8 +587,13 @@ enum SubagentApplyControl {
 
         let ask = requestApproval ?? {
             // Landing a patch is never a Turbo bypass: the contract in
-            // SUBAGENTS.md requires its own card.
-            await SubagentApprovalCenter.shared.request($0, honorsTurbo: false)
+            // SUBAGENTS.md requires its own card. Its own scope, because a
+            // Stop that owns the run did not raise this operator decision.
+            await SubagentApprovalCenter.shared.request(
+                $0,
+                honorsTurbo: false,
+                scope: .operatorApply($0.runId)
+            )
         }
         guard await ask(request) else { throw SubagentApplyControlError.approvalDenied }
         return try await SubagentApplyService.apply(runId: runId)
