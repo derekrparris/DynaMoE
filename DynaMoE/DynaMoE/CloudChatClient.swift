@@ -617,7 +617,7 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                             }
                             let failure = CloudTurnFailure.httpStatus(
                                 code: http.statusCode,
-                                summary: MCPHTTPTransport.summarizeErrorBody(body)
+                                summary: CloudChatClient.redactedErrorSummary(body, apiKey: self.apiKey)
                             )
                             // A 429's Retry-After is the provider telling us
                             // exactly how long its window needs. The receipt
@@ -1091,7 +1091,7 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                 let body = String(decoding: data.prefix(4096), as: UTF8.self)
                 throw CloudTurnFailure.httpStatus(
                     code: http.statusCode,
-                    summary: MCPHTTPTransport.summarizeErrorBody(body)
+                    summary: CloudChatClient.redactedErrorSummary(body, apiKey: self.apiKey)
                 )
             }
             return data
@@ -1192,6 +1192,20 @@ nonisolated enum CloudRetryAfter {
 }
 
 public nonisolated final class CloudChatClient: @unchecked Sendable {
+    /// Summarizes a non-2xx provider response body and redacts credentials
+    /// before the text reaches run records, UI errors, or coordinator prompts.
+    /// A proxy that echoes `Authorization: Bearer …` in a 400/5xx body must
+    /// never leak the API key into durable state or `[SUBAGENT_RESULT]`.
+    public static func redactedErrorSummary(_ rawBody: String, apiKey: String) -> String {
+        let summarized = MCPHTTPTransport.summarizeErrorBody(rawBody)
+        var cleaned = SubQDecisionClient.redactedErrorDetail(summarized, apiKey: apiKey)
+        cleaned = cleaned.replacingOccurrences(
+            of: #"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{6,}"#,
+            with: "Bearer [redacted]",
+            options: .regularExpression
+        )
+        return cleaned
+    }
     /// Idle (between-bytes) timeout for a chat turn. Generous on purpose: a
     /// large prompt or a reasoning model can take longer than half a minute to
     /// first token, and the timeout only has to catch a wedged connection.

@@ -273,16 +273,15 @@ enum SubagentApplyService {
                 "the patch landed, but this run's record could not be updated (its conversation may have been deleted). The worktree was kept so the landed changes still have a copy; clear the run manually."
             )
         }
-        // A run can commit some of its work and leave the rest uncommitted;
-        // the patch carries only the latter. Deleting the branch with `-D`
-        // would make the committed half reachable only through the reflog.
-        // nil means git could not compare the branch with a recorded base (an
-        // older record, a pruned ref), so the branch is kept rather than
-        // assumed empty.
-        let keptBranch = await WorkspaceIsolation.commitsAheadOfBase(worktree) != 0
+        // `snapshot` diffs `baseCommit` against the working tree, so commits on
+        // the worktree's branch that are reachable from `HEAD` are already in
+        // the patch we just applied. Keep the branch ONLY if it holds commits
+        // outside `HEAD` (e.g. the run committed on its branch and then
+        // switched away) or git could not prove it does not (`nil`).
+        let keptBranch = await WorkspaceIsolation.commitsOnBranchOutsideHead(worktree) != 0
         if keptIgnoredFiles.isEmpty {
-            // The branch is kept while the worktree is removed: the record is
-            // applied, so the tree is no longer the only copy of anything.
+            // The branch is kept only if it still holds uncarried commits;
+            // otherwise both worktree and branch are removed cleanly.
             await WorkspaceIsolation.cleanup(worktree, deleteBranch: !keptBranch)
         } else {
             let named = keptIgnoredFiles.joined(separator: ", ")
@@ -326,7 +325,7 @@ enum SubagentApplyService {
         }
 
         if keptBranch {
-            let note = "The patch was applied, but branch '\(branch)' was kept because it holds commits a patch cannot carry. Merge or delete it manually when you are done."
+            let note = "The patch was applied, but branch '\(branch)' was kept because it holds commits outside the applied working tree. Inspect or delete it manually when you are done."
             if let live {
                 await live.noteKeptBranch(branch)
             } else {

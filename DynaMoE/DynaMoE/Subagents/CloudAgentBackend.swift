@@ -172,13 +172,14 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
 
         let usage = Self.usage(from: result.usage, pricing: pricing)
         let calls = result.toolCalls.map { call -> AgentToolCall in
-            let arguments = Self.arguments(from: call.argumentsJSON)
+            let decoded = Self.arguments(from: call.argumentsJSON)
             return AgentToolCall(
                 id: call.id,
                 name: call.name,
-                arguments: arguments,
+                arguments: decoded ?? [:],
                 rawArguments: call.argumentsJSON,
-                rawText: call.name
+                rawText: call.name,
+                argumentsMalformed: decoded == nil
             )
         }
         return AgentBackendTurn(
@@ -324,15 +325,16 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
         return text
     }
 
-    static func arguments(from json: String) -> [String: Any] {
-        // An unparseable block answers with NO arguments, not a fabricated
-        // `_raw_arguments` key: the raw text already travels on the call's own
-        // `rawArguments` (and from there into the transcript), and a synthetic
-        // key turned a malformed call into one with a plausible-looking
-        // argument name that no tool declares.
-        guard let data = json.data(using: .utf8),
+    static func arguments(from json: String) -> [String: Any]? {
+        // Empty/whitespace arguments are a valid zero-argument call (`{}`).
+        // Any non-empty string that does not decode to a JSON object (such as a
+        // truncated payload) returns nil so the loop refuses to execute it
+        // instead of silently running the tool with empty arguments.
+        let trimmed = json.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return [:] }
+        guard let data = trimmed.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return [:]
+            return nil
         }
         return object
     }

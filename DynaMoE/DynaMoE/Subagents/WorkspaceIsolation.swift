@@ -1082,6 +1082,24 @@ nonisolated enum WorkspaceIsolation {
         return Int(out.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
+    /// Commits on the worktree's branch that are NOT reachable from the
+    /// worktree's `HEAD`.
+    ///
+    /// `snapshot` diffs `baseCommit` against the working tree on top of `HEAD`,
+    /// so every commit on `branch` that is an ancestor of `HEAD` (the normal
+    /// case when a run commits on its own branch) is ALREADY carried by the
+    /// patch and does not need the branch kept after apply. Only if the run
+    /// switched away from `branch` after committing on it does `HEAD..branch`
+    /// report uncarried commits (or `nil` if git could not compare).
+    static func commitsOnBranchOutsideHead(_ worktree: AgentWorktree) async -> Int? {
+        guard !worktree.branch.isEmpty else { return nil }
+        guard let (code, out, _) = try? await git(
+            ["rev-list", "--count", "HEAD..refs/heads/\(worktree.branch)"],
+            in: worktree.path
+        ), code == 0 else { return nil }
+        return Int(out.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
     /// Files the run created that git ignores. `snapshot` registers intent to
     /// add, which cannot carry them either, so an ignored-only run looks empty
     /// and would otherwise be reported as "no changes" and deleted with its

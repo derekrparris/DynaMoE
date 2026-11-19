@@ -2606,11 +2606,26 @@ public final class SpawnSubagentTool: AgentTool {
             return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: error), nil, error, false)
         }
 
-        // The legacy pipelines have no worktree of their own. Hearing the
-        // request for one and silently running in the coordinator's directory
-        // is the wrong answer: the work would be unisolated while the caller
-        // believes it is not.
-        let requestedIsolation = Self.isolation(from: arguments["isolation"]).isIsolated
+        // The legacy pipelines ignore `isolation`, `budget`, and `preset` —
+        // they run fixed archetype pipelines in the coordinator's directory.
+        // Accepting those arguments and silently discarding them leaves the
+        // caller believing work is isolated or budgeted when it is not.
+        var unsupportedLegacyArgs: [String] = []
+        if Self.isolation(from: arguments["isolation"]).isIsolated {
+            unsupportedLegacyArgs.append("isolation")
+        }
+        if arguments["budget"] != nil {
+            unsupportedLegacyArgs.append("budget")
+        }
+        if let preset = arguments["preset"] as? String,
+           !preset.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            unsupportedLegacyArgs.append("preset")
+        }
+        if !unsupportedLegacyArgs.isEmpty {
+            let list = unsupportedLegacyArgs.joined(separator: ", ")
+            let err = "The legacy subagent backend does not support \(list). Select backend 'local' or 'cloud' to use these options, or omit them for the legacy role pipelines."
+            return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: err), nil, err, false)
+        }
         guard !Task.isCancelled else { return Self.stoppedBeforeStartResult() }
         let subagent = SubagentManager.shared.spawn(
             role: role,
@@ -2629,10 +2644,7 @@ public final class SpawnSubagentTool: AgentTool {
         return await Self.respond(
             subagent: subagent,
             runInBackground: runInBackground,
-            maxOutputLength: maxOutputLength,
-            warning: requestedIsolation
-                ? "This spawn ran on the legacy role pipelines, which do not create a worktree: the run works in the coordinator's directory. Choose 'local' or 'cloud' for an isolated workspace."
-                : nil
+            maxOutputLength: maxOutputLength
         )
     }
 
@@ -2732,13 +2744,14 @@ public final class SpawnSubagentTool: AgentTool {
     /// the legacy role pipelines. Sending work to a model (and, for cloud,
     /// off-device) is a deliberate choice, not something an omitted argument
     /// should make on the operator's behalf.
-    private static func backendSelection(
-        from arguments: [String: Any]
+    static func backendSelection(
+        from arguments: [String: Any],
+        defaults: UserDefaults = .standard
     ) -> (preference: AgentBackendPreference, modelBacked: Bool, error: String?) {
         let raw = (arguments["backend"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         switch raw {
         case nil, "", "auto":
-            let stored = UserDefaults.standard
+            let stored = defaults
                 .string(forKey: SubagentBackendSettings.backendKey)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .lowercased()
@@ -2986,6 +2999,16 @@ public final class SendSubagentMessageTool: AgentTool {
         // the note was queued into an object nobody reads again.
         if subagent.status.isTerminal {
             let err = "Subagent [\(subagent.role)] (ID: \(idStr)) has already finished; it cannot consume new directives. Spawn a new run instead."
+            return (AgentHarness.toolErrorJSON(tool: "send_subagent_message", error: err), nil, err, false)
+        }
+
+        // A Plan Mode turn must not steer a Code Mode subagent that can execute
+        // shell commands or write files (e.g. a legacy Test Runner or a running
+        // implementer). Switching to Plan Mode mid-run must not leave an
+        // unaudited shell/write channel open.
+        let callerMode = AgentHarness.executingTurnMode ?? AgentHarness.shared.activeMode
+        if callerMode == .plan && subagent.canRunShellCommands {
+            let err = "Plan Mode cannot send directives to a Code Mode subagent ([\(subagent.role)], ID: \(idStr)). Switch to Code Mode or spawn a read-only subagent."
             return (AgentHarness.toolErrorJSON(tool: "send_subagent_message", error: err), nil, err, false)
         }
 
@@ -3286,7 +3309,7 @@ public final class ApplySubagentChangesTool: AgentTool {
                     composed += " The worktree was KEPT: it also holds git-ignored files a patch cannot carry (\(outcome.keptIgnoredFiles.joined(separator: ", "))). Retrieve them manually before the run is cleared."
                 }
                 if outcome.keptBranch {
-                    composed += " Its branch '\(outcome.branch)' was KEPT because it holds commits a patch cannot carry; merge or delete it manually when you are done."
+                    composed += " Its branch '\(outcome.branch)' was KEPT because it holds commits outside the applied working tree; inspect or delete it manually when you are done."
                 }
                 message = composed
             }
@@ -4491,6 +4514,9 @@ public final class AgentHarness {
         if toolName == "spawn_subagent" {
             return spawnSubagentRequiresApproval(arguments: arguments, mode: mode)
         }
+        if toolName == "send_subagent_message" {
+            return sendSubagentMessageRequiresApproval(arguments: arguments, mode: mode)
+        }
         if toolName == "subq_decide" {
             return subqDecideRequiresApproval(
                 arguments: arguments,
@@ -4524,6 +4550,16 @@ public final class AgentHarness {
         // Settings or on a card that says so. A read-only run is still a run:
         // file_read and grep_search upload repository content on every step.
         if spawnsWorkOffDevice(arguments: arguments, defaults: defaults) { return true }
+        let selection = SpawnSubagentTool.backendSelection(from: arguments, defaults: defaults)
+        if !selection.modelBacked {
+            // The legacy execution path ignores `preset` and `allowed_tools`
+            // and dispatches strictly by `SubagentRoleArchetype.match(from: role)`.
+            // The Test Runner executes shell commands directly via `/bin/zsh -c`,
+            // so it always requires operator approval regardless of any
+            // `preset` or `allowed_tools` the caller passed.
+            let archetype = SubagentRoleArchetype.match(from: arguments["role"] as? String ?? "")
+            return archetype == .testRunner
+        }
         let preset = AgentRolePresetCatalog.preset(
             named: arguments["preset"] as? String,
             role: arguments["role"] as? String ?? ""
@@ -4532,6 +4568,25 @@ public final class AgentHarness {
         let explicit = (arguments["allowed_tools"] as? [String]) ?? []
         let intended = explicit.isEmpty ? definition.toolNames : explicit
         return !Set(intended).isDisjoint(with: AgentToolSurface.writeCapable)
+    }
+
+    /// Steering a running legacy Test Runner executes shell commands extracted
+    /// from the directive via `/bin/zsh -c`, bypassing `SubagentToolExecutor`.
+    /// Gate those directives on operator approval in Code Mode; in Plan Mode,
+    /// `SendSubagentMessageTool` refuses to message Code Mode subagents outright.
+    static func sendSubagentMessageRequiresApproval(
+        arguments: [String: Any],
+        mode: AgentMode
+    ) -> Bool {
+        guard mode != .plan else { return false }
+        guard let idStr = arguments["subagent_id"] as? String,
+              let uuid = UUID(uuidString: idStr),
+              let subagent = SubagentManager.shared.getSubagent(byId: uuid) else {
+            return false
+        }
+        return subagent.modelPlan == nil
+            && subagent.archetype == .testRunner
+            && subagent.canRunShellCommands
     }
 
     /// Whether this spawn resolves to the Cloud backend, following the same
@@ -6919,6 +6974,8 @@ public final class AgentHarness {
                 return workingDirectory
             }
             return (cwd as NSString).expandingTildeInPath
+        case "subq_decide":
+            return SubQDecisionSettings.endpoint().absoluteString
         default:
             return workingDirectory
         }

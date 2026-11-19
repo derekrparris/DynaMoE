@@ -1632,14 +1632,14 @@ final class SubagentLoopTests: XCTestCase {
 
     /// `complete` succeeds without its (schema-required) summary argument, and
     /// a run whose only output is that call must still complete rather than
-    /// fail with "the backend produced no final answer". Calls the model emits
-    /// after it are recorded instead of vanishing at the break.
-    func testCompleteWithoutASummaryCompletesAndRecordsLaterCalls() async throws {
+    /// Calls the model emits after a valid `complete` are recorded as abandoned
+    /// instead of vanishing at the break.
+    func testCompleteWithSummaryRecordsLaterCallsAsAbandoned() async throws {
         let workspace = try makeWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }
         let backend = ScriptedBackend(turns: [
             .init(text: "", calls: [
-                AgentToolCall(name: "complete", arguments: [:]),
+                AgentToolCall(name: "complete", arguments: ["summary": "All done."]),
                 AgentToolCall(name: "file_read", arguments: ["path": "never.txt"])
             ])
         ])
@@ -1663,7 +1663,7 @@ final class SubagentLoopTests: XCTestCase {
         )
 
         XCTAssertEqual(outcome.status, .completed, outcome.error ?? "")
-        XCTAssertEqual(outcome.report?.summary, "Task completed.")
+        XCTAssertEqual(outcome.report?.summary, "All done.")
         let abandoned = outcome.transcript.compactMap { entry -> ToolCallRecord? in
             guard entry.kind == .toolResult,
                   let record = entry.toolRecord,
@@ -1671,6 +1671,179 @@ final class SubagentLoopTests: XCTestCase {
             return record
         }
         XCTAssertEqual(abandoned.map(\.name), ["file_read"])
+    }
+
+    /// A `complete` call with missing/empty required arguments must be refused
+    /// without fabricating a completed run; the model can recover on a later step.
+    func testEmptyCompleteIsRefusedByRequiredArgumentGuard() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let backend = ScriptedBackend(turns: [
+            .init(text: "", calls: [
+                AgentToolCall(name: "complete", arguments: [:])
+            ]),
+            .init(text: "", calls: [
+                AgentToolCall(name: "complete", arguments: ["summary": "Recovered with summary."])
+            ])
+        ])
+        let context = try makeContext(
+            workspace: workspace,
+            tools: ["complete"],
+            policy: .everyStateChange,
+            handler: { _ in true }
+        )
+
+        let outcome = await HeadlessAgentLoop().run(
+            input: input(budget: AgentBudget(
+                maxSteps: 4,
+                maxCompletionTokens: 2_000,
+                maxWallClockSeconds: 600,
+                maxCostUSD: nil
+            )),
+            backend: backend,
+            context: context,
+            emit: { _ in }
+        )
+
+        XCTAssertEqual(outcome.status, .completed, outcome.error ?? "")
+        XCTAssertEqual(outcome.report?.summary, "Recovered with summary.")
+        let errors = outcome.transcript.compactMap { entry -> ToolCallRecord? in
+            guard entry.kind == .toolResult,
+                  let record = entry.toolRecord,
+                  record.status == .error else { return nil }
+            return record
+        }
+        XCTAssertEqual(errors.count, 1)
+        XCTAssertTrue(errors.first?.error?.contains("required arguments") == true)
+    }
+
+    /// Malformed JSON arguments (e.g. a cut-off tool call) must be refused
+    /// instead of executing the tool with empty arguments.
+    func testMalformedToolCallArgumentsAreRefusedWithoutExecution() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let backend = ScriptedBackend(turns: [
+            .init(text: "", calls: [
+                AgentToolCall(
+                    name: "complete",
+                    arguments: [:],
+                    rawArguments: #"{"summary":"cut"#,
+                    argumentsMalformed: true
+                )
+            ]),
+            .init(text: "Done after retry.")
+        ])
+        let context = try makeContext(
+            workspace: workspace,
+            tools: ["complete"],
+            policy: .everyStateChange,
+            handler: { _ in true }
+        )
+
+        let outcome = await HeadlessAgentLoop().run(
+            input: input(budget: AgentBudget(
+                maxSteps: 4,
+                maxCompletionTokens: 2_000,
+                maxWallClockSeconds: 600,
+                maxCostUSD: nil
+            )),
+            backend: backend,
+            context: context,
+            emit: { _ in }
+        )
+
+        XCTAssertEqual(outcome.status, .completed, outcome.error ?? "")
+        XCTAssertEqual(outcome.report?.summary, "Done after retry.")
+        let malformed = outcome.transcript.compactMap { entry -> ToolCallRecord? in
+            guard entry.kind == .toolResult,
+                  let record = entry.toolRecord,
+                  record.status == .error,
+                  record.error?.contains("Malformed arguments JSON") == true else { return nil }
+            return record
+        }
+        XCTAssertEqual(malformed.count, 1)
+    }
+
+    /// A token-capped turn (`finish_reason == "length"`) with a `complete` call
+    /// must fail the run rather than executing the truncated call.
+    func testTruncatedTurnWithToolCallsFailsWithoutExecutingComplete() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let backend = ScriptedBackend(turns: [
+            .init(
+                text: "",
+                calls: [AgentToolCall(name: "complete", arguments: ["summary": "Cut off"])],
+                finishReason: "length"
+            )
+        ])
+        let context = try makeContext(
+            workspace: workspace,
+            tools: ["complete"],
+            policy: .everyStateChange,
+            handler: { _ in true }
+        )
+
+        let outcome = await HeadlessAgentLoop().run(
+            input: input(budget: AgentBudget(
+                maxSteps: 4,
+                maxCompletionTokens: 2_000,
+                maxWallClockSeconds: 600,
+                maxCostUSD: nil
+            )),
+            backend: backend,
+            context: context,
+            emit: { _ in }
+        )
+
+        XCTAssertEqual(outcome.status, .failed)
+        XCTAssertTrue(outcome.error?.contains("token limit") == true, outcome.error ?? "")
+    }
+
+    /// A blank turn (no text, no calls, finishReason == "stop") must fail rather
+    /// than reporting `.completed`.
+    func testBlankTurnWithStopFinishReasonFailsInsteadOfCompleting() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let backend = ScriptedBackend(turns: [
+            .init(text: "   \n  ", calls: [], finishReason: "stop")
+        ])
+        let context = try makeContext(
+            workspace: workspace,
+            tools: ["file_read"],
+            policy: .everyStateChange,
+            handler: { _ in true }
+        )
+
+        let outcome = await HeadlessAgentLoop().run(
+            input: input(budget: AgentBudget(
+                maxSteps: 4,
+                maxCompletionTokens: 2_000,
+                maxWallClockSeconds: 600,
+                maxCostUSD: nil
+            )),
+            backend: backend,
+            context: context,
+            emit: { _ in }
+        )
+
+        XCTAssertEqual(outcome.status, .failed)
+        XCTAssertTrue(outcome.error?.contains("empty turn") == true, outcome.error ?? "")
+    }
+
+    func testAgentUsageArithmeticSaturatesInsteadOfTrappingOnOverflow() {
+        var a = AgentUsage()
+        a.promptTokens = Int.max - 5
+        a.completionTokens = Int.max - 5
+        a.latestPromptTokens = Int.max - 5
+        a.latestCompletionTokens = 100
+        var b = AgentUsage()
+        b.promptTokens = 100
+        b.completionTokens = 100
+        a.merge(b)
+        XCTAssertEqual(a.promptTokens, Int.max)
+        XCTAssertEqual(a.completionTokens, Int.max)
+        XCTAssertEqual(a.totalTokens, Int.max)
+        XCTAssertEqual(a.contextTokens, Int.max)
     }
 
     // MARK: - Turbo cannot bypass the two reserved cards

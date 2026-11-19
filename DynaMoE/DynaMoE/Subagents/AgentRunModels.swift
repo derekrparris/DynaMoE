@@ -199,11 +199,19 @@ nonisolated struct AgentUsage: Codable, Equatable, Sendable {
     /// every call site builds a usage as `AgentUsage()` then sets fields.
     init() {}
 
+    private static func saturatingAdd(_ a: Int, _ b: Int) -> Int {
+        let (sum, overflow) = a.addingReportingOverflow(b)
+        if overflow {
+            return b >= 0 ? Int.max : Int.min
+        }
+        return sum
+    }
+
     mutating func merge(_ other: AgentUsage) {
-        steps += other.steps
-        promptTokens += other.promptTokens
-        completionTokens += other.completionTokens
-        cachedTokens += other.cachedTokens
+        steps = Self.saturatingAdd(steps, other.steps)
+        promptTokens = Self.saturatingAdd(promptTokens, other.promptTokens)
+        completionTokens = Self.saturatingAdd(completionTokens, other.completionTokens)
+        cachedTokens = Self.saturatingAdd(cachedTokens, other.cachedTokens)
         costUSD += other.costUSD
         costIsUnpriced = costIsUnpriced || other.costIsUnpriced
         // `noPriceRecorded` is the ACTIONABLE cause (recording a price fixes
@@ -215,8 +223,8 @@ nonisolated struct AgentUsage: Codable, Equatable, Sendable {
             costUnpricedReason = other.costUnpricedReason
         }
         wallClockSeconds += other.wallClockSeconds
-        toolCalls += other.toolCalls
-        backendRequests += other.backendRequests
+        toolCalls = Self.saturatingAdd(toolCalls, other.toolCalls)
+        backendRequests = Self.saturatingAdd(backendRequests, other.backendRequests)
         // "Latest" means the NEWEST step's value, not the largest: the loop can
         // compact a run's context, so a later prompt may be smaller than an
         // earlier one. Zero is ABSENCE (a usage-less turn, or a backend that
@@ -233,7 +241,7 @@ nonisolated struct AgentUsage: Codable, Equatable, Sendable {
     /// The billed token total: every step's full prompt plus everything
     /// generated. This is what the requests cost, not what the conversation
     /// carries.
-    var totalTokens: Int { promptTokens + completionTokens }
+    var totalTokens: Int { Self.saturatingAdd(promptTokens, completionTokens) }
 
     /// The context footprint the UI shows — the same doctrine as the chat
     /// header's token chip: "the prompt the model last ingested plus the tokens
@@ -243,12 +251,12 @@ nonisolated struct AgentUsage: Codable, Equatable, Sendable {
     var contextTokens: Int {
         guard latestPromptTokens > 0 else {
             // A record that predates both fields holds only the sums.
-            return promptTokens + completionTokens
+            return Self.saturatingAdd(promptTokens, completionTokens)
         }
         // The last prompt already CONTAINS every earlier step's generation,
         // so adding the summed `completionTokens` counted them twice. Only
         // this step's output is still part of the live context.
-        return latestPromptTokens + latestCompletionTokens
+        return Self.saturatingAdd(latestPromptTokens, latestCompletionTokens)
     }
 
     /// Defaults-tolerant on purpose: the store's decode-failure path is "the
@@ -491,19 +499,25 @@ nonisolated struct AgentToolCall: @unchecked Sendable {
     let arguments: [String: Any]
     let rawArguments: String
     let rawText: String
+    /// True when the wire arguments JSON could not be decoded into a JSON
+    /// object (e.g. truncated or malformed JSON). Callers must refuse to
+    /// execute such a call rather than running it with empty arguments.
+    let argumentsMalformed: Bool
 
     init(
         id: String = UUID().uuidString,
         name: String,
         arguments: [String: Any],
         rawArguments: String = "",
-        rawText: String = ""
+        rawText: String = "",
+        argumentsMalformed: Bool = false
     ) {
         self.id = id
         self.name = name
         self.arguments = arguments
         self.rawArguments = rawArguments
         self.rawText = rawText
+        self.argumentsMalformed = argumentsMalformed
     }
 
     var parsedCall: ParsedToolCall {

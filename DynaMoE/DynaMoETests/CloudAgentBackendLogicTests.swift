@@ -154,13 +154,22 @@ final class CloudAgentBackendLogicTests: XCTestCase {
     }
 
     func testAnUnparseableAssembledArgumentBlockIsReportedRatherThanGuessedAt() {
-        // No synthetic argument: the tool sees the arguments it was given
-        // (none) and reports the missing required field by name, while the raw
-        // JSON stays on the call's `rawArguments` for the transcript.
-        XCTAssertTrue(CloudAgentBackend.arguments(from: "{\"path\":").isEmpty)
-        XCTAssertTrue(CloudAgentBackend.arguments(from: "").isEmpty)
-        XCTAssertTrue(CloudAgentBackend.arguments(from: "[]").isEmpty)
-        XCTAssertEqual(CloudAgentBackend.arguments(from: "{\"a\":1}")["a"] as? Int, 1)
+        // Malformed/truncated JSON returns nil so the loop refuses to execute
+        // the call instead of silently running it with empty arguments. Empty
+        // string is a valid zero-argument call (`{}`).
+        XCTAssertNil(CloudAgentBackend.arguments(from: "{\"path\":"))
+        XCTAssertEqual(CloudAgentBackend.arguments(from: "")?.isEmpty, true)
+        XCTAssertNil(CloudAgentBackend.arguments(from: "[]"))
+        XCTAssertEqual(CloudAgentBackend.arguments(from: "{\"a\":1}")?["a"] as? Int, 1)
+    }
+
+    func testCloudErrorBodyRedactsAPIKeyAndBearerTokens() {
+        let key = "sk-live-super-secret-9999"
+        let body = #"{"error":{"message":"Upstream proxy rejected Authorization: Bearer sk-live-super-secret-9999 and Bearer tok_other_secret_12345"}}"#
+        let summary = CloudChatClient.redactedErrorSummary(body, apiKey: key)
+        XCTAssertFalse(summary.contains(key), "API key must never appear in error summary: \(summary)")
+        XCTAssertFalse(summary.contains("tok_other_secret_12345"), "Echoed Bearer token must be redacted: \(summary)")
+        XCTAssertTrue(summary.contains("[redacted]"), "Summary should mark redacted credentials: \(summary)")
     }
 
     func testFragmentedToolCallArgumentsAssembleBeforeTheBackendSeesThem() throws {
@@ -175,7 +184,7 @@ final class CloudAgentBackendLogicTests: XCTestCase {
         let call = try XCTUnwrap(result.toolCalls.first)
         XCTAssertEqual(call.name, "file_read")
         XCTAssertEqual(call.argumentsJSON, "{\"path\":\"main.swift\"}")
-        let decoded = CloudAgentBackend.arguments(from: call.argumentsJSON)
+        let decoded = try XCTUnwrap(CloudAgentBackend.arguments(from: call.argumentsJSON))
         XCTAssertEqual(decoded["path"] as? String, "main.swift")
     }
 

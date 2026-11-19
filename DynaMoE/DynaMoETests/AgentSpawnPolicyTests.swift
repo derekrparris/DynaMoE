@@ -675,4 +675,115 @@ final class AgentSpawnPolicyTests: XCTestCase {
         let required = try XCTUnwrap(parameters["required"]?.value as? [String])
         XCTAssertEqual(required, ["role", "task_description"])
     }
+
+    // MARK: - Legacy backend approval & argument refusal (B1 & M5)
+
+    func testLegacyTestRunnerRequiresApprovalEvenWithExplorePresetOrReadOnlyAllowedTools() {
+        let suiteName = "AgentSpawnPolicyTests-legacy-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        // Default (unset) backend resolves to legacy.
+
+        XCTAssertTrue(
+            AgentHarness.spawnSubagentRequiresApproval(
+                arguments: [
+                    "role": "Test Runner",
+                    "preset": "explore",
+                    "backend": "legacy",
+                    "task_description": "run `echo hi`"
+                ],
+                mode: .code,
+                defaults: defaults
+            ),
+            "Legacy Test Runner runs shell commands regardless of preset and must require approval"
+        )
+        XCTAssertTrue(
+            AgentHarness.spawnSubagentRequiresApproval(
+                arguments: [
+                    "role": "Test Runner",
+                    "allowed_tools": ["file_read"],
+                    "task_description": "run `echo hi`"
+                ],
+                mode: .code,
+                defaults: defaults
+            ),
+            "Legacy Test Runner ignores allowed_tools and must require approval"
+        )
+        XCTAssertFalse(
+            AgentHarness.spawnSubagentRequiresApproval(
+                arguments: [
+                    "role": "Codebase Researcher",
+                    "backend": "legacy",
+                    "task_description": "inspect files"
+                ],
+                mode: .code,
+                defaults: defaults
+            ),
+            "Read-only legacy archetypes still run without a card"
+        )
+    }
+
+    func testLegacySpawnRefusesIsolationBudgetAndPreset() async throws {
+        let tool = SpawnSubagentTool()
+        let res = try await tool.execute(
+            arguments: [
+                "role": "Codebase Researcher",
+                "task_description": "inspect",
+                "backend": "legacy",
+                "isolation": "worktree",
+                "budget": ["max_steps": 3],
+                "preset": "explore"
+            ],
+            workingDirectory: nil,
+            maxOutputLength: 2_000
+        )
+        XCTAssertNotNil(res.stderr, "Legacy spawn must refuse isolation/budget/preset")
+        let err = res.stderr ?? res.resultJSON
+        XCTAssertTrue(err.contains("isolation"), err)
+        XCTAssertTrue(err.contains("budget"), err)
+        XCTAssertTrue(err.contains("preset"), err)
+    }
+
+    func testSendSubagentMessageGatingForLegacyTestRunnerAndPlanMode() async throws {
+        let instance = SubagentManager.shared.spawn(
+            role: "Test Runner",
+            taskDescription: "run `sleep 5`",
+            parentMode: .code,
+            notifiesOnFinish: false
+        )
+        defer {
+            instance.cancel(reason: "test teardown")
+            SubagentManager.shared.clearCompleted()
+        }
+
+        XCTAssertTrue(
+            AgentHarness.requiresApproval(
+                toolName: "send_subagent_message",
+                arguments: ["subagent_id": instance.id.uuidString, "message": "run `echo hi`"],
+                mode: .code
+            ),
+            "Messaging a legacy Test Runner in Code Mode must require operator approval"
+        )
+        XCTAssertFalse(
+            AgentHarness.requiresApproval(
+                toolName: "send_subagent_message",
+                arguments: ["subagent_id": instance.id.uuidString, "message": "run `echo hi`"],
+                mode: .plan
+            ),
+            "Plan Mode refuses the tool directly rather than showing an approval card"
+        )
+
+        let previousMode = AgentHarness.shared.activeMode
+        AgentHarness.shared.setActiveMode(.plan)
+        defer { AgentHarness.shared.setActiveMode(previousMode) }
+        let sendResult = try await SendSubagentMessageTool().execute(
+            arguments: ["subagent_id": instance.id.uuidString, "message": "run `echo hi`"],
+            workingDirectory: nil,
+            maxOutputLength: 2_000
+        )
+        XCTAssertTrue(
+            (sendResult.stderr ?? sendResult.resultJSON).contains("Plan Mode cannot send directives"),
+            sendResult.resultJSON
+        )
+    }
 }

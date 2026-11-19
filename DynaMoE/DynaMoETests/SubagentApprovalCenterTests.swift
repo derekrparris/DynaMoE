@@ -101,7 +101,7 @@ final class SubagentApprovalCenterTests: XCTestCase {
     func testTheApprovalTimeoutDefaultsToTenMinutes() {
         XCTAssertEqual(
             SubagentApprovalCenter.resolvedApprovalTimeout(defaults: freshDefaults()),
-            SubagentApprovalCenter.defaultApprovalTimeout
+            600
         )
     }
 

@@ -293,16 +293,18 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 break
             }
             let loweredReason = turn.finishReason.lowercased()
-            let unusableReason = Self.finishReasonIsTruncated(turn.finishReason)
-                || loweredReason == "toolfreeze"
+            let alwaysUnusable = Self.finishReasonIsTruncated(turn.finishReason)
                 || loweredReason == "degeneratecycle"
                 || loweredReason == "stopped"
-            if turn.calls.isEmpty, unusableReason {
-                // A token-capped turn is a fragment. A `toolFreeze` with no
-                // executable call is the local parser filtering a malformed
-                // one: the turn stopped on a call boundary that produced
-                // nothing to run. `degenerateCycle` and `stopped` are the
-                // decode loop's own "no positive break reason" endings.
+            let emptyToolFreeze = turn.calls.isEmpty && loweredReason == "toolfreeze"
+            if alwaysUnusable || emptyToolFreeze {
+                // A token-capped turn is a fragment — even if it contains a
+                // partial tool call (such as a cut-off `complete`). Executing a
+                // truncated call can fabricate completion or run with missing
+                // arguments. `toolFreeze` is only unusable when it produced no
+                // executable call (the local parser's normal tool stop uses
+                // `toolFreeze` with calls). `degenerateCycle` and `stopped` are
+                // the decode loop's own "no positive break reason" endings.
                 status = .failed
                 switch loweredReason {
                 case "toolfreeze":
@@ -312,13 +314,20 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 case "stopped":
                     failure = "The backend's decode loop stopped without reaching an end-of-turn reason, so its text is a fragment."
                 default:
-                    failure = "The backend stopped at its token limit (finish reason '\(turn.finishReason)') before the run finished, so its text is a fragment rather than an answer."
+                    failure = "The backend stopped at its token limit (finish reason '\(turn.finishReason)') before the run finished, so its output is truncated rather than usable."
                 }
                 append(kind: .status, step: step, text: failure)
                 break
             }
 
             guard !turn.calls.isEmpty else {
+                let trimmed = turn.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty {
+                    status = .failed
+                    failure = "The backend returned an empty turn with no tool calls and no final answer."
+                    append(kind: .status, step: step, text: failure)
+                    break
+                }
                 finished = true
                 break
             }
@@ -352,6 +361,43 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                     emit(.toolFinished(record))
                 }
             }
+            func rejectCall(
+                _ call: AgentToolCall,
+                offset: Int,
+                recordStatus: ToolExecutionStatus,
+                error: String
+            ) async -> Bool {
+                let record = ToolCallRecord(
+                    name: call.name,
+                    arguments: call.arguments.mapValues { String(describing: $0) },
+                    rawArguments: call.rawArguments,
+                    status: recordStatus,
+                    output: AgentHarness.renderToolResultForModel(AgentHarness.toolErrorJSON(tool: call.name, error: error)),
+                    error: error
+                )
+                // A refusal is still a tool call the model made. It used to
+                // `continue` before both loop guards saw it, so a model that
+                // kept calling a tool it was never given (or emitting malformed
+                // arguments) ran until its step budget with no escalation.
+                usage.toolCalls += 1
+                await context.noteToolOutcome(record, call: call)
+                append(kind: .toolResult, step: step, record: record)
+                messages.append(.toolResult(callId: call.id, name: call.name, content: error, isError: true))
+                emit(.toolFinished(record))
+                if let tripped = await context.trippedGuard() {
+                    status = .blocked
+                    failure = "The run was stopped by its loop guard: \(tripped)."
+                    append(kind: .status, step: step, text: failure)
+                    recordAbandoned(
+                        turn.calls[(offset + 1)...],
+                        reason: "the run's loop guard stopped it."
+                    )
+                    finishedRun = true
+                    return true
+                }
+                return false
+            }
+
             for (offset, call) in turn.calls.enumerated() {
                 if Task.isCancelled {
                     status = .cancelled
@@ -362,32 +408,21 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 }
                 if !context.allowedTools.contains(call.name) {
                     let error = "Tool '\(call.name)' is not in this run's allowed tools (\(context.allowedTools.sorted().joined(separator: ", ")))."
-                    let record = ToolCallRecord(
-                        name: call.name,
-                        arguments: call.arguments.mapValues { String(describing: $0) },
-                        rawArguments: call.rawArguments,
-                        status: .withheld,
-                        output: AgentHarness.renderToolResultForModel(AgentHarness.toolErrorJSON(tool: call.name, error: error)),
-                        error: error
-                    )
-                    // A refusal is still a tool call the model made. It used to
-                    // `continue` before both loop guards saw it, so a model that
-                    // kept calling a tool it was never given ran until its step
-                    // budget with no escalation.
-                    usage.toolCalls += 1
-                    await context.noteToolOutcome(record, call: call)
-                    append(kind: .toolResult, step: step, record: record)
-                    messages.append(.toolResult(callId: call.id, name: call.name, content: error, isError: true))
-                    emit(.toolFinished(record))
-                    if let tripped = await context.trippedGuard() {
-                        status = .blocked
-                        failure = "The run was stopped by its loop guard: \(tripped)."
-                        append(kind: .status, step: step, text: failure)
-                        recordAbandoned(
-                            turn.calls[(offset + 1)...],
-                            reason: "the run's loop guard stopped it."
-                        )
-                        finishedRun = true
+                    if await rejectCall(call, offset: offset, recordStatus: .withheld, error: error) {
+                        break
+                    }
+                    continue
+                }
+                if call.argumentsMalformed {
+                    let error = "Malformed arguments JSON — this call was not executed."
+                    if await rejectCall(call, offset: offset, recordStatus: .error, error: error) {
+                        break
+                    }
+                    continue
+                }
+                if await AgentHarness.hasEmptyRequiredArguments(toolName: call.name, arguments: call.arguments) {
+                    let error = "Missing or empty required arguments for '\(call.name)' — this call was not executed."
+                    if await rejectCall(call, offset: offset, recordStatus: .error, error: error) {
                         break
                     }
                     continue

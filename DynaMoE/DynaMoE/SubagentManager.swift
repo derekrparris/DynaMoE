@@ -458,6 +458,13 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     /// `worktreeGone`. `finishRun` writes the record this feeds.
     func forgetDiscardedWorktree() {
         recordedIsolation = AgentIsolation.none
+        // If Stop/cancel already latched `isFinished` and persisted `.worktree`
+        // before the queued run could discard its unused worktree, `finishRun`
+        // returns early without writing again. Persist here so disk matches
+        // memory and the record is not left retention-exempt / `worktreeGone`.
+        if hasFinished() {
+            persistRecord()
+        }
     }
 
     /// Whether this run still holds worktree work nobody has landed, read from
@@ -532,12 +539,11 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         persistRecord()
     }
 
-    /// Records that an apply kept the run's branch because it holds commits a
-    /// patch cannot carry. The worktree may be gone, but the branch is the
-    /// only copy of that committed work and the operator has to land or delete
-    /// it themselves.
+    /// Records that an apply kept the run's branch because it holds commits
+    /// outside the applied working tree (e.g. the run switched away from its
+    /// branch after committing on it).
     func noteKeptBranch(_ branch: String) async {
-        let note = "The patch was applied, but branch '\(branch)' was kept because it holds commits a patch cannot carry. Merge or delete it manually when you are done."
+        let note = "The patch was applied, but branch '\(branch)' was kept because it holds commits outside the applied working tree. Inspect or delete it manually when you are done."
         if var current = report {
             current.openQuestions.append(note)
             report = current
@@ -1365,9 +1371,25 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         report += "### Output:\n```\n\(cleanOut.isEmpty ? stderr : cleanOut)\n```\n"
 
         // Fold in coordinator directive commands (e.g. "run `swift build --verbose`").
+        // Re-check Plan Mode on every directive: if the operator switched to
+        // Plan Mode while this Test Runner was already running, queued
+        // directives must not become an unaudited shell channel.
         var directiveNotes: [String] = []
         for msg in drainUnconsumedMessages() {
             if let directiveCmd = SubagentToolExecutor.extractShellCommand(from: msg.content) {
+                let inPlanMode = await MainActor.run { AgentHarness.shared.activeMode == .plan }
+                guard canRunShellCommands && !inPlanMode else {
+                    let note = "Directive command `\(directiveCmd)` withheld: Plan Mode is active and cannot execute shell commands."
+                    await recordStep(
+                        actionName: "shell_run",
+                        arguments: ["command": "<withheld in plan mode>"],
+                        output: note,
+                        duration: 0,
+                        isError: true
+                    )
+                    directiveNotes.append(note)
+                    continue
+                }
                 let (dExit, dOut, dErr, _) = await runShell(directiveCmd)
                 directiveNotes.append("Directive command `\(directiveCmd)` → exit code \(dExit):")
                 directiveNotes.append("```\n\(String((dOut.isEmpty ? dErr : dOut).prefix(1500)))\n```")
@@ -2287,7 +2309,9 @@ public final class SubagentManager: ObservableObject {
         lock.unlock()
         // A live run is stopped, not discarded: deleting its record underneath
         // it would drop its terminal write and leave an unstoppable worker.
-        guard instance == nil || instance?.status.isTerminal == true else { return }
+        // Also wait until execution has unwound (the same gate Apply uses) so
+        // Stop→Discard cannot `git worktree remove` under a still-exiting child.
+        guard instance == nil || (instance?.status.isTerminal == true && instance?.isExecutionUnwound == true) else { return }
         // An apply owns the record and the worktree while it runs. Discarding
         // mid-apply could delete the record after the patch landed (changes
         // with nothing naming them) or race cleanup against git.

@@ -594,12 +594,17 @@ private struct SubagentRunDetailView: View {
     @State private var applyError: String?
     @State private var applyNotice: String?
     @State private var appliedHereAt: Date?
+    @State private var keptIgnoredHere: [String] = []
     @State private var confirmDiscard = false
 
     /// The record is a value snapshot, so an apply performed from this pane is
     /// shown from local state until the parent reloads; the two are the same
     /// date once it does.
     private var appliedAt: Date? { appliedHereAt ?? record.appliedAt }
+
+    private var hasKeptIgnoredFiles: Bool {
+        !(record.keptIgnoredFiles?.isEmpty ?? true) || !keptIgnoredHere.isEmpty
+    }
 
     private var canApplyChanges: Bool {
         appliedHereAt == nil && SubagentApplyControl.canApply(
@@ -608,15 +613,18 @@ private struct SubagentRunDetailView: View {
         )
     }
 
-    /// Only a finished, still-unapplied isolated run needs a per-run discard:
-    /// every other finished run is what "Clear Finished" removes. Showing it
-    /// beside Apply makes the keep-or-discard decision the worktree's own.
+    /// Any finished isolated run that still holds a worktree (either unapplied,
+    /// or applied with git-ignored files kept in the tree) needs a per-run
+    /// discard: "Clear Finished" deliberately skips both so work is never lost
+    /// in bulk. Wait for execution to unwind so Stop→Discard cannot remove the
+    /// tree under a still-exiting child.
     private var canDiscard: Bool {
         record.status.isTerminal
             && record.isolation.isIsolated
-            && appliedAt == nil
+            && (appliedAt == nil || hasKeptIgnoredFiles)
             && !isApplying
             && !SubagentApplyService.isRunInFlight(record.id)
+            && (SubagentManager.shared.getSubagent(byId: record.id)?.isExecutionUnwound ?? true)
     }
 
     var body: some View {
@@ -649,7 +657,11 @@ private struct SubagentRunDetailView: View {
                 .disabled(isApplying || SubagentApplyService.isRunInFlight(record.id))
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("The run's record and its unapplied worktree are deleted. Its branch is removed too. This cannot be undone; apply the run first if you want to keep the work.")
+            if appliedAt != nil {
+                Text("This run's tracked changes are already applied. Discarding deletes its record, its kept worktree (including any git-ignored files), and its branch. This cannot be undone.")
+            } else {
+                Text("The run's record and its unapplied worktree are deleted. Its branch is removed too. This cannot be undone; apply the run first if you want to keep the work.")
+            }
         }
     }
 
@@ -1158,11 +1170,12 @@ private struct SubagentRunDetailView: View {
             do {
                 let outcome = try await SubagentApplyControl.apply(runId: record.id)
                 appliedHereAt = outcome.appliedAt
+                keptIgnoredHere = outcome.keptIgnoredFiles
                 if !outcome.keptIgnoredFiles.isEmpty {
                     applyNotice = "Applied the tracked patch, but kept the worktree: it also holds git-ignored files a patch cannot carry (\(outcome.keptIgnoredFiles.joined(separator: ", "))). Retrieve them manually before clearing the run."
                 }
                 if outcome.keptBranch {
-                    let branchNote = "Kept branch '\(outcome.branch)' because it holds commits a patch cannot carry. Merge or delete it manually when you are done."
+                    let branchNote = "Kept branch '\(outcome.branch)' because it holds commits outside the applied working tree. Inspect or delete it manually when you are done."
                     applyNotice = [applyNotice, branchNote].compactMap { $0 }.joined(separator: " ")
                 }
                 onRecordChanged()

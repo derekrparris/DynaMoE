@@ -2047,4 +2047,99 @@ final class WorkspaceIsolationTests: XCTestCase {
         )
         XCTAssertTrue(FileManager.default.fileExists(atPath: worktree.path.path))
     }
+
+    /// M2: `snapshot` diffs `baseCommit` against the working tree, so commits
+    /// made on the worktree's branch are already carried by the patch. Applying
+    /// a committing implementer run must delete the branch cleanly instead of
+    /// leaking it with a bogus "holds commits a patch cannot carry" notice.
+    func testApplyingACommittingRunRemovesItsBranchWhenHeadIsOnBranch() async throws {
+        let runId = UUID()
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: runId,
+            root: worktreeRoot
+        )
+        let committedFile = worktree.path.appendingPathComponent("committed.txt")
+        try "committed by agent\n".write(to: committedFile, atomically: true, encoding: .utf8)
+        _ = try await git(["add", "committed.txt"], in: worktree.path)
+        _ = try await git(["commit", "-m", "agent commit"], in: worktree.path)
+
+        let record = AgentRunRecord(
+            id: runId,
+            role: "Implementer",
+            preset: .implementer,
+            task: "Commit a file.",
+            backend: .scripted,
+            workingDirectory: worktree.path.path,
+            isolation: worktree.isolation,
+            allowedTools: ["file_write", "git_commit"],
+            status: .completed,
+            repositoryRoot: repository.path,
+            baseCommit: worktree.baseCommit
+        )
+        AgentRunStore.shared.saveImmediately(record)
+        defer {
+            AgentRunStore.shared.delete(runId: runId, sessionId: nil)
+            try? FileManager.default.removeItem(at: repository.appendingPathComponent("committed.txt"))
+        }
+
+        let outcome = try await SubagentApplyService.apply(runId: runId)
+        XCTAssertFalse(outcome.keptBranch, "A normal committing run's changes are in the patch, so its branch must not be leaked")
+        XCTAssertEqual(outcome.changedFiles, ["committed.txt"])
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: repository.appendingPathComponent("committed.txt").path),
+            "Committed file must land in the main working tree"
+        )
+        let branchCheck = try await AgentHarness.runProcess(
+            executableURL: URL(fileURLWithPath: "/usr/bin/git"),
+            arguments: ["rev-parse", "--verify", "refs/heads/\(worktree.branch)"],
+            currentDirectory: repository
+        )
+        XCTAssertNotEqual(branchCheck.exitCode, 0, "Worktree branch should be deleted after clean apply")
+    }
+
+    /// M3: Calling `forgetDiscardedWorktree()` after `cancel()` has already
+    /// latched `isFinished` must persist `.none` to disk so the record does not
+    /// stay retention-exempt / `worktreeGone` after relaunch.
+    func testForgettingDiscardedWorktreeAfterCancelPersistsClearedIsolation() async throws {
+        let runId = UUID()
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: runId,
+            root: worktreeRoot
+        )
+        defer { Task { await WorkspaceIsolation.cleanup(worktree) } }
+
+        let backend = ScriptedBackend(turns: [.init(text: "never runs")])
+        let plan = AgentSpawnPlan(
+            role: "Implementer",
+            taskDescription: "Queued work",
+            contextSummary: nil,
+            preset: .implementer,
+            backendDescriptor: .scripted,
+            schedulingClass: .cloud(providerId: "scripted"),
+            backend: backend,
+            toolNames: ["file_write"],
+            budget: AgentBudget(maxSteps: 4, maxCompletionTokens: 4_000, maxWallClockSeconds: 60, maxCostUSD: nil),
+            approvalPolicy: .spawnOnly,
+            isolation: worktree.isolation,
+            thinking: false,
+            sampling: .default,
+            priority: .userRequested,
+            parentSessionId: nil,
+            parentTurnId: nil,
+            workingDirectory: worktree.path,
+            repositoryRoot: repository,
+            baseCommit: worktree.baseCommit
+        )
+        let instance = SubagentInstance(id: runId, plan: plan)
+        defer { AgentRunStore.shared.delete(runId: runId, sessionId: nil) }
+
+        instance.cancel(reason: "Stopped while queued.")
+        instance.forgetDiscardedWorktree()
+
+        let stored = try XCTUnwrap(AgentRunStore.shared.loadAny(runId: runId))
+        XCTAssertEqual(stored.isolation, .none, "Persisted record must clear isolation after queued worktree discard")
+        XCTAssertFalse(stored.holdsWorktreeWork)
+    }
 }
