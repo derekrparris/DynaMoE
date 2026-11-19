@@ -2497,6 +2497,16 @@ public final class SpawnSubagentTool: AgentTool {
             ?? (inRunScope ? nil : AgentHarness.shared.currentSessionId)
         let parentTurnId = AgentHarness.executingTurnId
             ?? (inRunScope ? nil : AgentHarness.shared.currentTurnId)
+
+        // Reserve a per-session spawn slot BEFORE `AgentSpawnResolver.resolve`
+        // (and before any git worktree or legacy pipeline starts) so a batch of
+        // `spawn_subagent` calls cannot create unbounded worktrees or unprunable
+        // records.
+        guard let spawnSlot = SubagentManager.shared.tryReserveSpawnSlot(forSession: parentSessionId) else {
+            let err = "This conversation already has \(SubagentManager.defaultMaxActiveSubagentsPerSession) active subagent runs (the per-conversation limit). Wait for an active run to finish or stop one before spawning another."
+            return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: err), nil, err, false)
+        }
+        defer { SubagentManager.shared.releaseSpawnSlot(spawnSlot, forSession: parentSessionId) }
         if backendSelection.error == nil, backendSelection.modelBacked {
             let runId = UUID()
             // Priced ONCE, from the same pin and measured rate the backend
@@ -2644,12 +2654,19 @@ public final class SpawnSubagentTool: AgentTool {
             return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: err), nil, err, false)
         }
         guard !Task.isCancelled else { return Self.stoppedBeforeStartResult() }
+        let boundedTask = AgentSpawnResolver.boundedSpawnText(
+            taskDesc,
+            limit: AgentSpawnResolver.maxTaskDescriptionCharacters
+        )
+        let boundedContext = contextSummary.map {
+            AgentSpawnResolver.boundedSpawnText($0, limit: AgentSpawnResolver.maxContextSummaryCharacters)
+        }
         let subagent = SubagentManager.shared.spawn(
             role: role,
-            taskDescription: taskDesc,
+            taskDescription: boundedTask,
             allowedTools: allowedTools,
             parentMode: parentMode,
-            contextSummary: contextSummary,
+            contextSummary: boundedContext,
             parentSessionId: parentSessionId,
             parentTurnId: parentTurnId,
             workingDirectory: workingDirectory,
@@ -3009,9 +3026,9 @@ public final class GetSubagentStatusTool: AgentTool {
         let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeText(readable), limit: maxOutputLength)
         let res = AgentHarness.toolSuccessJSON(tool: "get_subagent_status", data: data)
 
-        if isTerminal && !subagent.finalSummary.isEmpty {
-            await MainActor.run { subagent.isSummaryRelayed = true }
-        }
+        // Do NOT mark `isSummaryRelayed = true` on a status read: a Stop, quota
+        // error, or app quit before the coordinator replies would consume the
+        // report forever. Every other path marks only on proven delivery.
         return (res, cleanOut, nil, false)
     }
 }
@@ -3347,7 +3364,8 @@ public final class ApplySubagentChangesTool: AgentTool {
                     "type": "string",
                     "description": "Alias for subagent_id."
                 ]
-            ])
+            ]),
+            "required": AnyCodable(["subagent_id"])
         ]
     )
 
@@ -3360,6 +3378,26 @@ public final class ApplySubagentChangesTool: AgentTool {
         guard let raw,
               let runId = UUID(uuidString: raw.trimmingCharacters(in: .whitespacesAndNewlines)) else {
             let err = "Error: missing or invalid 'subagent_id' parameter in apply_subagent_changes"
+            return (AgentHarness.toolErrorJSON(tool: "apply_subagent_changes", error: err), nil, err, false)
+        }
+
+        // Same conversation scope as `get_subagent_status` and
+        // `send_subagent_message`: a coordinator must not land (and then
+        // destroy) another conversation's worktree.
+        let ownerSessionId: UUID?
+        let runExists: Bool
+        if let live = SubagentManager.shared.getSubagent(byId: runId) {
+            ownerSessionId = live.parentSessionId
+            runExists = true
+        } else if let stored = AgentRunStore.shared.loadAny(runId: runId) {
+            ownerSessionId = stored.parentSessionId
+            runExists = true
+        } else {
+            ownerSessionId = nil
+            runExists = false
+        }
+        if runExists, ownerSessionId != AgentHarness.executingSessionId {
+            let err = "No subagent run with id \(runId.uuidString) was found."
             return (AgentHarness.toolErrorJSON(tool: "apply_subagent_changes", error: err), nil, err, false)
         }
 
@@ -4093,20 +4131,17 @@ public final class AgentHarness {
         return count
     }
 
-    /// Counts an identical WITHHELD call, without the reset a real mutation
-    /// performs.
+    /// Counts an identical call that DID NOT RUN (`.withheld` or `.rejected`),
+    /// without clearing any fingerprints.
     ///
-    /// `recordToolCallFingerprint` clears every count when a mutating tool runs,
-    /// because a successful write invalidates an earlier read. A withheld
-    /// `file_write` changed nothing, so counting it there would reset the
-    /// repeat guard on every refusal and let a model that keeps asking for a
-    /// tool it never had run to its step budget. It still has to count as a
-    /// repeat, which is what this does.
+    /// `recordToolCallFingerprint` clears counts when a mutating tool or
+    /// `shell_run` executes, because a real write can invalidate an earlier
+    /// read. A withheld or rejected call changed nothing, so routing it through
+    /// `recordToolCallFingerprint` reset the repeat guard on every refusal (or
+    /// dropped read fingerprints for a refused `shell_run`). Counting directly
+    /// for all tool names lets the 3-repeat limit trip on refusal loops.
     @discardableResult
     public func recordWithheldToolCall(toolName: String, arguments: [String: Any]) -> Int {
-        guard Self.mutatingToolNames.contains(toolName) else {
-            return recordToolCallFingerprint(toolName: toolName, arguments: arguments)
-        }
         let fingerprint = Self.toolCallFingerprint(toolName: toolName, arguments: arguments)
         let count = (repeatedToolCallCounts[fingerprint] ?? 0) + 1
         repeatedToolCallCounts[fingerprint] = count

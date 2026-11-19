@@ -728,9 +728,22 @@ public final class CompletionEngine: @unchecked Sendable {
                 // generated token. An attachment this engine already encoded is
                 // reused: a conversation that keeps a picture in context re-renders it
                 // every turn.
+                // Publish the turn's priority BEFORE image encoding so a
+                // foreground preemption check can see a background DS turn
+                // during its vision encode (up to ~7 s on device). Reset on any
+                // early throw before the turn task takes ownership.
                 stateLock.lock()
                 let cachedSpans = cachedImageSpans
+                activeTurnPriority = request.turnPriority
                 stateLock.unlock()
+                var deepSeekTurnLaunched = false
+                defer {
+                    if !deepSeekTurnLaunched {
+                        stateLock.lock()
+                        activeTurnPriority = .interactive
+                        stateLock.unlock()
+                    }
+                }
                 var freshSpans: [String: DeepSeekV41ImagePrompt.ImageSpan] = [:]
                 func spanKey(_ image: DeepSeekV41ImageInput) -> String {
                     "\(snapshotDir.path)|\(image.sha256)"
@@ -857,6 +870,7 @@ public final class CompletionEngine: @unchecked Sendable {
                 activeTurnCancelled = false
                 activeTurnPriority = request.turnPriority
                 stateLock.unlock()
+                deepSeekTurnLaunched = true
 
                 // The pin proposes how much of this prompt a previous turn may have
                 // left resident; the executor decides. It is the only thing that

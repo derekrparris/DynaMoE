@@ -140,7 +140,7 @@ enum SubagentNotifier {
         for request in requests {
             UNUserNotificationCenter.current().add(request) { error in
                 if let error {
-                    print("⚠️ [SubagentNotifier] could not post: \(error.localizedDescription)")
+                    DiagLog.warning("subagent.notifier", "could not post: \(error.localizedDescription)")
                 }
             }
         }

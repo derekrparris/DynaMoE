@@ -139,9 +139,9 @@ final class AgentRunContext {
 
     func noteToolOutcome(_ record: ToolCallRecord, call: AgentToolCall) {
         harness.recordToolCallOutcome(toolName: record.name, outcome: record.status.toolCallOutcome)
-        if record.status == .withheld {
-            // Counts as a repeat (so a refusal loop escalates) without the
-            // count-clearing a real mutation would cause.
+        if record.status == .withheld || record.status == .rejected {
+            // Neither ran, so neither can have mutated state or invalidated an
+            // earlier read; count as a repeat without clearing any fingerprints.
             _ = harness.recordWithheldToolCall(toolName: record.name, arguments: call.arguments)
         } else {
             _ = harness.recordToolCallFingerprint(toolName: record.name, arguments: call.arguments)

@@ -145,6 +145,15 @@ nonisolated struct LocalSubagentCostEstimate: Equatable, Sendable {
     /// card was clicked is consent the operator never gave. `approvedEstimate`
     /// is that number; nil keeps the older direct-call meaning (a caller with
     /// no card, e.g. a test or the opt-in published-turn harness).
+    /// Whether an operator approval of `approved` covers this estimate.
+    /// Re-measurements that are equal or cheaper (within floating-point noise)
+    /// are still covered; only a cost increase refuses the spawn.
+    func isCoveredBy(_ approved: LocalSubagentCostEstimate) -> Bool {
+        let tolerance = 1e-6
+        return coordinatorReprefillSeconds <= approved.coordinatorReprefillSeconds + tolerance
+            && runPrefillSeconds <= approved.runPrefillSeconds + tolerance
+    }
+
     func admits(
         operatorOverride: Bool,
         approvedEstimate: LocalSubagentCostEstimate? = nil
@@ -152,13 +161,13 @@ nonisolated struct LocalSubagentCostEstimate: Equatable, Sendable {
         guard exceedsLimit else { return true }
         guard operatorOverride else { return false }
         guard let approvedEstimate else { return true }
-        return self == approvedEstimate
+        return isCoveredBy(approvedEstimate)
     }
 
     /// Why an approved estimate no longer covers this spawn, or nil when it
     /// does.
     func approvalDriftMessage(approved: LocalSubagentCostEstimate) -> String? {
-        guard self != approved else { return nil }
+        guard !isCoveredBy(approved) else { return nil }
         return "The estimated cost changed after the card was shown (was \(approved.summary); now \(summary)). "
             + "The approval does not cover the new estimate; the run was not started. Try the spawn again to approve the current number."
     }

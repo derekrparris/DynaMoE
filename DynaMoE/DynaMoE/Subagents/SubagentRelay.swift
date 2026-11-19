@@ -17,7 +17,9 @@ import Foundation
 /// message reaches the model on every template without a per-family branch.
 nonisolated enum LocalSubagentRelay {
     static func directive(reports: [String]) -> String {
-        let context = reports.joined(separator: "\n\n")
+        let context = reports
+            .map { PromptMarkers.sanitizeControlMarkers($0) }
+            .joined(separator: "\n\n")
         return """
         <system>
         A delegated subagent finished while you were idle. You are the coordinator: the user only talks to you, and you are responsible for presenting subagent results. Answer the user's message below normally, folding this report in where it is relevant; if it is unrelated, mention the finished run briefly at the end. Do not claim you did the work yourself.

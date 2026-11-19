@@ -127,6 +127,7 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
             topP: request.sampling.topP,
             presencePenalty: nil,
             maxTokens: request.maxTokens,
+            stop: request.stopSequences.isEmpty ? nil : request.stopSequences,
             sessionKey: CloudSessionKey.hashed(request.sessionId)
         )
         let stream = client.streamTurn(
@@ -390,6 +391,36 @@ nonisolated enum SubagentBackendSettings {
     /// (`LocalSubagentCostEstimate.defaultLimitSeconds`) is a number out of the
     /// box too. 0 in the field is how the operator clears it.
     static let defaultCloudCostUSD: Double = 5
+    /// Per-conversation aggregate cloud spend cap. Bounding only a single run
+    /// still lets a coordinator spawn arbitrarily many read-only cloud runs
+    /// with no approval card. Defaults to 4× the per-run cap ($20 out of the
+    /// box) unless overridden or cleared.
+    static let sessionCloudCostCeilingKey = "dynamoe_subagent_cloud_session_max_cost_usd"
+    static let defaultSessionCloudCostMultiplier: Double = 4
+    static let maximumSessionCloudCostUSD: Double = 500
+
+    /// `nil` means "no per-conversation aggregate ceiling".
+    static func sessionCloudCostCeiling(defaults: UserDefaults = .standard) -> Double? {
+        if let stored = defaults.object(forKey: sessionCloudCostCeilingKey) as? NSNumber {
+            let ceiling = stored.doubleValue
+            guard ceiling.isFinite, ceiling > 0 else { return nil }
+            return min(ceiling, maximumSessionCloudCostUSD)
+        }
+        guard let perRun = cloudCostCeiling(defaults: defaults) else { return nil }
+        return min(perRun * defaultSessionCloudCostMultiplier, maximumSessionCloudCostUSD)
+    }
+
+    static func setSessionCloudCostCeiling(_ value: Double?, defaults: UserDefaults = .standard) {
+        guard let value else {
+            defaults.removeObject(forKey: sessionCloudCostCeilingKey)
+            return
+        }
+        guard value.isFinite, value > 0 else {
+            defaults.set(0, forKey: sessionCloudCostCeilingKey)
+            return
+        }
+        defaults.set(min(value, maximumSessionCloudCostUSD), forKey: sessionCloudCostCeilingKey)
+    }
 
     /// `nil` means "no operator ceiling". A stored 0, a negative or a
     /// non-finite value are the same answer: a $0 ceiling fails every run at

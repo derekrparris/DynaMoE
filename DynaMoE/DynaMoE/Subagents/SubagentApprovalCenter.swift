@@ -87,7 +87,7 @@ final class SubagentApprovalCenter: ObservableObject {
         // Past the cap the answer is an honest refusal rather than a card the
         // pane cannot show.
         guard !Self.refusesCard(pendingCount: pending.count) else {
-            print("⚠️ [SubagentApproval] refusing a card from \(request.toolName): \(pending.count) already pending")
+            DiagLog.warning("subagent.approval", "refusing a card from \(request.toolName): \(pending.count) already pending")
             ActionApprovalManager.shared.unregister(id: entry.id)
             return false
         }

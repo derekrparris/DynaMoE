@@ -25,6 +25,8 @@ nonisolated enum AgentSpawnError: LocalizedError, Equatable {
     case costCeilingOnUnpricedBackend(String)
     case operatorCostCeilingNeedsPricing(model: String, ceiling: Double)
     case budgetAboveOperatorCeiling(requested: Double, ceiling: Double)
+    case sessionCloudBudgetExhausted(spent: Double, ceiling: Double)
+    case sessionCloudBudgetExceeded(requested: Double, remaining: Double, ceiling: Double)
     case invalidBudgetOverride(String)
 
     var errorDescription: String? {
@@ -55,6 +57,19 @@ nonisolated enum AgentSpawnError: LocalizedError, Equatable {
             return String(
                 format: "This spawn asks for a $%.2f ceiling, above the operator's standing cloud spend cap of $%.2f per run. The run was not started. Ask for no more than the cap, or raise it under Agent & Tools.",
                 requested,
+                ceiling
+            )
+        case .sessionCloudBudgetExhausted(let spent, let ceiling):
+            return String(
+                format: "This conversation has already spent or committed $%.2f of its $%.2f aggregate cloud subagent budget. The run was not started.",
+                spent,
+                ceiling
+            )
+        case .sessionCloudBudgetExceeded(let requested, let remaining, let ceiling):
+            return String(
+                format: "This spawn asks for a $%.2f ceiling, but only $%.2f remains of this conversation's $%.2f aggregate cloud subagent budget. The run was not started.",
+                requested,
+                remaining,
                 ceiling
             )
         case .invalidBudgetOverride(let detail):
@@ -178,14 +193,31 @@ nonisolated struct AgentSpawnPlan: @unchecked Sendable {
 /// a run before it starts.
 @MainActor
 enum AgentSpawnResolver {
+    /// Maximum characters accepted in `task_description` and `context_summary`
+    /// at spawn. Prevents a coordinator pasting a 200 KB file body into a spawn
+    /// call from overflowing the subagent's context window on every step.
+    nonisolated static let maxTaskDescriptionCharacters = 24_000
+    nonisolated static let maxContextSummaryCharacters = 16_000
+
+    nonisolated static func boundedSpawnText(_ text: String, limit: Int) -> String {
+        guard text.count > limit else { return text }
+        let marker = "\n… [truncated at spawn: \(text.count) chars total]"
+        let keep = max(0, limit - marker.count)
+        return String(text.prefix(keep)) + marker
+    }
+
     static func resolve(
         _ request: AgentSpawnRequest,
         runId: UUID,
         sessionId: UUID,
         defaults: UserDefaults = .standard
     ) async throws -> AgentSpawnPlan {
-        let task = request.taskDescription.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !task.isEmpty else { throw AgentSpawnError.emptyTask }
+        let rawTask = request.taskDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawTask.isEmpty else { throw AgentSpawnError.emptyTask }
+        let task = Self.boundedSpawnText(rawTask, limit: Self.maxTaskDescriptionCharacters)
+        let contextSummary = request.contextSummary.map {
+            Self.boundedSpawnText($0, limit: Self.maxContextSummaryCharacters)
+        }
 
         let preset = AgentRolePresetCatalog.preset(named: request.presetName, role: request.role)
         let definition = AgentRolePresetCatalog.definition(for: preset)
@@ -257,6 +289,16 @@ enum AgentSpawnResolver {
         )
         budget = ceilingDecision.budget
         let usesOperatorCeiling = ceilingDecision.usesOperatorCeiling
+        if descriptor.kind == .cloud {
+            let sessionSpent = SubagentManager.shared.sessionCloudSpendUSD(forSession: request.parentSessionId)
+            budget = try Self.applySessionCloudCeiling(
+                budget: budget,
+                descriptor: descriptor,
+                usesOperatorCeiling: usesOperatorCeiling,
+                sessionSpentUSD: sessionSpent,
+                defaults: defaults
+            )
+        }
         if let problem = Self.costCeilingProblem(
             budget: budget,
             descriptor: descriptor,
@@ -292,7 +334,7 @@ enum AgentSpawnResolver {
         return AgentSpawnPlan(
             role: request.role,
             taskDescription: task,
-            contextSummary: request.contextSummary,
+            contextSummary: contextSummary,
             preset: preset,
             backendDescriptor: descriptor,
             schedulingClass: schedulingClass,
@@ -409,6 +451,46 @@ enum AgentSpawnResolver {
         var bounded = budget
         bounded.maxCostUSD = operatorCeiling
         return (bounded, true)
+    }
+
+    /// Enforces the per-conversation aggregate cloud spend cap so a coordinator
+    /// cannot multiply the per-run cap across arbitrarily many read-only cloud
+    /// spawns. Pure so unit tests can pin the rule directly.
+    nonisolated static func applySessionCloudCeiling(
+        budget: AgentBudget,
+        descriptor: AgentBackendDescriptor,
+        usesOperatorCeiling: Bool,
+        sessionSpentUSD: Double,
+        defaults: UserDefaults = .standard
+    ) throws -> AgentBudget {
+        guard descriptor.kind == .cloud,
+              let sessionCeiling = SubagentBackendSettings.sessionCloudCostCeiling(defaults: defaults) else {
+            return budget
+        }
+        let spent = max(0, sessionSpentUSD.isFinite ? sessionSpentUSD : 0)
+        let remaining = sessionCeiling - spent
+        guard remaining > 1e-6 else {
+            throw AgentSpawnError.sessionCloudBudgetExhausted(spent: spent, ceiling: sessionCeiling)
+        }
+        var bounded = budget
+        if let runCeiling = bounded.maxCostUSD {
+            if runCeiling > remaining {
+                if usesOperatorCeiling {
+                    // The run inherited the operator's default per-run cap;
+                    // trim it to the remaining conversation budget.
+                    bounded.maxCostUSD = remaining
+                } else {
+                    throw AgentSpawnError.sessionCloudBudgetExceeded(
+                        requested: runCeiling,
+                        remaining: remaining,
+                        ceiling: sessionCeiling
+                    )
+                }
+            }
+        } else {
+            bounded.maxCostUSD = remaining
+        }
+        return bounded
     }
 
     /// Why this spawn's cost ceiling cannot bind, or nil when it can.

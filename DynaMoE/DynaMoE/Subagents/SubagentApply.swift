@@ -14,6 +14,7 @@
 //  history.
 //
 
+import CryptoKit
 import Foundation
 
 nonisolated enum SubagentApplyError: LocalizedError, Equatable {
@@ -24,6 +25,8 @@ nonisolated enum SubagentApplyError: LocalizedError, Equatable {
     case beingDiscarded(String)
     case repositoryBusy(String)
     case worktreeGone(String)
+    case destinationBranchChanged(expected: String?, actual: String?)
+    case patchChangedSinceApproval
 
     var errorDescription: String? {
         switch self {
@@ -41,8 +44,25 @@ nonisolated enum SubagentApplyError: LocalizedError, Equatable {
             return "Another run from the same repository is being applied while '\(role)' is ready to land. Applying two patches to one tree at once can leave a mixed result; wait for that apply to finish."
         case .worktreeGone(let detail):
             return detail
+        case .destinationBranchChanged(let expected, let actual):
+            let was = expected.map { "branch '\($0)'" } ?? "detached HEAD"
+            let now = actual.map { "branch '\($0)'" } ?? "detached HEAD"
+            return "The destination repository moved from \(was) to \(now) while the approval card was open. Nothing was applied; review and approve again on the current branch."
+        case .patchChangedSinceApproval:
+            return "The worktree's patch changed after the approval card was shown. Nothing was applied; review and approve the current diff."
         }
     }
+}
+
+/// What the operator approved on the apply card, verified right before `git apply`
+/// writes a byte to the destination tree.
+nonisolated struct SubagentApplyExpectation: Sendable, Equatable {
+    /// The destination branch (or `nil` for detached HEAD) that was checked out
+    /// when the card was built.
+    var destinationBranch: String?
+    /// SHA-256 hex digest of the full unified diff snapshotted when the card was
+    /// built, or `nil` when no pre-approval snapshot was taken.
+    var patchDigest: String?
 }
 
 nonisolated struct SubagentApplyOutcome: Sendable {
@@ -155,7 +175,15 @@ enum SubagentApplyService {
     }
 #endif
 
-    static func apply(runId: UUID) async throws -> SubagentApplyOutcome {
+    nonisolated static func patchDigest(_ diff: String) -> String {
+        let digest = SHA256.hash(data: Data(diff.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func apply(
+        runId: UUID,
+        expectation: SubagentApplyExpectation? = nil
+    ) async throws -> SubagentApplyOutcome {
         // A discard owns this run's tree for the length of its removal, so there
         // is nothing to land and no tree to land it into.
         guard !discardsInFlight.contains(runId) else {
@@ -229,6 +257,25 @@ enum SubagentApplyService {
         defer { repositoriesInFlight.remove(repositoryClaimKey) }
 
         let changes = try await WorkspaceIsolation.snapshot(worktree, diffLimit: nil)
+
+        // Read the destination branch BEFORE writing a byte, and re-verify both
+        // the branch and the snapshotted patch digest against what the operator
+        // approved on the card so a `git checkout` or worktree edit during the
+        // approval window cannot land unreviewed bytes on the wrong branch.
+        let destinationBranch = await WorkspaceIsolation.currentBranch(of: worktree.repositoryRoot)
+        if let expectation {
+            if destinationBranch != expectation.destinationBranch {
+                throw SubagentApplyError.destinationBranchChanged(
+                    expected: expectation.destinationBranch,
+                    actual: destinationBranch
+                )
+            }
+            if let expectedDigest = expectation.patchDigest,
+               Self.patchDigest(changes.diff) != expectedDigest {
+                throw SubagentApplyError.patchChangedSinceApproval
+            }
+        }
+
         // Files a patch cannot carry (git-ignored, e.g. a `.env.local` the run
         // wrote) are only ever in the worktree. When the run also changed
         // tracked files, the patch lands below and the tree used to be deleted
@@ -285,14 +332,21 @@ enum SubagentApplyService {
             }
         }
 
-        // An apply lands on whatever the destination has CHECKED OUT, and the
-        // record is the only place that answers "where did it go" afterwards.
-        let destinationBranch = await WorkspaceIsolation.currentBranch(of: worktree.repositoryRoot)
-
         let appliedAt = Date()
+        // Captured immutable so the store's IO-queue mutation writes `appliedAt`,
+        // `appliedToBranch`, and `keptIgnoredFiles` atomically in a SINGLE
+        // durable record write. Writing `keptIgnoredFiles` in a second write
+        // left a crash window in which the 14-day retention sweep could delete
+        // the only copy of the run's ignored files.
+        let keptNames = keptIgnoredFiles
         let recordUpdated: Bool
         if let live {
-            recordUpdated = await live.markApplied(at: appliedAt, files: files, appliedTo: destinationBranch)
+            recordUpdated = await live.markApplied(
+                at: appliedAt,
+                files: files,
+                appliedTo: destinationBranch,
+                keptIgnoredFiles: keptNames
+            )
         } else {
             // Mutated against the CURRENT record on the store's IO queue, not
             // restored from the copy this apply loaded seconds ago: a
@@ -301,7 +355,35 @@ enum SubagentApplyService {
             recordUpdated = await AgentRunStore.shared.mutateAsync(runId: runId, sessionId: record.parentSessionId) { current in
                 current.appliedAt = appliedAt
                 current.appliedToBranch = destinationBranch
-                if var report = current.report, !files.isEmpty {
+                if !keptNames.isEmpty {
+                    current.keptIgnoredFiles = keptNames
+                    // A record without a report (an interrupted run, an older
+                    // schema) still deserves the kept-worktree explanation.
+                    if current.report == nil {
+                        current.report = AgentReport(
+                            status: current.status,
+                            summary: "",
+                            findings: [],
+                            changedFiles: files,
+                            diff: nil,
+                            tests: [],
+                            risks: [],
+                            openQuestions: [],
+                            usage: AgentUsage(),
+                            backend: current.backend
+                        )
+                    }
+                    if var report = current.report {
+                        let named = keptNames.joined(separator: ", ")
+                        report.openQuestions.append(
+                            "The tracked patch was applied, but the worktree was kept: it also holds files a patch cannot carry (\(named)). Retrieve them manually before clearing the run."
+                        )
+                        if !files.isEmpty {
+                            report.changedFiles = files
+                        }
+                        current.report = report
+                    }
+                } else if var report = current.report, !files.isEmpty {
                     report.changedFiles = files
                     current.report = report
                 }
@@ -330,44 +412,6 @@ enum SubagentApplyService {
             worktreeRemoved = await WorkspaceIsolation.cleanup(worktree, deleteBranch: !keptBranch)
         } else {
             worktreeRemoved = false
-            let named = keptIgnoredFiles.joined(separator: ", ")
-            // Captured immutable: the mutation closure runs on the store's
-            // queue, and the local array must not be read from there while
-            // this function could still change it.
-            let keptNames = keptIgnoredFiles
-            // The record must say why an applied run still has a worktree, or
-            // the inspector's Apply reads as unfinished business.
-            if let live {
-                await live.noteKeptIgnoredFiles(keptNames)
-            } else {
-                await AgentRunStore.shared.mutateAsync(runId: runId, sessionId: record.parentSessionId) { current in
-                    current.appliedAt = appliedAt
-                    current.appliedToBranch = destinationBranch
-                    current.keptIgnoredFiles = keptNames
-                    // A record without a report (an interrupted run, an older
-                    // schema) still deserves the kept-worktree explanation.
-                    if current.report == nil {
-                        current.report = AgentReport(
-                            status: current.status,
-                            summary: "",
-                            findings: [],
-                            changedFiles: files,
-                            diff: nil,
-                            tests: [],
-                            risks: [],
-                            openQuestions: [],
-                            usage: AgentUsage(),
-                            backend: current.backend
-                        )
-                    }
-                    if var report = current.report {
-                        report.openQuestions.append(
-                            "The tracked patch was applied, but the worktree was kept: it also holds files a patch cannot carry (\(named)). Retrieve them manually before clearing the run."
-                        )
-                        current.report = report
-                    }
-                }
-            }
         }
 
         if keptBranch {
@@ -447,14 +491,35 @@ enum SubagentApplyControl {
         return FileManager.default.fileExists(atPath: path)
     }
 
+    /// Maximum characters of unified diff included on an approval card so the
+    /// operator reviews the actual bytes without turning the card into a wall.
+    nonisolated static let cardDiffPreviewLimit = 4_000
+
+    /// Renders a bounded, sanitized diff preview for an operator-facing card.
+    nonisolated static func formattedDiffPreview(_ diff: String?, limit: Int = cardDiffPreviewLimit) -> String? {
+        guard let diff else { return nil }
+        let clean = AgentHarness.sanitizeText(diff).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return nil }
+        if clean.count <= limit { return clean }
+        let remaining = clean.count - limit
+        return String(clean.prefix(limit)) + "\n… [\(remaining) more characters]"
+    }
+
     /// The card the operator sees. `destination` is the main working tree the
     /// patch lands in, resolved by `apply` when the worktree still names it.
-    /// `diffStat` is `git diff --stat` for the worktree, so the decision is
-    /// made against the files that will change rather than a count.
+    /// `destinationBranch` is the checked-out branch of `destination` (or nil
+    /// when unresolved / detached HEAD; pass `destinationBranchResolved: true`
+    /// when a nil branch specifically means detached HEAD). `diffStat` is
+    /// `git diff --stat` for the worktree, and `diffPreview` (defaulting to
+    /// `record.report?.diff`) puts the actual patch bytes on the card so the
+    /// operator approves the diff rather than only a file count.
     static func applyRequest(
         for record: AgentRunRecord,
         destination: String? = nil,
+        destinationBranch: String? = nil,
+        destinationBranchResolved: Bool = false,
         diffStat: String? = nil,
+        diffPreview: String? = nil,
         destinationNote: String? = nil
     ) -> AgentApprovalRequest? {
         guard canApply(record),
@@ -471,7 +536,15 @@ enum SubagentApplyControl {
         // worktree it no longer owns rather than following its `.git` pointer,
         // so naming it on the card keeps the approval attached to that tree.
         let destinationText = destination ?? "the main working tree (resolved when the apply runs)"
-        var reason = "Apply \(summary) from \(branch) to \(destinationText). Changes land unstaged."
+        let branchClause: String
+        if let destinationBranch {
+            branchClause = " (branch '\(Self.displayPath(destinationBranch, limit: 120))')"
+        } else if destinationBranchResolved {
+            branchClause = " (detached HEAD)"
+        } else {
+            branchClause = ""
+        }
+        var reason = "Apply \(summary) from \(branch) to \(destinationText)\(branchClause). Changes land unstaged."
         if let destinationNote, !destinationNote.isEmpty {
             reason += "\n\n" + destinationNote
         }
@@ -485,14 +558,23 @@ enum SubagentApplyControl {
             let more = files.count > 10 ? "\n… and \(files.count - 10) more" : ""
             reason += "\n\n" + named + more
         }
+        if let preview = Self.formattedDiffPreview(diffPreview ?? record.report?.diff) {
+            reason += "\n\n" + preview
+        }
+        var arguments: [String: String] = [
+            "subagent_id": record.id.uuidString,
+            "branch": branch,
+            "worktree": path
+        ]
+        if let destinationBranch {
+            arguments["destination_branch"] = destinationBranch
+        } else if destinationBranchResolved {
+            arguments["destination_branch"] = "(detached HEAD)"
+        }
         return AgentApprovalRequest(
             runId: record.id,
             toolName: "apply_subagent_changes",
-            arguments: [
-                "subagent_id": record.id.uuidString,
-                "branch": branch,
-                "worktree": path
-            ],
+            arguments: arguments,
             workingDirectory: destination,
             reason: reason
         )
@@ -541,13 +623,26 @@ enum SubagentApplyControl {
     /// The pure form, so a card can build it from a record it read OFF the
     /// main actor. `loadAny` is a synchronous `ioQueue.sync`, so calling it in
     /// a view body parked the UI behind every queued run write.
-    nonisolated static func approvalSummary(for record: AgentRunRecord, destinationNote: String? = nil) -> String? {
+    nonisolated static func approvalSummary(
+        for record: AgentRunRecord,
+        destinationBranch: String? = nil,
+        destinationBranchResolved: Bool = false,
+        destinationNote: String? = nil
+    ) -> String? {
         guard case .worktree(_, let branch) = record.isolation else { return nil }
         // A record with no stored root has no destination that can be named
         // without following the sandbox-writable `.git` pointer, which is the
         // one thing the apply path refuses to trust: say so rather than
         // naming the WORKTREE as if it were the tree the patch lands in.
         let destination = record.repositoryRoot ?? "the main working tree (resolved when the apply runs)"
+        let branchClause: String
+        if let destinationBranch {
+            branchClause = " (branch '\(Self.displayPath(destinationBranch, limit: 120))')"
+        } else if destinationBranchResolved {
+            branchClause = " (detached HEAD)"
+        } else {
+            branchClause = ""
+        }
         let files = record.report?.changedFiles ?? []
         let count: String
         switch files.count {
@@ -555,7 +650,7 @@ enum SubagentApplyControl {
         case 1: count = "1 changed file"
         default: count = "\(files.count) changed files"
         }
-        var summary = "Applies \(count) from \(branch) to \(destination). Changes land unstaged."
+        var summary = "Applies \(count) from \(branch) to \(destination)\(branchClause). Changes land unstaged."
         if let destinationNote, !destinationNote.isEmpty {
             summary += "\n" + destinationNote
         }
@@ -564,6 +659,9 @@ enum SubagentApplyControl {
             // through the same one-line sanitization as the inspector's.
             summary += "\n" + files.prefix(8).map { Self.displayPath($0) }.joined(separator: ", ")
             if files.count > 8 { summary += ", …" }
+        }
+        if let preview = Self.formattedDiffPreview(record.report?.diff) {
+            summary += "\n\n" + preview
         }
         return summary
     }
@@ -599,18 +697,37 @@ enum SubagentApplyControl {
                 for: URL(fileURLWithPath: path, isDirectory: true)
             )?.path
         }
-        // Read the stat from the worktree the apply reads, so the card lists
-        // the changes rather than a count that can be stale.
-        let stat = await WorkspaceIsolation.diffStat(
-            AgentWorktree(
-                runId: record.id,
-                repositoryRoot: destination.map { URL(fileURLWithPath: $0, isDirectory: true) }
-                    ?? URL(fileURLWithPath: path, isDirectory: true),
-                path: URL(fileURLWithPath: path, isDirectory: true),
-                branch: branch,
-                baseCommit: record.baseCommit ?? ""
-            )
-        )
+        let destinationURL = destination.map { URL(fileURLWithPath: $0, isDirectory: true) }
+        let destinationBranch: String?
+        let destinationBranchResolved: Bool
+        if let destinationURL {
+            destinationBranch = await WorkspaceIsolation.currentBranch(of: destinationURL)
+            destinationBranchResolved = true
+        } else {
+            destinationBranch = nil
+            destinationBranchResolved = false
+        }
+
+        // Snapshot the worktree BEFORE raising the card so we can show the
+        // actual diff preview and bind the approval to both the destination
+        // branch and the exact patch digest.
+        var stat: String? = nil
+        var diffPreview: String? = record.report?.diff
+        var patchDigest: String? = nil
+        if let worktree = try? await WorkspaceIsolation.open(
+            path: path,
+            branch: branch,
+            repositoryRoot: destinationURL,
+            baseCommit: record.baseCommit
+        ) {
+            stat = await WorkspaceIsolation.diffStat(worktree)
+            if let preApprovalChanges = try? await WorkspaceIsolation.snapshot(worktree, diffLimit: nil) {
+                patchDigest = SubagentApplyService.patchDigest(preApprovalChanges.diff)
+                if diffPreview == nil || diffPreview?.isEmpty == true {
+                    diffPreview = preApprovalChanges.diff
+                }
+            }
+        }
         // The patch lands on whatever the destination has checked out, and a
         // dirty destination is the usual reason an apply conflicts. Saying so
         // on the card is what lets the operator stash or commit first instead
@@ -619,7 +736,10 @@ enum SubagentApplyControl {
         guard let request = applyRequest(
             for: record,
             destination: destination,
+            destinationBranch: destinationBranch,
+            destinationBranchResolved: destinationBranchResolved,
             diffStat: stat,
+            diffPreview: diffPreview,
             destinationNote: destinationNote
         ) else {
             throw SubagentApplyControlError.nothingToApply(record.role)
@@ -636,6 +756,9 @@ enum SubagentApplyControl {
             )
         }
         guard await ask(request) else { throw SubagentApplyControlError.approvalDenied }
-        return try await SubagentApplyService.apply(runId: runId)
+        let expectation: SubagentApplyExpectation? = destinationBranchResolved
+            ? SubagentApplyExpectation(destinationBranch: destinationBranch, patchDigest: patchDigest)
+            : nil
+        return try await SubagentApplyService.apply(runId: runId, expectation: expectation)
     }
 }

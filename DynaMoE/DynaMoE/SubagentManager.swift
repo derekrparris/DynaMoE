@@ -504,23 +504,62 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     /// record still said unapplied. `mutate` locates the record by id for
     /// exactly that case.
     @discardableResult
-    func markApplied(at date: Date, files: [String], appliedTo: String? = nil) async -> Bool {
+    func markApplied(
+        at date: Date,
+        files: [String],
+        appliedTo: String? = nil,
+        keptIgnoredFiles: [String] = []
+    ) async -> Bool {
         appliedAt = date
         appliedToBranch = appliedTo
-        if var report, !files.isEmpty {
-            report.changedFiles = files
+        if !keptIgnoredFiles.isEmpty {
+            self.keptIgnoredFiles = keptIgnoredFiles
+        }
+        let ignoredNote: String? = keptIgnoredFiles.isEmpty
+            ? nil
+            : "The tracked patch was applied, but the worktree was kept: it also holds files a patch cannot carry (\(keptIgnoredFiles.joined(separator: ", "))). Retrieve them manually before clearing the run."
+        if var report {
+            if !files.isEmpty {
+                report.changedFiles = files
+            }
+            if let ignoredNote {
+                report.openQuestions.append(ignoredNote)
+            }
             self.report = report
         }
         let written = await AgentRunStore.shared.mutateAsync(runId: id, sessionId: parentSessionId) { current in
             current.appliedAt = date
             current.appliedToBranch = appliedTo
-            if !files.isEmpty, var report = current.report {
-                report.changedFiles = files
+            if !keptIgnoredFiles.isEmpty {
+                current.keptIgnoredFiles = keptIgnoredFiles
+                if current.report == nil {
+                    current.report = AgentReport(
+                        status: current.status,
+                        summary: "",
+                        findings: [],
+                        changedFiles: files,
+                        diff: nil,
+                        tests: [],
+                        risks: [],
+                        openQuestions: [],
+                        usage: AgentUsage(),
+                        backend: current.backend
+                    )
+                }
+            }
+            if var report = current.report {
+                if !files.isEmpty {
+                    report.changedFiles = files
+                }
+                if let ignoredNote {
+                    report.openQuestions.append(ignoredNote)
+                }
                 current.report = report
             }
         } != nil
         // Keeps the rest of the live state fresh in the normal case. A dropped
-        // write here cannot lose `appliedAt`: the mutation above already wrote it.
+        // write here cannot lose `appliedAt` or `keptIgnoredFiles`: the
+        // mutation above already wrote both atomically.
         persistRecord()
         return written
     }
@@ -569,6 +608,13 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     /// skips unchanged bytes and dispatches its own IO.
     func persistRecord() {
         AgentRunStore.shared.save(snapshotRecord())
+    }
+
+    /// Awaits a durable (fsync + atomic rename) write on the store's IO queue.
+    /// Used at terminal boundaries so a crash right after a run finishes cannot
+    /// lose its report or billed usage.
+    func persistRecordDurably() async {
+        _ = await AgentRunStore.shared.saveAsync(snapshotRecord())
     }
 
     private func legacyTranscriptEntries() -> [AgentTranscriptEntry] {
@@ -728,7 +774,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
 
         let duration = CFAbsoluteTimeGetCurrent() - startTime
         let finalStatus: SubagentStatus = Task.isCancelled ? .cancelled : .completed
-        finishRun(
+        await finishRun(
             summary: accumulatedSummary,
             status: finalStatus,
             duration: duration,
@@ -778,7 +824,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             }
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             let cancelled = (error as? AgentSchedulerError) == .cancelled || Task.isCancelled
-            finishRun(
+            await finishRun(
                 summary: message,
                 status: cancelled ? .cancelled : .failed,
                 duration: CFAbsoluteTimeGetCurrent() - startTime,
@@ -804,7 +850,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
                 forgetDiscardedWorktree()
             }
             if !hasFinished() {
-                finishRun(
+                await finishRun(
                     summary: "The run was cancelled.",
                     status: .cancelled,
                     duration: CFAbsoluteTimeGetCurrent() - startTime,
@@ -850,7 +896,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
                 forgetDiscardedWorktree()
             }
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            finishRun(
+            await finishRun(
                 summary: message,
                 status: .failed,
                 duration: CFAbsoluteTimeGetCurrent() - startTime,
@@ -985,7 +1031,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
                     isSummaryRelayed = false
                 }
             }
-            persistRecord()
+            await persistRecordDurably()
             return
         }
         report = finalReport
@@ -1025,7 +1071,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         }
         let liveStatus = outcome.error
             ?? String(format: "Completed in %.2fs", duration)
-        finishRun(summary: summary, status: finalStatus, duration: duration, liveStatus: liveStatus)
+        await finishRun(summary: summary, status: finalStatus, duration: duration, liveStatus: liveStatus)
     }
 
     /// Reads an isolated run's worktree into its report. A worktree that
@@ -1208,7 +1254,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         status: SubagentStatus,
         duration: Double,
         liveStatus: String
-    ) {
+    ) async {
         // A cancel can land while the execution task is unwinding. Whichever
         // transition reaches this point FIRST owns the record; a later one must
         // not overwrite a terminal summary (or delete an applied worktree).
@@ -1262,10 +1308,15 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             }
         }
 
+        // Persist durably (fsync + atomic rename) BEFORE resuming completion
+        // waiters so a crash right after completion cannot lose the report or
+        // spend, AND so `defer { markExecutionUnwound() }` in the caller runs
+        // in the same actor turn that wakes `waitForCompletion()`.
+        await persistRecordDurably()
+
         for continuation in continuations {
             continuation.resume(returning: summary)
         }
-        persistRecord()
         if notifiesOnFinish {
             SubagentNotifier.runFinished(
                 runId: id,
@@ -2041,7 +2092,77 @@ public final class SubagentManager: ObservableObject {
     /// `@Published` mutation on a run would not redraw anything that holds a
     /// value snapshot of it.
     private var instanceObservers: [UUID: AnyCancellable] = [:]
+    /// In-flight spawn reservations keyed by parent session (nil = unscoped).
+    /// Taken BEFORE `AgentSpawnResolver.resolve()` so concurrent `spawn_subagent`
+    /// calls cannot race past the per-session cap and create excess worktrees.
+    private var pendingSpawnSlots: [UUID?: Set<UUID>] = [:]
     private let lock = NSLock()
+
+    /// Maximum number of active (non-terminal) + in-flight subagent runs one
+    /// conversation may hold at once.
+    public static let defaultMaxActiveSubagentsPerSession = 6
+
+    /// Reserves a spawn slot for `sessionId` before any worktree or backend
+    /// resolution runs. Returns a reservation token on success, or `nil` when
+    /// active runs plus in-flight spawns have reached `cap`.
+    public func tryReserveSpawnSlot(
+        forSession sessionId: UUID?,
+        cap: Int = SubagentManager.defaultMaxActiveSubagentsPerSession
+    ) -> UUID? {
+        let limit = max(1, cap)
+        lock.lock()
+        defer { lock.unlock() }
+        let active = subagentsOrder.filter {
+            $0.parentSessionId == sessionId && !$0.status.isTerminal
+        }.count
+        let pending = pendingSpawnSlots[sessionId]?.count ?? 0
+        guard active + pending < limit else { return nil }
+        let token = UUID()
+        pendingSpawnSlots[sessionId, default: []].insert(token)
+        return token
+    }
+
+    /// Releases a previously reserved spawn slot. Always called via `defer`
+    /// after `spawnModelBacked`/`spawn` registers the instance (or on error).
+    public func releaseSpawnSlot(_ token: UUID, forSession sessionId: UUID?) {
+        lock.lock()
+        defer { lock.unlock() }
+        pendingSpawnSlots[sessionId]?.remove(token)
+        if pendingSpawnSlots[sessionId]?.isEmpty == true {
+            pendingSpawnSlots.removeValue(forKey: sessionId)
+        }
+    }
+
+    /// Total cloud spend already billed or committed by subagent runs in
+    /// `sessionId`. Combines live instances (with in-flight runs reserving
+    /// `max(actual, maxCostUSD)`) and persisted terminal records from disk
+    /// (deduped by run ID) so a conversation cannot multiply its per-run cap
+    /// across sequential or parallel cloud spawns.
+    public func sessionCloudSpendUSD(forSession sessionId: UUID?) -> Double {
+        var byRunId: [UUID: Double] = [:]
+        for record in AgentRunStore.shared.load(sessionId: sessionId) {
+            guard record.backend.kind == .cloud else { continue }
+            let cost = record.usage.costUSD
+            if cost.isFinite, cost > 0 {
+                byRunId[record.id] = cost
+            }
+        }
+        lock.lock()
+        let liveSnapshot = subagentsOrder.filter { $0.parentSessionId == sessionId }
+        lock.unlock()
+        for instance in liveSnapshot {
+            guard instance.backendDescriptor?.kind == .cloud else { continue }
+            let actual = instance.usage.costUSD.isFinite ? max(0, instance.usage.costUSD) : 0
+            if instance.status.isTerminal {
+                byRunId[instance.id] = actual
+            } else {
+                let committed = instance.modelPlan?.budget.maxCostUSD ?? 0
+                let reserved = committed.isFinite ? max(0, committed) : 0
+                byRunId[instance.id] = max(actual, reserved)
+            }
+        }
+        return byRunId.values.reduce(0, +)
+    }
 
     public var activeSubagentsCount: Int {
         lock.lock()

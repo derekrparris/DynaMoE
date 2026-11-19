@@ -219,6 +219,8 @@ public nonisolated struct CloudChatGenerationParams: Equatable, Sendable {
     public var topP: Double?
     public var presencePenalty: Double?
     public var maxTokens: Int?
+    /// Optional stop sequences forwarded as the OpenAI-compatible `stop` field.
+    public var stop: [String]?
     /// Stable per-conversation identifier carrying the cache hint. Hashed
     /// before it leaves the machine (see `CloudSessionKey`) so a provider never
     /// receives a raw DynaMoE session UUID.
@@ -229,12 +231,14 @@ public nonisolated struct CloudChatGenerationParams: Equatable, Sendable {
         topP: Double? = nil,
         presencePenalty: Double? = nil,
         maxTokens: Int? = nil,
+        stop: [String]? = nil,
         sessionKey: String? = nil
     ) {
         self.temperature = temperature
         self.topP = topP
         self.presencePenalty = presencePenalty
         self.maxTokens = maxTokens
+        self.stop = stop
         self.sessionKey = sessionKey
     }
 }

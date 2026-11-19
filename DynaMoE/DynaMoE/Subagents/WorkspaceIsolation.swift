@@ -613,7 +613,7 @@ nonisolated enum WorkspaceIsolation {
         }
 
         let (nameCode, nameOut, nameErr) = try await git(
-            ["diff", worktree.baseCommit, "--name-status", "--find-renames", "-z"],
+            ["diff", worktree.baseCommit, "--no-ext-diff", "--no-textconv", "--name-status", "--find-renames", "-z"],
             in: directory
         )
         guard nameCode == 0 else {
@@ -624,7 +624,7 @@ nonisolated enum WorkspaceIsolation {
         let changedFiles = parseNameStatus(nameOut)
 
         let (diffCode, diffOut, diffErr) = try await git(
-            ["diff", worktree.baseCommit, "--binary", "--find-renames", "--no-color"],
+            ["diff", worktree.baseCommit, "--no-ext-diff", "--no-textconv", "--binary", "--find-renames", "--no-color"],
             in: directory
         )
         guard diffCode == 0 else {
@@ -1346,6 +1346,13 @@ nonisolated enum WorkspaceIsolation {
     /// failure produces (see `snapshot`). Anything other than a successful,
     /// empty status is treated as "do not delete".
     static func hasNoWorkingTreeChanges(_ worktree: AgentWorktree) async -> Bool {
+        // Clear any intent-to-add index entries left by an earlier `snapshot` or
+        // `diffStat` (`git add -N .`). If a file registered as intent-to-add was
+        // later removed, `git status` reports ` D <file>` even though the tree
+        // matches HEAD; resetting the index first turns real changes into
+        // normal unstaged/untracked entries while clearing stale intent-to-add
+        // entries.
+        _ = try? await git(["reset", "-q", "--", "."], in: worktree.path)
         guard let (code, stdout, _) = try? await git(
             ["status", "--porcelain", "-z"],
             in: worktree.path
@@ -1459,7 +1466,7 @@ nonisolated enum WorkspaceIsolation {
         guard (try? await verifyWorktreeLinkage(worktree)) != nil else { return nil }
         _ = try? await git(["add", "-N", "."], in: worktree.path)
         guard let (code, out, _) = try? await git(
-            ["diff", worktree.baseCommit, "--stat", "--stat-width=78", "--no-color"],
+            ["diff", worktree.baseCommit, "--no-ext-diff", "--no-textconv", "--stat", "--stat-width=78", "--no-color"],
             in: worktree.path
         ), code == 0 else { return nil }
         let lines = out

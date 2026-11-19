@@ -281,12 +281,13 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
         let topP: Double?
         let presencePenalty: Double?
         let maxTokens: Int?
+        let stop: [String]?
         let tools: [ToolDefinition]?
         let toolChoice: String?
         let promptCacheKey: String?
 
         enum CodingKeys: String, CodingKey {
-            case model, messages, stream, temperature, tools
+            case model, messages, stream, temperature, stop, tools
             case streamOptions = "stream_options"
             case topP = "top_p"
             case presencePenalty = "presence_penalty"
@@ -413,6 +414,7 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
             topP: params.topP,
             presencePenalty: params.presencePenalty,
             maxTokens: params.maxTokens,
+            stop: (params.stop?.isEmpty == false) ? params.stop : nil,
             tools: (tools?.isEmpty == false) ? tools : nil,
             toolChoice: (tools?.isEmpty == false) ? "auto" : nil,
             promptCacheKey: wantsCacheKey ? params.sessionKey : nil

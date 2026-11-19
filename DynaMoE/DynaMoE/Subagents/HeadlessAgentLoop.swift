@@ -115,7 +115,8 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
         var status: AgentRunStatus = .completed
         var finished = false
 
-        for step in 0..<input.budget.maxSteps {
+        let maxSteps = max(0, input.budget.maxSteps)
+        for step in 0..<maxSteps {
             if Task.isCancelled {
                 status = .cancelled
                 break
@@ -673,12 +674,28 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 throw AgentLoopError.wallClockExceeded
             }
             defer { group.cancelAll() }
-            while let next = try await group.next() {
-                if let turn = next {
-                    return turn
+            do {
+                while let next = try await group.next() {
+                    if let turn = next {
+                        return turn
+                    }
                 }
+                throw AgentBackendError.malformedResponse("The backend produced no turn.")
+            } catch {
+                group.cancelAll()
+                // If the deadline timer won the race right as `backend.runTurn`
+                // returned a completed turn, the turn itself is discarded — but
+                // the provider already billed it. Record its usage into the
+                // ledger so the run's spend accounting does not lose it.
+                while let result = await group.nextResult() {
+                    if case .success(.some(let discardedTurn)) = result {
+                        var billed = discardedTurn.usage
+                        billed.backendRequests += 1
+                        request.usageLedger?.add(billed)
+                    }
+                }
+                throw error
             }
-            throw AgentBackendError.malformedResponse("The backend produced no turn.")
         }
     }
 
@@ -855,8 +872,10 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 continue
             }
             switch message {
-            case .user:
-                trimmed.append(message)
+            case .user(let text):
+                let shortText = Self.folded(text, to: hardTrimTextLimit)
+                total -= text.count - shortText.count
+                trimmed.append(.user(shortText))
             case .assistant(let text, let thinking, let calls):
                 let shortText = Self.folded(text, to: hardTrimTextLimit)
                 let shortThinking = Self.folded(thinking, to: hardTrimTextLimit)
@@ -885,6 +904,18 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                     isError: isError
                 ))
             }
+        }
+        // If the history is STILL over budget after shrinking every later turn,
+        // the initial task message (`index == 0`) itself exceeds the remaining
+        // budget (e.g. a coordinator pasted a 200 KB file body into
+        // `task_description`). Fold it to fit so the bound is never a no-op.
+        if total > contextCharacterBudget,
+           let first = trimmed.first,
+           case .user(let taskText) = first {
+            let excess = total - contextCharacterBudget
+            let targetLimit = max(hardTrimTextLimit, taskText.count - excess)
+            let shortTask = Self.folded(taskText, to: targetLimit)
+            trimmed[0] = .user(shortTask)
         }
         return trimmed
     }

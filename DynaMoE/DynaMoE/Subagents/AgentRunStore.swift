@@ -199,6 +199,19 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         }
     }
 
+    /// Durable async write: suspends until the bounded record has been fsynced
+    /// and atomically renamed on `ioQueue` without blocking the caller's actor.
+    @discardableResult
+    func saveAsync(_ record: AgentRunRecord) async -> Bool {
+        let url = fileURL(runId: record.id, sessionId: record.parentSessionId)
+        return await withCheckedContinuation { continuation in
+            ioQueue.async { [self] in
+                let ok = writeNow(Self.bounded(record), to: url)
+                continuation.resume(returning: ok)
+            }
+        }
+    }
+
     /// Synchronous write, used by tests and by the app's termination path where
     /// losing the last run is the one outcome worth pausing for. Safe to call
     /// from the store's own queue: it runs inline there instead of
@@ -381,10 +394,27 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     @discardableResult
     private func writeNow(_ record: AgentRunRecord, to url: URL) -> Bool {
         signatureLock.lock()
-        let wasDeleted = deletedRunIds.contains(record.id)
-            || (record.parentSessionId.map { deletedSessionIds.contains($0) } ?? false)
+        let runDeleted = deletedRunIds.contains(record.id)
+        let sessionDeleted = record.parentSessionId.map { deletedSessionIds.contains($0) } ?? false
         signatureLock.unlock()
-        if wasDeleted { return false }
+        if runDeleted { return false }
+
+        var record = record
+        var url = url
+        if sessionDeleted {
+            // A conversation delete rescues worktree-holding runs into the
+            // unscoped bucket, while the live `SubagentInstance` still carries
+            // its immutable `parentSessionId`. If the run was rescued, redirect
+            // its post-Stop partial report/spend write to the unscoped survivor
+            // instead of dropping it.
+            let unscopedURL = fileURL(runId: record.id, sessionId: nil)
+            guard fileManager.fileExists(atPath: unscopedURL.path) else {
+                return false
+            }
+            record.parentSessionId = nil
+            record.summaryRelayed = true
+            url = unscopedURL
+        }
 
         let directory = url.deletingLastPathComponent()
         do {
@@ -394,7 +424,7 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
                 attributes: [.posixPermissions: 0o700]
             )
         } catch {
-            print("⚠️ [AgentRunStore] could not create \(directory.lastPathComponent): \(error.localizedDescription)")
+            DiagLog.warning("subagent.store", "could not create \(directory.lastPathComponent): \(error.localizedDescription)")
             return false
         }
         let data: Data
@@ -403,7 +433,7 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
             encoder.outputFormatting = [.sortedKeys]
             data = try encoder.encode(record)
         } catch {
-            print("⚠️ [AgentRunStore] failed to encode run \(record.id): \(error.localizedDescription)")
+            DiagLog.warning("subagent.store", "failed to encode run \(record.id): \(error.localizedDescription)")
             return false
         }
         let signature = SHA256.hash(data: data)
@@ -415,6 +445,10 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         if previous == signature,
            fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory),
            !isDirectory.boolValue {
+            // Re-assert owner-only permissions even when bytes are unchanged so
+            // a 0644 record from an older build is still repaired.
+            try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            try? fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
             noteRelayMembership(record)
             return true
         }
@@ -435,7 +469,7 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
             postRecordsDidChange()
             return true
         } catch {
-            print("⚠️ [AgentRunStore] failed to write run \(record.id): \(error.localizedDescription)")
+            DiagLog.warning("subagent.store", "failed to write run \(record.id): \(error.localizedDescription)")
             return false
         }
     }
@@ -1273,7 +1307,7 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
                 // Surfaced, never deleted: a file this build cannot decode may
                 // be a record a NEWER build wrote, and deleting it would make a
                 // downgrade-then-upgrade cycle destroy history.
-                print("ℹ️ [AgentRunStore] \(undecodable) record(s) on disk are not decodable by this build; they are kept untouched.")
+                DiagLog.info("subagent.store", "\(undecodable) record(s) on disk are not decodable by this build; they are kept untouched.")
             }
             return removedTemps
         }

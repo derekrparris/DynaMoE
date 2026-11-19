@@ -577,7 +577,23 @@ struct TimelineStepCardView: View {
                 // reads only the RECORDED root; a legacy record's `.git`
                 // pointer is sandbox-writable and is not a destination.
                 let note = await SubagentApplyControl.destinationNote(for: record.repositoryRoot)
-                return SubagentApplyControl.approvalSummary(for: record, destinationNote: note)
+                let branch: String?
+                let branchResolved: Bool
+                if let root = record.repositoryRoot {
+                    branch = await WorkspaceIsolation.currentBranch(
+                        of: URL(fileURLWithPath: root, isDirectory: true)
+                    )
+                    branchResolved = true
+                } else {
+                    branch = nil
+                    branchResolved = false
+                }
+                return SubagentApplyControl.approvalSummary(
+                    for: record,
+                    destinationBranch: branch,
+                    destinationBranchResolved: branchResolved,
+                    destinationNote: note
+                )
             }.value
             guard !Task.isCancelled else { return }
             applyDestinationSummary = summary

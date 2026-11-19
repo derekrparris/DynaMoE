@@ -2471,7 +2471,7 @@ struct ContentView: View {
     private func gatherCompletedSubagentRelayResponses(forSession sessionId: UUID?) -> [String] {
         guard let sessionId else { return [] }
         var seen = Set<UUID>()
-        var reports: [String] = []
+        var entries: [(timestamp: Date, text: String)] = []
         let budget = AgentHarness.charBudget(forTokenBudget: self.maxToolOutputLength)
 
         func line(role: String, id: UUID, status: String, summary: String) -> String? {
@@ -2513,28 +2513,19 @@ struct ContentView: View {
                 status: instance.status.rawValue,
                 summary: summary
             ) {
-                reports.append(text)
+                let timestamp = instance.completedAt ?? instance.startedAt ?? instance.createdAt
+                entries.append((timestamp: timestamp, text: text))
             }
         }
 
         // Only the records the store's relay index still owes this
         // conversation are decoded. Reading every record on each send would
         // parse a session's whole run history to find, usually, nothing.
-        //
-        // The ids arrive as a `Set`, whose iteration order is arbitrary: two
-        // restored reports relayed in a different order from one send to the
-        // next, which reads as shuffled history to the model. Oldest first is
-        // the order the runs actually finished.
         let owed = AgentRunStore.shared.unrelayedRunIds(sessionId: sessionId)
         let restored = owed
             .filter { !seen.contains($0) }
             .compactMap { id in
                 AgentRunStore.shared.load(runId: id, sessionId: sessionId).map { (id, $0) }
-            }
-            .sorted { lhs, rhs in
-                let l = lhs.1.completedAt ?? lhs.1.startedAt ?? lhs.1.createdAt
-                let r = rhs.1.completedAt ?? rhs.1.startedAt ?? rhs.1.createdAt
-                return l < r
             }
         for (_, record) in restored {
             let summary: String
@@ -2555,10 +2546,16 @@ struct ContentView: View {
                 status: record.status.rawValue,
                 summary: summary
             ) {
-                reports.append(text)
+                let timestamp = record.completedAt ?? record.startedAt ?? record.createdAt
+                entries.append((timestamp: timestamp, text: text))
             }
         }
-        return reports
+        // Sort live and restored reports together, oldest first, so one
+        // directive never mixes newest-first live runs with oldest-first
+        // restored records.
+        return entries
+            .sorted { $0.timestamp < $1.timestamp }
+            .map(\.text)
     }
 
     /// Marks the given subagent summaries as delivered so the auto-relay does not inject
