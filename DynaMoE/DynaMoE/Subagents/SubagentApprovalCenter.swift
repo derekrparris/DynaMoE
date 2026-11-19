@@ -31,6 +31,14 @@ final class SubagentApprovalCenter: ObservableObject {
 
     static let approvalTimeoutKey = "dynamoe_subagent_approval_timeout"
     static let defaultApprovalTimeout: TimeInterval = 600
+    /// The most cards that may wait on the operator at once.
+    static let maximumPendingCards = 32
+
+    /// Whether a new card would exceed the queue. Pure so the bound is pinned
+    /// without filling the operator's real list.
+    static func refusesCard(pendingCount: Int) -> Bool {
+        pendingCount >= maximumPendingCards
+    }
 
     /// Bounded so a card nobody answers cannot hold a scheduler ticket (and a
     /// run's engine work) for the rest of the process's life.
@@ -53,7 +61,11 @@ final class SubagentApprovalCenter: ObservableObject {
     /// escape from the configuration presented as safe — an out-of-workspace
     /// write, a shell with its own `cwd`, a `.git` pointer rewrite — is
     /// exactly the write the operator would most want to see.
-    func request(_ request: AgentApprovalRequest, honorsTurbo: Bool = true) async -> Bool {
+    func request(
+        _ request: AgentApprovalRequest,
+        honorsTurbo: Bool = true,
+        timeout overrideTimeout: TimeInterval? = nil
+    ) async -> Bool {
         if Self.turboBypasses(
             request: request,
             honorsTurbo: honorsTurbo,
@@ -62,6 +74,15 @@ final class SubagentApprovalCenter: ObservableObject {
             return true
         }
         let entry = PendingSubagentApproval(id: UUID(), request: request)
+        // Bounded, because nothing else bounds it. A model that loops on a
+        // refused tool used to append a card per call for a run nobody is
+        // reading; the list is the operator's queue and it is not infinite.
+        // Past the cap the answer is an honest refusal rather than a card the
+        // pane cannot show.
+        guard !Self.refusesCard(pendingCount: pending.count) else {
+            print("⚠️ [SubagentApproval] refusing a card from \(request.toolName): \(pending.count) already pending")
+            return false
+        }
         pending.append(entry)
         SubagentManager.shared.isDrawerOpen = true
         // The card is visible and the run is blocked on it, so the drawer must
@@ -73,7 +94,7 @@ final class SubagentApprovalCenter: ObservableObject {
             SubagentManager.shared.noteApprovalResolved(runId: request.runId)
         }
 
-        let timeout = min(Self.resolvedApprovalTimeout(), 86_400)
+        let timeout = min(overrideTimeout ?? Self.resolvedApprovalTimeout(), 86_400)
         let approved = await withTaskGroup(of: Bool.self) { group in
             group.addTask {
                 await ActionApprovalManager.shared.waitForApproval(id: entry.id)

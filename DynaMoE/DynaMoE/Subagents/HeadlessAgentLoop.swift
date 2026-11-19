@@ -293,9 +293,22 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 break
             }
             let loweredReason = turn.finishReason.lowercased()
+            let disposition = CloudFinishDisposition(finishReason: turn.finishReason)
+            // A cloud provider's own STOP reasons are not answers. `content_filter`
+            // and `refusal` are the provider saying it would not produce the
+            // reply, and `pause_turn`/an unknown spelling says the reply was not
+            // finished for a reason this app cannot vouch for — the same
+            // allowlist rule `CloudTextCompletion.finishedCleanly` already
+            // applies before a compaction may delete anything. The LOCAL decode
+            // loop reports its own vocabulary (`eos`, `endTag`, `stoppedBySequence`)
+            // which is never a cloud reason, so this classification is scoped
+            // to cloud backends rather than read as universal.
+            let cloudHalted = backend.descriptor.isRemote
+                && (disposition == .halted || disposition == .unrecognized)
             let alwaysUnusable = Self.finishReasonIsTruncated(turn.finishReason)
                 || loweredReason == "degeneratecycle"
                 || loweredReason == "stopped"
+                || cloudHalted
             let emptyToolFreeze = turn.calls.isEmpty && loweredReason == "toolfreeze"
             if alwaysUnusable || emptyToolFreeze {
                 // A token-capped turn is a fragment — even if it contains a
@@ -313,6 +326,10 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                     failure = "The backend stopped because it began repeating itself, so its text is not a considered answer."
                 case "stopped":
                     failure = "The backend's decode loop stopped without reaching an end-of-turn reason, so its text is a fragment."
+                case _ where cloudHalted && disposition == .halted:
+                    failure = "The provider stopped the reply before it finished (finish reason '\(turn.finishReason)'), so its text is not the answer the task asked for."
+                case _ where cloudHalted:
+                    failure = "The provider reported a finish reason this app does not recognise ('\(turn.finishReason)'), so its text cannot be treated as a complete answer."
                 default:
                     failure = "The backend stopped at its token limit (finish reason '\(turn.finishReason)') before the run finished, so its output is truncated rather than usable."
                 }
@@ -709,8 +726,17 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
         let blockStarts = messages.indices.filter {
             if case .assistant = messages[$0] { return true } else { return false }
         }
-        guard blockStarts.count > keptRecentTurns else { return messages }
-        let recentWindowStart = blockStarts[blockStarts.count - keptRecentTurns]
+        // A history with too few blocks for a "recent window" used to be
+        // returned UNCHANGED, which is not a bound: two enormous turns blew the
+        // budget just as thoroughly as twenty. Everything after the task is
+        // foldable in that case; the hard-trim pass at the end still protects
+        // the newest message by working oldest-first.
+        let recentWindowStart: Int
+        if blockStarts.count > keptRecentTurns {
+            recentWindowStart = blockStarts[blockStarts.count - keptRecentTurns]
+        } else {
+            recentWindowStart = messages.isEmpty ? 0 : 1
+        }
 
         var folded: [AgentBackendMessage] = []
         folded.reserveCapacity(messages.count)
@@ -759,7 +785,10 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
         // assistant turns. Ending only at the next assistant dropped that note
         // with the block in front of it.
         var droppedRanges: [Range<Int>] = []
-        var searchFrom = 0
+        // Index 0 is the run's TASK, the one message the loop may never lose;
+        // an assistant turn that somehow landed first is still not a block this
+        // pass may delete.
+        var searchFrom = 1
         while total > contextCharacterBudget, searchFrom < recentWindowStart {
             guard let blockStart = folded[searchFrom..<recentWindowStart].firstIndex(where: {
                 if case .assistant = $0 { return true } else { return false }
@@ -774,7 +803,12 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             total -= removed
             searchFrom = blockEnd
         }
-        guard !droppedRanges.isEmpty else { return folded }
+        guard !droppedRanges.isEmpty else {
+            // Nothing could be dropped (a short history, or a window with no
+            // aged block): the hard trim is the only bound left, and skipping
+            // it would return a history over budget.
+            return hardTrimIfNeeded(folded, overheadCharacters: overheadCharacters)
+        }
         var result: [AgentBackendMessage] = []
         result.reserveCapacity(folded.count)
         var cursor = 0
@@ -783,8 +817,57 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             cursor = range.upperBound
         }
         result.append(contentsOf: folded[cursor...])
-        return result
+        return hardTrimIfNeeded(result, overheadCharacters: overheadCharacters)
     }
+
+    /// The last resort: a bound that is actually a bound.
+    ///
+    /// Folding and dropping both refuse to touch the window that has to be sent
+    /// verbatim, so a run whose recent window alone is over budget came back
+    /// over budget and the engine answered with its own context refusal. This
+    /// walks OLDEST first and shrinks each message's text until the total fits,
+    /// so the newest turn (the one the next decision reads) is the last thing
+    /// to lose anything. The task and a steering note's existence are never
+    /// removed, only shortened.
+    private static func hardTrimIfNeeded(
+        _ messages: [AgentBackendMessage],
+        overheadCharacters: Int
+    ) -> [AgentBackendMessage] {
+        var total = overheadCharacters + messages.reduce(0) { $0 + Self.contextCharacterCount(of: $1) }
+        guard total > contextCharacterBudget else { return messages }
+        var trimmed: [AgentBackendMessage] = []
+        trimmed.reserveCapacity(messages.count)
+        for (index, message) in messages.enumerated() {
+            guard total > contextCharacterBudget, index > 0 else {
+                trimmed.append(message)
+                continue
+            }
+            switch message {
+            case .user:
+                trimmed.append(message)
+            case .assistant(let text, let thinking, let calls):
+                let shortText = Self.folded(text, to: hardTrimTextLimit)
+                let shortThinking = Self.folded(thinking, to: hardTrimTextLimit)
+                total -= (text.count - shortText.count) + (thinking.count - shortThinking.count)
+                trimmed.append(.assistant(text: shortText, thinking: shortThinking, calls: calls))
+            case .toolResult(let callId, let name, let content, let isError):
+                let shortContent = Self.folded(content, to: hardTrimTextLimit)
+                total -= content.count - shortContent.count
+                trimmed.append(.toolResult(
+                    callId: callId,
+                    name: name,
+                    content: shortContent,
+                    isError: isError
+                ))
+            }
+        }
+        return trimmed
+    }
+
+    /// The per-message ceiling the hard trim applies. Small enough that a
+    /// handful of messages fit any budget this loop uses, large enough that the
+    /// model still sees what each step did.
+    private static let hardTrimTextLimit = 400
 
     private static func folded(_ text: String, to limit: Int) -> String {
         guard text.count > limit else { return text }

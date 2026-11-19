@@ -4089,6 +4089,31 @@ public final class AgentHarness {
     /// must not then move it, so this is the branch the commit guard checks
     /// HEAD against.
     public private(set) var workspaceBranch: String?
+    /// True once this run has read a path outside its workspace (or inside
+    /// `.git`). It never clears for the run's life.
+    ///
+    /// The write path was the only half enforced: a read-only run could read
+    /// any path it could name — `resolvePath` returns absolute and
+    /// `~`-expanded paths verbatim — and its own egress tools could send the
+    /// bytes out. Carding a `.git` read inside the workspace matters for the
+    /// same reason the write rule does: `.git/config` is where a remote URL's
+    /// embedded credential lives, and it is not work content.
+    ///
+    /// A read that leaves the workspace also TAINTS the run: a secret committed
+    /// INSIDE the workspace (a `.env`, a token in a source file) is readable
+    /// cardlessly, so egress is carded from then on as the other half of the
+    /// same leak. Read tools are listed by name so a new tool has to be added
+    /// deliberately rather than inheriting containment it does not have.
+    private var runReadOutsideWorkspace: Bool = false
+    /// Tools that read a path the caller names. `codebase_search` is absent on
+    /// purpose: it searches the workspace index and takes no path.
+    static let pathReadToolNames: Set<String> = [
+        "file_read", "find_files", "grep_search", "find_symbol_definition", "find_references"
+    ]
+    /// Tools whose purpose is to send bytes off this Mac. `subq_decide` uploads
+    /// its `state` (and any image bytes) to the decisions API.
+    static let egressToolNames: Set<String> = ["web_fetch", "web_search", "subq_decide"]
+    public var runHasReadOutsideWorkspace: Bool { runReadOutsideWorkspace }
     public var runApprovalHandler: (@Sendable (AgentApprovalRequest) async -> Bool)?
 
     private init() {
@@ -6316,6 +6341,30 @@ public final class AgentHarness {
         return resolved == root || resolved.hasPrefix(root.hasSuffix("/") ? root : root + "/")
     }
 
+    /// The destination a read tool names, when that destination is not the
+    /// run's work content: a path outside `workspace`, or any path touching git
+    /// metadata. Nil when the read is confined.
+    ///
+    /// `path` is the only argument that widens a read's scope, and every tool in
+    /// `pathReadToolNames` takes it as an optional override of the workspace, so
+    /// an omitted path is confined by construction. `.git` counts as outside for
+    /// reads for the same reason it does for writes: `.git/config` is where a
+    /// remote URL's embedded credential lives, and the metadata is not what the
+    /// run was asked to read.
+    static func readEscapeDestination(_ call: ParsedToolCall, workspace: URL?) -> String? {
+        guard let raw = call.arguments["path"] as? String, !raw.isEmpty else { return nil }
+        let resolved = resolvePath(raw, workingDirectory: workspace)
+        if pathTouchesGitMetadata(resolved) {
+            return "\(resolved.path) — git metadata, which can hold credentials"
+        }
+        guard let workspace else {
+            // No workspace means no containment claim to make: card it rather
+            // than assume confinement.
+            return resolved.path
+        }
+        return contains(resolved, in: workspace) ? nil : resolved.path
+    }
+
     private func runScopeDecision(for call: ParsedToolCall, workingDirectory: URL?) -> RunScopeDecision {
         guard isRunScoped else { return .allow }
         if Self.runScopedForbiddenToolNames.contains(call.name) {
@@ -6342,6 +6391,28 @@ public final class AgentHarness {
                 reason: reason,
                 containmentEscape: containmentEscape
             ))
+        }
+        // The READ half of containment, decided before the policy switch
+        // because every policy is a rule about WRITES and none of them says
+        // anything about reads. `resolvePath` returns absolute and `~`-expanded
+        // paths verbatim, so a read-only run could name `~/.ssh/id_ed25519`
+        // with no card and post it out with its own egress tools.
+        if Self.pathReadToolNames.contains(call.name),
+           let escape = Self.readEscapeDestination(
+                call,
+                workspace: workingDirectory ?? defaultWorkingDirectory
+           ) {
+            // Taint FIRST: the card may be approved, and an approved read of a
+            // key is not an approved upload of it. Every later egress call in
+            // this run is carded from here on.
+            runReadOutsideWorkspace = true
+            return ask("it reads outside the run's work files (\(escape))")
+        }
+        // A secret committed inside the workspace is readable cardlessly, so
+        // containment alone does not stop the leak: once anything outside the
+        // workspace has been read, egress is the other half and gets a card.
+        if runReadOutsideWorkspace, Self.egressToolNames.contains(call.name) {
+            return ask("this run has read content from outside its workspace, and this call sends data off this Mac")
         }
         switch runApprovalPolicy {
         case .deny, .auto:
@@ -6560,9 +6631,28 @@ public final class AgentHarness {
         // keeps the exploit two steps long instead of one: the approved
         // tamper no longer buys a cardless commit staging into the operator's
         // shared index and landing on their checked-out branch.
-        if call.name == "git_commit", isRunScoped, isWorkspaceIsolated,
-           let workspace = workingDirectory ?? defaultWorkingDirectory,
-           let repositoryRoot = workspaceRepositoryRoot {
+        if call.name == "git_commit", isRunScoped, isWorkspaceIsolated {
+            // A cardless commit is authorised by an isolated worktree whose
+            // linkage can be RE-VERIFIED here. Without the recorded repository
+            // root that verification cannot run, and a check that cannot run is
+            // a failed check, not a pass: the old `if let repositoryRoot`
+            // silently skipped the whole guard and let the commit land
+            // unauthorised. Fail closed, with the worktree kept.
+            guard let workspace = workingDirectory ?? defaultWorkingDirectory,
+                  let repositoryRoot = workspaceRepositoryRoot else {
+                let err = "SUBAGENT POLICY: git_commit was not executed because this run's repository root is unknown, so its worktree's linkage to the operator's repository could not be verified. Nothing was staged or committed; the worktree and its files were kept. Use the report's diff (or apply_subagent_changes) instead."
+                let json = AgentHarness.toolErrorJSON(tool: call.name, error: err)
+                let rec = ToolCallRecord(
+                    name: call.name,
+                    arguments: strArgs,
+                    rawArguments: call.rawArguments,
+                    status: .withheld,
+                    output: AgentHarness.renderToolResultForModel(json),
+                    error: err,
+                    executionDurationSeconds: CFAbsoluteTimeGetCurrent() - startTime
+                )
+                return (json, rec, false)
+            }
             let worktree = AgentWorktree(
                 runId: runId ?? UUID(),
                 repositoryRoot: repositoryRoot,
@@ -6982,7 +7072,10 @@ public final class AgentHarness {
     ) -> String? {
         let base = workingDirectory.map { URL(fileURLWithPath: $0, isDirectory: true) }
         switch toolName {
-        case "file_write", "file_edit":
+        case "file_write", "file_edit", "file_read", "find_files", "grep_search",
+             "find_symbol_definition", "find_references":
+            // A read's path is the reason its card exists, so the card must
+            // name where it points rather than the sandbox it leaves.
             guard let path = arguments["path"], !path.isEmpty else {
                 return workingDirectory
             }

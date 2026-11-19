@@ -152,9 +152,9 @@ public final class ControlledProcessRunner {
     /// tool locations to whatever PATH the app inherited, and force
     /// non-interactive behaviour (no pagers, no prompts, no auto-update).
     nonisolated public static func toolEnvironment() -> [String: String] {
-        var env = ProcessInfo.processInfo.environment
+        let inherited = ProcessInfo.processInfo.environment
         let userHome = FileManager.default.homeDirectoryForCurrentUser.path
-        let currentPath = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+        let currentPath = inherited["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
         let extraPaths = [
             "/opt/homebrew/bin",
             "/opt/homebrew/sbin",
@@ -163,6 +163,17 @@ public final class ControlledProcessRunner {
             "\(userHome)/.cargo/bin",
             "\(userHome)/.local/bin"
         ]
+        // An ALLOWLIST, not a copy of this process's environment. A subagent can
+        // CHOOSE the command, so every variable it cannot use is a secret not to
+        // hand over: a cloud provider's key, a token in some build tool's
+        // variable, an SSH agent socket, a proxy credential. Naming the secrets
+        // to strip is a losing game (this used to name only SUBQ_API_KEY); what
+        // a build or test command actually needs is HOME, a user identity, a
+        // temp directory and a locale.
+        var env: [String: String] = [:]
+        for key in ["HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"] {
+            if let value = inherited[key] { env[key] = value }
+        }
         env["PATH"] = (extraPaths + [currentPath]).joined(separator: ":")
         env["HOMEBREW_NO_AUTO_UPDATE"] = "1"
         env["HOMEBREW_NO_INSTALL_CLEANUP"] = "1"
@@ -173,11 +184,6 @@ public final class ControlledProcessRunner {
         env["GIT_TERMINAL_PROMPT"] = "0"
         env["NONINTERACTIVE"] = "1"
         env["DEBIAN_FRONTEND"] = "noninteractive"
-        // `subq_decide` accepts a key from the app's environment as a developer
-        // convenience, so the same variable must not reach a process the model
-        // can ask to `printenv`. The app process keeps its own copy; a child
-        // environment is a place the model can read.
-        env.removeValue(forKey: "SUBQ_API_KEY")
         return env
     }
 

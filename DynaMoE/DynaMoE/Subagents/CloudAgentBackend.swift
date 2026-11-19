@@ -162,11 +162,38 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
                 thinking: streamedThinking
             )
         }
-        if let failure { throw failure }
+        if let failure {
+            // Whatever the provider streamed before it failed is the run's
+            // work, exactly as with a Stop. The loop appends `partialTurn` for
+            // a cancelled turn only, so the partial has to travel WITH the
+            // failure or the report falls back to an earlier step.
+            if !streamedText.isEmpty || !streamedThinking.isEmpty {
+                throw AgentBackendError.failedAfterPartial(
+                    text: streamedText,
+                    thinking: streamedThinking,
+                    message: failure.errorDescription ?? "The provider failed mid-stream."
+                )
+            }
+            throw failure
+        }
         guard let result else {
+            if !streamedText.isEmpty || !streamedThinking.isEmpty {
+                throw AgentBackendError.failedAfterPartial(
+                    text: streamedText,
+                    thinking: streamedThinking,
+                    message: "The provider closed the stream without a terminal event."
+                )
+            }
             throw AgentBackendError.malformedResponse("The provider closed the stream without a terminal event.")
         }
         guard result.terminated else {
+            if !streamedText.isEmpty || !streamedThinking.isEmpty {
+                throw AgentBackendError.failedAfterPartial(
+                    text: streamedText,
+                    thinking: streamedThinking,
+                    message: "The provider's stream ended without a completion marker."
+                )
+            }
             throw AgentBackendError.malformedResponse("The provider's stream ended without a completion marker.")
         }
 

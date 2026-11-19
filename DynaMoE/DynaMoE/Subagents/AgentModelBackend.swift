@@ -95,6 +95,12 @@ nonisolated enum AgentBackendError: LocalizedError, Equatable {
     /// transcript entry (and the report fell back to an earlier step) even
     /// though the operator had watched it stream.
     case cancelledAfterPartial(text: String, thinking: String)
+    /// A turn that failed for a reason OTHER than a Stop after streaming part
+    /// of its answer: a provider error mid-stream, a dropped connection, a
+    /// stream that closed without a result. The partial text is the same work a
+    /// cancellation keeps — a transport error is not evidence the model said
+    /// nothing — so it travels with the error and the loop appends it.
+    case failedAfterPartial(text: String, thinking: String, message: String)
 
     /// Whether this error means "the run was stopped", with or without a
     /// partial turn. Comparisons against `.cancelled` alone miss the partial
@@ -106,10 +112,16 @@ nonisolated enum AgentBackendError: LocalizedError, Equatable {
         }
     }
 
-    /// What the model managed to say before the Stop, when there is any.
+    /// What the model managed to say before the turn ended, when there is any.
     var partialTurn: (text: String, thinking: String)? {
-        guard case .cancelledAfterPartial(let text, let thinking) = self else { return nil }
-        return (text, thinking)
+        switch self {
+        case .cancelledAfterPartial(let text, let thinking):
+            return (text, thinking)
+        case .failedAfterPartial(let text, let thinking, _):
+            return (text, thinking)
+        default:
+            return nil
+        }
     }
 
     var errorDescription: String? {
@@ -119,6 +131,7 @@ nonisolated enum AgentBackendError: LocalizedError, Equatable {
         case .transport(let message): return message
         case .malformedResponse(let message): return message
         case .cancelled, .cancelledAfterPartial: return "The subagent run was cancelled."
+        case .failedAfterPartial(_, _, let message): return message
         }
     }
 }

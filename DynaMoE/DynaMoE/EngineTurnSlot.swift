@@ -46,10 +46,17 @@ nonisolated enum TurnPriority: Sendable, Equatable {
 nonisolated final class TurnSlotClaim: @unchecked Sendable {
     private let ledger: TurnSlotLedger
     private let ticket: UInt64
+    /// Why the slot was taken. A claim is the ONLY evidence a turn in
+    /// PREPARATION leaves: the ledger can say the slot is spoken for, and an
+    /// operator's send must be able to tell a background run's preparation (a
+    /// subagent step, which may be stopped) from a chat turn, a server request
+    /// or a model load (none of which may be).
+    let priority: TurnPriority
 
-    fileprivate init(ledger: TurnSlotLedger, ticket: UInt64) {
+    fileprivate init(ledger: TurnSlotLedger, ticket: UInt64, priority: TurnPriority) {
         self.ledger = ledger
         self.ticket = ticket
+        self.priority = priority
     }
 
     /// Gives the slot back. Idempotent, and callable from any isolation domain.
@@ -72,16 +79,20 @@ nonisolated final class TurnSlotLedger: @unchecked Sendable {
     private let lock = NSLock()
     /// Ticket of the outstanding claim, or 0 when the slot is unclaimed.
     private var outstanding: UInt64 = 0
+    /// Why the outstanding claim was taken, so a prober can tell a background
+    /// run's preparation from a chat turn's.
+    private var outstandingPriority: TurnPriority = .interactive
     private var nextTicket: UInt64 = 0
 
     /// Takes the slot if nobody else holds it. Nil means somebody does.
-    func tryClaim() -> TurnSlotClaim? {
+    func tryClaim(priority: TurnPriority = .interactive) -> TurnSlotClaim? {
         lock.lock()
         defer { lock.unlock() }
         guard outstanding == 0 else { return nil }
         nextTicket &+= 1
         outstanding = nextTicket
-        return TurnSlotClaim(ledger: self, ticket: nextTicket)
+        outstandingPriority = priority
+        return TurnSlotClaim(ledger: self, ticket: nextTicket, priority: priority)
     }
 
     /// True while any claim is outstanding, i.e. a turn is being prepared.
@@ -91,11 +102,21 @@ nonisolated final class TurnSlotLedger: @unchecked Sendable {
         return outstanding != 0
     }
 
+    /// The priority of the outstanding claim, or nil when the slot is
+    /// unclaimed. A claim's priority cannot change while it is held, so this is
+    /// a stable answer for the length of a preparation.
+    var claimedPriority: TurnPriority? {
+        lock.lock()
+        defer { lock.unlock() }
+        return outstanding == 0 ? nil : outstandingPriority
+    }
+
     func release(_ ticket: UInt64) {
         lock.lock()
         defer { lock.unlock() }
         guard ticket != 0, outstanding == ticket else { return }
         outstanding = 0
+        outstandingPriority = .interactive
     }
 
     func holds(_ ticket: UInt64) -> Bool {

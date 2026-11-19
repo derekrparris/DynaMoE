@@ -461,11 +461,18 @@ public final class CompletionEngine: @unchecked Sendable {
     ///
     /// `nonisolated` because the load task is detached and the claim is a lock box:
     /// the only state it touches is `stateLock` and the ledger, both guarded.
-    nonisolated func reserveTurnSlot() -> TurnSlotClaim? {
+    ///
+    /// `priority` travels with the claim so a prober can tell a BACKGROUND turn in
+    /// preparation (a subagent step, which an operator's send may stop) from a chat
+    /// turn, a server request or a model load, none of which may be. Without it the
+    /// whole preparation window — a DeepSeek turn's runtime and image span is
+    /// seconds — was invisible to preemption, and a send that could have been
+    /// running waited out its slot budget instead.
+    nonisolated func reserveTurnSlot(priority: TurnPriority = .interactive) -> TurnSlotClaim? {
         stateLock.lock()
         defer { stateLock.unlock() }
         guard currentGenerationTask == nil else { return nil }
-        return turnSlotLedger.tryClaim()
+        return turnSlotLedger.tryClaim(priority: priority)
     }
 
     /// Launches one turn, taking the single-flight slot on the way in.
@@ -491,7 +498,7 @@ public final class CompletionEngine: @unchecked Sendable {
         claim: TurnSlotClaim? = nil
     ) throws -> CompletionLaunch {
         stateLock.lock()
-        guard let held = claim ?? turnSlotLedger.tryClaim() else {
+        guard let held = claim ?? turnSlotLedger.tryClaim(priority: request.turnPriority) else {
             stateLock.unlock()
             throw CompletionLaunchError.engineNotReady(
                 "❌ Another caller is holding the generation slot — a turn being prepared, or "
@@ -11657,10 +11664,18 @@ if layer.attnGateProjTensor != nil,
 
     /// True while the turn holding the engine is one an operator's send may
     /// preempt, i.e. a subagent step.
+    ///
+    /// A turn in PREPARATION counts too: it holds a claim and no task yet, and
+    /// that window is seconds long (a DeepSeek runtime, an image span), so
+    /// watching only `currentGenerationTask` hid exactly the work that could be
+    /// stopped. The claim's own priority is what decides — a chat turn, a server
+    /// request or a model load answering `.interactive` is still never
+    /// cancellable from here.
     public var hasActiveBackgroundTurn: Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return currentGenerationTask != nil && activeTurnPriority == .background
+        if currentGenerationTask != nil { return activeTurnPriority == .background }
+        return turnSlotLedger.claimedPriority == .background
     }
 
     /// Cancels the active turn only when it is background.
@@ -11714,18 +11729,31 @@ if layer.attnGateProjTensor != nil,
     /// guards is a multi-second operation on the main actor and the poll yields,
     /// which is what lets the preparation it is waiting for finish.
     public func awaitIdle() async {
-        while true {
-            stateLock.lock()
-            let pending = currentGenerationTask
-            let preparing = turnSlotLedger.isClaimed
-            stateLock.unlock()
-            if let task = pending {
-                _ = await task.value
-                continue
-            }
-            guard preparing else { break }
+        _ = await awaitIdle(boundedBy: nil)
+    }
+
+    /// The same wait with a deadline, for a caller that must not block forever.
+    ///
+    /// Returns false when the deadline passed with the engine still busy. The
+    /// preemption path needs this: it cancels a background turn and then waits
+    /// for the drain, but the party that ends up holding the slot can be one it
+    /// cannot cancel (the API server's request, a model load), and an unbounded
+    /// wait there locks every composer behind a notice about a subagent that is
+    /// not the reason.
+    @discardableResult
+    public func awaitIdle(boundedBy seconds: TimeInterval?) async -> Bool {
+        let deadline = seconds.map { Date().addingTimeInterval($0) }
+        while isActive {
+            if let deadline, Date() >= deadline { return false }
+            // Poll rather than awaiting the turn's task: the await is not
+            // cancellation-aware, so a holder this caller cannot stop (the API
+            // server's request) would park the wait past its own deadline.
+            // Five milliseconds is the same cadence the claim half already
+            // uses, and yielding is what lets the preparation being waited on
+            // finish.
             try? await Task.sleep(nanoseconds: 5_000_000)
         }
+        return true
     }
 
     private func turnDidBegin(_ id: UInt64) {

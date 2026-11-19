@@ -295,9 +295,17 @@ final class CloudAgentBackendLogicTests: XCTestCase {
             _ = try await backend.runTurn(Self.request())
             XCTFail("a closed stream with no terminal event is not a completed turn")
         } catch let error as AgentBackendError {
-            guard case .malformedResponse = error else {
-                return XCTFail("expected a malformed-response error, got \(error)")
+            // A failure after text already streamed still carries the text:
+            // dropping it lost the step from the run's transcript and fell the
+            // report back to an earlier turn. The distinction from a clean
+            // `.malformedResponse` is the `partialTurn` payload.
+            guard case .failedAfterPartial(let text, _, let message) = error else {
+                return XCTFail("expected the streamed text with the failure, got \(error)")
             }
+            XCTAssertEqual(text, "half a sentence")
+            XCTAssertTrue(message.contains("without a terminal event"), message)
+            XCTAssertEqual(error.partialTurn?.text, "half a sentence")
+            XCTAssertFalse(error.isCancellation, "a closed stream is not a Stop")
         }
     }
 

@@ -273,7 +273,12 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
     @MainActor
     private static func waitForEngineSlot(_ engine: CompletionEngine) async throws -> TurnSlotClaim {
         while true {
-            if let claim = engine.reserveTurnSlot() {
+            // `.background` because a subagent step IS one: the claim is the
+            // only evidence a turn in preparation leaves, and without the
+            // priority an operator's send cannot tell this preparation (which
+            // it may stop) from a chat turn's or a server request's (which it
+            // may not).
+            if let claim = engine.reserveTurnSlot(priority: .background) {
                 // The claim is granted by the ledger, not by this run's state:
                 // check cancellation AFTER taking it, so a run stopped while
                 // it waited hands the slot straight back instead of launching
@@ -393,6 +398,17 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
                 // still unwinding would read a vocabulary that no longer
                 // belongs to it.
                 await launch.handle.task.value
+                // A transport failure after the model already streamed part of
+                // its answer is not evidence it said nothing. The loop appends
+                // `partialTurn` for a cancelled turn; a failed one deserves the
+                // same, or the run's report fell back to an earlier step.
+                if !emittedText.isEmpty || !emittedThinking.isEmpty {
+                    throw AgentBackendError.failedAfterPartial(
+                        text: emittedText,
+                        thinking: emittedThinking,
+                        message: failure.message
+                    )
+                }
                 throw AgentBackendError.transport(failure.message)
             case .finished(let result):
                 // `TurnResult` carries main-actor-isolated value types, so its
@@ -418,6 +434,13 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
         // so awaiting it is immediate here and guarantees no turn outlives the
         // tool mask this call is nested in.
         await launch.handle.task.value
+        if !emittedText.isEmpty || !emittedThinking.isEmpty {
+            throw AgentBackendError.failedAfterPartial(
+                text: emittedText,
+                thinking: emittedThinking,
+                message: "The local engine's stream closed without a result."
+            )
+        }
         throw AgentBackendError.malformedResponse("The local engine's stream closed without a result.")
     }
 
@@ -480,12 +503,21 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
             visibleText = visibleText.replacingOccurrences(of: call.rawText, with: "")
         }
         visibleText = visibleText.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A GESTURE-ONLY turn is a finished run, not a broken one. The local
+        // parser freezes on the closing tag of a tool call, so a model that
+        // signals "done" with a no-op call (`echo`, `true`, `:`) reports
+        // `toolFreeze`; `actionableCallIndices` then drops every call, and the
+        // loop's `emptyToolFreeze` guard read that as "a tool-call boundary
+        // that produced no complete call" and failed a run that had actually
+        // completed. The gesture's own skip notice is already in the text, so
+        // reporting the turn as a normal stop keeps the answer.
+        let gestureOnly = calls.isEmpty && !result.parsedToolCalls.isEmpty
         return AgentBackendTurn(
             text: visibleText,
             thinking: result.thinkingText,
             calls: calls,
             rawText: result.rawDecodedText,
-            finishReason: result.finishReason.rawValue,
+            finishReason: gestureOnly ? TurnFinishReason.eos.rawValue : result.finishReason.rawValue,
             usage: usage
         )
     }

@@ -122,4 +122,53 @@ final class SubagentApprovalCenterTests: XCTestCase {
             SubagentApprovalCenter.defaultApprovalTimeout
         )
     }
+
+    // MARK: - The round trip
+
+    /// A card nobody answers must resolve as REFUSED after the timeout, and it
+    /// must leave the pending list: an unanswered card that parked its run
+    /// forever is exactly what the bound exists to prevent, and nothing pinned
+    /// that the continuation ever came back.
+    func testAnUnansweredCardTimesOutAsRejectedAndLeavesTheQueue() async {
+        // A containment-escape card, because Turbo Mode is a real operator
+        // preference this test must not depend on: every routine write is
+        // bypassed when it is on, and this suite must not flip it.
+        let card = request(tool: "file_write", containmentEscape: true)
+        let approved = await SubagentApprovalCenter.shared.request(card, timeout: 0.05)
+        XCTAssertFalse(approved, "an unanswered card is a refusal")
+        XCTAssertFalse(
+            SubagentApprovalCenter.shared.pending.contains { $0.request.runId == card.runId },
+            "the timed-out card must not stay in the operator's queue"
+        )
+    }
+
+    /// The other half: an answered card resolves true, and the queue drains.
+    func testAnAnsweredCardResolvesApproved() async throws {
+        let card = request(tool: "file_write", containmentEscape: true)
+        let answer = Task { await SubagentApprovalCenter.shared.request(card, timeout: 5) }
+        // Wait for the card to appear rather than sleeping a fixed time.
+        var entryId: UUID?
+        for _ in 0..<200 {
+            if let entry = SubagentApprovalCenter.shared.pending.first(where: { $0.request.runId == card.runId }) {
+                entryId = entry.id
+                break
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let id = try XCTUnwrap(entryId, "the card must reach the operator")
+        SubagentApprovalCenter.shared.approve(id)
+        let approved = await answer.value
+        XCTAssertTrue(approved)
+        XCTAssertTrue(SubagentApprovalCenter.shared.pending.isEmpty, "an answered card is removed")
+    }
+
+    /// The queue is bounded: a model that loops on a refused tool must not be
+    /// able to grow the operator's list without limit.
+    func testThePendingQueueIsBounded() {
+        XCTAssertEqual(SubagentApprovalCenter.maximumPendingCards, 32)
+        XCTAssertFalse(SubagentApprovalCenter.refusesCard(pendingCount: 0))
+        XCTAssertFalse(SubagentApprovalCenter.refusesCard(pendingCount: 31))
+        XCTAssertTrue(SubagentApprovalCenter.refusesCard(pendingCount: 32))
+        XCTAssertTrue(SubagentApprovalCenter.refusesCard(pendingCount: 33))
+    }
 }

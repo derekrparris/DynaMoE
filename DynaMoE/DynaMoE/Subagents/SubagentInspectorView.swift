@@ -137,7 +137,7 @@ struct SubagentInspectorView: View {
             Button("Clear Anyway", role: .destructive) { clearFinished() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("\(unreadTerminalCount) finished run\(unreadTerminalCount == 1 ? "" : "s") still \(unreadTerminalCount == 1 ? "has" : "have") a report the coordinator has not seen. Clearing removes \(unreadTerminalCount == 1 ? "it" : "them") from this list.")
+            Text("\(unreadTerminalCount) finished run\(unreadTerminalCount == 1 ? "" : "s") still \(unreadTerminalCount == 1 ? "has" : "have") a report the coordinator has not seen. Clearing DELETES the record and its report; it does not just hide the row.")
         }
     }
 
@@ -171,8 +171,12 @@ struct SubagentInspectorView: View {
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundColor(.primary)
 
-            if manager.activeSubagentsCount > 0 {
-                Text("\(manager.activeSubagentsCount) active")
+            // Scoped to the rows this pane shows. The manager's count is
+            // process-wide, so a subagent working in another conversation (or
+            // one the API spawned) read as "2 active" over a list with no
+            // running run in it.
+            if !activeRuns.isEmpty {
+                Text("\(activeRuns.count) active")
                     .font(.system(size: 10, weight: .bold))
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
@@ -196,7 +200,8 @@ struct SubagentInspectorView: View {
                         .foregroundColor(.secondary)
                 }
                 .buttonStyle(.plain)
-                .help("Remove finished runs from this conversation")
+                .help("Delete finished runs and their reports from this conversation")
+                .accessibilityLabel("Clear finished runs")
             }
 
             Button(action: onClose) {
@@ -209,6 +214,7 @@ struct SubagentInspectorView: View {
             }
             .buttonStyle(.plain)
             .help("Close Inspector")
+            .accessibilityLabel("Close inspector")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
@@ -767,6 +773,7 @@ private struct SubagentRunDetailView: View {
                 }
                 .buttonStyle(.plain)
                 .help("Reveal in Finder")
+                .accessibilityLabel("Reveal the working directory in Finder")
                 Spacer(minLength: 0)
             }
             if case .worktree(let worktreePath, let branch) = record.isolation {
@@ -791,6 +798,7 @@ private struct SubagentRunDetailView: View {
                         }
                         .buttonStyle(.plain)
                         .help("Reveal the run's worktree in Finder")
+                        .accessibilityLabel("Reveal the run's worktree in Finder")
                     }
                     Spacer(minLength: 0)
                 }

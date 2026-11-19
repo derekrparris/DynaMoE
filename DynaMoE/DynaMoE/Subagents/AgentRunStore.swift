@@ -330,20 +330,38 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     }
 
     /// The record's actual file when the preferred bucket no longer holds it.
+    ///
+    /// A conversation delete re-scopes a run by writing the new copy BEFORE
+    /// removing the old one, so a crash between the two leaves both. Choosing
+    /// the preferred bucket here while `loadAny` chose the NEWEST made the two
+    /// disagree: the next save wrote the stale copy, `prune`/`delete` removed
+    /// the other, and the tombstone then refused the survivor — a record no
+    /// read could repair. A write must land on the copy a read returns, so this
+    /// picks the newest too, with the preferred bucket winning a tie.
     private func existingRecordURL(runId: UUID, preferredSession: UUID?) -> URL? {
         let preferred = fileURL(runId: runId, sessionId: preferredSession)
-        if fileManager.fileExists(atPath: preferred.path) { return preferred }
         let name = "\(runId.uuidString).json"
         guard let directories = try? fileManager.contentsOfDirectory(atPath: rootURL.path) else {
-            return nil
+            return fileManager.fileExists(atPath: preferred.path) ? preferred : nil
         }
+        var best: (date: Date, url: URL)?
         for directory in directories {
             let candidate = rootURL
                 .appendingPathComponent(directory, isDirectory: true)
                 .appendingPathComponent(name, isDirectory: false)
-            if fileManager.fileExists(atPath: candidate.path) { return candidate }
+            guard fileManager.fileExists(atPath: candidate.path) else { continue }
+            let modified = (try? candidate.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate ?? .distantPast
+            let isPreferred = candidate.path == preferred.path
+            if let current = best {
+                if modified > current.date || (modified == current.date && isPreferred) {
+                    best = (modified, candidate)
+                }
+            } else {
+                best = (modified, candidate)
+            }
         }
-        return nil
+        return best?.url
     }
 
     @discardableResult

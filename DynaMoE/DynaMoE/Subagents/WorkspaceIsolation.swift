@@ -786,14 +786,33 @@ nonisolated enum WorkspaceIsolation {
         try await refuseIfTheMainTreeIsMidOperation(worktree.repositoryRoot)
         try refuseIfTargetsAreNotWritable(changes.changedFiles, in: worktree.repositoryRoot)
 
-        let patchURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("dynamoe-\(worktree.branch.replacingOccurrences(of: "/", with: "-")).patch")
+        // A PRIVATE directory, not a name derived from the branch. The old path
+        // was `dynamoe-<branch>.patch` in the shared temp directory: predictable
+        // across runs, so another process (or a later run of this app) could
+        // pre-create or replace it between the check and the apply and have
+        // `git apply` read bytes nobody reviewed. One UUID directory at 0700,
+        // removed with everything in it.
+        let patchDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dynamoe-apply-\(UUID().uuidString)", isDirectory: true)
+        let patchURL = patchDirectory.appendingPathComponent("change.patch", isDirectory: false)
         do {
-            try changes.diff.data(using: .utf8)?.write(to: patchURL, options: .atomic)
+            try FileManager.default.createDirectory(
+                at: patchDirectory,
+                withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700]
+            )
+            guard let data = changes.diff.data(using: .utf8) else {
+                throw WorkspaceIsolationError.applyFailed("the patch could not be encoded as UTF-8.")
+            }
+            try data.write(to: patchURL, options: .atomic)
+        } catch let error as WorkspaceIsolationError {
+            try? FileManager.default.removeItem(at: patchDirectory)
+            throw error
         } catch {
+            try? FileManager.default.removeItem(at: patchDirectory)
             throw WorkspaceIsolationError.applyFailed(error.localizedDescription)
         }
-        defer { try? FileManager.default.removeItem(at: patchURL) }
+        defer { try? FileManager.default.removeItem(at: patchDirectory) }
 
         let (checkCode, _, checkErr) = try await git(
             ["apply", "--check", "--binary", "--whitespace=nowarn", patchURL.path],

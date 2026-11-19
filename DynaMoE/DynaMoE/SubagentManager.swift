@@ -21,6 +21,11 @@ public enum SubagentStatus: String, Codable, CaseIterable {
     case waitingForApproval = "waiting_for_approval"
     case completed = "completed"
     case failed = "failed"
+    /// A run its loop guard stopped (a repeat loop, a failure streak, a
+    /// withdrawn tool). Distinct from `failed` because nothing went wrong with
+    /// the machinery: the run was working and the guard decided continuing
+    /// would not help. It used to be flattened to `failed` at every surface.
+    case blocked = "blocked"
     case cancelled = "cancelled"
 
     public var displayName: String {
@@ -30,6 +35,7 @@ public enum SubagentStatus: String, Codable, CaseIterable {
         case .waitingForApproval: return "Awaiting Approval"
         case .completed: return "Completed"
         case .failed: return "Failed"
+        case .blocked: return "Blocked"
         case .cancelled: return "Cancelled"
         }
     }
@@ -41,13 +47,14 @@ public enum SubagentStatus: String, Codable, CaseIterable {
         case .waitingForApproval: return "hand.raised.fill"
         case .completed: return "checkmark.circle.fill"
         case .failed: return "exclamationmark.triangle.fill"
+        case .blocked: return "exclamationmark.octagon.fill"
         case .cancelled: return "xmark.circle"
         }
     }
 
     /// True once the run can no longer change state on its own.
     public var isTerminal: Bool {
-        self == .completed || self == .failed || self == .cancelled
+        self == .completed || self == .failed || self == .blocked || self == .cancelled
     }
 
     public var color: Color {
@@ -57,6 +64,7 @@ public enum SubagentStatus: String, Codable, CaseIterable {
         case .waitingForApproval: return .orange
         case .completed: return .green
         case .failed: return .red
+        case .blocked: return .orange
         case .cancelled: return .secondary
         }
     }
@@ -602,6 +610,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         case .waitingForApproval: return .waitingForApproval
         case .completed: return .completed
         case .failed: return .failed
+        case .blocked: return .blocked
         case .cancelled: return .cancelled
         }
     }
@@ -941,6 +950,25 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             // that unrolls through a `.failed` budget/teardown path otherwise
             // dropped the last step's validated spend the same way.
             usage = outcome.usage
+            // The loop's own work is written for the same reason. `cancel`
+            // persisted the record from live state at the instant of the Stop,
+            // which was BEFORE the loop's final step landed its assistant text
+            // and tool results — so `cancelledAfterPartial` kept the partial
+            // turn only in memory, the drawer disagreed with the record after
+            // relaunch, and the report the run had earned was lost. Status,
+            // summary and the worktree stay exactly as the terminal transition
+            // wrote them: only the work is added.
+            if !outcome.transcript.isEmpty {
+                runTranscript = outcome.transcript
+            }
+            // The report the loop derived from what the run managed to do.
+            // Its report's `status` is `.cancelled`, so the record's own
+            // terminal status and summary (written by `cancel`) still win; the
+            // partial findings and best-effort summary are what the drawer and
+            // the relay would otherwise have lost.
+            if let finalReport {
+                report = finalReport
+            }
             persistRecord()
             return
         }
@@ -976,6 +1004,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         switch outcome.status {
         case .completed: finalStatus = .completed
         case .cancelled: finalStatus = .cancelled
+        case .blocked: finalStatus = .blocked
         default: finalStatus = .failed
         }
         let liveStatus = outcome.error
@@ -1049,8 +1078,13 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     }
 
     /// The loop's events, applied to the drawer's own state.
+    ///
+    /// `internal` rather than private so a test can drive the exact race it
+    /// guards: a queued event that lands AFTER the terminal transition must not
+    /// flap a finished run back to Running (and let the next persist overwrite
+    /// the terminal record on disk with it).
     @MainActor
-    private func apply(_ event: AgentRunEvent) {
+    func apply(_ event: AgentRunEvent) {
         switch event {
         case .status(let status, let detail):
             // A queued event can lag a terminal transition: a Stop cancels
@@ -1071,7 +1105,9 @@ public final class SubagentInstance: Identifiable, ObservableObject {
                 self.status = .waitingForApproval
             case .cancelled:
                 self.status = .cancelled
-            case .failed, .blocked:
+            case .blocked:
+                self.status = .blocked
+            case .failed:
                 self.status = .failed
             default:
                 break

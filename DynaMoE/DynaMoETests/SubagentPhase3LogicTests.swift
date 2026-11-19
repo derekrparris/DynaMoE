@@ -111,6 +111,29 @@ final class SubagentRecordProjectionTests: XCTestCase {
         XCTAssertNotNil(record.completedAt)
     }
 
+    /// A queued event can land AFTER the terminal transition (the Stop latches
+    /// `isFinished` while the event pump still holds an earlier `.running`).
+    /// Applying it used to flap a finished run back to Running, and the next
+    /// `persistRecord()` then overwrote the terminal record on disk with it —
+    /// the run read as live again after a relaunch. The terminal state owns the
+    /// record from that moment.
+    @MainActor
+    func testAQueuedEventCannotReopenAFinishedRecord() {
+        let instance = SubagentInstance(role: "Test Runner", taskDescription: "Run the suite.")
+        instance.cancel(reason: "Stopped by the operator.")
+        let terminalStatus = instance.status
+        let terminalText = instance.liveStatusText
+
+        instance.apply(.status(.running, detail: "Working on Test Runner…"))
+        instance.apply(.toolFinished(ToolCallRecord(name: "complete", arguments: [:], status: .success)))
+
+        XCTAssertEqual(instance.status, terminalStatus, "a finished run must not flap back to Running")
+        XCTAssertEqual(instance.liveStatusText, terminalText)
+        XCTAssertEqual(instance.snapshotRecord().status, .cancelled)
+        XCTAssertTrue(instance.transcript.filter { $0.actionName == "complete" }.isEmpty,
+                      "a late tool event must not append to the cancelled record")
+    }
+
     /// A run refused before its loop discards its freshly created worktree.
     /// The record used to keep claiming `isolation: .worktree` with no
     /// `appliedAt`, which made `holdsWorktreeWork` true forever: prune,
