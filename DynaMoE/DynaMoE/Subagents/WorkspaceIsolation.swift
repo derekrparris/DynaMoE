@@ -963,6 +963,7 @@ nonisolated enum WorkspaceIsolation {
         var entries: [(String, URL?)] = []
         for path in paths {
             guard let target = safeURL(for: path, in: root) else {
+                try? fileManager.removeItem(at: directory)
                 throw WorkspaceIsolationError.applyFailed("the patch names an unsafe path: \(path)")
             }
             guard fileManager.fileExists(atPath: target.path) else {

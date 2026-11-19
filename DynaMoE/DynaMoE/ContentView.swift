@@ -7820,10 +7820,16 @@ struct ContentView: View {
                     // A same-tool failure streak, too many failed calls overall, or one
                     // identical call re-issued past its limit means the model is stuck;
                     // stop spending steps and force a synthesis turn instead.
-                    let agent = AgentHarness.shared
-                    let toolFailureLoop = agent.consecutiveFailedToolCalls >= agent.failedToolCallLimit
-                        || agent.totalFailedToolCalls >= agent.failedToolCallTotalLimit
-                        || agent.maxRepeatedToolCallCount >= agent.repeatedToolCallLimit
+                    // Read on the main actor: the harness's failure counters and
+                    // limits are main-actor state, and this turn runs on a
+                    // detached task. The `||` operands are autoclosures, which
+                    // is where the isolation diagnostic was raised.
+                    let toolFailureLoop = await MainActor.run {
+                        let harness = AgentHarness.shared
+                        return harness.consecutiveFailedToolCalls >= harness.failedToolCallLimit
+                            || harness.totalFailedToolCalls >= harness.failedToolCallTotalLimit
+                            || harness.maxRepeatedToolCallCount >= harness.repeatedToolCallLimit
+                    }
 
                     // Resolve the cap once for this post-turn decision, so the
                     // status below names the budget that actually applied even
@@ -7940,11 +7946,20 @@ struct ContentView: View {
                         // hard-stopped the run — or the model kept emitting tool calls with
                         // empty arguments — give the model one final synthesis turn with
                         // tool calling disabled so it actually answers instead of spinning.
-                        let escalateToSynthesis = AgentHarness.shared.consecutiveEmptyToolCalls >= 2
-                            || AgentHarness.shared.consecutiveFailedToolCalls >= AgentHarness.shared.failedToolCallLimit
-                            || AgentHarness.shared.totalFailedToolCalls >= AgentHarness.shared.failedToolCallTotalLimit
-                            || AgentHarness.shared.maxRepeatedToolCallCount >= AgentHarness.shared.repeatedToolCallLimit
-                        if (AgentHarness.shared.lastSearchGuardAction == .forceSynthesis || escalateToSynthesis) && !ranCompleteTool {
+                        // Resolved on the main actor for the same reason as the
+                        // post-turn loop check above: the harness's counters,
+                        // limits and guard action are main-actor state.
+                        let (shouldForceSynthesis, escalateToSynthesis) = await MainActor.run {
+                            let harness = AgentHarness.shared
+                            return (
+                                harness.lastSearchGuardAction == .forceSynthesis,
+                                harness.consecutiveEmptyToolCalls >= 2
+                                    || harness.consecutiveFailedToolCalls >= harness.failedToolCallLimit
+                                    || harness.totalFailedToolCalls >= harness.failedToolCallTotalLimit
+                                    || harness.maxRepeatedToolCallCount >= harness.repeatedToolCallLimit
+                            )
+                        }
+                        if (shouldForceSynthesis || escalateToSynthesis) && !ranCompleteTool {
                             let endTag = (modelConfig?.isGemma4Model == true) ? "<turn|>" : ((modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>") )
                             let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: endTag)
                             let toolResponseContext = toolResponses.map { AgentHarness.renderToolResultForModel($0) }.joined(separator: "\n")

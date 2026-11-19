@@ -155,12 +155,13 @@ final class SubagentRecordProjectionTests: XCTestCase {
         usage.promptTokens = 220
         usage.latestPromptTokens = 120
         usage.completionTokens = 12
-        // The drawer's number: the last request's size plus everything
-        // generated, not 220 + 12.
-        XCTAssertEqual(usage.contextTokens, 132)
+        usage.latestCompletionTokens = 8
+        // The drawer's number: the last request's size plus only the LAST
+        // step's generation, not the summed 12 and not 220 + 12.
+        XCTAssertEqual(usage.contextTokens, 128)
         // The billed total stays available for anything that prices it.
         XCTAssertEqual(usage.totalTokens, 232)
-        XCTAssertTrue(usage.compactDescription.contains("132 tok"))
+        XCTAssertTrue(usage.compactDescription.contains("128 tok"))
 
         // A legacy record never stored the last request's size, so its
         // recorded sum is the only honest number it can show.
@@ -172,5 +173,19 @@ final class SubagentRecordProjectionTests: XCTestCase {
         // The new field survives a coding round trip.
         let decoded = try JSONDecoder().decode(AgentUsage.self, from: JSONEncoder().encode(usage))
         XCTAssertEqual(decoded, usage)
+
+        // A newer step's counts replace the previous ones even when they are
+        // SMALLER (a compacted context makes that normal), while an absent
+        // (zero) value leaves what the last reporting step said.
+        var merged = AgentUsage()
+        merged.latestPromptTokens = 200
+        merged.latestCompletionTokens = 9
+        var next = AgentUsage()
+        next.latestPromptTokens = 120
+        next.latestCompletionTokens = 4
+        merged.merge(next)
+        XCTAssertEqual(merged.contextTokens, 124)
+        merged.merge(AgentUsage())
+        XCTAssertEqual(merged.contextTokens, 124)
     }
 }

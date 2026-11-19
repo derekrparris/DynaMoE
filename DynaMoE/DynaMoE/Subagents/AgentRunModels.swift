@@ -217,8 +217,17 @@ nonisolated struct AgentUsage: Codable, Equatable, Sendable {
         wallClockSeconds += other.wallClockSeconds
         toolCalls += other.toolCalls
         backendRequests += other.backendRequests
-        latestPromptTokens = max(latestPromptTokens, other.latestPromptTokens)
-        latestCompletionTokens = max(latestCompletionTokens, other.latestCompletionTokens)
+        // "Latest" means the NEWEST step's value, not the largest: the loop can
+        // compact a run's context, so a later prompt may be smaller than an
+        // earlier one. Zero is ABSENCE (a usage-less turn, or a backend that
+        // reports only the billed sums), so it leaves what the last step that
+        // did report said.
+        if other.latestPromptTokens > 0 {
+            latestPromptTokens = other.latestPromptTokens
+        }
+        if other.latestCompletionTokens > 0 {
+            latestCompletionTokens = other.latestCompletionTokens
+        }
     }
 
     /// The billed token total: every step's full prompt plus everything

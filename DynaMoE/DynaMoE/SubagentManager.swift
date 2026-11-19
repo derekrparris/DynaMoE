@@ -460,6 +460,21 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         recordedIsolation = AgentIsolation.none
     }
 
+    /// Whether this run still holds worktree work nobody has landed, read from
+    /// the LIVE fields rather than from `modelPlan`.
+    ///
+    /// `modelPlan` keeps the isolation the run was SPAWNED with, so a pre-loop
+    /// refusal that discarded its new worktree still looked isolated here after
+    /// `forgetDiscardedWorktree()` cleared `recordedIsolation`: the record was
+    /// clearable on disk while the in-memory instance stayed in the drawer
+    /// until relaunch. Mirrors `AgentRunRecord.holdsWorktreeWork` so the two
+    /// halves answer the same question.
+    var holdsUnappliedWorktreeWork: Bool {
+        let isolation = recordedIsolation ?? .none
+        return isolation.isIsolated
+            && (appliedAt == nil || !keptIgnoredFiles.isEmpty)
+    }
+
     /// Records that this run's worktree landed on the main tree. The store is
     /// written synchronously by the apply path, so a crash immediately after
     /// the patch cannot leave a record that would try to apply it twice.
@@ -2213,8 +2228,7 @@ public final class SubagentManager: ObservableObject {
         terminal = subagentsOrder.filter {
             $0.status.isTerminal
                 && (sessionId == nil || $0.parentSessionId == sessionId || $0.parentSessionId == nil)
-                && !($0.modelPlan?.isolation.isIsolated == true
-                    && ($0.appliedAt == nil || !$0.keptIgnoredFiles.isEmpty))
+                && !$0.holdsUnappliedWorktreeWork
         }
         let clearedIds = Set(terminal.map(\.id))
         let liveIds = Set(subagentsOrder.map(\.id))

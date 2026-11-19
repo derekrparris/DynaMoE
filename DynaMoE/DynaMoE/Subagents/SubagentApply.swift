@@ -413,9 +413,10 @@ enum SubagentApplyControl {
         case 1: summary = "1 changed file"
         default: summary = "\(changed) changed files"
         }
-        // `repositoryRoot` on a record can be stale (a moved checkout), and the
-        // service falls back to git's own answer. Naming the DESTINATION on the
-        // card keeps the approval attached to the tree the patch lands in.
+        // `destination` is the tree the apply will actually use. A recorded
+        // root is validated by `WorkspaceIsolation.open`, which refuses a
+        // worktree it no longer owns rather than following its `.git` pointer,
+        // so naming it on the card keeps the approval attached to that tree.
         let destinationText = destination ?? "the main working tree (resolved when the apply runs)"
         var reason = "Apply \(summary) from \(branch) to \(destinationText). Changes land unstaged."
         if let diffStat, !diffStat.isEmpty {
@@ -480,19 +481,25 @@ enum SubagentApplyControl {
         guard let record = live?.snapshotRecord() ?? AgentRunStore.shared.loadAny(runId: runId) else {
             throw SubagentApplyControlError.runNotFound(runId)
         }
-        guard canApply(record),
-              case .worktree(let path, let branch) = record.isolation else {
+        guard canApply(
+            record,
+            executionStillUnwinding: !(live?.isExecutionUnwound ?? true)
+        ), case .worktree(let path, let branch) = record.isolation else {
             throw SubagentApplyControlError.nothingToApply(record.role)
         }
 
-        // Git's own answer about the worktree wins over the record's stored
-        // root: a checkout that MOVED leaves `repositoryRoot` stale, and the
-        // apply itself resolves the owning repository from the worktree. The
-        // card must name the tree the patch will actually land in.
-        var destination = await WorkspaceIsolation.owningRepository(
-            for: URL(fileURLWithPath: path, isDirectory: true)
-        )?.path
-        if destination == nil { destination = record.repositoryRoot }
+        // The RECORDED root outranks the worktree's `.git` pointer, exactly as
+        // `WorkspaceIsolation.open` (which the apply itself uses) decides it:
+        // the pointer is a writable file inside the sandbox, so a retargeted
+        // one would make the card name a different repository than the apply
+        // touches. Git's own answer is the fallback for an older record that
+        // stored no root.
+        var destination = record.repositoryRoot
+        if destination == nil {
+            destination = await WorkspaceIsolation.owningRepository(
+                for: URL(fileURLWithPath: path, isDirectory: true)
+            )?.path
+        }
         // Read the stat from the worktree the apply reads, so the card lists
         // the changes rather than a count that can be stale.
         let stat = await WorkspaceIsolation.diffStat(

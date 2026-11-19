@@ -135,15 +135,10 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             if let maxCost = input.budget.maxCostUSD {
                 if usage.costIsUnpriced {
                     status = .failed
-                    switch usage.costUnpricedReason {
-                    case .providerOmittedUsage:
-                        // The price IS recorded; the provider withheld the
-                        // counts. Sending the operator to Settings to fix a
-                        // price that already exists is a dead end.
-                        failure = "The run has a \(Self.currency(maxCost)) cost ceiling, but its provider billed a request and reported no usage for it, so neither the tokens nor the cost can be priced. The ceiling cannot be enforced. Clear the ceiling, or check the provider's dashboard for the spend."
-                    case .noPriceRecorded, .none:
-                        failure = "The run has a \(Self.currency(maxCost)) cost ceiling, but no price is recorded for its model, so the ceiling cannot be enforced."
-                    }
+                    failure = Self.unpricedCeilingFailure(
+                        maxCost: maxCost,
+                        reason: usage.costUnpricedReason
+                    )
                     break
                 }
                 if usage.costUSD >= maxCost {
@@ -815,6 +810,22 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
         }
     }
 
+    /// Why a run with a cost ceiling cannot enforce it because its cost is
+    /// unknown. Shared by the pre-step guard and `postTurnBudgetFailure` so
+    /// both name the same cause: a provider that omitted usage is NOT a missing
+    /// price, and sending the operator to record one would fix nothing.
+    private static func unpricedCeilingFailure(
+        maxCost: Double,
+        reason: AgentUnpricedReason?
+    ) -> String {
+        switch reason {
+        case .providerOmittedUsage:
+            return "The run has a \(currency(maxCost)) cost ceiling, but its provider billed a request and reported no usage for it, so neither the tokens nor the cost can be priced. The ceiling cannot be enforced. Clear the ceiling, or check the provider's dashboard for the spend."
+        case .noPriceRecorded, .none:
+            return "The run has a \(currency(maxCost)) cost ceiling, but no price is recorded for its model, so the ceiling cannot be enforced."
+        }
+    }
+
     /// What a just-finished turn did to the run's budget, or nil. A cost of
     /// exactly the ceiling is allowed for a turn that then stopped: the ceiling
     /// is the most the run may SPEND, and the next step's pre-check would stop
@@ -829,7 +840,7 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
         }
         if let maxCost = input.budget.maxCostUSD {
             if usage.costIsUnpriced {
-                return "The run has a \(currency(maxCost)) cost ceiling, but no price is recorded for its model, so the ceiling cannot be enforced."
+                return unpricedCeilingFailure(maxCost: maxCost, reason: usage.costUnpricedReason)
             }
             if usage.costUSD > maxCost {
                 return "The run spent \(currency(usage.costUSD)), over its \(currency(maxCost)) cost budget."
