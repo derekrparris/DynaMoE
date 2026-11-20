@@ -687,7 +687,7 @@ it.
 - **Inspector** (replaces `SubagentDrawerView`): list of runs for the current
   session with status, backend, model, duration, usage and cost, plus a
   conversation strip (active/runs/tokens/spend/time) over the same merged list;
-  a detail pane with live streamed text/thinking, tool timeline, artifacts,
+  a detail pane with live streamed text/thinking, tool timeline,
   diff, report, Reveal Worktree, the applied date and controls (stop, steer,
   approve, Apply Changes). Apply Changes is the operator's own path to land a
   stopped isolated run: it raises the ordinary approval card and then calls the
@@ -705,7 +705,9 @@ it.
 - **Settings**: default backend, cloud model for subagents, the cloud spend cap
   (see §8), local cost limit,
   max concurrency (per provider and global), retention (runs and days),
-  notifications, and the subagent approval timeout. The AGENT STEP CAP in the
+  notifications. The subagent approval timeout is a default
+  (`SubagentApprovalCenter.resolvedApprovalTimeout`) readable from
+  `dynamoe_subagent_approval_timeout`; no Settings control writes it yet. The AGENT STEP CAP in the
   same tab is the coordinator's own loop budget (`AgentStepBudget`), not a
   subagent's: a run's steps come from its preset and the spawn's explicit
   `max_steps`, so changing the coordinator cap cannot silently shorten a
@@ -716,6 +718,10 @@ it.
 ## 12. Testing
 
 Pure-logic and fake-backend tests are the default; real-model tests are opt-in.
+One file can hold several suites (`SubagentPhase3LogicTests.swift` holds
+`SubagentRecordProjectionTests`, `SubagentRunLinkTests` and
+`LocalSubagentRelayTests`), so a suite name is an `-only-testing:` identifier,
+not a file name.
 
 | Suite | What it proves |
 |---|---|
@@ -783,8 +789,8 @@ Naming drift from §4/§6 as implemented: `AgentBackendTurn.calls` (not
 - [x] `LocalAgentBackend`: family formatting, tool mask, parser, engine lease
 - [x] Cost estimate + refusal for local in-turn
 - [x] Backend logic tests; one opt-in real turn per backend
-      (`CloudAgentBackendLogicTests`, 18 cases incl. the opt-in real turn;
-      `LocalAgentBackendLogicTests`, 22 cases; the real-turn cases in
+      (`CloudAgentBackendLogicTests`, 31 cases incl. two opt-in real cases;
+      `LocalAgentBackendLogicTests`, 25 cases; the real-turn cases in
       `DeepSeekV41PublishedTurnTests` and `CloudAgentBackendLogicTests`).
 
 **Exit criteria:** the same loop runs a real cloud turn and a real local turn,
@@ -853,12 +859,11 @@ main tree without approval.
 the published checkpoint in 116.7 s total (`1 step(s), 906 prompt / 7
 generated`, "The capital of France is Paris."), and the cloud run answered
 through the manager on a discovered tool-capable model. `AgentSchedulerTests`
-(9) pins local capacity 1, per-class priority, per-provider and global cloud
+(14) pins local capacity 1, per-class priority, per-provider and global cloud
 caps, the cancellation tree, session-scoped stop and both queue outcomes;
-`AgentRunIntegrationTests` (4) drives a real manager run with a scripted
-backend; `AgentSpawnPolicyTests` (14) pins the preset table, plan-mode filtering,
-the write-spawn approval rule and the tool schema. 153 related tests green
-(2 opt-in cloud cases skipped), zero failures.
+`AgentRunIntegrationTests` (15) drives a real manager run with a scripted
+backend; `AgentSpawnPolicyTests` (37) pins the preset table, plan-mode filtering,
+the write-spawn approval rule and the tool schema.
 
 **Implemented in Phase 2, with the reasoning recorded:**
 
@@ -966,8 +971,8 @@ Implemented, with the decisions worth carrying:
   the keys were dead in production.
 
 Measured: the Phase 3 logic suites (`AgentRunStoreTests`, `SubagentRunLinkTests`,
-`LocalSubagentRelayTests`, `SubagentRecordProjectionTests`) are 17 cases; the
-Phase 2 suites still pass (35). App and test targets build with the new files.
+`LocalSubagentRelayTests`, `SubagentRecordProjectionTests`) are 44 cases; the
+Phase 2 suites still pass (66). App and test targets build with the new files.
 At the time of Phase 3 the inspector could only show isolation as metadata; the
 worktree picker and `apply_subagent_changes` landed in Phase 4.
 
