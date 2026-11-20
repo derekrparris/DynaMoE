@@ -69,8 +69,13 @@ enum SubagentNotifier {
         // a run gets when notifications are off (the default). It is skipped
         // under test because an app-hosted test run has a real NSApp and would
         // bounce the Dock once per finished run.
+        // `NSApp` is an implicitly-unwrapped optional and is nil in a
+        // non-app-hosted XCTest process, so the test guard is evaluated FIRST:
+        // reading `NSApp.isActive` before it trapped exactly where the guard
+        // was meant to protect.
+        guard !isRunningTests, Bundle.main.bundleIdentifier != nil else { return }
         let isInactive = !NSApp.isActive
-        guard isInactive, !isRunningTests, Bundle.main.bundleIdentifier != nil else { return }
+        guard isInactive else { return }
         NSApp.requestUserAttention(.informationalRequest)
 
         // The banner is opt-IN, so everything below is the operator's choice.

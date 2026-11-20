@@ -61,7 +61,11 @@ public nonisolated final class ActionApprovalManager: @unchecked Sendable {
     /// the waiter registers) so a scoped cancel can find the click-before-wait
     /// window too. Removed with the decision or by the waiter's own exit.
     private var scopes: [UUID: ActionApprovalScope] = [:]
-    private static let rememberedDecisionLimit = 8
+    /// Bounded because ids are single-use, but comfortably above the number of
+    /// cards that can be pending at once (the subagent center caps at 32): a
+    /// decision evicted before its waiter registers parks that run until its
+    /// timeout, which is the exact failure the memory exists to prevent.
+    private static let rememberedDecisionLimit = 64
 
     private init() {}
 
@@ -75,11 +79,25 @@ public nonisolated final class ActionApprovalManager: @unchecked Sendable {
     }
 
     /// Drops a scope record for an id whose card went away without a waiter
-    /// ever registering.
+    /// ever registering — and any decision remembered for it, which nothing
+    /// could consume once the card is gone (ids are single-use, so it would
+    /// otherwise sit until eviction).
     public func unregister(id: UUID) {
         lock.lock()
         scopes.removeValue(forKey: id)
+        if pendingDecisions.removeValue(forKey: id) != nil {
+            pendingDecisionOrder.removeAll { $0 == id }
+        }
         lock.unlock()
+    }
+
+    /// A decision remembered for an id whose waiter has not registered yet,
+    /// or nil. A caller racing a timeout reads this so a click that landed
+    /// first is honoured rather than reported as a decline.
+    public func rememberedDecision(id: UUID) -> Bool? {
+        lock.lock()
+        defer { lock.unlock() }
+        return pendingDecisions[id]
     }
 
     public func waitForApproval(
@@ -151,14 +169,19 @@ public nonisolated final class ActionApprovalManager: @unchecked Sendable {
         let ids = scopes.filter { $0.value == scope }.map(\.key)
         var resumed: [CheckedContinuation<Bool, Never>] = []
         for id in ids {
+            // Only an id with no waiter left needs the cancelled mark: one
+            // that was resumed here has nobody to consume it, and ids are
+            // single-use, so inserting anyway grew the set for the process's
+            // lifetime with every scoped Stop.
             if let continuation = pendingContinuations.removeValue(forKey: id) {
                 resumed.append(continuation)
+            } else {
+                // A card whose waiter has not registered yet must still resolve
+                // as declined; the waiter consumes this on arrival.
+                cancelledWaits.insert(id)
             }
             pendingDecisions.removeValue(forKey: id)
             pendingDecisionOrder.removeAll { $0 == id }
-            // A card whose waiter has not registered yet must still resolve as
-            // declined; the waiter consumes this on arrival.
-            cancelledWaits.insert(id)
             scopes.removeValue(forKey: id)
         }
         lock.unlock()

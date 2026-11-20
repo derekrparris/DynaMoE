@@ -74,15 +74,27 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
                 // stream while the persisted transcript kept just the final
                 // turn. Later attempts still produce the turn; only the live
                 // commentary is silenced.
+                //
+                // Silence is only enough when attempt 1 streamed NOTHING: a
+                // failed attempt's partial text is already in the drawer and
+                // is discarded with the attempt, so retrying on top of it
+                // leaves the operator a truncated prefix that never gets
+                // corrected. Such a failure is final (the streamed text is
+                // real work, and it travels with the error like a Stop's).
                 var streamed = request
                 if attempt > 1 {
                     streamed.onDelta = nil
                 }
                 return try await performTurn(streamed, receipt: receipt)
             } catch let failure as CloudTurnFailure
-                where attempt < 2 && Self.isRetryable(failure, spentRequest: receipt.spentRequest) {
+                where attempt < 2
+                    && !receipt.streamedAnything
+                    && Self.isRetryable(failure, spentRequest: receipt.spentRequest) {
                 Self.recordSpentUsage(receipt, pricing: pricing, into: request.usageLedger)
                 await Self.backoffBeforeRetry(failure, receipt: receipt)
+                // A cancelled run does not retry: `backoffBeforeRetry` returns
+                // at once when its sleep is cancelled, so without this the
+                // retry fired on a run the operator already stopped.
                 if Task.isCancelled { throw AgentBackendError.cancelled }
                 continue
             } catch let failure as CloudTurnFailure {
@@ -143,14 +155,21 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
         var streamedText = ""
         var streamedThinking = ""
         for await event in stream {
+            // A cloud stream does not end on its own when the operator hits
+            // Stop, so cancellation is checked per event (the local backend
+            // does the same): without it the run kept streaming into a drawer
+            // nobody was reading until the provider finished.
+            if Task.isCancelled { break }
             switch event {
             case .started:
                 break
             case .thinkingDelta(let text):
                 streamedThinking += text
+                receipt.recordStreamedDelta()
                 request.onDelta?(text, true)
             case .contentDelta(let text):
                 streamedText += text
+                receipt.recordStreamedDelta()
                 request.onDelta?(text, false)
             case .finished(let finished):
                 result = finished
@@ -211,7 +230,15 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
                 name: call.name,
                 arguments: decoded ?? [:],
                 rawArguments: call.argumentsJSON,
-                rawText: call.name,
+                // Not the tool name: `rawText` is the call's markup as it
+                // appeared in the response text, and the local backend strips
+                // it from the visible prose. A cloud call has no such markup
+                // (the text and the call are separate wire fields), so it is
+                // empty — and `parsedCall` substitutes the name when it needs
+                // one. Putting the name here made a cloud call and a local one
+                // with the same name/args compare unequal and let any echo
+                // logic treat the tool name as markup.
+                rawText: "",
                 argumentsMalformed: decoded == nil
             )
         }

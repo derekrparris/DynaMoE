@@ -261,6 +261,14 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     private var messageStore: [SubagentMessage] = []
     private var consumedMessageIds: Set<UUID> = []
     private var isFinished: Bool = false
+    /// Latched by the first `startExecution`, so a second call in the same
+    /// actor turn cannot launch a second task over the first.
+    /// Latched by the first `startExecution`, so a second call in the same
+    /// actor turn cannot launch a second task over the first.
+    private var hasStarted: Bool = false
+    /// The scheduler admission this run holds until it goes terminal. Taken by
+    /// `claimFinish`, released by `finishRun` (or re-queued by `cancel`).
+    private var schedulerTicket: UUID?
     /// False from `startExecution` until the execution task has actually
     /// unwound. A Stop latches `status`/`isFinished` immediately, but the task
     /// may still be killing a child process or writing its last tool result;
@@ -337,12 +345,22 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     /// `NSLock` touched from an `async` context is an error in Swift 6 mode.
     /// Returning the parked continuations lets each caller resume them after
     /// it has written the state they were waiting for.
-    private func claimFinish(requireNotTerminal: Bool = false) -> [CheckedContinuation<String, Never>]? {
+    private func claimFinish(
+        requireNotTerminal: Bool = false,
+        cancelExecutionTask: Bool = true
+    ) -> [CheckedContinuation<String, Never>]? {
         lock.lock()
         defer { lock.unlock() }
         if isFinished { return nil }
         if requireNotTerminal, status.isTerminal { return nil }
-        executionTask?.cancel()
+        // Only an OUTSIDE claim cancels the task. `finishRun` runs INSIDE it on
+        // every path, and cancelling there left `Task.isCancelled` true for the
+        // rest of the run (the durable write, the notifier), so anything added
+        // after it that consults the flag — the pattern used everywhere else —
+        // would silently take the cancellation branch on a completed run.
+        if cancelExecutionTask {
+            executionTask?.cancel()
+        }
         executionTask = nil
         isFinished = true
         let continuations = completionContinuations
@@ -357,7 +375,18 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         // way out (Quit calls `cancelAll`) must not rewrite a completed record
         // as `.cancelled`, or erase the summary the operator waited for.
         guard let continuations = claimFinish(requireNotTerminal: true) else { return }
-
+        // `cancel` is synchronous (callers rely on reading the summary right
+        // after it), so the admission is handed to a tracked task rather than
+        // awaited here. Unlike the old fire-and-forget release this one owns a
+        // ticket taken exactly once — `takeSchedulerTicket` nils it — so it
+        // cannot double-release or leak capacity.
+        if let ticket = takeSchedulerTicket() {
+            let runId = id
+            Task {
+                await AgentScheduler.shared.release(ticket)
+                await AgentScheduler.shared.finish(runId: runId)
+            }
+        }
         // Synchronous, not dispatched: a caller that cancels and then asks for
         // the summary must not observe `isFinished` with an empty report.
         status = .cancelled
@@ -395,13 +424,11 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         messageStore.append(msg)
         lock.unlock()
 
-        if Thread.isMainThread {
-            self.messages.append(msg)
-        } else {
-            DispatchQueue.main.async {
-                self.messages.append(msg)
-            }
-        }
+        // This type is MainActor-isolated, so the caller is on the main actor
+        // by construction: the `Thread.isMainThread` branch only papered over a
+        // call made from somewhere else, and the two stores could then
+        // disagree in ORDER (recordedMessages reads the locked one first).
+        messages.append(msg)
     }
 
     public var recordedMessages: [SubagentMessage] {
@@ -683,6 +710,17 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     }
 
     /// Waits asynchronously until this subagent reaches a terminal state.
+    /// Hands the scheduler admission to whoever is ending the run, exactly
+    /// once. Synchronous so both claimers (`finishRun`, which awaits the
+    /// release, and `cancel`, which cannot) can take it under one lock.
+    private func takeSchedulerTicket() -> UUID? {
+        lock.lock()
+        defer { lock.unlock() }
+        let ticket = schedulerTicket
+        schedulerTicket = nil
+        return ticket
+    }
+
     public func waitForCompletion() async -> String {
         await withCheckedContinuation { continuation in
             registerCompletionWaiter(continuation)
@@ -741,7 +779,18 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     }
 
     public func startExecution() {
-        guard status == .pending else { return }
+        // The latch is taken under the lock, not read from `status`: the task
+        // body sets `.running` later, so two calls in one actor turn both
+        // passed a status guard and the second overwrote `executionTask`,
+        // orphaning the first (never cancelled by `claimFinish`, never
+        // counted by the unwind bookkeeping).
+        lock.lock()
+        guard !hasStarted, status == .pending else {
+            lock.unlock()
+            return
+        }
+        hasStarted = true
+        lock.unlock()
 
         startedAt = Date()
         persistRecord()
@@ -823,7 +872,12 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     /// slot the server queue and the chat send path share.
     private func runModelBackedExecution(_ plan: AgentSpawnPlan) async {
         let startTime = CFAbsoluteTimeGetCurrent()
-        liveStatusText = "Preparing \(plan.role)…"
+        // Only when no Stop already wrote a reason: a terminal record that
+        // says "Cancelled" must not be overwritten by "Preparing …", which is
+        // the same hazard `status = .running` below is guarded against.
+        if !hasFinished() {
+            liveStatusText = "Preparing \(plan.role)…"
+        }
         // See `runAutonomousPipeline`: the flag must clear in the same actor
         // turn that resumes the completion waiters.
         defer { markExecutionUnwound() }
@@ -864,12 +918,15 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             )
             return
         }
-        defer {
-            Task {
-                await scheduler.release(ticket)
-                await scheduler.finish(runId: id)
-            }
-        }
+        // No `defer` here: a defer cannot await, and a fire-and-forget Task
+        // raced `cancelAll`/`cancelRuns` and any caller inspecting scheduler
+        // state right after `waitForCompletion()`. The ticket is handed to the
+        // terminal transition instead — `claimFinish` takes it, `finishRun`
+        // awaits the release, `cancel` re-queues it — so every exit path
+        // releases exactly once and in order.
+        lock.lock()
+        schedulerTicket = ticket
+        lock.unlock()
 
         // A Stop can land between the scheduler's last cancellation read and
         // this MainActor continuation. The `defer` above still releases the
@@ -1295,8 +1352,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         // as "already finished" left every waiter parked forever.
         // Synchronous helper: `NSLock` must not be touched from an `async`
         // context, which is an error in Swift 6 mode.
-        guard let continuations = claimFinish() else { return }
-        _ = continuations
+        guard let continuations = claimFinish(cancelExecutionTask: false) else { return }
 
         self.status = status
         completedAt = Date()
@@ -1340,6 +1396,11 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         // spend, AND so `defer { markExecutionUnwound() }` in the caller runs
         // in the same actor turn that wakes `waitForCompletion()`.
         await persistRecordDurably()
+
+        if let ticket = takeSchedulerTicket() {
+            await AgentScheduler.shared.release(ticket)
+            await AgentScheduler.shared.finish(runId: id)
+        }
 
         for continuation in continuations {
             continuation.resume(returning: summary)
@@ -2550,6 +2611,10 @@ public final class SubagentManager: ObservableObject {
         // only a live one cancelled: its record is gone, so keeping the object
         // lets the "All Runs" list resurrect a run the operator deleted and
         // overwrite the unscoped record a delete rescued.
+        // The terminal instance is dropped from BOTH stores: `subagentsOrder`
+        // is the registry `subagents` is derived from, so pruning only the
+        // former leaves the object listed (and reachable by id through
+        // `getSubagent`'s fallback) for a conversation the operator deleted.
         lock.lock()
         let terminal = subagentsOrder.filter {
             $0.parentSessionId == sessionId && $0.status.isTerminal
@@ -2561,8 +2626,11 @@ public final class SubagentManager: ObservableObject {
                 subagentsById.removeValue(forKey: id)
                 instanceObservers.removeValue(forKey: id)?.cancel()
             }
+            lock.unlock()
+            subagents.removeAll { dropped.contains($0.id) }
+        } else {
+            lock.unlock()
         }
-        lock.unlock()
         Task { await AgentScheduler.shared.cancelRuns(parentSessionId: sessionId, reason: reason) }
     }
 

@@ -146,13 +146,13 @@ struct SubagentInspectorView: View {
             reloadStored()
             consumeManagerSelection()
         }
-        .onChange(of: manager.subagents.count) { _, _ in reloadStored() }
-        .onChange(of: manager.activeSubagentsCount) { _, _ in reloadStored() }
+        .onChange(of: manager.subagents.count) { _, _ in scheduleStoreReload() }
+        .onChange(of: manager.activeSubagentsCount) { _, _ in scheduleStoreReload() }
         // A count is not a status. A run moving into an approval wait, or a
         // stored record whose apply completed, changes no count at all; the
         // manager's publisher redraws the pane but does not reload the list.
         // Watching the statuses reloads on exactly those transitions.
-        .onChange(of: manager.subagents.map(\.status)) { _, _ in reloadStored() }
+        .onChange(of: manager.subagents.map(\.status)) { _, _ in scheduleStoreReload() }
         // The pane is not keyed by conversation, so switching chats left the
         // previous conversation's rows (and any detail selection) on screen.
         // Clear both before loading the new session's records.
@@ -384,7 +384,7 @@ struct SubagentInspectorView: View {
 
     @ViewBuilder
     private var runList: some View {
-        if activeRuns.isEmpty && terminalRuns.isEmpty {
+        if activeRuns.isEmpty && terminalRuns.isEmpty && orphanedRuns.isEmpty {
             emptyState
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
@@ -393,6 +393,17 @@ struct SubagentInspectorView: View {
                     if !activeRuns.isEmpty {
                         sectionLabel("ACTIVE")
                         ForEach(activeRuns, id: \.id) { record in
+                            row(for: record)
+                        }
+                    }
+                    // A non-terminal record with no live instance (a process
+                    // that crashed or was killed before reconcile reached it)
+                    // used to be dropped here while `usageStrip` still counted
+                    // it: the list said "No Subagent Runs" over "1 run", and
+                    // there was no Stop, Clear or detail for it at all.
+                    if !orphanedRuns.isEmpty {
+                        sectionLabel("ORPHANED")
+                        ForEach(orphanedRuns, id: \.id) { record in
                             row(for: record)
                         }
                     }

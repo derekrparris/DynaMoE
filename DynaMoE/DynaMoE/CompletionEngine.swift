@@ -914,7 +914,12 @@ public final class CompletionEngine: @unchecked Sendable {
                 let runnerReused = boundRows.isEmpty ? reusablePrefix : 0
 
                 let prep = TurnPrepInfo(
-                    prefixTokensReused: reusablePrefix,
+                    // What the runner actually preserved, not what the pin
+                    // offered: an image turn re-prefills its span (the pin is
+                    // keyed on token ids, and two pictures share ids), so
+                    // reporting `reusablePrefix` billed cached tokens for rows
+                    // that were recomputed.
+                    prefixTokensReused: runnerReused,
                     promptTokenCount: expandedPromptIds.count,
                     effectiveKVPrecision: runtime.cachePrecision == .fp16 ? .fp16 : .fp8,
                     provisionedSequenceLength: runtime.contextLength
@@ -1124,10 +1129,7 @@ public final class CompletionEngine: @unchecked Sendable {
                             // at launch instead dropped a still-valid pin for a
                             // turn the runner went on to refuse.
                             onCacheWillChange: {
-                                PrefixCacheManager.shared.invalidateIfNotPreserved(
-                                    runnerReused,
-                                    matchedPrefixCount: reusablePrefix
-                                )
+                                PrefixCacheManager.shared.invalidateIfNotPreserved(runnerReused)
                             }
                         )
                         emit(.prefillProgress(status: nil, speed: nil, rssGB: nil))
@@ -2571,10 +2573,7 @@ public final class CompletionEngine: @unchecked Sendable {
         // machine cannot hold, and a refused launch overwrites no rows —
         // invalidating the pin on the way to a 400 dropped a still-valid pin
         // for a refusal the operator could fix by lowering the prompt.
-        PrefixCacheManager.shared.invalidateIfNotPreserved(
-            prefixTokensReused,
-            matchedPrefixCount: reuseCandidate
-        )
+        PrefixCacheManager.shared.invalidateIfNotPreserved(prefixTokensReused)
 
         KVCacheManager.shared.reset(
             device: device,

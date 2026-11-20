@@ -642,14 +642,24 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             summaryText = derivedSummary ?? finalText
         }
         let summary = Self.bounded(summaryText, limit: 6000)
+        // The findings cap drops everything past the twelfth, and a bare list
+        // reads as the whole story. The count is appended to `risks` (a field
+        // that already means "what the reader should know beyond the claims")
+        // rather than to a finding's claim, so each entry stays one assertion.
+        let findings = AgentReportBuilder.findings(from: transcript)
+        let totalFindings = AgentReportBuilder.findingCount(from: transcript)
+        var risks = failure.map { [$0] } ?? []
+        if totalFindings > findings.count {
+            risks.append("\(totalFindings - findings.count) more finding(s) were omitted from this report; the full transcript has them.")
+        }
         let report = AgentReport(
             status: status,
             summary: summary,
-            findings: AgentReportBuilder.findings(from: transcript),
+            findings: findings,
             changedFiles: Self.changedFiles(in: transcript),
             diff: nil,
             tests: Self.testOutcomes(in: transcript),
-            risks: failure.map { [$0] } ?? [],
+            risks: risks,
             openQuestions: AgentReportBuilder.openQuestions(from: transcript),
             usage: usage,
             backend: backend.descriptor
@@ -689,6 +699,17 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                     // Parent cancellation (Stop) must let `backend.runTurn`
                     // finish unwinding so its `cancelledAfterPartial` error is
                     // collected rather than raced out by the timer.
+                    //
+                    // This is deliberately NOT a grace-then-throw backstop: a
+                    // structured group awaits its children at scope exit, so
+                    // throwing here would not bound a backend that ignores
+                    // cancellation — it would only replace the Stop's own
+                    // error with a wall-clock failure, losing the partial the
+                    // run had already earned. What bounds a stopped turn is
+                    // the BACKEND: both implementations check cancellation per
+                    // event (`LocalAgentBackend`, `CloudAgentBackend`), so a
+                    // responsive backend returns promptly and an unresponsive
+                    // one is a backend bug this group cannot paper over.
                     return nil
                 }
                 throw AgentLoopError.wallClockExceeded

@@ -43,6 +43,17 @@ nonisolated enum AgentReportBuilder {
     /// (ties go to the later step), so a long run's finished analysis survives
     /// the cap even when it is followed by a dozen short preambles.
     static func findings(from transcript: [AgentTranscriptEntry]) -> [AgentFinding] {
+        Array(allFindings(from: transcript).prefix(maximumFindings))
+    }
+
+    /// How many findings the run produced, before the report's cap. The
+    /// report says what it dropped, and it can only do that by counting the
+    /// whole list.
+    static func findingCount(from transcript: [AgentTranscriptEntry]) -> Int {
+        allFindings(from: transcript).count
+    }
+
+    private static func allFindings(from transcript: [AgentTranscriptEntry]) -> [AgentFinding] {
         var findings: [AgentFinding] = []
         var seen = Set<String>()
         for block in rankedTexts(in: transcript) {
@@ -59,7 +70,6 @@ nonisolated enum AgentReportBuilder {
                     evidence: evidence(step: block.entry.stepIndex, tools: tools),
                     confidence: statementConfidence
                 ))
-                if findings.count >= maximumFindings { return findings }
             }
         }
         return findings
@@ -80,7 +90,7 @@ nonisolated enum AgentReportBuilder {
                 guard trimmed.hasSuffix("?"), trimmed.count >= 8 else { continue }
                 let sanitized = AgentHarness.sanitizeText(trimmed)
                 guard seen.insert(normalized(sanitized)).inserted else { continue }
-                questions.append(String(sanitized.prefix(maximumQuestionCharacters)))
+                questions.append(eliding(sanitized, to: maximumQuestionCharacters))
                 if questions.count >= maximumOpenQuestions { return questions }
             }
         }
@@ -109,6 +119,13 @@ nonisolated enum AgentReportBuilder {
     }
 
     // MARK: Parsing
+
+    /// Cuts text to a limit and SAYS it was cut. A bare `prefix` ends a
+    /// paragraph mid-sentence, which reads as a complete claim.
+    static func eliding(_ text: String, to limit: Int) -> String {
+        guard text.count > limit else { return text }
+        return String(text.prefix(max(0, limit - 1))) + "…"
+    }
 
     /// The run's assistant texts, most substantive first. `longestFirst` false
     /// ranks later steps first instead, which is what open questions want.
@@ -141,7 +158,7 @@ nonisolated enum AgentReportBuilder {
             guard !stripped.hasSuffix("?") else { continue }
             guard stripped.count >= minimumClaimCharacters else { continue }
             let sanitized = AgentHarness.sanitizeText(stripped)
-            claims.append(String(sanitized.prefix(maximumClaimCharacters)))
+            claims.append(eliding(sanitized, to: maximumClaimCharacters))
         }
         return claims
     }

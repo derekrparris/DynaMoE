@@ -673,6 +673,16 @@ nonisolated enum WorkspaceIsolation {
         guard FileManager.default.fileExists(atPath: directory.path) else {
             throw WorkspaceIsolationError.worktreeMissing(directory.path)
         }
+        // A commit id is interpolated into git's argv below, and `AgentWorktree`
+        // is constructible from a RECORD, so it is data: `git diff --output=<file>
+        // <commit>` writes an arbitrary path if the "commit" starts with `--`.
+        // `createWorktree` and `open` always produce a resolved hex id; this
+        // refuses anything else rather than trusting every caller.
+        guard Self.isResolvedCommitID(worktree.baseCommit) else {
+            throw WorkspaceIsolationError.snapshotFailed(
+                "the recorded base commit '\(worktree.baseCommit)' is not a resolved commit id"
+            )
+        }
         // `git add -N .` below is a WRITE whose destination is decided by the
         // worktree's `.git` pointer — a file inside the sandbox. A retargeted
         // pointer would register paths in the operator's shared index, so
@@ -958,6 +968,22 @@ nonisolated enum WorkspaceIsolation {
             try await verifyWorktreeLinkage(worktree)
         }
         try await refuseIfTheMainTreeIsMidOperation(worktree.repositoryRoot)
+        // The FILE LIST is caller-supplied data too, and it is what the
+        // preflight and the rollback snapshot are taken over: a change set whose
+        // diff touches a path the list omits would get neither, so a partial
+        // apply could not restore it. A list that disagrees with the patch is
+        // refused rather than reconciled — one of the two is not what the
+        // operator approved, and guessing which would be worse.
+        let patchFiles = await Self.filesTouched(byPatch: changes.diff)
+        if !patchFiles.isEmpty {
+            let listed = Set(changes.changedFiles)
+            if !patchFiles.isSubset(of: listed) {
+                let missing = patchFiles.subtracting(listed).sorted()
+                throw WorkspaceIsolationError.applyFailed(
+                    "the change set's file list omits \(missing.joined(separator: ", ")), which its patch touches."
+                )
+            }
+        }
         try refuseIfTargetsAreNotWritable(changes.changedFiles, in: worktree.repositoryRoot)
 
         // A PRIVATE directory, not a name derived from the branch. The old path
@@ -1299,7 +1325,16 @@ nonisolated enum WorkspaceIsolation {
     ) async -> Bool {
         let fileManager = FileManager.default
         let contained = isInsideRoot(worktree.path, root: root)
-        if contained {
+        // A FIFO or symlink `.git` makes every git command in that directory
+        // block for the full process timeout (see `worktreeGitEntryState`),
+        // so the discard path checks it before running one there — the same
+        // gate the launch sweep applies.
+        var gitSafe = true
+        switch await worktreeGitEntryState(worktree.path) {
+        case .regularFile, .missing: break
+        case .unreadable, .hostile: gitSafe = false
+        }
+        if contained && gitSafe {
             _ = try? await git(
                 ["worktree", "remove", "--force", worktree.path.path],
                 in: worktree.repositoryRoot
@@ -1334,6 +1369,61 @@ nonisolated enum WorkspaceIsolation {
     /// process's own worktree root qualifies; a record's path is data.
     static func isInsideProcessWorktreeRoot(_ url: URL) -> Bool {
         isInsideRoot(url, root: processRootURL)
+    }
+
+    /// Whether a recorded commit is a resolved object id (hex, non-empty).
+    ///
+    /// `AgentWorktree.baseCommit` is interpolated into git's argv, and git
+    /// accepts option-looking operands there (`--output=<path>` for `diff`), so
+    /// a value read from a record must be proven to be an id before it is
+    /// passed. `createWorktree` and `open` resolve it with `rev-parse`; this is
+    /// the check for every other source.
+    static func isResolvedCommitID(_ value: String) -> Bool {
+        !value.isEmpty && value.count <= 64 && value.allSatisfy(\.isHexDigit)
+    }
+
+    /// Every path a unified diff touches, both sides of a rename.
+    ///
+    /// Parsed by git itself (`apply --numstat`, which reads the patch and writes
+    /// nothing) rather than by hand: the patch format has quoting, binary
+    /// hunks and rename headers that a hand parser gets subtly wrong exactly
+    /// where it matters — deciding which files a preflight and a rollback have
+    /// to cover.
+    static func filesTouched(byPatch patch: String) async -> Set<String> {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dynamoe-numstat-\(UUID().uuidString)", isDirectory: true)
+        let url = directory.appendingPathComponent("change.patch", isDirectory: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        do {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700]
+            )
+            try patch.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            return []
+        }
+        guard let (code, out, _) = try? await git(
+            ["apply", "--numstat", url.path],
+            in: directory
+        ), code == 0 else { return [] }
+        // One line per file: "added\tdeleted\tpath", with a rename spelled
+        // "added\tdeleted\told => new" (or a brace form) and a binary file's
+        // counts as dashes.
+        var files = Set<String>()
+        for line in out.split(separator: "\n", omittingEmptySubsequences: true) {
+            let fields = line.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
+            guard fields.count == 3 else { continue }
+            let path = String(fields[2])
+            if let arrow = path.range(of: " => ") {
+                files.insert(String(path[..<arrow.lowerBound]))
+                files.insert(String(path[arrow.upperBound...]))
+            } else {
+                files.insert(path)
+            }
+        }
+        return files
     }
 
     static func isInsideRoot(_ url: URL, root: URL) -> Bool {
@@ -1639,7 +1729,8 @@ nonisolated enum WorkspaceIsolation {
     /// worktree that fails it gets no stat at all, and the card falls back to
     /// the recorded file list.
     static func diffStat(_ worktree: AgentWorktree, lineLimit: Int = 14) async -> String? {
-        guard (try? await verifyWorktreeLinkage(worktree)) != nil else { return nil }
+        guard (try? await verifyWorktreeLinkage(worktree)) != nil,
+              isResolvedCommitID(worktree.baseCommit) else { return nil }
         _ = try? await git(["add", "-N", "."], in: worktree.path)
         guard let (code, out, _) = try? await git(
             ["diff", worktree.baseCommit, "--no-ext-diff", "--no-textconv", "--stat", "--stat-width=78", "--no-color"],
@@ -1672,6 +1763,15 @@ nonisolated enum WorkspaceIsolation {
         // refuses it with "header lacks filename information". An inherited
         // `GIT_DIR` / `GIT_WORK_TREE` can redirect the apply into another
         // repository entirely, so the child gets neither.
+        //
+        // The `-c` overrides below close the same hole from the other side: a
+        // linked worktree shares the MAIN repository's config file, and a run
+        // can write it from inside its own worktree. `core.fsmonitor` and
+        // hooks are then EXECUTED as commands by the plain read-only git calls
+        // this file makes in the operator's tree (status, diff, add), which is
+        // code execution outside the sandbox that needs no shell escape at all.
+        // `filter.<n>.clean` is the same class and cannot be enumerated away,
+        // so the destructive calls also avoid `git add` where they can.
         var environment = ControlledProcessRunner.toolEnvironment(
             scoped: AgentHarness.executingInRunScope
         )
@@ -1679,7 +1779,15 @@ nonisolated enum WorkspaceIsolation {
             environment.removeValue(forKey: key)
         }
         var arguments = arguments
-        arguments.insert(contentsOf: ["-c", "diff.noprefix=false"], at: 0)
+        arguments.insert(
+            contentsOf: [
+                "-c", "diff.noprefix=false",
+                "-c", "core.fsmonitor=false",
+                "-c", "core.hooksPath=/dev/null",
+                "-c", "core.untrackedCache=false",
+            ],
+            at: 0
+        )
         return try await AgentHarness.runProcess(
             executableURL: gitURL,
             arguments: arguments,

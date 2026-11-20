@@ -3458,14 +3458,17 @@ public final class ApplySubagentChangesTool: AgentTool {
         // the apply resolves too (the worktree's `.git` pointer is sandbox-
         // writable and is deliberately not trusted for this).
         var destinationBranch: String?
+        var destinationBranchResolved = false
         if let recordedRoot {
+            destinationBranchResolved = true
             destinationBranch = await WorkspaceIsolation.currentBranch(
                 of: URL(fileURLWithPath: recordedRoot, isDirectory: true)
             )
         }
         let preview = await SubagentApplyService.applyExpectation(
             runId: runId,
-            destinationBranch: destinationBranch
+            destinationBranch: destinationBranch,
+            destinationBranchResolved: destinationBranchResolved
         )
         do {
             let outcome = try await SubagentApplyService.apply(

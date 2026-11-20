@@ -800,6 +800,26 @@ public nonisolated final class CloudTurnReceipt: @unchecked Sendable {
         terminalFailure = failure
         lock.unlock()
     }
+
+    /// Whether this attempt already put text in front of the operator.
+    ///
+    /// A retry re-emits the turn from its beginning and the drawer only
+    /// appends, so retrying over streamed text leaves a truncated prefix that
+    /// is never corrected. The caller records a delta here as it forwards it,
+    /// and refuses to retry once this is true.
+    private var streamedText: Bool = false
+
+    var streamedAnything: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return streamedText
+    }
+
+    func recordStreamedDelta() {
+        lock.lock()
+        streamedText = true
+        lock.unlock()
+    }
 }
 
 // MARK: - Failures
@@ -1517,7 +1537,12 @@ public nonisolated enum CloudMessageAssembler {
             // an older picture because a later question carried no file defeats
             // the setting: the user asked for text-only follow-ups not to keep
             // paying for a picture they already stopped asking about.
-            newestImageTurnId = messages.last(where: { $0.role == .user })?.id
+            //
+            // Prompt-only rows are skipped for the same reason the loop below
+            // skips them: a relay directive left by an earlier LOCAL send is
+            // not a turn the provider sees, so letting it be "newest" would
+            // omit the real turn's images and price zero attachments.
+            newestImageTurnId = messages.last(where: { $0.role == .user && $0.isPromptOnly != true })?.id
         }
         var assembled: [CloudChatMessage] = []
         for message in messages {
@@ -1580,7 +1605,7 @@ public nonisolated enum CloudMessageAssembler {
         case .all:
             carrying = messages
         case .newestUserTurnOnly:
-            carrying = messages.last(where: { $0.role == .user }).map { [$0] } ?? []
+            carrying = messages.last(where: { $0.role == .user && $0.isPromptOnly != true }).map { [$0] } ?? []
         }
         return carrying.reduce(0) { total, message in
             guard message.role == .user else { return total }

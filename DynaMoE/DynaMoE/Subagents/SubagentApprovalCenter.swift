@@ -100,7 +100,13 @@ final class SubagentApprovalCenter: ObservableObject {
         defer {
             pending.removeAll { $0.id == entry.id }
             ActionApprovalManager.shared.unregister(id: entry.id)
-            SubagentManager.shared.noteApprovalResolved(runId: request.runId)
+            // Only when no OTHER card of this run is still pending: a run can
+            // have several in flight (a looping model, a tool call plus a
+            // local-cost card), and resolving one used to flip the run back to
+            // "running" while it was still parked on the next.
+            if !pending.contains(where: { $0.request.runId == request.runId }) {
+                SubagentManager.shared.noteApprovalResolved(runId: request.runId)
+            }
         }
 
         let timeout = min(overrideTimeout ?? Self.resolvedApprovalTimeout(), 86_400)
@@ -114,6 +120,13 @@ final class SubagentApprovalCenter: ObservableObject {
             }
             let first = await group.next() ?? false
             group.cancelAll()
+            // A click that lands as the timeout fires is not lost: the group
+            // returns the FIRST result, so if the sleep won by a hair, the
+            // operator's decision is still recorded in the manager and is
+            // consumed here instead of being reported as a decline.
+            if !first, let decided = ActionApprovalManager.shared.rememberedDecision(id: entry.id) {
+                return decided
+            }
             return first
         }
         return approved

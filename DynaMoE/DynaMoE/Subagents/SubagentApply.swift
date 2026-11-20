@@ -60,6 +60,12 @@ nonisolated struct SubagentApplyExpectation: Sendable, Equatable {
     /// The destination branch (or `nil` for detached HEAD) that was checked out
     /// when the card was built.
     var destinationBranch: String?
+    /// Whether `destinationBranch` was actually READ at card time. A resolved
+    /// detached HEAD is `true` with a nil branch, and it must be verified too:
+    /// a `git checkout main` during the approval window would otherwise land
+    /// the patch on a branch the operator never saw, which is exactly the case
+    /// a nil branch used to skip.
+    var destinationBranchResolved: Bool = false
     /// SHA-256 hex digest of the full unified diff snapshotted when the card was
     /// built, or `nil` when no pre-approval snapshot was taken.
     var patchDigest: String?
@@ -190,7 +196,8 @@ enum SubagentApplyService {
     /// Nil pieces simply drop out of the expectation, which then checks less.
     static func applyExpectation(
         runId: UUID,
-        destinationBranch: String?
+        destinationBranch: String?,
+        destinationBranchResolved: Bool
     ) async -> (expectation: SubagentApplyExpectation?, diffPreview: String?) {
         let record = SubagentManager.shared.getSubagent(byId: runId)?.snapshotRecord()
             ?? AgentRunStore.shared.loadAny(runId: runId)
@@ -202,16 +209,17 @@ enum SubagentApplyService {
             path: path,
             branch: branch,
             repositoryRoot: destination,
-            baseCommit: record.baseCommit
+            baseCommit: record.baseCommit,
+            runId: runId
         ), let changes = try? await WorkspaceIsolation.snapshot(worktree, diffLimit: nil) else {
             return (nil, nil)
         }
         // Built even when the destination is a detached HEAD (`nil` branch):
-        // there the branch check cannot help, so the patch digest is the only
-        // binding left and dropping the whole expectation would discard it.
-        // Both fields are optional and a nil one simply checks less.
+        // there the branch check can still help — it verifies the destination
+        // is STILL detached — and the patch digest binds the bytes.
         let expectation = SubagentApplyExpectation(
             destinationBranch: destinationBranch,
+            destinationBranchResolved: destinationBranchResolved,
             patchDigest: patchDigest(changes.diff)
         )
         return (expectation, changes.diff)
@@ -276,7 +284,8 @@ enum SubagentApplyService {
                 path: path,
                 branch: branch,
                 repositoryRoot: record.repositoryRoot.map { URL(fileURLWithPath: $0, isDirectory: true) },
-                baseCommit: record.baseCommit
+                baseCommit: record.baseCommit,
+                runId: runId
             )
         } catch {
             let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
@@ -301,13 +310,19 @@ enum SubagentApplyService {
         // approval window cannot land unreviewed bytes on the wrong branch.
         let destinationBranch = await WorkspaceIsolation.currentBranch(of: worktree.repositoryRoot)
         if let expectation {
-            // Only a branch the card RESOLVED can be checked. A nil expected
-            // branch means "detached HEAD", but it is also what a caller that
-            // built the expectation without resolving one passes, and those
-            // must not be refused when the destination is on a branch — the
-            // earlier code dropped the whole expectation in that case, and
-            // failing here instead would turn a permissive path strict.
-            if let expectedBranch = expectation.destinationBranch,
+            // A branch the card RESOLVED is checked even when it resolved to
+            // nil (detached HEAD): nil-vs-nil is a pass, nil-vs-"main" is a
+            // refusal. An unresolved expectation keeps the permissive rule —
+            // only a non-nil expected branch is checked — so a caller that
+            // built one without reading the destination is not made strict.
+            if expectation.destinationBranchResolved {
+                if destinationBranch != expectation.destinationBranch {
+                    throw SubagentApplyError.destinationBranchChanged(
+                        expected: expectation.destinationBranch,
+                        actual: destinationBranch
+                    )
+                }
+            } else if let expectedBranch = expectation.destinationBranch,
                destinationBranch != expectedBranch {
                 throw SubagentApplyError.destinationBranchChanged(
                     expected: expectedBranch,
@@ -829,7 +844,8 @@ enum SubagentApplyControl {
         let expectation: SubagentApplyExpectation? = patchDigest == nil && !destinationBranchResolved
             ? nil
             : SubagentApplyExpectation(
-                destinationBranch: destinationBranchResolved ? destinationBranch : nil,
+                destinationBranch: destinationBranch,
+                destinationBranchResolved: destinationBranchResolved,
                 patchDigest: patchDigest
             )
         return try await SubagentApplyService.apply(runId: runId, expectation: expectation)

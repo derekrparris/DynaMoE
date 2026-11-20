@@ -153,8 +153,13 @@ nonisolated struct LocalSubagentCostEstimate: Equatable, Sendable {
     /// are still covered; only a cost increase refuses the spawn.
     func isCoveredBy(_ approved: LocalSubagentCostEstimate) -> Bool {
         let tolerance = 1e-6
-        return coordinatorReprefillSeconds <= approved.coordinatorReprefillSeconds + tolerance
-            && runPrefillSeconds <= approved.runPrefillSeconds + tolerance
+        // Token counts, not seconds: both sides of a seconds comparison are
+        // divided by their own rate, so a rate change that keeps the wall time
+        // equal would cancel out — exactly the case this check exists to
+        // refuse (the pin and the measured rate can both move while the card
+        // is open, and "same seconds at twice the rate" is twice the tokens).
+        return Double(coordinatorPrefixTokens) <= Double(approved.coordinatorPrefixTokens) * (1 + tolerance)
+            && Double(runPromptTokens) <= Double(approved.runPromptTokens) * (1 + tolerance)
     }
 
     func admits(
