@@ -977,7 +977,10 @@ public final class SubagentInstance: Identifiable, ObservableObject {
                     return nil
                 }(),
                 approvalHandler: { request in
-                    await SubagentApprovalCenter.shared.request(request)
+                    // Routine in-sandbox work is what Turbo Mode exists to
+                    // skip; the center still keeps a card for an apply, a
+                    // containment escape or a cost refusal.
+                    await SubagentApprovalCenter.shared.request(request, honorsTurbo: true)
                 }
             )
         } catch {

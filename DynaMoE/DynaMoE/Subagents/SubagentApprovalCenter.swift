@@ -61,9 +61,13 @@ final class SubagentApprovalCenter: ObservableObject {
     /// escape from the configuration presented as safe — an out-of-workspace
     /// write, a shell with its own `cwd`, a `.git` pointer rewrite — is
     /// exactly the write the operator would most want to see.
+    ///
+    /// `honorsTurbo` defaults to FALSE: a new caller that has not thought about
+    /// whether Turbo may decide for it gets the card, not the bypass. The
+    /// routine cases opt in explicitly at their call site.
     func request(
         _ request: AgentApprovalRequest,
-        honorsTurbo: Bool = true,
+        honorsTurbo: Bool = false,
         timeout overrideTimeout: TimeInterval? = nil,
         scope overrideScope: ActionApprovalScope? = nil
     ) async -> Bool {

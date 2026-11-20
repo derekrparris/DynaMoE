@@ -381,6 +381,20 @@ enum SubagentApplyService {
             }
             files = []
         } else {
+            // The branch was read once, before the snapshot, and is RECORDED
+            // after the apply — so a `git checkout` in between would land the
+            // patch somewhere the record does not name, and the operator's
+            // approval was for the other branch. Re-read it at the last moment
+            // a refusal is still possible.
+            if let expectation, expectation.destinationBranchResolved {
+                let current = await WorkspaceIsolation.currentBranch(of: worktree.repositoryRoot)
+                if current != destinationBranch {
+                    throw SubagentApplyError.destinationBranchChanged(
+                        expected: destinationBranch ?? "detached HEAD",
+                        actual: current ?? "detached HEAD"
+                    )
+                }
+            }
             let result = try await WorkspaceIsolation.apply(worktree, changeSet: changes)
             files = result.changedFiles
             // The tracked patch does not remove the run's ignored files, nor

@@ -974,15 +974,17 @@ nonisolated enum WorkspaceIsolation {
         // apply could not restore it. A list that disagrees with the patch is
         // refused rather than reconciled — one of the two is not what the
         // operator approved, and guessing which would be worse.
-        let patchFiles = await Self.filesTouched(byPatch: changes.diff)
-        if !patchFiles.isEmpty {
-            let listed = Set(changes.changedFiles)
-            if !patchFiles.isSubset(of: listed) {
-                let missing = patchFiles.subtracting(listed).sorted()
-                throw WorkspaceIsolationError.applyFailed(
-                    "the change set's file list omits \(missing.joined(separator: ", ")), which its patch touches."
-                )
-            }
+        //
+        // A patch whose file list cannot be read is refused too (the helper
+        // throws): skipping the cross-check would apply exactly the change set
+        // nothing could vouch for.
+        let patchFiles = try await Self.filesTouched(byPatch: changes.diff)
+        let listed = Set(changes.changedFiles)
+        if !patchFiles.isSubset(of: listed) {
+            let missing = patchFiles.subtracting(listed).sorted()
+            throw WorkspaceIsolationError.applyFailed(
+                "the change set's file list omits \(missing.joined(separator: ", ")), which its patch touches."
+            )
         }
         try refuseIfTargetsAreNotWritable(changes.changedFiles, in: worktree.repositoryRoot)
 
@@ -1389,7 +1391,14 @@ nonisolated enum WorkspaceIsolation {
     /// hunks and rename headers that a hand parser gets subtly wrong exactly
     /// where it matters — deciding which files a preflight and a rollback have
     /// to cover.
-    static func filesTouched(byPatch patch: String) async -> Set<String> {
+    ///
+    /// THROWS rather than answering an empty set when the patch cannot be read:
+    /// the caller uses this to cross-check the patch against the change set's
+    /// file list, and an empty set there means "nothing to check", so a failure
+    /// silently skipped the check on exactly the change set nobody could vouch
+    /// for. An empty PATCH is still a legitimate empty answer — git reads it
+    /// happily and reports no files.
+    static func filesTouched(byPatch patch: String) async throws -> Set<String> {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("dynamoe-numstat-\(UUID().uuidString)", isDirectory: true)
         let url = directory.appendingPathComponent("change.patch", isDirectory: false)
@@ -1402,12 +1411,23 @@ nonisolated enum WorkspaceIsolation {
             )
             try patch.write(to: url, atomically: true, encoding: .utf8)
         } catch {
-            return []
+            throw WorkspaceIsolationError.applyFailed(
+                "the patch could not be staged to read its file list: \(error.localizedDescription)"
+            )
         }
-        guard let (code, out, _) = try? await git(
-            ["apply", "--numstat", url.path],
-            in: directory
-        ), code == 0 else { return [] }
+        let (code, out, err): (Int32, String, String)
+        do {
+            (code, out, err) = try await git(["apply", "--numstat", url.path], in: directory)
+        } catch {
+            throw WorkspaceIsolationError.applyFailed(
+                "the patch's file list could not be read: \(error.localizedDescription)"
+            )
+        }
+        guard code == 0 else {
+            throw WorkspaceIsolationError.applyFailed(
+                "the patch's file list could not be read: \(err.trimmingCharacters(in: .whitespacesAndNewlines))"
+            )
+        }
         // One line per file: "added\tdeleted\tpath", with a rename spelled
         // "added\tdeleted\told => new" (or a brace form) and a binary file's
         // counts as dashes.
@@ -1442,6 +1462,12 @@ nonisolated enum WorkspaceIsolation {
     /// treat as "do not assume it is empty".
     static func commitsAheadOfBase(_ worktree: AgentWorktree) async -> Int? {
         guard !worktree.baseCommit.isEmpty, !worktree.branch.isEmpty else { return nil }
+        // Both operands are read from a record and interpolated into git's argv,
+        // and git accepts option-looking operands there (`--output=<path>` for
+        // `diff`). The base must be a resolved id; the branch is checked
+        // against the same shape the branch commands require.
+        guard isResolvedCommitID(worktree.baseCommit),
+              worktree.branch.hasPrefix(branchPrefix) else { return nil }
         guard let (code, out, _) = try? await git(
             ["rev-list", "--count", "\(worktree.baseCommit)..\(worktree.branch)"],
             in: worktree.repositoryRoot

@@ -262,9 +262,19 @@ public final class ControlledProcessRunner {
             "SECRET", "TOKEN", "PASSWORD", "PASSWD", "CREDENTIAL",
             "API_KEY", "APIKEY", "ACCESS_KEY", "ACCESS_TOKEN",
             "PRIVATE_KEY", "SESSION_KEY", "AUTH_TOKEN", "AUTH_KEY",
-            "CLIENT_KEY", "SIGNING_KEY", "ENCRYPTION_KEY"
+            "CLIENT_KEY", "SIGNING_KEY", "ENCRYPTION_KEY",
+            // Spelled without any of the words above: OPENAI_KEY is a key by
+            // the same convention as OPENAI_API_KEY, and DATABASE_URL (with
+            // its sibling *_URI spellings) routinely embeds user:password in
+            // the URL. `_KEY` is anchored to the underscore so MONKEY is not
+            // a credential.
+            "_KEY", "DATABASE_URL", "_URI"
         ]
         if markers.contains(where: { upper.contains($0) }) { return true }
+        // X_AUTH is how a bearer credential is often named, but the SUFFIX
+        // form is what makes it safe to add: SSH_AUTH_SOCK is a socket PATH,
+        // and stripping it would break every ssh-backed git command.
+        if upper.hasSuffix("_AUTH") { return true }
         // A personal access token spelled as an abbreviation.
         return upper.hasSuffix("_PAT")
     }
