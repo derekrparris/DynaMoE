@@ -4836,7 +4836,9 @@ public final class AgentHarness {
     /// operator makes once, with the role, backend and tool set in front of
     /// them, rather than a stream of per-call cards they cannot attribute to a
     /// background run. A read-only LOCAL spawn, and any local spawn in plan
-    /// mode, runs without a card.
+    /// mode, runs without a card, unless it asks for a wall-clock budget above
+    /// its preset's default, which is the one unattended number that can hold
+    /// the single local engine for hours.
     ///
     /// Plan mode is not a blanket exemption. Its write tools are withheld, but
     /// the READ tools stay available, so a run that works off-device uploads
@@ -4850,7 +4852,14 @@ public final class AgentHarness {
         defaults: UserDefaults = .standard
     ) -> Bool {
         if mode == .plan {
-            return spawnResolvesToCloud(arguments: arguments, defaults: defaults)
+            // Plan mode's local runs are read-only, but they still hold the
+            // single local engine for their whole budget, so an inflated
+            // wall clock is carded here too. Legacy pipelines do not run the
+            // model loop and never hold that engine, so their budget is not a
+            // reason for a card.
+            if spawnResolvesToCloud(arguments: arguments, defaults: defaults) { return true }
+            let selection = SpawnSubagentTool.backendSelection(from: arguments, defaults: defaults)
+            return selection.modelBacked && requestsWallClockAbovePresetDefault(arguments)
         }
         // Sending a run off-device is a decision the operator makes in
         // Settings or on a card that says so. A read-only run is still a run:
@@ -4871,11 +4880,40 @@ public final class AgentHarness {
             role: arguments["role"] as? String ?? ""
         )
         let definition = AgentRolePresetCatalog.definition(for: preset)
+        // A WALL-CLOCK BUDGET THE MODEL CHOSE is a decision the operator makes.
+        // The local engine is single-flight and a scheduler ticket is held for
+        // the run's WHOLE life, so one unattended 24 h run blocks every later
+        // local spawn for the queue's whole admission budget, a wait nothing
+        // the operator ever saw can justify. The preset's own default is the
+        // unattended bound; above it the card appears with the number on it.
+        if requestsWallClockAbovePresetDefault(arguments) { return true }
         let explicit = ((arguments["allowed_tools"] as? [String]) ?? [])
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         let intended = explicit.isEmpty ? definition.toolNames : explicit
         return !Set(intended).isDisjoint(with: AgentToolSurface.writeCapable)
+    }
+
+    /// Whether a spawn asked for more wall clock than its preset's default.
+    /// The number is read the same way `budgetOverrides` reads it, so the
+    /// approval decision and the budget the run actually gets cannot disagree.
+    private static func requestsWallClockAbovePresetDefault(_ arguments: [String: Any]) -> Bool {
+        guard let requested = requestedWallClockSeconds(from: arguments) else { return false }
+        let preset = AgentRolePresetCatalog.preset(
+            named: arguments["preset"] as? String,
+            role: arguments["role"] as? String ?? ""
+        )
+        return requested > AgentRolePresetCatalog.definition(for: preset).maxWallClockSeconds
+    }
+
+    /// The `budget.max_wall_clock_seconds` a spawn asked for, if it named one.
+    /// Read the same way `budgetOverrides` reads it, so the approval decision
+    /// and the budget the run actually gets cannot disagree about the number.
+    private static func requestedWallClockSeconds(from arguments: [String: Any]) -> Int? {
+        guard let budget = arguments["budget"] as? [String: Any] else { return nil }
+        if let value = budget["max_wall_clock_seconds"] as? Int { return value }
+        if let value = budget["max_wall_clock_seconds"] as? NSNumber { return value.intValue }
+        return nil
     }
 
     /// Steering a running legacy Test Runner executes shell commands extracted

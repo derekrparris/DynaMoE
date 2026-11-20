@@ -282,8 +282,10 @@ nonisolated public final class GrammarConstrainedSampler {
     /// an unconditional snapshot on every exit therefore put the run's
     /// vocabulary back after the server had restored the app catalog, leaving
     /// the run's mask installed for every later turn. Each scope is tracked by
-    /// identity, and an exit rebuilds the registry from the base snapshot plus
-    /// every scope still live, in install order.
+    /// identity, and an exit rebuilds the registry from every scope still live
+    /// , the UNION of their names, not the base plus them, because a scoped
+    /// turn must not be able to emit an in-app tool name. The base snapshot is
+    /// restored once the LAST scope ends.
     nonisolated public static func withTurnToolMask<T>(
         _ schemas: [GrammarToolSchema],
         _ body: () async throws -> T

@@ -197,7 +197,15 @@ final class EngineTurnSlotTests: XCTestCase {
     func testARefusedLaunchWithoutAClaimGivesTheSlotBack() {
         let engine = CompletionEngine.shared
         XCTAssertFalse(engine.isActive, "the slot must be free at the start of the case")
-        XCTAssertThrowsError(try engine.launchTurn(makeRequest()))
+        XCTAssertThrowsError(try engine.launchTurn(makeRequest())) { error in
+            // Not just "an error": a refusal for the slot would also throw,
+            // and would make this case pass while proving the opposite.
+            let text = message(error)
+            XCTAssertTrue(
+                text.contains("Metal or Tokenizer"),
+                "the refusal must come from the missing model, not from a lost slot: \(text)"
+            )
+        }
         XCTAssertFalse(engine.isActive, "a launch that took the slot and refused must not keep it")
     }
 

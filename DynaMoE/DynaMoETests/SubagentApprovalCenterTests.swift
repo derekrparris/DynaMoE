@@ -221,4 +221,44 @@ final class SubagentApprovalCenterTests: XCTestCase {
         XCTAssertTrue(SubagentApprovalCenter.refusesCard(pendingCount: 32))
         XCTAssertTrue(SubagentApprovalCenter.refusesCard(pendingCount: 33))
     }
+
+    /// `refusesCard` is only the predicate; the `request` path is what a
+    /// looping model actually reaches, and it used to append unconditionally.
+    /// A card past the cap must resolve REJECTED without ever being shown.
+    func testRequestRefusesACardPastTheCap() async {
+        let center = SubagentApprovalCenter.shared
+        XCTAssertTrue(center.pending.isEmpty, "the suite must start from an empty queue")
+        let parked = (0..<SubagentApprovalCenter.maximumPendingCards).map { _ in
+            request(tool: "file_write", containmentEscape: true)
+        }
+        let waiters = parked.map { card in
+            Task { await center.request(card, timeout: 15) }
+        }
+        defer {
+            // Resolve every parked card so no continuation outlives the case.
+            for entry in center.pending { center.reject(entry.id) }
+            for waiter in waiters { waiter.cancel() }
+        }
+        var filled = false
+        for _ in 0..<1_000 {
+            if center.pending.count == SubagentApprovalCenter.maximumPendingCards {
+                filled = true
+                break
+            }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertTrue(filled, "all \(SubagentApprovalCenter.maximumPendingCards) cards must reach the queue")
+
+        let overflow = request(tool: "file_write", containmentEscape: true)
+        let answer = await center.request(overflow, timeout: 0.05)
+        XCTAssertFalse(answer, "a card past the cap is refused, not parked")
+        XCTAssertFalse(
+            center.pending.contains { $0.request.runId == overflow.runId },
+            "the refused card never reaches the operator's list"
+        )
+
+        for entry in center.pending { center.reject(entry.id) }
+        for waiter in waiters { _ = await waiter.value }
+        XCTAssertTrue(center.pending.isEmpty, "the queue drains once every card is answered")
+    }
 }

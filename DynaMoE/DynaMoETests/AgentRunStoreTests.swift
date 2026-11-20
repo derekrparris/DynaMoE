@@ -35,7 +35,10 @@ final class AgentRunStoreTests: XCTestCase {
         status: AgentRunStatus = .completed,
         transcript: [AgentTranscriptEntry] = [],
         isolation: AgentIsolation = .none,
-        appliedAt: Date? = nil
+        appliedAt: Date? = nil,
+        report: AgentReport? = nil,
+        error: String? = nil,
+        summaryRelayed: Bool = false
     ) -> AgentRunRecord {
         AgentRunRecord(
             id: id,
@@ -57,7 +60,33 @@ final class AgentRunStoreTests: XCTestCase {
             startedAt: createdAt,
             completedAt: completedAt,
             transcript: transcript,
+            report: report,
+            error: error,
+            summaryRelayed: summaryRelayed,
             appliedAt: appliedAt
+        )
+    }
+
+    private func report(
+        status: AgentRunStatus = .cancelled,
+        summary: String
+    ) -> AgentReport {
+        AgentReport(
+            status: status,
+            summary: summary,
+            findings: [],
+            changedFiles: [],
+            diff: nil,
+            tests: [],
+            risks: [],
+            openQuestions: [],
+            usage: AgentUsage(),
+            backend: AgentBackendDescriptor(
+                kind: .local,
+                providerId: nil,
+                modelId: "local",
+                displayName: "Local model"
+            )
         )
     }
 
@@ -648,8 +677,16 @@ final class AgentRunStoreTests: XCTestCase {
     func testTheRelayIndexFindsUnrelayedRecordsOnDiskAndFollowsChanges() throws {
         let store = makeStore()
         let sessionId = UUID()
-        let pending = record(sessionId: sessionId)
-        var delivered = record(sessionId: sessionId)
+        // A terminal record still needs something to DELIVER to be owed; the
+        // index asks `relaySummaryText`, so a bare completed status is settled.
+        let pending = record(
+            sessionId: sessionId,
+            report: report(status: .completed, summary: "Found the scheduler.")
+        )
+        var delivered = record(
+            sessionId: sessionId,
+            report: report(status: .completed, summary: "Already shown.")
+        )
         delivered.summaryRelayed = true
         store.saveImmediately(pending)
         store.saveImmediately(delivered)
@@ -679,7 +716,10 @@ final class AgentRunStoreTests: XCTestCase {
     func testMarkingRelayedIsVisibleBeforeItsWriteLands() throws {
         let store = makeStore()
         let sessionId = UUID()
-        let run = record(sessionId: sessionId)
+        let run = record(
+            sessionId: sessionId,
+            report: report(status: .completed, summary: "Found the scheduler.")
+        )
         store.saveImmediately(run)
         // Build the index so the answer comes from the in-memory fast path.
         store.prepareRelayIndex()
@@ -869,6 +909,92 @@ final class AgentRunStoreTests: XCTestCase {
         }
     }
 
+    /// The directory flush happens AFTER the rename, so its failure must not
+    /// be reported as a failed write. Callers treat `false` as "nothing
+    /// happened": a conversation-delete rescue kept files it had already
+    /// moved, and an apply stamp claimed the record update failed after it had
+    /// landed. The record is in place; only its crash durability is reduced.
+    func testADirectoryFlushFailureAfterTheRenameIsStillASuccessfulWrite() throws {
+        let store = makeStore()
+        let sessionId = UUID()
+        var saved = record(sessionId: sessionId)
+        saved.task = "the first version"
+        XCTAssertTrue(store.saveImmediately(saved))
+
+        var updated = saved
+        updated.task = "the second version"
+        store.injectWriteFaultForTesting { .directoryFsync }
+        XCTAssertTrue(
+            store.saveImmediately(updated),
+            "the bytes are already in place; a directory fsync failure is a warning, not a failed write"
+        )
+        XCTAssertEqual(
+            store.load(runId: saved.id, sessionId: sessionId)?.task,
+            "the second version",
+            "and the record that landed is the new one, not the prior copy"
+        )
+
+        store.injectWriteFaultForTesting(nil)
+        store.flush()
+    }
+
+    // MARK: - What the relay owes
+
+    /// A cancelled run's `error` is the stop reason, not a report. Keeping it
+    /// in the relay index made every later send pay a decode for it forever,
+    /// and the inspector badge stayed UNREAD forever, because the relay's own
+    /// cancelled rule refuses to inject a bare stop reason. Once terminal with
+    /// no partial there is nothing left to wait for, so the record settles;
+    /// a partial that lands later re-opens it.
+    func testACancelledRunWithNothingToRelayIsNotOwed() throws {
+        let store = makeStore()
+        let sessionId = UUID()
+        let cancelled = record(
+            sessionId: sessionId,
+            completedAt: Date(),
+            status: .cancelled,
+            error: "Cancelled by user or coordinator."
+        )
+        XCTAssertNil(cancelled.relaySummaryText, "the stop reason is not a report")
+        XCTAssertTrue(store.saveImmediately(cancelled))
+        store.flush()
+        XCTAssertFalse(
+            store.unrelayedRunIds(sessionId: sessionId).contains(cancelled.id),
+            "a settled run must not be decoded on every send"
+        )
+
+        // The loop's unwind writes the partial it managed to produce.
+        var withPartial = cancelled
+        withPartial.report = report(summary: "Halfway through the analysis.")
+        XCTAssertEqual(withPartial.relaySummaryText, "Halfway through the analysis.")
+        XCTAssertTrue(store.saveImmediately(withPartial))
+        store.flush()
+        XCTAssertTrue(
+            store.unrelayedRunIds(sessionId: sessionId).contains(cancelled.id),
+            "the partial the run earned is owed once it lands"
+        )
+
+        // Delivered, it settles for good.
+        var delivered = withPartial
+        delivered.summaryRelayed = true
+        XCTAssertNil(delivered.relaySummaryText)
+        XCTAssertTrue(store.saveImmediately(delivered))
+        store.flush()
+        XCTAssertFalse(store.unrelayedRunIds(sessionId: sessionId).contains(cancelled.id))
+    }
+
+    /// Non-cancelled runs keep the old fallback: a failure with no report
+    /// still has the failure text to show the coordinator.
+    func testAFailedRunWithOnlyAnErrorIsStillOwed() {
+        let failed = record(
+            sessionId: UUID(),
+            completedAt: Date(),
+            status: .failed,
+            error: "The provider refused the request."
+        )
+        XCTAssertEqual(failed.relaySummaryText, "The provider refused the request.")
+    }
+
     // MARK: - Duplicate copies after a crashed conversation delete
 
     /// A conversation delete writes the rescued copy BEFORE removing the old
@@ -899,6 +1025,62 @@ final class AgentRunStoreTests: XCTestCase {
         XCTAssertFalse(
             store.hasRecordFile(runId: saved.id),
             "the launch sweep must not see a file for a deleted run"
+        )
+    }
+
+    /// The rescue write is the one step of a conversation delete that can
+    /// fail, and the failure branch exists because removing the original then
+    /// would hand an unapplied worktree to the 14-day sweep. Inject the fault
+    /// and prove the branch: both the record and its directory stay, no
+    /// half-rescue appears in the unscoped bucket, and a retry after the fault
+    /// clears completes the delete.
+    func testAFailedRescueKeepsTheConversationsFilesAndARetryCompletes() throws {
+        let store = makeStore()
+        let sessionId = UUID()
+        var saved = record(sessionId: sessionId)
+        saved.isolation = .worktree(path: "/tmp/still-here", branch: "dynamoe/agent/rescue")
+        saved.status = .cancelled
+        saved.task = "the run that must not lose its tree"
+        XCTAssertTrue(store.saveImmediately(saved))
+        let directory = root.appendingPathComponent(sessionId.uuidString, isDirectory: true)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.path))
+
+        store.injectWriteFaultForTesting { .write }
+        store.deleteSession(sessionId)
+        store.flush()
+
+        XCTAssertNotNil(
+            store.load(runId: saved.id, sessionId: sessionId),
+            "a failed rescue must leave the only copy of the record where it was"
+        )
+        XCTAssertNil(
+            store.load(runId: saved.id, sessionId: nil),
+            "the failed rescue must not leave a half-written copy in the unscoped bucket"
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: directory.path),
+            "the conversation's directory stays so its worktree keeps a record"
+        )
+
+        store.injectWriteFaultForTesting(nil)
+        store.deleteSession(sessionId)
+        store.flush()
+
+        // The retry RESCUES the worktree-holding record: it now lives in the
+        // unscoped bucket, which is the whole point (the tree keeps a record
+        // the sweep can see). The conversation's copy and directory are gone.
+        XCTAssertNil(
+            store.load(runId: saved.id, sessionId: sessionId),
+            "the conversation's copy must be removed once the rescue lands"
+        )
+        XCTAssertEqual(
+            store.load(runId: saved.id, sessionId: nil)?.task,
+            "the run that must not lose its tree",
+            "the rescued record carries the run whose worktree it protects"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: directory.path),
+            "and the conversation's directory is removed"
         )
     }
 }

@@ -320,17 +320,16 @@ struct SubagentInspectorView: View {
         .background(Color(NSColor.controlBackgroundColor).opacity(0.55))
     }
 
-    private func usageStat(_ value: String, _ label: String, tint: Color = .secondary) -> some View {
-        VStack(alignment: .leading, spacing: 1) {
-            Text(value)
-                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                .foregroundColor(tint == .secondary ? .primary : tint)
-            Text(label)
-                .font(.system(size: 8.5, weight: .medium))
-                .foregroundColor(.secondary)
-        }
-    }
-
+    /// The figures `usageStrip` draws.
+    ///
+    /// "Conversation" is literal: the totals cover the records this chat owns
+    /// plus the unscoped ones `clearableRuns` selects, never `allRecords`.
+    /// With "All Runs" on, the list is a superset and these figures, the
+    /// tokens help text and the spend help all say "this conversation's", so
+    /// summing every row made the strip describe a set the labels did not.
+    /// `active` also uses `liveInstance`, the same predicate as the header's
+    /// `activeRuns`: an orphaned non-terminal record is listed as ORPHANED,
+    /// not counted as work that is happening.
     private var sessionTotals: (runs: Int, active: Int, tokens: Int, cost: Double, unpriced: Bool, seconds: Double) {
         var runs = 0
         var active = 0
@@ -338,9 +337,9 @@ struct SubagentInspectorView: View {
         var cost = 0.0
         var unpriced = false
         var seconds = 0.0
-        for record in allRecords {
+        for record in conversationRecords {
             runs += 1
-            if !record.status.isTerminal { active += 1 }
+            if !record.status.isTerminal, liveInstance(record.id) != nil { active += 1 }
             tokens += record.usage.contextTokens
             cost += record.usage.costUSD
             unpriced = unpriced || record.usage.costIsUnpriced
@@ -351,6 +350,26 @@ struct SubagentInspectorView: View {
             }
         }
         return (runs, active, tokens, cost, unpriced, seconds)
+    }
+
+    /// This conversation's records (and the unscoped ones that ride every
+    /// inspector). The same selection `clearableRuns` and the list's default
+    /// mode use, independent of `showsAllSessions`.
+    private var conversationRecords: [AgentRunRecord] {
+        allRecords.filter {
+            $0.parentSessionId == sessionId || $0.parentSessionId == nil
+        }
+    }
+
+    private func usageStat(_ value: String, _ label: String, tint: Color = .secondary) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(value)
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundColor(tint == .secondary ? .primary : tint)
+            Text(label)
+                .font(.system(size: 8.5, weight: .medium))
+                .foregroundColor(.secondary)
+        }
     }
 
     private func compactTokens(_ count: Int) -> String {
@@ -525,13 +544,11 @@ struct SubagentInspectorView: View {
     /// bulk clear still removes them (the operator asked), but it says how
     /// many unread reports go with it first.
     private var unreadTerminalCount: Int {
-        clearableRuns.filter { record in
-            guard !record.summaryRelayed else { return false }
-            // The relay's own fallback: a run with no report can still carry
-            // the failure text the coordinator has never been shown.
-            let summary = record.report?.summary ?? record.error ?? ""
-            return !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        }.count
+        // `relaySummaryText` is the relay's own answer: a cancelled run with
+        // no partial, or a terminal record with no text at all, is settled
+        // rather than unread. Counting the bare stop reason here promised the
+        // coordinator a report that would never be delivered.
+        clearableRuns.filter { $0.relaySummaryText != nil }.count
     }
 
     private func clearFinished() {
@@ -632,9 +649,9 @@ private struct SubagentRunRow: View {
     var sessionLabel: UUID? = nil
 
     private var hasUnreadReport: Bool {
-        guard record.status.isTerminal, !record.summaryRelayed else { return false }
-        let summary = record.report?.summary ?? record.error ?? ""
-        return !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        // Same definition the relay owes by, so a cancelled run whose only
+        // text is the stop reason is not badged UNREAD forever.
+        record.relaySummaryText != nil
     }
 
     var body: some View {

@@ -173,7 +173,7 @@ final class SubagentPR104ReviewFixesTests: XCTestCase {
             runId: UUID(),
             root: wtRoot
         )
-        defer { Task { await WorkspaceIsolation.cleanup(worktree) } }
+        addTeardownBlock { await WorkspaceIsolation.cleanup(worktree) }
 
         try "updated\n".write(
             to: worktree.path.appendingPathComponent("README.md"),
@@ -201,7 +201,7 @@ final class SubagentPR104ReviewFixesTests: XCTestCase {
             runId: UUID(),
             root: wtRoot
         )
-        defer { Task { await WorkspaceIsolation.cleanup(worktree) } }
+        addTeardownBlock { await WorkspaceIsolation.cleanup(worktree) }
 
         let scratch = worktree.path.appendingPathComponent("temp_notes.txt")
         try "temporary\n".write(to: scratch, atomically: true, encoding: .utf8)

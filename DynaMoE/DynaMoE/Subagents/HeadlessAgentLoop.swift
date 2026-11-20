@@ -9,10 +9,21 @@ import Foundation
 
 nonisolated enum AgentLoopError: LocalizedError, Equatable {
     case wallClockExceeded
+    /// The deadline won the race while the backend was mid-answer. The partial
+    /// turn travels on the error because the timer's `catch` is the last place
+    /// it exists: dropping it made text the operator watched stream vanish
+    /// from the transcript (and from the report derived from it), which is the
+    /// same loss a Stop without a kept partial used to cause.
+    case wallClockExceededAfterPartial(text: String, thinking: String)
+
+    var partialTurn: (text: String, thinking: String)? {
+        guard case .wallClockExceededAfterPartial(let text, let thinking) = self else { return nil }
+        return (text, thinking)
+    }
 
     var errorDescription: String? {
         switch self {
-        case .wallClockExceeded:
+        case .wallClockExceeded, .wallClockExceededAfterPartial:
             return "The run exceeded its wall-clock budget."
         }
     }
@@ -232,10 +243,24 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 // more time than the run has left.
                 let remaining = Double(input.budget.maxWallClockSeconds) - (CFAbsoluteTimeGetCurrent() - start)
                 turn = try await Self.runTurn(backend, request, remainingSeconds: max(0, remaining))
-            } catch AgentLoopError.wallClockExceeded {
+            } catch let deadlineError as AgentLoopError {
                 usage.merge(usageLedger.drain())
                 status = .failed
                 failure = "The run exceeded its \(input.budget.maxWallClockSeconds)-second wall-clock budget."
+                // The deadline can win while the backend is mid-answer. Keep
+                // what it streamed: the transcript is authoritative once the
+                // run unwinds, so dropping it here erased text the operator
+                // had already watched appear.
+                if let partial = deadlineError.partialTurn {
+                    if !partial.thinking.isEmpty {
+                        append(kind: .assistantThinking, step: step, text: partial.thinking, id: deltaThinkingId)
+                    }
+                    if !partial.text.isEmpty {
+                        append(kind: .assistantText, step: step, text: partial.text, id: deltaTextId)
+                        finalText = partial.text
+                    }
+                    emit(.usage(usage))
+                }
                 append(kind: .status, step: step, text: failure)
                 break
             } catch {
@@ -742,16 +767,40 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 throw AgentBackendError.malformedResponse("The backend produced no turn.")
             } catch {
                 group.cancelAll()
-                // If the deadline timer won the race right as `backend.runTurn`
-                // returned a completed turn, the turn itself is discarded — but
-                // the provider already billed it. Record its usage into the
-                // ledger so the run's spend accounting does not lose it.
+                // Drain BOTH children before leaving the group. A completed
+                // turn the deadline discarded is still billed, and a backend
+                // that unwinds as a cancellation carries the text the model
+                // had already streamed.
+                var partial: (text: String, thinking: String)?
                 while let result = await group.nextResult() {
-                    if case .success(.some(let discardedTurn)) = result {
+                    switch result {
+                    case .success(.some(let discardedTurn)):
+                        // If the deadline timer won the race right as
+                        // `backend.runTurn` returned a completed turn, the turn
+                        // itself is discarded, but the provider already billed
+                        // it. Record its usage into the ledger so the run's
+                        // spend accounting does not lose it.
                         var billed = discardedTurn.usage
                         billed.backendRequests += 1
                         request.usageLedger?.add(billed)
+                    case .failure(let backendError):
+                        // The timer won and its cancellation reached the
+                        // backend mid-answer. The partial turn is the run's
+                        // work; dropping it here lost text the operator
+                        // watched stream, because `SubagentManager` replaces
+                        // the transcript with the loop's own.
+                        if let text = (backendError as? AgentBackendError)?.partialTurn {
+                            partial = text
+                        }
+                    case .success(.none):
+                        break
                     }
+                }
+                if case AgentLoopError.wallClockExceeded = error, let partial {
+                    throw AgentLoopError.wallClockExceededAfterPartial(
+                        text: partial.text,
+                        thinking: partial.thinking
+                    )
                 }
                 throw error
             }
@@ -1306,20 +1355,51 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
         return files
     }
 
+    /// The test invocations a `shell_run` is allowed to count as an outcome.
+    ///
+    /// A word-boundary "test" arm used to stand in for a runner, so `ls tests/`
+    /// and `cat test.txt` were reported as PASSING tests: the command exited 0,
+    /// so the report showed a green check for work no runner performed. Only a
+    /// real runner's invocation is evidence; "test" in a path is not.
+    private static let testRunnerCommands = [
+        "xcodebuild test",
+        "swift test",
+        "pytest",
+        "python -m pytest",
+        "python3 -m pytest",
+        "npm test",
+        "npm run test",
+        "yarn test",
+        "pnpm test",
+        "cargo test",
+        "go test",
+        "make test",
+        "ctest",
+        "dotnet test",
+        "mvn test",
+        "gradlew test",
+        "jest",
+        "vitest",
+        "mocha",
+        "rspec",
+        "phpunit",
+        "mix test",
+        "bats"
+    ]
+
+    /// Whether a `shell_run` command names a test RUNNER. Internal so the rule
+    /// is pinned directly, without spawning a process.
+    nonisolated static func isTestRunnerInvocation(_ command: String) -> Bool {
+        let lowered = command.lowercased()
+        return testRunnerCommands.contains { lowered.contains($0) }
+    }
+
     private static func testOutcomes(in transcript: [AgentTranscriptEntry]) -> [AgentTestOutcome] {
         var outcomes: [AgentTestOutcome] = []
         for entry in transcript {
             guard let record = entry.toolRecord, record.name == "shell_run" else { continue }
             guard let command = record.arguments["command"] else { continue }
-            let lowered = command.lowercased()
-            // The bare `contains("test")` matched "latest" and "contest";
-            // the generic arm is word-bounded now.
-            let looksLikeTest = lowered.contains("xcodebuild test")
-                || lowered.contains("swift test")
-                || lowered.contains("pytest")
-                || lowered.contains("npm test")
-                || Self.containsWord("test", in: lowered)
-            guard looksLikeTest else { continue }
+            guard isTestRunnerInvocation(command) else { continue }
             // A command that never ran has no outcome. `withheld` (plan mode,
             // not in this run's tools) and `rejected` (the operator or an
             // approval card said no) used to be reported as a FAILED test,
@@ -1354,14 +1434,5 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             total += Int(value) ?? 0
         }
         return total
-    }
-
-    /// Word-boundary match, so "the latest run" and "contest" do not count a
-    /// shell command as a test invocation.
-    private static func containsWord(_ word: String, in text: String) -> Bool {
-        let pattern = "(^|[^a-z0-9_])" + word + "([^a-z0-9_]|$)"
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return false }
-        let range = NSRange(location: 0, length: (text as NSString).length)
-        return regex.firstMatch(in: text, options: [], range: range) != nil
     }
 }

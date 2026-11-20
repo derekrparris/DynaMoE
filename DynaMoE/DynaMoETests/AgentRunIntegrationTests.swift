@@ -13,9 +13,26 @@ import XCTest
 @MainActor
 final class AgentRunIntegrationTests: XCTestCase {
     private var workingDirectory: URL!
+    /// The conversation every run in this suite belongs to, so teardown can
+    /// clear EXACTLY this suite's records. `clearCompleted()` with no session
+    /// selects only the UNSCOPED bucket, so a session-scoped run was left on
+    /// disk for the next case (and every later relay scan) to read.
+    private var conversationId: UUID!
+    /// Sessions a case mints for its own scenario (a cancelled-run check, a
+    /// cross-session refusal). Registered so teardown can remove their records
+    /// too; a UUID created without this helper is a leak this suite cannot see.
+    private var usedSessions: Set<UUID> = []
+
+    private func newSession() -> UUID {
+        let id = UUID()
+        usedSessions.insert(id)
+        return id
+    }
 
     override func setUp() async throws {
         try await super.setUp()
+        conversationId = UUID()
+        usedSessions = [conversationId]
         // Turbo Mode is deliberately NOT touched here. It is the operator's
         // process-wide preference and this target is hosted inside the app
         // (same bundle id, same defaults domain), so setting it would turn a
@@ -36,6 +53,15 @@ final class AgentRunIntegrationTests: XCTestCase {
         // process-wide registry).
         SubagentManager.shared.cancelAll()
         await AgentScheduler.shared.cancelAll(reason: "test teardown")
+        // Every session this case touched, not just the default one: a case
+        // that mints its own session still leaves a record bucket behind.
+        for session in usedSessions {
+            SubagentManager.shared.clearCompleted(sessionId: session)
+            // Any record this conversation left non-terminal (a cancel that
+            // raced the loop) is still this suite's; deleteSession owns the
+            // whole bucket, including undecodable files.
+            AgentRunStore.shared.deleteSession(session)
+        }
         SubagentManager.shared.clearCompleted()
         AgentRunStore.shared.flush()
         if let workingDirectory {
@@ -85,7 +111,7 @@ final class AgentRunIntegrationTests: XCTestCase {
         let backend = ScriptedBackend(turns: [
             .init(text: "The scheduler lives in AgentScheduler.swift.", usage: usage)
         ])
-        let session = UUID()
+        let session = newSession()
         let subagent = SubagentManager.shared.spawnModelBacked(
             plan(backend: backend, sessionId: session),
             id: UUID()
@@ -108,8 +134,8 @@ final class AgentRunIntegrationTests: XCTestCase {
     /// process-wide, and a second chat could previously read (and mark relayed)
     /// the first chat's report — silently suppressing its own delivery.
     func testTheStatusToolsOnlySeeTheCallersConversation() async throws {
-        let sessionA = UUID()
-        let sessionB = UUID()
+        let sessionA = newSession()
+        let sessionB = newSession()
         let runA = SubagentManager.shared.spawnModelBacked(
             plan(
                 backend: ScriptedBackend(turns: [.init(text: "finding from A")]),
@@ -188,20 +214,24 @@ final class AgentRunIntegrationTests: XCTestCase {
         let subagent = SubagentManager.shared.spawnModelBacked(
             plan(
                 backend: ScriptedBackend(turns: [.init(text: "done")]),
-                sessionId: UUID()
+                sessionId: conversationId
             ),
             id: UUID()
         )
         _ = await subagent.waitForCompletion()
 
+        // The LOCAL class, not the process-wide total: this suite is
+        // app-hosted, so a real run (or another suite's) can legitimately hold
+        // a cloud ticket and the global count would make this case flaky for
+        // work it never started.
         var tickets = -1
         let deadline = Date().addingTimeInterval(5)
         while Date() < deadline {
-            tickets = await AgentScheduler.shared.snapshot().totalTickets
+            tickets = await AgentScheduler.shared.snapshot().tickets[.local] ?? 0
             if tickets == 0 { break }
             try await Task.sleep(nanoseconds: 20_000_000)
         }
-        XCTAssertEqual(tickets, 0, "the finished run must give its scheduler ticket back")
+        XCTAssertEqual(tickets, 0, "the finished run must give its local scheduler ticket back")
     }
 
     /// A completion that stopped at the token limit is a fragment, not an
@@ -212,7 +242,7 @@ final class AgentRunIntegrationTests: XCTestCase {
             .init(text: "The scheduler lives in", finishReason: "lengthCapped")
         ])
         let subagent = SubagentManager.shared.spawnModelBacked(
-            plan(backend: backend, sessionId: UUID()),
+            plan(backend: backend, sessionId: conversationId),
             id: UUID()
         )
         _ = await subagent.waitForCompletion()
@@ -228,7 +258,7 @@ final class AgentRunIntegrationTests: XCTestCase {
             .init(text: "again again again", finishReason: "degenerateCycle")
         ])
         let subagent = SubagentManager.shared.spawnModelBacked(
-            plan(backend: backend, sessionId: UUID()),
+            plan(backend: backend, sessionId: conversationId),
             id: UUID()
         )
         _ = await subagent.waitForCompletion()
@@ -248,7 +278,7 @@ final class AgentRunIntegrationTests: XCTestCase {
         usage.costUSD = 5
         usage.backendRequests = 1
         let backend = ScriptedBackend(turns: [.init(text: "done", usage: usage)])
-        var runPlan = plan(backend: backend, sessionId: UUID())
+        var runPlan = plan(backend: backend, sessionId: conversationId)
         runPlan.budget = AgentBudget(
             maxSteps: 3,
             maxCompletionTokens: 200,
@@ -267,7 +297,7 @@ final class AgentRunIntegrationTests: XCTestCase {
 
     func testCancellingAFinishedRunCannotRewriteItsRecord() async throws {
         let backend = ScriptedBackend(turns: [.init(text: "the answer")])
-        let session = UUID()
+        let session = newSession()
         let subagent = SubagentManager.shared.spawnModelBacked(
             plan(backend: backend, sessionId: session),
             id: UUID()
@@ -303,7 +333,7 @@ final class AgentRunIntegrationTests: XCTestCase {
         let backend = ScriptedBackend(turns: [
             .init(text: "truncated", finishReason: "lengthCapped")
         ])
-        let session = UUID()
+        let session = newSession()
         let runId = UUID()
         let subagent = SubagentManager.shared.spawnModelBacked(
             plan(backend: backend, sessionId: session),
@@ -329,7 +359,7 @@ final class AgentRunIntegrationTests: XCTestCase {
 
     func testTheRunRendersTheWorkersPromptWithItsOwnTools() async throws {
         let backend = ScriptedBackend(turns: [.init(text: "done")])
-        let session = UUID()
+        let session = newSession()
         let subagent = SubagentManager.shared.spawnModelBacked(
             plan(backend: backend, sessionId: session, toolNames: ["file_read", "grep_search"]),
             id: UUID()
@@ -351,7 +381,7 @@ final class AgentRunIntegrationTests: XCTestCase {
     /// it narrate the XML in prose instead of calling anything.
     func testACloudRunIsToldToUseNativeFunctionCalling() async throws {
         let backend = ScriptedBackend(turns: [.init(text: "done")])
-        let session = UUID()
+        let session = newSession()
         var cloudPlan = plan(backend: backend, sessionId: session)
         cloudPlan.backendDescriptor = AgentBackendDescriptor(
             kind: .cloud,
@@ -372,7 +402,7 @@ final class AgentRunIntegrationTests: XCTestCase {
         let backend = ScriptedBackend(turns: [
             .init(text: "late", delayNanoseconds: 3_000_000_000)
         ])
-        let session = UUID()
+        let session = newSession()
         let subagent = SubagentManager.shared.spawnModelBacked(
             plan(backend: backend, sessionId: session),
             id: UUID()
@@ -400,7 +430,7 @@ final class AgentRunIntegrationTests: XCTestCase {
                     workingDirectory: workingDirectory
                 ),
                 runId: UUID(),
-                sessionId: UUID()
+                sessionId: conversationId
             )
             XCTFail("a forbidden tool must be refused before a backend is resolved")
         } catch {
@@ -458,7 +488,7 @@ final class AgentRunIntegrationTests: XCTestCase {
     }
 
     func testDeletingAConversationStopsAParkedRunAndRemovesItsRecord() async throws {
-        let session = UUID()
+        let session = newSession()
         let subagent = parkedWriteRun(sessionId: session)
         defer {
             SubagentManager.shared.clearCompleted()
@@ -493,7 +523,7 @@ final class AgentRunIntegrationTests: XCTestCase {
     }
 
     func testAQuitWithAParkedRunLeavesATerminalRecord() async throws {
-        let session = UUID()
+        let session = newSession()
         let subagent = parkedWriteRun(sessionId: session)
         defer {
             SubagentManager.shared.clearCompleted()

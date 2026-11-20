@@ -510,6 +510,12 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         case write
         case fsync
         case rename
+        /// The rename landed but flushing its DIRECTORY entry failed. Unlike
+        /// the three above this must NOT be reported as a failed write: the
+        /// record is in place, and callers that treat the answer as "nothing
+        /// happened" (a conversation-delete rescue, an apply stamp) would undo
+        /// or forget work that is already durable.
+        case directoryFsync
     }
 
 #if DEBUG
@@ -631,14 +637,30 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
                 [.posixPermissions: 0o600],
                 ofItemAtPath: url.path
             )
-            // The rename is not durable until the DIRECTORY is flushed: a
-            // power loss can lose a rename that was reported as a successful
-            // write, which is exactly what the header promises it cannot. The
-            // file's own fsync above covers its bytes; this covers the entry.
-            try Self.fsyncDirectory(url.deletingLastPathComponent())
         } catch {
             try? FileManager.default.removeItem(at: temporary)
             throw error
+        }
+        // The rename is not durable until the DIRECTORY is flushed: a power
+        // loss can lose a rename that was reported as a successful write. That
+        // is a durability warning, NOT a failed write: the bytes are already in
+        // place, so reporting failure here made `deleteSession` treat a
+        // completed rescue as undone (and keep the conversation's files) and
+        // `markApplied` claim a record update failed after it had landed.
+        do {
+            if fault == .directoryFsync {
+                throw NSError(
+                    domain: NSPOSIXErrorDomain,
+                    code: Int(EIO),
+                    userInfo: [NSFilePathErrorKey: url.deletingLastPathComponent().path]
+                )
+            }
+            try Self.fsyncDirectory(url.deletingLastPathComponent())
+        } catch {
+            DiagLog.warning(
+                "agentRunStore.write",
+                "the record is in place but its directory entry was not flushed: \(error.localizedDescription)"
+            )
         }
     }
 
@@ -749,8 +771,7 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
                 guard let data = try? Data(contentsOf: directory.appendingPathComponent(file)),
                       let record = try? JSONDecoder().decode(AgentRunRecord.self, from: data),
                       record.schemaVersion <= AgentRunRecord.currentSchemaVersion,
-                      record.status.isTerminal,
-                      !record.summaryRelayed else { continue }
+                      record.relaySummaryText != nil else { continue }
                 found[Self.relayBucket(record.parentSessionId), default: []].insert(record.id)
             }
         }
@@ -797,10 +818,16 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     /// A save or a delete changes what the relay owes. Called from the write
     /// queue; the index is additive until built, so a save that lands before
     /// the scan cannot be lost by it.
+    ///
+    /// Membership is `relaySummaryText != nil`, not "terminal and unrelayed":
+    /// a cancelled run that never wrote a partial has nothing to deliver, and
+    /// keeping it here made every later send decode it forever (and showed it
+    /// as UNREAD in the inspector). A partial that lands later re-adds it on
+    /// its own save.
     private func noteRelayMembership(_ record: AgentRunRecord) {
         signatureLock.lock()
         defer { signatureLock.unlock() }
-        if record.status.isTerminal, !record.summaryRelayed {
+        if record.relaySummaryText != nil {
             addRelayLocked(record)
         } else {
             removeRelayLocked(runId: record.id, sessionId: record.parentSessionId)

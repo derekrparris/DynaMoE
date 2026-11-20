@@ -111,6 +111,16 @@ final class SubagentLoopTests: XCTestCase {
         return url
     }
 
+    /// Releases a `Gate` after `seconds`. A Stop case waits for a signal from
+    /// inside the loop; without this a signal that never arrives would hang
+    /// the suite instead of failing the case.
+    private func releaseAfter(_ gate: Gate, seconds: Double = 10) -> Task<Void, Never> {
+        Task {
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            gate.resume()
+        }
+    }
+
     /// A cancelled run's `shell_run` used to keep writing for up to its 120 s
     /// timeout: `ControlledProcessRunner.runCommand` had no cancellation
     /// handler and no `terminate()`. The tool now spawns through
@@ -432,13 +442,17 @@ final class SubagentLoopTests: XCTestCase {
             ]),
             .init(text: "unreachable")
         ])
+        let approvalStarted = Gate()
         let context = try makeContext(
             workspace: workspace,
             tools: ["shell_run", "complete"],
             policy: .everyStateChange,
             handler: { _ in
-                // The approval is decided "after" the Stop: the sleep is cut
-                // short by the cancellation and the handler still says yes.
+                // Signal BEFORE parking so the test cancels at a known point
+                // rather than after a guessed sleep. The approval is decided
+                // "after" the Stop: the sleep is cut short by the
+                // cancellation and the handler still says yes.
+                approvalStarted.resume()
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
                 return true
             }
@@ -457,7 +471,9 @@ final class SubagentLoopTests: XCTestCase {
                 emit: { _ in }
             )
         }
-        try await Task.sleep(nanoseconds: 400_000_000)
+        let approvalWatchdog = releaseAfter(approvalStarted)
+        await approvalStarted.wait()
+        approvalWatchdog.cancel()
         task.cancel()
         let outcome = await task.value
 
@@ -615,6 +631,19 @@ final class SubagentLoopTests: XCTestCase {
         })
     }
 
+    /// A path is not a runner. `ls tests/` exits 0, so the old word-boundary
+    /// "test" arm reported a PASSING suite the run never executed; only an
+    /// actual runner invocation is evidence.
+    func testOnlyARealTestRunnerCountsAsATestOutcome() {
+        XCTAssertFalse(HeadlessAgentLoop.isTestRunnerInvocation("ls tests/"))
+        XCTAssertFalse(HeadlessAgentLoop.isTestRunnerInvocation("cat test.txt"))
+        XCTAssertFalse(HeadlessAgentLoop.isTestRunnerInvocation("echo 'the latest test'"))
+        XCTAssertTrue(HeadlessAgentLoop.isTestRunnerInvocation("xcodebuild test -scheme DynaMoE"))
+        XCTAssertTrue(HeadlessAgentLoop.isTestRunnerInvocation("swift test --filter Foo"))
+        XCTAssertTrue(HeadlessAgentLoop.isTestRunnerInvocation("python3 -m pytest -q"))
+        XCTAssertTrue(HeadlessAgentLoop.isTestRunnerInvocation("npm test -- --runInBand"))
+    }
+
     func testReportCollectsChangedFilesAndTests() async throws {
         let workspace = try makeWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }
@@ -623,7 +652,11 @@ final class SubagentLoopTests: XCTestCase {
         let backend = ScriptedBackend(turns: [
             .init(text: "writing", calls: [
                 AgentToolCall(name: "file_write", arguments: ["path": target.path, "content": "changed"]),
-                AgentToolCall(name: "shell_run", arguments: ["command": "echo 'test suite: 3 passed, 0 failed'"])
+                // A real runner token is what makes this an outcome; the
+                // controlled output is only there to pin the parsing. `make`
+                // is present on macOS, and the `;` keeps the exit code from
+                // the printf even when the target does not exist.
+                AgentToolCall(name: "shell_run", arguments: ["command": "make test 2>/dev/null; printf 'test suite: 3 passed, 0 failed\\n'"])
             ]),
             .init(text: "done", calls: [completeCall("Wrote Changed.txt and ran the tests.")])
         ])
@@ -1615,6 +1648,7 @@ final class SubagentLoopTests: XCTestCase {
         let workspace = try makeWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }
         let gate = Gate()
+        let approvalReached = Gate()
         let backend = ScriptedBackend(turns: [
             .init(text: "three calls", calls: [
                 AgentToolCall(name: "shell_run", arguments: ["command": "touch blocked.txt"]),
@@ -1627,6 +1661,10 @@ final class SubagentLoopTests: XCTestCase {
             tools: ["shell_run", "file_read", "complete"],
             policy: .everyStateChange,
             handler: { _ in
+                // Signal on ARRIVAL, then park: the Stop must land while the
+                // first approval is in front of the operator, not after a
+                // guessed 300 ms that a slow machine can outrun.
+                approvalReached.resume()
                 await gate.wait()
                 return true
             }
@@ -1645,7 +1683,9 @@ final class SubagentLoopTests: XCTestCase {
                 emit: { _ in }
             )
         }
-        try await Task.sleep(nanoseconds: 300_000_000)
+        let arrivalWatchdog = releaseAfter(approvalReached)
+        await approvalReached.wait()
+        arrivalWatchdog.cancel()
         task.cancel()
         gate.resume()
         let outcome = await task.value

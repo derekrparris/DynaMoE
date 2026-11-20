@@ -525,6 +525,35 @@ nonisolated struct AgentRunRecord: Identifiable, Codable, Equatable, Sendable {
         isolation.isIsolated
             && (appliedAt == nil || !(keptIgnoredFiles?.isEmpty ?? true))
     }
+
+    /// The text the relay still owes the coordinator, or nil when there is
+    /// nothing to deliver.
+    ///
+    /// This is the ONE definition of "owed": the store's relay index, the send
+    /// path and the inspector's unread badge all ask it, so they cannot
+    /// disagree about which reports are still waiting to be shown.
+    ///
+    /// A cancelled run is the case with a rule of its own. Its `error` is the
+    /// stop reason, and injecting "the run was cancelled" into the next turn
+    /// spends a request to say what the operator just did. The partial report
+    /// the loop manages to write as it unwinds is the part worth relaying,
+    /// which is why the run stays unread until that lands. Once it is terminal
+    /// with no partial (a Stop during preparation, a loop that produced
+    /// nothing), there is nothing left to wait for and the record settles
+    /// rather than being owed on every later send.
+    nonisolated var relaySummaryText: String? {
+        guard status.isTerminal, !summaryRelayed else { return nil }
+        let trimmedError = error?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if status == .cancelled {
+            let partial = report?.summary
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !partial.isEmpty, partial != trimmedError else { return nil }
+            return partial
+        }
+        let summary = (report?.summary ?? error ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return summary.isEmpty ? nil : summary
+    }
 }
 
 nonisolated extension AgentRunRecord {

@@ -2567,16 +2567,8 @@ struct ContentView: View {
             sessionId: sessionId
         )
         for id in owed.sorted(by: { $0.uuidString < $1.uuidString }) {
-            guard let record = restored[id] else { continue }
-            let summary: String
-            if record.status == .cancelled {
-                let partial = record.report?.summary
-                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                guard !partial.isEmpty, partial != record.error else { continue }
-                summary = partial
-            } else {
-                summary = record.report?.summary ?? record.error ?? ""
-            }
+            guard let record = restored[id],
+                  let summary = record.relaySummaryText else { continue }
             if let text = line(
                 role: record.role,
                 id: record.id,
@@ -2655,18 +2647,9 @@ struct ContentView: View {
             }
         }.value
         for (_, record) in restored {
-            let summary: String
-            if record.status == .cancelled {
-                // Same rule as the live instance: the stop reason is not a
-                // report. A cancelled run with no partial analysis has nothing
-                // to deliver.
-                let partial = record.report?.summary
-                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                guard !partial.isEmpty, partial != record.error else { continue }
-                summary = partial
-            } else {
-                summary = record.report?.summary ?? record.error ?? ""
-            }
+            // The record's own definition, so the send path, the store's
+            // index and the inspector cannot disagree about what is owed.
+            guard let summary = record.relaySummaryText else { continue }
             if let text = line(
                 role: record.role,
                 id: record.id,
@@ -7092,6 +7075,16 @@ struct ContentView: View {
             let relaunchKey = UUID()
             if let sessionId { deferredRelaunchSessions[relaunchKey] = sessionId }
             deferredRelaunchTasks[relaunchKey] = Task { @MainActor in
+                // Whether the launch below actually started. Only an abandoned
+                // relaunch has a stranded placeholder to clear: a launch that
+                // succeeded set `isThinking` itself and its turn owns the
+                // bubble, so clearing it here (content is still empty at this
+                // point) killed the spinner of a turn that IS running, which
+                // is exactly what the sibling slot-wait branch guards with its
+                // own `launched`. A retry routed into that wait transfers
+                // ownership to the inner task, which clears on its own early
+                // exits.
+                var launched = false
                 defer {
                     self.deferredRelaunchTasks[relaunchKey] = nil
                     self.deferredRelaunchSessions[relaunchKey] = nil
@@ -7101,7 +7094,9 @@ struct ContentView: View {
                     // exactly as it was: an empty bubble spinning forever,
                     // because the turn that would have cleared `isThinking`
                     // never ran. A launch that DID start owns the message.
-                    self.clearThinkingPlaceholder(sessionId: sessionId, messageId: messageId)
+                    if !launched {
+                        self.clearThinkingPlaceholder(sessionId: sessionId, messageId: messageId)
+                    }
                 }
                 // A Stop can land between the task being created and this
                 // line. Cancellation does not abort a `Task` body on its own,
@@ -7153,7 +7148,7 @@ struct ContentView: View {
                 // not lose the operator's send too. Passing `preemptionRetry:
                 // false` when the claim is nil routes the retry into the normal
                 // wait branch instead of letting it launch with no authority.
-                _ = self.startAutoregressiveGeneration(
+                launched = self.startAutoregressiveGeneration(
                     customPrompt: customPrompt,
                     promptTokens: promptTokens,
                     images: images,

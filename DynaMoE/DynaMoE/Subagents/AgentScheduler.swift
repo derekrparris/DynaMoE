@@ -61,10 +61,14 @@ nonisolated struct AgentSchedulerLimits: Equatable, Sendable {
     /// only local a floor, so a fourth spawn on one provider was refused after
     /// the configured 120 s while three legitimate holders were still working
     /// through a 600 s budget. The floor now covers a standard run plus the
-    /// longest approval card a run can park on. The configured value can only
-    /// raise it. A spawn that overrides its wall-clock budget past this floor
-    /// can still outlive a waiter; that is the operator's explicit choice and
-    /// the queue says which class it waited on.
+    /// default approval park. The configured value can only raise it.
+    ///
+    /// A model-chosen wall clock above its preset's default is no longer an
+    /// unattended hole: `spawnSubagentRequiresApproval` card-gates that
+    /// override, so a holder past this floor is one the operator saw a number
+    /// for. A waiter can still time out behind it, and the refusal names the
+    /// class and the wait rather than disappearing.
+    ///
     /// The waiting class is deliberately not consulted: every class holds its
     /// ticket for the run's whole life, so a class-specific floor would let one
     /// class's waiters time out on another's legitimate work. The parameter

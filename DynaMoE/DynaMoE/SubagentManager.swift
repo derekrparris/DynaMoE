@@ -2575,24 +2575,38 @@ public final class SubagentManager: ObservableObject {
     /// Drops the oldest FINISHED instances past the in-memory bound. Their
     /// records stay on disk, which is what the inspector and the report relay
     /// read once the object is gone.
+    ///
+    /// A terminal instance is not necessarily DONE: `cancel` latches the
+    /// terminal status immediately while the execution task is still unwinding
+    /// (killing a child, writing one last tool result). The other eviction
+    /// paths wait for `isExecutionUnwound`, and this one used to free the
+    /// object anyway, orphaning that unwind. The latch is read OUTSIDE the
+    /// manager lock so the two locks never nest; terminal and unwound are both
+    /// one-way, so an instance that qualified while unlocked cannot become
+    /// live again before the removal below.
     private func trimRetainedTerminalInstances() {
         lock.lock()
+        let candidates = subagentsOrder
+        lock.unlock()
         var finishedSeen = 0
-        var removed: [UUID] = []
-        subagentsOrder.removeAll { instance in
-            guard instance.status.isTerminal else { return false }
+        var removable: [UUID] = []
+        for instance in candidates where instance.status.isTerminal {
             finishedSeen += 1
-            guard finishedSeen > maximumRetainedTerminalInstances else { return false }
-            removed.append(instance.id)
-            return true
+            guard finishedSeen > maximumRetainedTerminalInstances else { continue }
+            guard instance.isExecutionUnwound else { continue }
+            removable.append(instance.id)
         }
+        guard !removable.isEmpty else { return }
+
+        lock.lock()
+        let removed = Set(removable)
+        subagentsOrder.removeAll { removed.contains($0.id) }
         for id in removed {
             subagentsById.removeValue(forKey: id)
             instanceObservers.removeValue(forKey: id)?.cancel()
         }
         lock.unlock()
-        guard !removed.isEmpty else { return }
-        let ids = Set(removed)
+        let ids = removed
         if Thread.isMainThread {
             subagents.removeAll { ids.contains($0.id) }
             if let selected = selectedSubagentId, ids.contains(selected) {

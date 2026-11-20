@@ -14,13 +14,24 @@ import XCTest
 final class TurnToolMaskTests: XCTestCase {
 
     private var savedRegistry: GrammarToolRegistry!
+    private var savedIsEnabled: Bool!
+    private var savedMode: AgentMode!
 
     override func setUp() {
         super.setUp()
         savedRegistry = GrammarConstrainedSampler.shared.snapshotRegistry()
+        // These cases enable the sampler and assert a mode; both are
+        // process-wide state the app shares (the target is app-hosted), so a
+        // case that left them changed would leak into the next one.
+        savedIsEnabled = GrammarConstrainedSampler.shared.isEnabled
+        savedMode = AgentHarness.shared.activeMode
     }
 
     override func tearDown() {
+        // Mode first: `setActiveMode` may rebuild the shared registry from the
+        // harness catalog, and the snapshot restore below must be last.
+        AgentHarness.shared.setActiveMode(savedMode)
+        GrammarConstrainedSampler.shared.isEnabled = savedIsEnabled
         GrammarConstrainedSampler.shared.restoreRegistry(savedRegistry)
         GrammarConstrainedSampler.shared.reset()
         super.tearDown()
@@ -228,6 +239,8 @@ final class TurnToolMaskTests: XCTestCase {
             [true, false],
             "an idle assertion restores the harness surface"
         )
-        harness.resetLoadedToolsToCore()
+        // The final `.code` assertion above also disarms plan mode's temporary
+        // tools; `tearDown` restores the mode (and the sampler) the process
+        // started with, so this case leaves neither changed.
     }
 }

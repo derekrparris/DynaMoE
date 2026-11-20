@@ -182,6 +182,12 @@ enum SubagentNotifier {
     /// can show. Nonisolated because the store's delete path runs on its IO
     /// queue, and the notification centre's own API is thread-safe.
     nonisolated static func withdraw(runId: UUID) {
+        // The guard comes FIRST. `UNUserNotificationCenter.current()` and its
+        // removals are the same calls `post` refuses to make under a test run
+        // or an unbundled build; reaching them here contradicted the rule
+        // stated above and could touch the notification daemon from a
+        // headless suite that never posted anything.
+        guard !isRunningTestsInThisProcess, Bundle.main.bundleIdentifier != nil else { return }
         let identifier = "dynamoe.subagent.\(runId.uuidString)"
         let center = UNUserNotificationCenter.current()
         center.removeDeliveredNotifications(withIdentifiers: [identifier])
@@ -194,9 +200,7 @@ enum SubagentNotifier {
         // already drained the queue, and then it would drop a request posted in
         // between. `deliverPendingNotifications` mutates the same array from a
         // `DispatchQueue.main.async`, so this stays on that queue — ordered
-        // with it — and skips it entirely in a test run or an unbundled build,
-        // where no notice was ever queued.
-        guard !isRunningTestsInThisProcess, Bundle.main.bundleIdentifier != nil else { return }
+        // with it.
         DispatchQueue.main.async {
             pendingRequests.removeAll { $0.identifier == identifier }
         }

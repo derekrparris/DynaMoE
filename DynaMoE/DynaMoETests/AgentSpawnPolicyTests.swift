@@ -215,15 +215,24 @@ final class AgentSpawnPolicyTests: XCTestCase {
     // MARK: - Spawn approval
 
     func testAWriteCapableSpawnNeedsApproval() {
+        // `backend: local` on purpose: without it the decision reads the
+        // operator's `dynamoe_subagent_backend`, and a clean defaults domain
+        // resolves to the legacy path where the archetype rule only gates the
+        // Test Runner. The rule under test is the model-backed tool set.
         XCTAssertTrue(AgentHarness.spawnSubagentRequiresApproval(
-            arguments: ["role": "Shader Optimizer", "task_description": "opt"],
+            arguments: [
+                "role": "Shader Optimizer",
+                "task_description": "opt",
+                "backend": "local"
+            ],
             mode: .code
         ))
         XCTAssertTrue(AgentHarness.spawnSubagentRequiresApproval(
             arguments: [
                 "role": "Custom",
                 "task_description": "edit",
-                "allowed_tools": ["file_read", "file_edit"]
+                "allowed_tools": ["file_read", "file_edit"],
+                "backend": "local"
             ],
             mode: .code
         ))
@@ -231,17 +240,55 @@ final class AgentSpawnPolicyTests: XCTestCase {
 
     func testAReadOnlySpawnNeedsNoApproval() {
         XCTAssertFalse(AgentHarness.spawnSubagentRequiresApproval(
-            arguments: ["role": "Codebase Researcher", "task_description": "look"],
+            arguments: [
+                "role": "Codebase Researcher",
+                "task_description": "look",
+                "backend": "local"
+            ],
             mode: .code
         ))
         XCTAssertFalse(AgentHarness.spawnSubagentRequiresApproval(
             arguments: [
                 "role": "Shader Optimizer",
                 "task_description": "opt",
-                "allowed_tools": ["file_read", "grep_search"]
+                "allowed_tools": ["file_read", "grep_search"],
+                "backend": "local"
             ],
             mode: .code
         ))
+    }
+
+    func testAModelChosenWallClockPastThePresetDefaultNeedsACard() {
+        // A read-only LOCAL spawn is otherwise routine: no write tools, no
+        // off-device work. A model-chosen 24 h budget is not routine: the
+        // local engine is single-flight and a scheduler ticket is held for the
+        // run's whole life, so one unattended run blocks every later local
+        // spawn for the queue's admission budget with nothing the operator
+        // ever saw behind it.
+        let excessive: [String: Any] = [
+            "role": "Codebase Researcher",
+            "task_description": "look",
+            "backend": "local",
+            "budget": ["max_wall_clock_seconds": 86_400]
+        ]
+        XCTAssertTrue(
+            AgentHarness.spawnSubagentRequiresApproval(arguments: excessive, mode: .code),
+            "the card is where a budget past the preset's default becomes the operator's choice"
+        )
+        XCTAssertTrue(
+            AgentHarness.spawnSubagentRequiresApproval(arguments: excessive, mode: .plan),
+            "a plan-mode local run still holds the single engine for its whole budget"
+        )
+        let within: [String: Any] = [
+            "role": "Codebase Researcher",
+            "task_description": "look",
+            "backend": "local",
+            "budget": ["max_wall_clock_seconds": 420]
+        ]
+        XCTAssertFalse(
+            AgentHarness.spawnSubagentRequiresApproval(arguments: within, mode: .code),
+            "the preset's own default is the unattended bound, so it needs no card"
+        )
     }
 
     func testAReadOnlySpawnThatForcesCloudNeedsAnOffDeviceCard() {

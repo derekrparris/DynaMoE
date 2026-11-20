@@ -1178,10 +1178,6 @@ nonisolated final class AnthropicCloudChatService: CloudChatServicing, @unchecke
 
 // MARK: - Client Facade
 
-/// One turn's worth of provider client. Construct per turn (or per
-/// connection test): the underlying URLSession is shared per endpoint, so a
-/// multi-step agent run reuses connections, while a per-turn client means a
-/// rotated key is picked up without restarting anything.
 /// `Retry-After` in seconds, clamped to a minute.
 ///
 /// The header comes in two spellings: delta-seconds, and an HTTP-date. A date
@@ -1208,6 +1204,10 @@ nonisolated enum CloudRetryAfter {
     }
 }
 
+/// One turn's worth of provider client. Construct per turn (or per
+/// connection test): the underlying URLSession is shared per endpoint, so a
+/// multi-step agent run reuses connections, while a per-turn client means a
+/// rotated key is picked up without restarting anything.
 public nonisolated final class CloudChatClient: @unchecked Sendable {
     /// Summarizes a non-2xx provider response body and redacts credentials
     /// before the text reaches run records, UI errors, or coordinator prompts.

@@ -1180,13 +1180,23 @@ nonisolated enum WorkspaceIsolation {
         func isInside(_ resolved: String) -> Bool {
             resolved == resolvedRoot || resolved.hasPrefix(resolvedPrefix)
         }
+        // The raw component check above only sees the SPELLING. A directory
+        // symlink inside the tree can point at `.git` and still resolve inside
+        // the root, which made that check unreachable for exactly the path a
+        // patch could use to write a hook. Git metadata is refused in the
+        // RESOLVED form too.
+        func isGitMetadata(_ resolved: String) -> Bool {
+            URL(fileURLWithPath: resolved).pathComponents.contains {
+                $0.lowercased() == ".git"
+            }
+        }
         if let ancestor = existingAncestor(of: url, fileManager: fileManager) {
             let resolvedAncestor = ancestor.resolvingSymlinksInPath().standardizedFileURL.path
-            guard isInside(resolvedAncestor) else { return nil }
+            guard isInside(resolvedAncestor), !isGitMetadata(resolvedAncestor) else { return nil }
         }
         if fileManager.fileExists(atPath: url.path) {
             let resolvedLeaf = url.resolvingSymlinksInPath().standardizedFileURL.path
-            guard isInside(resolvedLeaf) else { return nil }
+            guard isInside(resolvedLeaf), !isGitMetadata(resolvedLeaf) else { return nil }
         }
         return url
     }
@@ -1359,7 +1369,18 @@ nonisolated enum WorkspaceIsolation {
         case .regularFile, .missing: break
         case .unreadable, .hostile: gitSafe = false
         }
-        if contained && gitSafe {
+        // The git commands below run in the RECORD's `repositoryRoot`, which is
+        // data. Containment proves the PATH is ours; it says nothing about the
+        // repository a forged record could pair it with. Prove the worktree's
+        // own `.git` agrees before letting `worktree remove` or `branch -D`
+        // touch anything, so a record cannot aim our cleanup at somebody
+        // else's checkout.
+        var repositoryOwnsWorktree = false
+        if contained, gitSafe, let owning = await owningRepository(for: worktree.path) {
+            repositoryOwnsWorktree = owning.standardizedFileURL.resolvingSymlinksInPath()
+                == worktree.repositoryRoot.standardizedFileURL.resolvingSymlinksInPath()
+        }
+        if contained && gitSafe && repositoryOwnsWorktree {
             _ = try? await git(
                 ["worktree", "remove", "--force", worktree.path.path],
                 in: worktree.repositoryRoot
@@ -1377,10 +1398,12 @@ nonisolated enum WorkspaceIsolation {
         // so an apply can say the worktree was kept instead of claiming it was
         // removed.
         let treeGone = !fileManager.fileExists(atPath: worktree.path.path)
-        // The branch command runs in the RECORD's repository too. A path that
-        // is not this process's worktree is a record that cannot be trusted
-        // about its repository either, so nothing is deleted on its word.
+        // The branch command runs in the RECORD's repository too, and deletes a
+        // ref there, so it takes the same ownership proof as the removals
+        // above: a path that is not this process's worktree, or a repository
+        // that does not own it, deletes nothing on the record's word.
         if contained,
+           repositoryOwnsWorktree,
            treeGone,
            deleteBranch,
            worktree.branch != "HEAD",
@@ -1444,8 +1467,12 @@ nonisolated enum WorkspaceIsolation {
             // C-quotes any path it considers unusual (`"caf\303\251.txt"`,
             // escaped quotes and backslashes), and the cross-check below would
             // reject a valid patch because the two sides spell the name
-            // differently. It also drops the rename arrow: a rename is emitted
-            // as two records, one per path, so nothing has to parse " => ".
+            // differently. It also drops the rename arrow. NOTE: `apply
+            // --numstat -z` emits only the DESTINATION of a rename
+            // (`0\t0\tnew.txt\0`, measured), unlike `git diff --numstat -z`,
+            // which emits both paths as separate NUL fields. The other side is
+            // not lost from the check: the caller compares this set with the
+            // change set's own `--name-status -z` list, which carries both.
             (code, out, err) = try await git(["apply", "--numstat", "-z", url.path], in: directory)
         } catch {
             throw WorkspaceIsolationError.applyFailed(

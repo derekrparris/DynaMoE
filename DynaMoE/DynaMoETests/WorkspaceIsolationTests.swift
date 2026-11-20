@@ -402,6 +402,26 @@ final class WorkspaceIsolationTests: XCTestCase {
             "a name that merely starts with .git is ordinary content"
         )
         XCTAssertNotNil(WorkspaceIsolation.safeURL(for: "nested/.gitattributes", in: root))
+
+        // A symlink is the way the raw `.git` component check could be
+        // bypassed: `metadata/hooks/...` names no `.git` component but
+        // RESOLVES into the repository's metadata, which is still a hook write.
+        try fileManager.createDirectory(
+            at: root.appendingPathComponent(".git/hooks", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try fileManager.createSymbolicLink(
+            at: root.appendingPathComponent("metadata"),
+            withDestinationURL: root.appendingPathComponent(".git", isDirectory: true)
+        )
+        XCTAssertNil(
+            WorkspaceIsolation.safeURL(for: "metadata/hooks/post-commit", in: root),
+            "a path that RESOLVES into .git is metadata even when its spelling is not"
+        )
+        XCTAssertNil(
+            WorkspaceIsolation.safeURL(for: "metadata", in: root),
+            "and the symlink itself must not be writable as content"
+        )
     }
 
     /// A C-quoted `diff --git` header is legal whenever a path holds a quote, a
@@ -2251,7 +2271,7 @@ final class WorkspaceIsolationTests: XCTestCase {
             runId: runId,
             root: worktreeRoot
         )
-        defer { Task { await WorkspaceIsolation.cleanup(worktree) } }
+        addTeardownBlock { await WorkspaceIsolation.cleanup(worktree) }
 
         let backend = ScriptedBackend(turns: [.init(text: "never runs")])
         let plan = AgentSpawnPlan(
@@ -2324,7 +2344,7 @@ final class WorkspaceIsolationTests: XCTestCase {
             runId: runId,
             root: worktreeRoot
         )
-        defer { Task { await WorkspaceIsolation.cleanup(worktree) } }
+        addTeardownBlock { await WorkspaceIsolation.cleanup(worktree) }
 
         // Delete the worktree's `.git` pointer file inside the sandbox.
         let dotGit = worktree.path.appendingPathComponent(".git")

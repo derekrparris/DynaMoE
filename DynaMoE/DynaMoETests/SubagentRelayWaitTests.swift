@@ -14,15 +14,22 @@ final class SubagentRelayWaitTests: XCTestCase {
     private final class Calls: @unchecked Sendable {
         private let lock = NSLock()
         private var count = 0
-        func note() {
+        private var sessions: [UUID] = []
+        func note(_ sessionId: UUID) {
             lock.lock()
             count += 1
+            sessions.append(sessionId)
             lock.unlock()
         }
         var value: Int {
             lock.lock()
             defer { lock.unlock() }
             return count
+        }
+        var seenSessions: [UUID] {
+            lock.lock()
+            defer { lock.unlock() }
+            return sessions
         }
     }
 
@@ -51,15 +58,24 @@ final class SubagentRelayWaitTests: XCTestCase {
     /// the deadline it was given.
     func testTheWaitReturnsAsSoonAsNoRunIsActive() async {
         let calls = Calls()
+        let sessionId = UUID()
         let started = Date()
-        await SubagentRelayWait.wait(sessionId: UUID(), timeout: 30) { _ in
-            calls.note()
+        await SubagentRelayWait.wait(sessionId: sessionId, timeout: 30) { askedFor in
+            calls.note(askedFor)
             // Active once, then done: only a wait that CONSULTED the
             // predicate again can end before the deadline.
             return calls.value < 2
         }
         let elapsed = Date().timeIntervalSince(started)
         XCTAssertEqual(calls.value, 2, "the predicate must be re-asked until it answers false")
+        // Scoping is the predicate's only input besides the clock: a wait that
+        // dropped the session would watch every conversation's runs, and this
+        // case's fixture would not notice.
+        XCTAssertEqual(
+            calls.seenSessions,
+            [sessionId, sessionId],
+            "every ask must carry the conversation whose builds it is waiting on"
+        )
         XCTAssertLessThan(elapsed, 2, "it must return once the runs are done, not at the deadline")
     }
 
