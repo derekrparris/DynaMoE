@@ -224,6 +224,17 @@ struct DynaMoEApp: App {
                 }
                 .keyboardShortcut("?", modifiers: .command)
             }
+            // The inspector toggle's tooltip promises ⌘D, and a tooltip is not a
+            // binding: the button was the only way in from the keyboard. The
+            // menu item is the binding, and it toggles the same state.
+            CommandGroup(after: .toolbar) {
+                Button("Toggle Subagent Inspector") {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        SubagentManager.shared.isDrawerOpen.toggle()
+                    }
+                }
+                .keyboardShortcut("d", modifiers: .command)
+            }
         }
 
         Window("About DynaMoE", id: "about-dynamoe") {

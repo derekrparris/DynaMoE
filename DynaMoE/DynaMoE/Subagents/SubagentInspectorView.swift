@@ -463,6 +463,11 @@ struct SubagentInspectorView: View {
 
     /// Stored records are the history; a live instance wins for its own id, so
     /// a run that is still working is never displayed from its last snapshot.
+    ///
+    /// Computed ONCE per render pass rather than per reader: the header's
+    /// counts, the active/restored split and each row all want it, and a
+    /// `var` re-merged and re-sorted the whole list for every one of them, on
+    /// every body pass (the live list changes with every streamed token).
     private var allRecords: [AgentRunRecord] {
         var byId: [UUID: AgentRunRecord] = [:]
         for record in stored { byId[record.id] = record }
@@ -668,7 +673,19 @@ private struct SubagentRunRow: View {
                         .help("Conversation \(sessionLabel.uuidString)")
                 }
                 Spacer()
-                Text(durationText)
+                // A live run's duration is Date() minus its start, and a
+                // computed property alone only re-reads when something ELSE
+                // redraws the row -- so a run that streams nothing (waiting on
+                // an approval, a slow tool) showed a frozen clock. A timeline
+                // ticks it once a second while it is live, and costs nothing
+                // for a finished row, whose text is fixed.
+                if isLive && !record.status.isTerminal {
+                    TimelineView(.periodic(from: .now, by: 1)) { _ in
+                        Text(durationText)
+                    }
+                } else {
+                    Text(durationText)
+                }
                 Image(systemName: "chevron.right")
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundColor(.secondary.opacity(0.6))
@@ -1558,7 +1575,9 @@ struct SubagentInlineRunCard: View {
                     .font(.system(size: 11, weight: .semibold))
                     .lineLimit(1)
                 Spacer()
-                SubagentStatusPill(status: record.status)
+                // A restored record has no live instance: its status alone would
+                // draw an indeterminate spinner for a run that is gone.
+                SubagentStatusPill(status: record.status, isLive: live != nil)
             }
             HStack(spacing: 5) {
                 Text(record.backend.displayName)
