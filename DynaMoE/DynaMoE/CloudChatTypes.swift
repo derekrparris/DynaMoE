@@ -219,6 +219,8 @@ public nonisolated struct CloudChatGenerationParams: Equatable, Sendable {
     public var topP: Double?
     public var presencePenalty: Double?
     public var maxTokens: Int?
+    /// Optional stop sequences forwarded as the OpenAI-compatible `stop` field.
+    public var stop: [String]?
     /// Stable per-conversation identifier carrying the cache hint. Hashed
     /// before it leaves the machine (see `CloudSessionKey`) so a provider never
     /// receives a raw DynaMoE session UUID.
@@ -229,12 +231,14 @@ public nonisolated struct CloudChatGenerationParams: Equatable, Sendable {
         topP: Double? = nil,
         presencePenalty: Double? = nil,
         maxTokens: Int? = nil,
+        stop: [String]? = nil,
         sessionKey: String? = nil
     ) {
         self.temperature = temperature
         self.topP = topP
         self.presencePenalty = presencePenalty
         self.maxTokens = maxTokens
+        self.stop = stop
         self.sessionKey = sessionKey
     }
 }
@@ -722,6 +726,7 @@ public nonisolated final class CloudTurnReceipt: @unchecked Sendable {
     private var spent: Bool?
     private var terminalResult: CloudTurnResult?
     private var terminalFailure: CloudTurnFailure?
+    private var retryAfter: Double?
 
     public init() {}
 
@@ -748,6 +753,21 @@ public nonisolated final class CloudTurnReceipt: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return terminalFailure
+    }
+
+    /// The provider's `Retry-After` for a refusal that carries one (a 429),
+    /// already clamped by the transport. Nil when the header was absent or
+    /// unparseable.
+    public var retryAfterSeconds: Double? {
+        lock.lock()
+        defer { lock.unlock() }
+        return retryAfter
+    }
+
+    func record(retryAfterSeconds seconds: Double) {
+        lock.lock()
+        retryAfter = seconds
+        lock.unlock()
     }
 
     /// Records the transport's current answer. A later attempt or a terminal
@@ -778,6 +798,26 @@ public nonisolated final class CloudTurnReceipt: @unchecked Sendable {
         lock.lock()
         spent = failure.spentRequest
         terminalFailure = failure
+        lock.unlock()
+    }
+
+    /// Whether this attempt already put text in front of the operator.
+    ///
+    /// A retry re-emits the turn from its beginning and the drawer only
+    /// appends, so retrying over streamed text leaves a truncated prefix that
+    /// is never corrected. The caller records a delta here as it forwards it,
+    /// and refuses to retry once this is true.
+    private var streamedText: Bool = false
+
+    var streamedAnything: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return streamedText
+    }
+
+    func recordStreamedDelta() {
+        lock.lock()
+        streamedText = true
         lock.unlock()
     }
 }
@@ -1497,12 +1537,26 @@ public nonisolated enum CloudMessageAssembler {
             // an older picture because a later question carried no file defeats
             // the setting: the user asked for text-only follow-ups not to keep
             // paying for a picture they already stopped asking about.
-            newestImageTurnId = messages.last(where: { $0.role == .user })?.id
+            //
+            // Prompt-only rows are skipped for the same reason the loop below
+            // skips them: a relay directive left by an earlier LOCAL send is
+            // not a turn the provider sees, so letting it be "newest" would
+            // omit the real turn's images and price zero attachments.
+            newestImageTurnId = messages.last(where: { $0.role == .user && $0.isPromptOnly != true })?.id
         }
         var assembled: [CloudChatMessage] = []
         for message in messages {
             if excludingMessageIds.contains(message.id) { continue }
             guard message.role != .system else { continue }
+            // A prompt-only message is a LOCAL-render construct: the relay
+            // directive exists so the local renderer can splice delivered
+            // subagent reports into the prompt it builds itself. The cloud wire
+            // has its own relay path, and a prompt-only directive left in the
+            // session by an earlier LOCAL send would otherwise ship as a
+            // visible user turn on every later cloud step of the conversation —
+            // re-feeding reports the coordinator already saw and disturbing
+            // the provider prefix cache with a turn that is not part of it.
+            if message.isPromptOnly == true { continue }
             let content = AppleFoundationModelService.stripLeadingSpeakerLabel(message.content)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if message.role == .assistant, let records = message.toolCalls, !records.isEmpty {
@@ -1551,7 +1605,7 @@ public nonisolated enum CloudMessageAssembler {
         case .all:
             carrying = messages
         case .newestUserTurnOnly:
-            carrying = messages.last(where: { $0.role == .user }).map { [$0] } ?? []
+            carrying = messages.last(where: { $0.role == .user && $0.isPromptOnly != true }).map { [$0] } ?? []
         }
         return carrying.reduce(0) { total, message in
             guard message.role == .user else { return total }

@@ -237,15 +237,8 @@ nonisolated public final class GrammarConstrainedSampler {
     /// registry, exactly like `registerTools`; callers that must not disturb the
     /// in-app registry should snapshot it first and restore it afterwards.
     public func registerToolSchemas(_ schemas: [GrammarToolSchema]) {
-        var names = Set<String>()
-        var parameterKeys: [String: Set<String>] = [:]
-        var requiredKeys: [String: Set<String>] = [:]
-        for schema in schemas {
-            names.insert(schema.name)
-            parameterKeys[schema.name] = schema.parameterKeys
-            requiredKeys[schema.name] = schema.requiredKeys
-        }
-        applyRegistry(names: names, parameterKeys: parameterKeys, requiredKeys: requiredKeys)
+        let maps = Self.registryMaps(for: schemas)
+        applyRegistry(names: maps.names, parameterKeys: maps.parameterKeys, requiredKeys: maps.requiredKeys)
     }
 
     /// Snapshot of the current registry, for callers that install temporary
@@ -265,8 +258,157 @@ nonisolated public final class GrammarConstrainedSampler {
         applyRegistry(names: registry.names, parameterKeys: registry.parameterKeys, requiredKeys: registry.requiredKeys)
     }
 
-    private func applyRegistry(names: Set<String>, parameterKeys: [String: Set<String>], requiredKeys: [String: Set<String>]) {
-        registrationLock.lock()
+    /// Runs `body` with exactly these tool schemas installed, restoring the
+    /// previous registry afterwards.
+    ///
+    /// The registry is process-global, so every turn that carries its own tool
+    /// vocabulary (an API client's tools, a subagent run's tools) has to install
+    /// it around the turn and put back what was live before. One implementation
+    /// for both callers, because restoring the wrong registry rewrites the
+    /// in-app tool names for every later turn. An empty schema list leaves the
+    /// registry alone rather than clearing it: a turn with no tools must not
+    /// unregister the app's own.
+    ///
+    /// While one of these is installed the app's own catalog must not rebuild
+    /// the registry: `AgentHarness.syncGrammar` is reached from tool
+    /// registration, Skills and MCP, and a reload landing mid-turn replaced a
+    /// client's vocabulary with the app catalog for the rest of that step.
+    /// `scopedMaskStack` is the state it consults.
+    ///
+    /// Masks can OVERLAP rather than merely nest: a run's mask stays installed
+    /// until its engine task has actually unwound, and the engine frees its
+    /// slot the moment that task ends. A server turn claiming the slot in that
+    /// window installs its own mask while the run's is still live. Restoring
+    /// an unconditional snapshot on every exit therefore put the run's
+    /// vocabulary back after the server had restored the app catalog, leaving
+    /// the run's mask installed for every later turn. Each scope is tracked by
+    /// identity, and an exit rebuilds the registry from every scope still live
+    /// , the UNION of their names, not the base plus them, because a scoped
+    /// turn must not be able to emit an in-app tool name. The base snapshot is
+    /// restored once the LAST scope ends.
+    nonisolated public static func withTurnToolMask<T>(
+        _ schemas: [GrammarToolSchema],
+        _ body: () async throws -> T
+    ) async rethrows -> T {
+        guard !schemas.isEmpty else { return try await body() }
+        let token = UUID()
+        // Install and record under one lock, and remove and rebuild under it
+        // too, so a `syncGrammar` racing the boundary cannot see "installed"
+        // and still overwrite the registry, nor read "not installed" while it
+        // is about to be.
+        scopedMaskLock.lock()
+        if scopedMaskStack.isEmpty {
+            scopedMaskBase = shared.snapshotRegistry()
+        }
+        scopedMaskStack.append(ScopedMask(token: token, schemas: schemas))
+        // INSTALL through the same composer the exit uses. Registering only
+        // this scope replaced the registry with its vocabulary, so while two
+        // turns overlapped the first scope's tools were callable only again
+        // after the second ended.
+        scopedMaskRebuildLocked()
+        scopedMaskLock.unlock()
+        defer {
+            scopedMaskLock.lock()
+            scopedMaskStack.removeAll { $0.token == token }
+            scopedMaskRebuildLocked()
+            scopedMaskLock.unlock()
+        }
+        return try await body()
+    }
+
+    /// Rebuilds the registry from the live scopes, or restores the base once
+    /// none are left. Caller holds `scopedMaskLock`.
+    ///
+    /// While ANY scope is live the registry is the UNION OF THE SCOPES, not
+    /// the base plus them: a scoped turn replaces the app catalog (a server
+    /// turn must not be able to emit an in-app tool name). The base comes back
+    /// only when the last scope ends.
+    ///
+    /// The union is deliberate and it means overlapping scopes can SEE each
+    /// other's tool names: while a subagent run and an API client overlap, the
+    /// run's model can emit a name only the client declared. That is a
+    /// vocabulary leak, not an execution one — each scope decides its own calls
+    /// against its own loaded tools, so a name it did not get is refused. It is
+    /// the price of the restore fix above: intersecting instead would hide a
+    /// turn's own tools whenever another turn were live, which is the bug this
+    /// replaced.
+    ///
+    /// `registrationLock` is held across the WHOLE rebuild. Each replacement
+    /// is a multi-field write and a token's mask read takes the same lock, so
+    /// rebuilding one scope at a time exposed the intermediate registry (one
+    /// scope alone, or a subset) to a token drawn in the overlap window. A
+    /// token masked against the wrong vocabulary can emit a call the registry
+    /// would have withheld; the lock makes the swap a single step.
+    nonisolated private static func scopedMaskRebuildLocked() {
+        guard let base = scopedMaskBase else { return }
+        var names: Set<String> = []
+        var parameterKeys: [String: Set<String>] = [:]
+        var requiredKeys: [String: Set<String>] = [:]
+        for entry in scopedMaskStack {
+            let maps = Self.registryMaps(for: entry.schemas)
+            names.formUnion(maps.names)
+            for (name, keys) in maps.parameterKeys {
+                parameterKeys[name] = keys
+            }
+            for (name, keys) in maps.requiredKeys {
+                requiredKeys[name] = keys
+            }
+        }
+        if scopedMaskStack.isEmpty {
+            names = base.names
+            parameterKeys = base.parameterKeys
+            requiredKeys = base.requiredKeys
+        }
+        shared.registrationLock.lock()
+        shared.replaceRegistryLocked(
+            names: names,
+            parameterKeys: parameterKeys,
+            requiredKeys: requiredKeys
+        )
+        shared.registrationLock.unlock()
+        if scopedMaskStack.isEmpty {
+            scopedMaskBase = nil
+        }
+    }
+
+    /// True while a scoped mask owns the registry.
+    nonisolated public static var isScopedMaskInstalled: Bool {
+        scopedMaskLock.lock()
+        defer { scopedMaskLock.unlock() }
+        return !scopedMaskStack.isEmpty
+    }
+
+    /// Installs the app's own tool catalog, unless a scoped mask owns the
+    /// registry right now.
+    ///
+    /// The check and the write are one operation under `scopedMaskLock`: a
+    /// caller that tested `isScopedMaskInstalled` and then registered could
+    /// lose the race to a mask installing between the two, and that window is
+    /// exactly the mid-step rewrite this guard exists to prevent. Returns false
+    /// when the registration was refused (the caller may retry later).
+    @discardableResult
+    nonisolated public static func registerAppTools(_ tools: [ToolDefinition]) -> Bool {
+        scopedMaskLock.lock()
+        defer { scopedMaskLock.unlock() }
+        guard scopedMaskStack.isEmpty else { return false }
+        shared.registerTools(tools)
+        return true
+    }
+
+    private struct ScopedMask {
+        let token: UUID
+        let schemas: [GrammarToolSchema]
+    }
+
+    nonisolated private static let scopedMaskLock = NSLock()
+    nonisolated(unsafe) private static var scopedMaskStack: [ScopedMask] = []
+    /// The registry that was live before the first scope installed. Rebuilt
+    /// under every scope exit, so a scope that ends before a later one cannot
+    /// leave its own vocabulary behind.
+    nonisolated(unsafe) private static var scopedMaskBase: GrammarToolRegistry?
+
+    /// Replaces the registry. Caller holds `registrationLock`.
+    private func replaceRegistryLocked(names: Set<String>, parameterKeys: [String: Set<String>], requiredKeys: [String: Set<String>]) {
         registeredToolNames = names
         toolParameterKeys = parameterKeys
         toolRequiredKeys = requiredKeys
@@ -274,7 +416,28 @@ nonisolated public final class GrammarConstrainedSampler {
         for name in names {
             toolTrie.insert(word: name)
         }
-        registrationLock.unlock()
+    }
+
+    private func applyRegistry(names: Set<String>, parameterKeys: [String: Set<String>], requiredKeys: [String: Set<String>]) {
+        registrationLock.lock()
+        defer { registrationLock.unlock() }
+        replaceRegistryLocked(names: names, parameterKeys: parameterKeys, requiredKeys: requiredKeys)
+    }
+
+    /// The registry a schema list installs. Pure, so a scoped rebuild can
+    /// compose several without taking the registration lock per scope.
+    nonisolated private static func registryMaps(
+        for schemas: [GrammarToolSchema]
+    ) -> (names: Set<String>, parameterKeys: [String: Set<String>], requiredKeys: [String: Set<String>]) {
+        var names = Set<String>()
+        var parameterKeys: [String: Set<String>] = [:]
+        var requiredKeys: [String: Set<String>] = [:]
+        for schema in schemas {
+            names.insert(schema.name)
+            parameterKeys[schema.name] = schema.parameterKeys
+            requiredKeys[schema.name] = schema.requiredKeys
+        }
+        return (names, parameterKeys, requiredKeys)
     }
 
     /// Starts a generation: clears the live context and returns the token that

@@ -12263,7 +12263,12 @@ final class DynaMoETests: XCTestCase {
             arguments: [
                 "role": "Shader Optimizer",
                 "task_description": "Analyze vector alignment in compute kernel",
-                "run_in_background": false
+                "run_in_background": false,
+                // This case exercises the canned role pipelines. Naming the
+                // backend keeps it off the operator's Settings value: "auto"
+                // reads `dynamoe_subagent_backend`, so a machine configured for
+                // a model-backed default turns this into a different run.
+                "backend": "legacy"
             ],
             workingDirectory: tempDir,
             maxOutputLength: 4000
@@ -12286,7 +12291,10 @@ final class DynaMoETests: XCTestCase {
             arguments: [
                 "role": "Test Runner",
                 "task_description": "Run unit test suite",
-                "run_in_background": true
+                "run_in_background": true,
+                // Pinned to the canned pipelines for the same reason as the
+                // synchronous case: "auto" reads the operator's Settings value.
+                "backend": "legacy"
             ],
             workingDirectory: tempDir,
             maxOutputLength: 4000

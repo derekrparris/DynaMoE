@@ -282,7 +282,9 @@ final class ChatSessionStore: ObservableObject {
         // streams an uncommitted summary into the array) are dropped entirely:
         // clearing their flags would still leave a partial summary on screen as
         // an ordinary settled system message, and compaction cannot resume.
-        restored.messages.removeAll { $0.isTransient == true }
+        // A prompt-only directive is the same kind of thing: it was built for one
+        // model step and has no meaning as a transcript turn.
+        restored.messages.removeAll { $0.isTransient == true || $0.isPromptOnly == true }
         for idx in restored.messages.indices {
             restored.messages[idx].isThinking = false
             restored.messages[idx].prefillStatus = nil

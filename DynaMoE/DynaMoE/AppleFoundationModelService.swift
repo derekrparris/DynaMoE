@@ -417,7 +417,10 @@ public enum AppleFoundationModelService {
     /// information, so both stay out. Returns nil when a message holds
     /// nothing worth keeping, which is what "nothing to compact" keys on.
     nonisolated public static func compactionTranscriptTurn(for message: ChatMessage) -> String? {
-        guard message.role != .system else { return nil }
+        // A prompt-only row is relay machinery the model reads for one turn:
+        // it is not conversation, and folding "User: [subagent report]…" into
+        // the permanent digest invents a turn the operator never sent.
+        guard message.role != .system, message.isPromptOnly != true else { return nil }
         var parts: [String] = []
         let speaker = message.role == .user ? "User" : "Assistant"
         let content = stripLeadingSpeakerLabel(message.content)
@@ -634,6 +637,24 @@ public enum AppleFoundationModelService {
             usedChars += turn.count + 2
         }
         return keptTurns.reversed().joined(separator: "\n\n")
+    }
+
+    /// Whether the built transcript actually carries the subagent relay.
+    ///
+    /// A turn that started is not proof the model saw the reports: the
+    /// transcript keeps turns NEWEST-FIRST and drops one WHOLE when it would
+    /// cross the character budget, so the relay turn (older than the user's
+    /// message) can be absent from a small history. Marking it delivered there
+    /// consumed a report no model ever read.
+    nonisolated public static func transcriptDeliversRelay(
+        _ transcript: String,
+        reports: [String]
+    ) -> Bool {
+        guard !reports.isEmpty else { return false }
+        let directive = LocalSubagentRelay.directive(reports: reports)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !directive.isEmpty else { return false }
+        return transcript.contains(directive)
     }
 
     /// Rough token estimate for UI stats. The macOS 26 streaming API does not

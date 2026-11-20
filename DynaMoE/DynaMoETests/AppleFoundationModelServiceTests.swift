@@ -67,6 +67,52 @@ final class AppleFoundationModelServiceTests: XCTestCase {
         XCTAssertEqual(transcript, "User: Hello\n\nAssistant: Hi there!\n\nUser: Write a haiku")
     }
 
+    /// The relay is delivered only when the built transcript actually carries
+    /// it. A turn that STARTS with a small history can drop the relay turn
+    /// whole, and consuming its report there loses it silently.
+    func testRelayDeliveryRequiresTheDirectiveToSurviveTheBudget() {
+        let report = "[SUBAGENT_RESULT] id=\(UUID().uuidString) status=completed role=researcher\nFound it."
+        let directive = LocalSubagentRelay.directive(reports: [report])
+
+        let carrying = AppleFoundationModelService.buildConversationTranscript(
+            from: [
+                makeMessage(.user, directive),
+                makeMessage(.user, "What did it find?")
+            ],
+            excludingMessageIds: [],
+            charBudget: 10_000
+        )
+        XCTAssertTrue(
+            AppleFoundationModelService.transcriptDeliversRelay(carrying, reports: [report])
+        )
+
+        let dropped = AppleFoundationModelService.buildConversationTranscript(
+            from: [
+                makeMessage(.user, directive),
+                makeMessage(.user, "What did it find?")
+            ],
+            excludingMessageIds: [],
+            // Room for the newest turn only, not the directive in front of it.
+            charBudget: 60
+        )
+        XCTAssertFalse(
+            AppleFoundationModelService.transcriptDeliversRelay(dropped, reports: [report]),
+            "a transcript without the directive did not deliver the report"
+        )
+        // The guard this pins is the CONTAINS check, not the empty-reports
+        // early exit: `reports: []` answers false whatever the transcript is,
+        // so asserting it proved nothing about delivery.
+        XCTAssertFalse(
+            AppleFoundationModelService.transcriptDeliversRelay("User: hello", reports: [report]),
+            "a transcript that does not carry the directive is not a delivery"
+        )
+        XCTAssertFalse(
+            AppleFoundationModelService.transcriptDeliversRelay("", reports: [report]),
+            "an empty transcript cannot carry the directive"
+        )
+        XCTAssertFalse(AppleFoundationModelService.transcriptDeliversRelay("", reports: []))
+    }
+
     func testTranscriptSkipsPlaceholderAndEmptyTurns() {
         var placeholder = makeMessage(.assistant, "   ")
         placeholder.id = UUID()

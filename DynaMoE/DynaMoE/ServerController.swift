@@ -1941,11 +1941,10 @@ final class ServerController: ObservableObject {
         _ schemas: [GrammarToolSchema],
         _ body: () async throws -> T
     ) async rethrows -> T {
-        guard !schemas.isEmpty else { return try await body() }
-        let previous = GrammarConstrainedSampler.shared.snapshotRegistry()
-        GrammarConstrainedSampler.shared.registerToolSchemas(schemas)
-        defer { GrammarConstrainedSampler.shared.restoreRegistry(previous) }
-        return try await body()
+        // One implementation, shared with the local subagent backend: the
+        // restore is what keeps a client's tool vocabulary from rewriting the
+        // in-app registry for every later turn.
+        try await GrammarConstrainedSampler.withTurnToolMask(schemas, body)
     }
 
     nonisolated private static func buildTurnPlan(_ apiRequest: OpenAIChatRequest) throws -> TurnPlan {

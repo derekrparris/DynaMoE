@@ -1,0 +1,425 @@
+//
+//  AgentScheduler.swift
+//  DynaMoE
+//
+//  Concurrency, priority and cancellation for model-backed subagent runs.
+//  See SUBAGENTS.md §8.
+//
+
+import Foundation
+
+/// What a run needs in order to take a step.
+///
+/// The local engine is one slot wide, so a local run is its own class; cloud
+/// providers are independent quotas and are grouped by provider, with a global
+/// cap on top.
+nonisolated enum AgentSchedulingClass: Hashable, Sendable {
+    case local
+    case appleFoundationModel
+    case cloud(providerId: String)
+
+    var displayName: String {
+        switch self {
+        case .local: return "Local"
+        case .appleFoundationModel: return "Apple Foundation Model"
+        case .cloud(let providerId): return "Cloud (\(providerId))"
+        }
+    }
+
+    var isCloud: Bool {
+        if case .cloud = self { return true }
+        return false
+    }
+}
+
+/// FIFO within a class: interactive coordinator work outranks a run the
+/// operator asked for, which outranks speculative work.
+nonisolated enum AgentSchedulingPriority: Int, Sendable, Comparable, CaseIterable {
+    case interactive = 0
+    case userRequested = 1
+    case speculative = 2
+
+    static func < (lhs: AgentSchedulingPriority, rhs: AgentSchedulingPriority) -> Bool {
+        lhs.rawValue < rhs.rawValue
+    }
+}
+
+nonisolated struct AgentSchedulerLimits: Equatable, Sendable {
+    var local = 1
+    var cloudPerProvider = 3
+    var cloudGlobal = 6
+    var appleFoundationModel = 1
+    var queueTimeoutSeconds: TimeInterval = 120
+
+    static let `default` = AgentSchedulerLimits()
+
+    /// The admission wait for one class.
+    ///
+    /// A ticket is held for the run's WHOLE life for EVERY class — `acquire`
+    /// grants it once and `runModelBackedExecution` releases it when the run
+    /// ends, not per step. The comment here used to claim otherwise and gave
+    /// only local a floor, so a fourth spawn on one provider was refused after
+    /// the configured 120 s while three legitimate holders were still working
+    /// through a 600 s budget. The floor now covers a standard run plus the
+    /// default approval park. The configured value can only raise it.
+    ///
+    /// A model-chosen wall clock above its preset's default is no longer an
+    /// unattended hole: `spawnSubagentRequiresApproval` card-gates that
+    /// override, so a holder past this floor is one the operator saw a number
+    /// for. A waiter can still time out behind it, and the refusal names the
+    /// class and the wait rather than disappearing.
+    ///
+    /// The waiting class is deliberately not consulted: every class holds its
+    /// ticket for the run's whole life, so a class-specific floor would let one
+    /// class's waiters time out on another's legitimate work. The parameter
+    /// stays because admission asks BY class (and reports the class it waited
+    /// on); `for _:` says the answer does not depend on it rather than reading
+    /// as an input that was forgotten.
+    func queueTimeout(for _: AgentSchedulingClass) -> TimeInterval {
+        max(queueTimeoutSeconds, Self.standardRunLifetimeWithApproval)
+    }
+
+    /// `AgentBudget.standard.maxWallClockSeconds` (600) plus the default
+    /// approval park (600). Spelled out here because the scheduler is not
+    /// allowed to read the MainActor approval center's constants.
+    static let standardRunLifetimeWithApproval: TimeInterval = 1_200
+
+    /// Debug/settings seams. Each falls back to the default when absent or not
+    /// a positive number, because a capacity of zero would deadlock the queue.
+    static func configured(defaults: UserDefaults = .standard) -> AgentSchedulerLimits {
+        var limits = AgentSchedulerLimits()
+        // The engine is single-flight: a second local permit cannot run a turn,
+        // it can only hold a scheduler ticket while its run waits at the engine
+        // and then fails on the queue timeout. An older build allowed 1...4
+        // here, so the stored value is ignored rather than trusted.
+        limits.local = 1
+        if let value = positiveInteger(defaults, "dynamoe_subagent_cloud_per_provider") { limits.cloudPerProvider = value }
+        if let value = positiveInteger(defaults, "dynamoe_subagent_cloud_global") { limits.cloudGlobal = value }
+        if let value = positiveInteger(defaults, "dynamoe_subagent_afm_capacity") { limits.appleFoundationModel = value }
+        if let number = defaults.object(forKey: "dynamoe_subagent_queue_timeout") as? NSNumber,
+           number.doubleValue > 0 {
+            limits.queueTimeoutSeconds = number.doubleValue
+        }
+        return limits
+    }
+
+    private static func positiveInteger(_ defaults: UserDefaults, _ key: String) -> Int? {
+        guard let number = defaults.object(forKey: key) as? NSNumber else { return nil }
+        let value = number.intValue
+        return value > 0 ? value : nil
+    }
+}
+
+nonisolated enum AgentSchedulerError: LocalizedError, Equatable {
+    case queueTimeout(AgentSchedulingClass, TimeInterval)
+    case cancelled
+
+    var errorDescription: String? {
+        switch self {
+        case .queueTimeout(let schedulingClass, let seconds):
+            if case .local = schedulingClass {
+                return "The subagent run waited \(Int(seconds)) s for local model capacity and was refused. Local model runs are strictly serial: another run holds the engine for its whole life, including any approval card it is waiting on. Wait for it to finish, or send this run to a cloud backend."
+            }
+            return "The subagent run waited \(Int(seconds)) s for \(schedulingClass.displayName) capacity and was refused."
+        case .cancelled:
+            return "The subagent run was cancelled while it waited for capacity."
+        }
+    }
+}
+
+/// An observation of the scheduler, for tests and diagnostics.
+nonisolated struct AgentSchedulerSnapshot: Equatable, Sendable {
+    var tickets: [AgentSchedulingClass: Int] = [:]
+    var waiting: Int = 0
+    var registeredRuns: Int = 0
+
+    var totalTickets: Int { tickets.values.reduce(0, +) }
+    var cloudTickets: Int {
+        tickets.filter { $0.key.isCloud }.values.reduce(0, +)
+    }
+}
+
+/// Admits runs to a class when it has capacity, in priority order.
+///
+/// It is an actor because the queue is state: a ticket is granted only when the
+/// highest-priority waiter fits, so a burst of speculative spawns cannot starve
+/// the run the operator actually asked for. It does NOT own the engine lease —
+/// a local run still claims the single-flight slot per step, which is the
+/// mechanism the server queue and the chat send path share (`EngineTurnSlot.swift`).
+/// What this enforces is that only one local run is ever asking for that slot.
+actor AgentScheduler {
+    static let shared = AgentScheduler(limits: .configured())
+
+    private struct Waiter {
+        var ticket: UUID
+        var schedulingClass: AgentSchedulingClass
+        var priority: AgentSchedulingPriority
+        var runId: UUID
+        var enqueuedAt: Date
+        var sequence: UInt64
+    }
+
+    private var limits: AgentSchedulerLimits
+    private let pollIntervalNanoseconds: UInt64
+
+    private var tickets: [AgentSchedulingClass: Set<UUID>] = [:]
+    private var ticketClasses: [UUID: AgentSchedulingClass] = [:]
+    /// Which run each granted ticket belongs to. Preemption needs to know who
+    /// HOLDS the class, not who is queued for it: with local capacity 1 every
+    /// other local run is a waiter, and cancelling those destroyed work that
+    /// was not blocking anything.
+    private var ticketRunIds: [UUID: UUID] = [:]
+    private var waiters: [UUID: Waiter] = [:]
+    private var nextSequence: UInt64 = 0
+    private var cancelledRunIds: Set<UUID> = []
+    /// A cancellation can arrive before its run has registered (the instance's
+    /// execution task starts asynchronously). Dropping it left the run free to
+    /// start afterwards, so the reason waits here until `register` consumes it.
+    private var pendingCancellations: [UUID: String] = [:]
+    private var pendingCancellationOrder: [UUID] = []
+    private let maximumPendingCancellations = 128
+    private var registry: [UUID: Registration] = [:]
+
+    private struct Registration {
+        var parentRunId: UUID?
+        var parentSessionId: UUID?
+        var parentTurnId: UUID?
+        var schedulingClass: AgentSchedulingClass
+        var priority: AgentSchedulingPriority
+        var cancel: @Sendable (String) -> Void
+    }
+
+    init(
+        limits: AgentSchedulerLimits = .default,
+        pollIntervalNanoseconds: UInt64 = 20_000_000
+    ) {
+        self.limits = limits
+        self.pollIntervalNanoseconds = pollIntervalNanoseconds
+    }
+
+    var currentLimits: AgentSchedulerLimits { limits }
+
+    /// Re-reads the Settings values. A capacity change applies to the NEXT
+    /// admission; the comment beside the settings promised that, and a `let`
+    /// snapshot taken at first use made it false until the app relaunched.
+    func reloadLimits(_ limits: AgentSchedulerLimits = .configured()) {
+        self.limits = limits
+    }
+
+    // MARK: - Admission
+
+    /// Waits until `schedulingClass` has capacity and grants a ticket.
+    ///
+    /// The wait is priority ordered and bounded: a run that cannot start within
+    /// the queue timeout is refused by name rather than left pending forever.
+    func acquire(
+        _ schedulingClass: AgentSchedulingClass,
+        priority: AgentSchedulingPriority,
+        runId: UUID,
+        timeout: TimeInterval? = nil
+    ) async throws -> UUID {
+        let ticket = UUID()
+        let budget = timeout ?? limits.queueTimeout(for: schedulingClass)
+        let deadline = Date().addingTimeInterval(budget)
+        nextSequence &+= 1
+        waiters[ticket] = Waiter(
+            ticket: ticket,
+            schedulingClass: schedulingClass,
+            priority: priority,
+            runId: runId,
+            enqueuedAt: Date(),
+            sequence: nextSequence
+        )
+        defer { waiters.removeValue(forKey: ticket) }
+
+        while true {
+            if Task.isCancelled || cancelledRunIds.contains(runId) {
+                cancelledRunIds.remove(runId)
+                throw AgentSchedulerError.cancelled
+            }
+            if canGrant(schedulingClass), isHeadWaiter(ticket) {
+                tickets[schedulingClass, default: []].insert(ticket)
+                ticketClasses[ticket] = schedulingClass
+                ticketRunIds[ticket] = runId
+                return ticket
+            }
+            if Date() >= deadline {
+                throw AgentSchedulerError.queueTimeout(schedulingClass, budget)
+            }
+            try? await Task.sleep(nanoseconds: pollIntervalNanoseconds)
+        }
+    }
+
+    /// Gives a granted ticket back. Idempotent.
+    func release(_ ticket: UUID) {
+        guard let schedulingClass = ticketClasses.removeValue(forKey: ticket) else { return }
+        tickets[schedulingClass]?.remove(ticket)
+        ticketRunIds.removeValue(forKey: ticket)
+    }
+
+    // MARK: - Cancellation tree
+
+    /// Records how to stop a run, and who it belongs to.
+    func register(
+        runId: UUID,
+        parentRunId: UUID?,
+        parentSessionId: UUID?,
+        parentTurnId: UUID? = nil,
+        schedulingClass: AgentSchedulingClass,
+        priority: AgentSchedulingPriority,
+        cancel: @escaping @Sendable (String) -> Void
+    ) {
+        cancelledRunIds.remove(runId)
+        registry[runId] = Registration(
+            parentRunId: parentRunId,
+            parentSessionId: parentSessionId,
+            parentTurnId: parentTurnId,
+            schedulingClass: schedulingClass,
+            priority: priority,
+            cancel: cancel
+        )
+        // A Stop that landed before this registration is not stale: the run has
+        // not consumed it, so it is applied now that the closure exists.
+        if let reason = pendingCancellations.removeValue(forKey: runId) {
+            pendingCancellationOrder.removeAll { $0 == runId }
+            cancelSubtree(runId: runId, reason: reason)
+        }
+    }
+
+    /// Stops one run: a queued run fails its wait, a live one is cancelled, and
+    /// every descendant is cancelled with it.
+    func cancel(runId: UUID, reason: String = "The run was cancelled.") {
+        cancelSubtree(runId: runId, reason: reason)
+    }
+
+    /// Stops every run whose coordinator turn belongs to `sessionId`.
+    ///
+    /// Delegation is part of the coordinator's turn: a Stop must not leave a
+    /// child working on work the operator has abandoned.
+    func cancelRuns(parentSessionId: UUID, reason: String = "The coordinator turn was stopped.") {
+        let roots = registry.filter { $0.value.parentSessionId == parentSessionId }.map(\.key)
+        for runId in roots {
+            cancelSubtree(runId: runId, reason: reason)
+        }
+    }
+
+    /// Stops only the runs the given coordinator TURN spawned. The session-wide
+    /// form above reaches runs spawned by earlier turns of the same
+    /// conversation; a Stop scopes to the turn that owns the run, so background
+    /// work an earlier turn left running survives it.
+    func cancelRuns(parentTurnId: UUID, reason: String = "The coordinator turn was stopped.") {
+        let roots = registry.filter { $0.value.parentTurnId == parentTurnId }.map(\.key)
+        for runId in roots {
+            cancelSubtree(runId: runId, reason: reason)
+        }
+    }
+
+    /// Interactive work outranks background work: the LOCAL ticket holder is
+    /// cancelled at its next boundary rather than allowed to hold the engine
+    /// indefinitely. Returns how many runs were asked to stop.
+    ///
+    /// Only the ticket HOLDER is stopped. This used to cancel every
+    /// non-interactive local registration, which with local capacity 1 included
+    /// every other conversation's QUEUED run: one chat send destroyed work that
+    /// was not using the engine at all, and discarded its worktree with it. A
+    /// waiter loses nothing by staying queued — it starts when the slot frees.
+    @discardableResult
+    func preemptLocalRuns(reason: String = "An interactive turn needed the engine.") -> Int {
+        let localHolders = tickets[.local, default: []].compactMap { ticketRunIds[$0] }
+        let localRuns = registry.filter { runId, registration in
+            registration.priority != .interactive && localHolders.contains(runId)
+        }
+        for (runId, _) in localRuns {
+            cancelSubtree(runId: runId, reason: reason)
+        }
+        return localRuns.count
+    }
+
+    /// Stops every registered run. Application teardown and the inspector's
+    /// "cancel all" both land here.
+    func cancelAll(reason: String) {
+        for runId in Array(registry.keys) {
+            cancelSubtree(runId: runId, reason: reason)
+        }
+        for waiter in waiters.values {
+            cancelledRunIds.insert(waiter.runId)
+        }
+    }
+
+    func finish(runId: UUID) {
+        registry.removeValue(forKey: runId)
+        cancelledRunIds.remove(runId)
+        if pendingCancellations.removeValue(forKey: runId) != nil {
+            pendingCancellationOrder.removeAll { $0 == runId }
+        }
+    }
+
+    // MARK: - Observation
+
+    func snapshot() -> AgentSchedulerSnapshot {
+        AgentSchedulerSnapshot(
+            tickets: tickets.mapValues(\.count),
+            waiting: waiters.count,
+            registeredRuns: registry.count
+        )
+    }
+
+    func isWaiting(runId: UUID) -> Bool {
+        waiters.values.contains { $0.runId == runId }
+    }
+
+    /// True once a cancellation has been requested for `runId`.
+    func isCancelled(runId: UUID) -> Bool {
+        cancelledRunIds.contains(runId) || pendingCancellations[runId] != nil
+    }
+
+    // MARK: - Internals
+
+    private func cancelSubtree(runId: UUID, reason: String) {
+        let children = registry.filter { $0.value.parentRunId == runId }.map(\.key)
+        if registry[runId] != nil || waiters.values.contains(where: { $0.runId == runId }) {
+            cancelledRunIds.insert(runId)
+        } else {
+            // Unknown run ids are a cancellation that arrived before the run
+            // registered. Remember it instead of dropping it; `register`
+            // applies it and `finish` forgets it if the run never comes back.
+            pendingCancellations[runId] = reason
+            pendingCancellationOrder.append(runId)
+            while pendingCancellationOrder.count > maximumPendingCancellations {
+                let oldest = pendingCancellationOrder.removeFirst()
+                pendingCancellations.removeValue(forKey: oldest)
+            }
+        }
+        registry[runId]?.cancel(reason)
+        for child in children {
+            cancelSubtree(runId: child, reason: reason)
+        }
+    }
+
+    private func canGrant(_ schedulingClass: AgentSchedulingClass) -> Bool {
+        switch schedulingClass {
+        case .local:
+            return (tickets[.local]?.count ?? 0) < limits.local
+        case .appleFoundationModel:
+            return (tickets[.appleFoundationModel]?.count ?? 0) < limits.appleFoundationModel
+        case .cloud(let providerId):
+            let perProvider = (tickets[.cloud(providerId: providerId)]?.count ?? 0)
+            let global = tickets.filter { $0.key.isCloud }.values.reduce(0) { $0 + $1.count }
+            return perProvider < limits.cloudPerProvider && global < limits.cloudGlobal
+        }
+    }
+
+    /// Lowest priority number first, then earliest enqueue — among waiters of
+    /// the SAME class. Ordering across classes would let one class's head starve
+    /// another class that has capacity, which is exactly what independent cloud
+    /// quotas are for.
+    private func isHeadWaiter(_ ticket: UUID) -> Bool {
+        guard let mine = waiters[ticket] else { return false }
+        for other in waiters.values
+        where other.ticket != mine.ticket && other.schedulingClass == mine.schedulingClass {
+            if other.priority < mine.priority { return false }
+            if other.priority == mine.priority, other.sequence < mine.sequence { return false }
+        }
+        return true
+    }
+}

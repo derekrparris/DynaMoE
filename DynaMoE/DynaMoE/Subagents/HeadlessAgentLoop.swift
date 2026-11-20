@@ -1,0 +1,1438 @@
+//
+//  HeadlessAgentLoop.swift
+//  DynaMoE
+//
+//  Backend-agnostic step loop for a subagent run. See SUBAGENTS.md §5.
+//
+
+import Foundation
+
+nonisolated enum AgentLoopError: LocalizedError, Equatable {
+    case wallClockExceeded
+    /// The deadline won the race while the backend was mid-answer. The partial
+    /// turn travels on the error because the timer's `catch` is the last place
+    /// it exists: dropping it made text the operator watched stream vanish
+    /// from the transcript (and from the report derived from it), which is the
+    /// same loss a Stop without a kept partial used to cause.
+    case wallClockExceededAfterPartial(text: String, thinking: String)
+
+    var partialTurn: (text: String, thinking: String)? {
+        guard case .wallClockExceededAfterPartial(let text, let thinking) = self else { return nil }
+        return (text, thinking)
+    }
+
+    var errorDescription: String? {
+        switch self {
+        case .wallClockExceeded, .wallClockExceededAfterPartial:
+            return "The run exceeded its wall-clock budget."
+        }
+    }
+}
+
+nonisolated struct AgentLoopInput: Sendable {
+    var role: String
+    var task: String
+    var contextSummary: String?
+    var systemPrompt: String
+    var budget: AgentBudget
+    var sampling: AgentSampling
+    var sessionId: UUID
+    var thinking: Bool
+    var stopSequences: [String]
+    /// Steering queued for a run while it works (coordinator directives,
+    /// operator notes from the inspector). Drained before each step so a
+    /// message the run was told it received actually reaches the model; a nil
+    /// drain keeps a context-free caller (and every test input) unchanged.
+    var drainSteering: (@Sendable () async -> [(sender: String, content: String)])? = nil
+
+    init(
+        role: String,
+        task: String,
+        contextSummary: String? = nil,
+        systemPrompt: String,
+        budget: AgentBudget = .standard,
+        sampling: AgentSampling = .default,
+        sessionId: UUID,
+        thinking: Bool = false,
+        stopSequences: [String] = [],
+        drainSteering: (@Sendable () async -> [(sender: String, content: String)])? = nil
+    ) {
+        self.role = role
+        self.task = task
+        self.contextSummary = contextSummary
+        self.systemPrompt = systemPrompt
+        self.budget = budget
+        self.sampling = sampling
+        self.sessionId = sessionId
+        self.thinking = thinking
+        self.stopSequences = stopSequences
+        self.drainSteering = drainSteering
+    }
+}
+
+nonisolated struct AgentLoopOutcome: Sendable {
+    var status: AgentRunStatus
+    var transcript: [AgentTranscriptEntry]
+    var report: AgentReport?
+    var usage: AgentUsage
+    var error: String?
+}
+
+nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
+    typealias EventSink = @Sendable (AgentRunEvent) -> Void
+
+    /// `@concurrent` because this target defaults to MainActor isolation: the
+    /// loop is started from the main actor (and from tests on it), and a plain
+    /// async func would run there, so every tool call, tokenize and file read
+    /// of every run would serialize on the UI's actor. Nothing in the loop
+    /// touches UI state; what does (the event sink's consumer) hops itself,
+    /// and the local backend wraps its single launch in `MainActor.run`.
+    @concurrent func run(
+        input: AgentLoopInput,
+        backend: any AgentModelBackend,
+        context: AgentRunContext,
+        emit: @escaping EventSink
+    ) async -> AgentLoopOutcome {
+        let start = CFAbsoluteTimeGetCurrent()
+        var transcript: [AgentTranscriptEntry] = []
+        var usage = AgentUsage()
+        // Spend a failed or cancelled cloud attempt incurred is recorded here;
+        // it has no turn to carry it. Drained after every step so the budget
+        // checks below see it.
+        let usageLedger = AgentUsageLedger()
+        var index = 0
+
+        @discardableResult
+        func append(
+            kind: AgentTranscriptEntryKind,
+            step: Int,
+            text: String? = nil,
+            record: ToolCallRecord? = nil,
+            id: UUID = UUID()
+        ) -> UUID {
+            transcript.append(AgentTranscriptEntry(
+                id: id,
+                index: index,
+                stepIndex: step,
+                kind: kind,
+                text: text,
+                toolRecord: record
+            ))
+            index += 1
+            return id
+        }
+
+        append(kind: .task, step: 0, text: input.task)
+        emit(.status(.running, detail: "Starting \(input.role)"))
+
+        var messages: [AgentBackendMessage] = [.user(Self.initialTaskText(task: input.task, context: input.contextSummary))]
+        var finalText = ""
+        var completionSummary: String?
+        var failure: String?
+        var status: AgentRunStatus = .completed
+        var finished = false
+
+        let maxSteps = max(0, input.budget.maxSteps)
+        for step in 0..<maxSteps {
+            if Task.isCancelled {
+                status = .cancelled
+                break
+            }
+            let elapsed = CFAbsoluteTimeGetCurrent() - start
+            if elapsed >= Double(input.budget.maxWallClockSeconds) {
+                status = .failed
+                failure = "The run exceeded its \(input.budget.maxWallClockSeconds)-second wall-clock budget."
+                break
+            }
+            let remainingTokens = input.budget.maxCompletionTokens - usage.completionTokens
+            if remainingTokens <= 0 {
+                status = .failed
+                failure = "The run exhausted its \(input.budget.maxCompletionTokens)-token completion budget."
+                break
+            }
+            if let maxCost = input.budget.maxCostUSD {
+                if usage.costIsUnpriced {
+                    status = .failed
+                    failure = Self.unpricedCeilingFailure(
+                        maxCost: maxCost,
+                        reason: usage.costUnpricedReason
+                    )
+                    break
+                }
+                if usage.costUSD >= maxCost {
+                    status = .failed
+                    failure = "The run exhausted its cost budget."
+                    break
+                }
+            }
+
+            // Steering queued while the run worked: `send_subagent_message`
+            // and the inspector's message box are reported delivered, so the
+            // loop has to consume them or the sender is lied to. Each drained
+            // note rides as a user turn before this step's request.
+            if let drain = input.drainSteering {
+                let notes = await drain()
+                for note in notes {
+                    append(kind: .status, step: step, text: "Steering from \(note.sender): \(note.content)")
+                    messages.append(.user(Self.steeringText(sender: note.sender, content: note.content)))
+                }
+            }
+
+            // Resolved EVERY step, not once per run: a `tools_load` inside the
+            // loop changes the loaded set, and a step that still advertised
+            // step 0's array never told the model the tool it had just asked
+            // for was available.
+            let toolDefinitions = await context.toolDefinitions()
+
+            // The in-loop context is BOUNDED here. Every step appends its full
+            // thinking text and every tool result verbatim, and the implementer
+            // preset's budgets (40 steps x 2,048-token turns x 4,000-token
+            // tool outputs) overflow any real context long before they bind —
+            // the run used to die mid-work on the engine's context refusal,
+            // after the spend. Once the history passes the character budget,
+            // old turns are compacted, oldest first; the newest stay verbatim.
+            // Below it the history is returned UNCHANGED so each step's prompt
+            // extends the previous one and the local KV prefix pin survives the
+            // step (see `compactContextIfNeeded`). The transcript and the
+            // report keep everything — only what the MODEL re-reads each step
+            // shrinks.
+            //
+            // The budget covers the WHOLE prompt, so the system block and the
+            // tool schemas count against it. They were invisible here, which
+            // let a run whose history was just under the cap still overflow on
+            // a large tool catalogue after the spend.
+            messages = Self.compactContextIfNeeded(
+                messages,
+                overheadCharacters: input.systemPrompt.count
+                    + Self.toolSchemaCharacterCount(toolDefinitions)
+            )
+
+            let deltaTextId = UUID()
+            let deltaThinkingId = UUID()
+            let sink = emit
+            let request = AgentBackendRequest(
+                systemPrompt: input.systemPrompt,
+                messages: messages,
+                tools: toolDefinitions,
+                sampling: input.sampling,
+                maxTokens: min(input.sampling.maxTokens, remainingTokens),
+                stopSequences: input.stopSequences,
+                thinking: input.thinking,
+                sessionId: input.sessionId,
+                onDelta: { text, isThinking in
+                    sink(.assistantDelta(entryId: isThinking ? deltaThinkingId : deltaTextId, text: text, isThinking: isThinking))
+                },
+                usageLedger: usageLedger
+            )
+
+            // Counted BEFORE the request: a first request that throws (a
+            // provider error, a cancelled turn) still spent a step, and a
+            // report saying `steps: 0` for a run that never got a turn is not
+            // a usage block an operator can act on. `backendRequests` is not
+            // counted here: it reports requests the backend BILLED, which the
+            // usage ledger already accounts for on the failure path.
+            usage.steps += 1
+            let turn: AgentBackendTurn
+            do {
+                // A step is bounded, not merely checked between steps: a
+                // provider that stops responding would otherwise run past the
+                // wall-clock budget with the scheduler ticket still held.
+                // Measured NOW rather than reusing the loop's `elapsed`: that
+                // value was taken before the steering drain and the request
+                // assembly, so a budget of a few seconds could hand the step
+                // more time than the run has left.
+                let remaining = Double(input.budget.maxWallClockSeconds) - (CFAbsoluteTimeGetCurrent() - start)
+                turn = try await Self.runTurn(backend, request, remainingSeconds: max(0, remaining))
+            } catch let deadlineError as AgentLoopError {
+                usage.merge(usageLedger.drain())
+                status = .failed
+                failure = "The run exceeded its \(input.budget.maxWallClockSeconds)-second wall-clock budget."
+                // The deadline can win while the backend is mid-answer. Keep
+                // what it streamed: the transcript is authoritative once the
+                // run unwinds, so dropping it here erased text the operator
+                // had already watched appear.
+                if let partial = deadlineError.partialTurn {
+                    if !partial.thinking.isEmpty {
+                        append(kind: .assistantThinking, step: step, text: partial.thinking, id: deltaThinkingId)
+                    }
+                    if !partial.text.isEmpty {
+                        append(kind: .assistantText, step: step, text: partial.text, id: deltaTextId)
+                        finalText = partial.text
+                    }
+                    emit(.usage(usage))
+                }
+                append(kind: .status, step: step, text: failure)
+                break
+            } catch {
+                usage.merge(usageLedger.drain())
+                // A Stop that arrived mid-turn still produced whatever the
+                // model had streamed. The backend reports it with the error so
+                // the transcript (and the partial report) keeps that work
+                // instead of falling back to an earlier step.
+                if let partial = (error as? AgentBackendError)?.partialTurn {
+                    if !partial.thinking.isEmpty {
+                        append(kind: .assistantThinking, step: step, text: partial.thinking, id: deltaThinkingId)
+                    }
+                    if !partial.text.isEmpty {
+                        append(kind: .assistantText, step: step, text: partial.text, id: deltaTextId)
+                        finalText = partial.text
+                    }
+                    emit(.usage(usage))
+                }
+                if Task.isCancelled || (error as? AgentBackendError)?.isCancellation == true {
+                    status = .cancelled
+                    failure = "The run was cancelled."
+                } else {
+                    status = .failed
+                    failure = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    append(kind: .status, step: step, text: failure)
+                }
+                break
+            }
+
+            usage.backendRequests += 1
+            usage.merge(turn.usage)
+            // Failed or cancelled attempts inside this same step (a retry that
+            // never produced a turn) are billed too.
+            usage.merge(usageLedger.drain())
+            // A step's prompt size is the run's "last ingested prompt" for the
+            // context count; `merge` cannot infer it because backends report
+            // only the billed sum, and the sum is not what the drawer shows.
+            // A usage-less turn (a provider that omitted the block) reports
+            // zero, which is ABSENCE, not a prompt of no tokens: overwriting
+            // with 0 reset the drawer's count to nothing on every such turn.
+            if turn.usage.promptTokens > 0 {
+                usage.latestPromptTokens = turn.usage.promptTokens
+            }
+            if turn.usage.completionTokens > 0 {
+                usage.latestCompletionTokens = turn.usage.completionTokens
+            }
+            usage.wallClockSeconds = CFAbsoluteTimeGetCurrent() - start
+
+            // The text lands first even when the turn then fails a budget or a
+            // truncation check: what the model managed to say is part of the
+            // transcript, it just is not reported as a finished answer.
+            if !turn.thinking.isEmpty {
+                append(kind: .assistantThinking, step: step, text: turn.thinking, id: deltaThinkingId)
+            }
+            if !turn.text.isEmpty {
+                append(kind: .assistantText, step: step, text: turn.text, id: deltaTextId)
+                finalText = turn.text
+            }
+            emit(.usage(usage))
+
+            // A turn that ends the run still emitted calls, and a call that
+            // never ran must appear in the transcript: the assistant text
+            // names it, the operator's timeline is where the run is judged,
+            // and a step that emitted `[file_write, complete]` and then
+            // crossed a ceiling used to leave neither call behind.
+            func recordAbandoned(
+                _ calls: ArraySlice<AgentToolCall>,
+                reason: String,
+                recordStatus: ToolExecutionStatus = .withheld
+            ) {
+                for call in calls {
+                    let message = "Not completed: \(reason)"
+                    let record = ToolCallRecord(
+                        name: call.name,
+                        arguments: call.arguments.mapValues { String(describing: $0) },
+                        rawArguments: call.rawArguments,
+                        status: recordStatus,
+                        output: AgentHarness.renderToolResultForModel(
+                            AgentHarness.toolErrorJSON(tool: call.name, error: message)
+                        ),
+                        error: message
+                    )
+                    append(kind: .toolResult, step: step, record: record)
+                    emit(.toolFinished(record))
+                }
+            }
+
+            // The budget checks at the TOP of the loop only see what earlier
+            // steps spent. A final turn that crosses a ceiling must not be
+            // reported as a completion, and a truncated answer is not an answer.
+            if let problem = Self.postTurnBudgetFailure(
+                input: input,
+                usage: usage,
+                elapsed: CFAbsoluteTimeGetCurrent() - start
+            ) {
+                status = .failed
+                failure = problem
+                append(kind: .status, step: step, text: problem)
+                recordAbandoned(turn.calls[...], reason: problem)
+                break
+            }
+            let loweredReason = turn.finishReason.lowercased()
+            let disposition = CloudFinishDisposition(finishReason: turn.finishReason)
+            // A cloud provider's own STOP reasons are not answers. `content_filter`
+            // and `refusal` are the provider saying it would not produce the
+            // reply, and `pause_turn`/an unknown spelling says the reply was not
+            // finished for a reason this app cannot vouch for — the same
+            // allowlist rule `CloudTextCompletion.finishedCleanly` already
+            // applies before a compaction may delete anything. The LOCAL decode
+            // loop reports its own vocabulary (`eos`, `endTag`, `stoppedBySequence`)
+            // which is never a cloud reason, so this classification is scoped
+            // to cloud backends rather than read as universal.
+            // The local loop's own vocabulary, which no cloud provider uses:
+            // it is the one set of spellings that is a legitimate completion on
+            // a local backend. Anything else unrecognised is not an answer —
+            // scoping the unknown check to cloud backends let a local turn end
+            // with `error` (a scripted backend running out of turns does) and
+            // report a successful run whose answer is an error sentence.
+            let localCompletionReasons: Set<String> = [
+                "eos", "endtag", "stoppedbysequence", "toolfreeze"
+            ]
+            // A truncation, a degenerate cycle and a bare `stopped` are the
+            // decode loop's own endings and each has a more specific message
+            // below, so `cloudHalted` must not claim them: it means "a reason
+            // this app cannot vouch for", and `lengthCapped` is vouched for.
+            let cloudHalted = disposition == .halted
+                || (disposition == .unrecognized
+                    && !localCompletionReasons.contains(loweredReason)
+                    && !Self.finishReasonIsTruncated(turn.finishReason)
+                    && loweredReason != "degeneratecycle"
+                    && loweredReason != "stopped")
+            let alwaysUnusable = Self.finishReasonIsTruncated(turn.finishReason)
+                || loweredReason == "degeneratecycle"
+                || loweredReason == "stopped"
+                || cloudHalted
+            let emptyToolFreeze = turn.calls.isEmpty && loweredReason == "toolfreeze"
+            if alwaysUnusable || emptyToolFreeze {
+                // A token-capped turn is a fragment — even if it contains a
+                // partial tool call (such as a cut-off `complete`). Executing a
+                // truncated call can fabricate completion or run with missing
+                // arguments. `toolFreeze` is only unusable when it produced no
+                // executable call (the local parser's normal tool stop uses
+                // `toolFreeze` with calls). `degenerateCycle` and `stopped` are
+                // the decode loop's own "no positive break reason" endings.
+                status = .failed
+                switch loweredReason {
+                case "toolfreeze":
+                    failure = "The backend stopped on a tool-call boundary that produced no complete call, so nothing could run."
+                case "degeneratecycle":
+                    failure = "The backend stopped because it began repeating itself, so its text is not a considered answer."
+                case "stopped":
+                    failure = "The backend's decode loop stopped without reaching an end-of-turn reason, so its text is a fragment."
+                case _ where disposition == .halted:
+                    failure = "The provider stopped the reply before it finished (finish reason '\(turn.finishReason)'), so its text is not the answer the task asked for."
+                case _ where cloudHalted:
+                    failure = "The backend reported a finish reason this app does not recognise ('\(turn.finishReason)'), so its text cannot be treated as a complete answer."
+                default:
+                    failure = "The backend stopped at its token limit (finish reason '\(turn.finishReason)') before the run finished, so its output is truncated rather than usable."
+                }
+                append(kind: .status, step: step, text: failure)
+                recordAbandoned(
+                    turn.calls[...],
+                    reason: failure ?? "the turn could not be used."
+                )
+                break
+            }
+
+            guard !turn.calls.isEmpty else {
+                let trimmed = turn.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty {
+                    status = .failed
+                    failure = "The backend returned an empty turn with no tool calls and no final answer."
+                    append(kind: .status, step: step, text: failure)
+                    break
+                }
+                finished = true
+                break
+            }
+
+            messages.append(.assistant(text: turn.text, thinking: turn.thinking, calls: turn.calls))
+
+            var finishedRun = false
+            func rejectCall(
+                _ call: AgentToolCall,
+                offset: Int,
+                recordStatus: ToolExecutionStatus,
+                error: String
+            ) async -> Bool {
+                let record = ToolCallRecord(
+                    name: call.name,
+                    arguments: call.arguments.mapValues { String(describing: $0) },
+                    rawArguments: call.rawArguments,
+                    status: recordStatus,
+                    output: AgentHarness.renderToolResultForModel(AgentHarness.toolErrorJSON(tool: call.name, error: error)),
+                    error: error
+                )
+                // A refusal is still a tool call the model made. It used to
+                // `continue` before both loop guards saw it, so a model that
+                // kept calling a tool it was never given (or emitting malformed
+                // arguments) ran until its step budget with no escalation.
+                usage.toolCalls += 1
+                await context.noteToolOutcome(record, call: call)
+                append(kind: .toolResult, step: step, record: record)
+                // The same renderer every other tool result goes through: the
+                // error text can quote a model-authored tool name, and the marker
+                // pass in it is this app's prompt-injection defense for tool
+                // output. Appending the raw string skipped both.
+                messages.append(.toolResult(
+                    callId: call.id,
+                    name: call.name,
+                    content: AgentHarness.renderToolResultForModel(
+                        AgentHarness.toolErrorJSON(tool: call.name, error: error)
+                    ),
+                    isError: true
+                ))
+                emit(.toolFinished(record))
+                if let tripped = await context.trippedGuard() {
+                    status = .blocked
+                    failure = "The run was stopped by its loop guard: \(tripped)."
+                    append(kind: .status, step: step, text: failure)
+                    recordAbandoned(
+                        turn.calls[(offset + 1)...],
+                        reason: "the run's loop guard stopped it."
+                    )
+                    finishedRun = true
+                    return true
+                }
+                return false
+            }
+
+            for (offset, call) in turn.calls.enumerated() {
+                if Task.isCancelled {
+                    status = .cancelled
+                    failure = "The run was cancelled."
+                    recordAbandoned(turn.calls[offset...], reason: "the run was cancelled.")
+                    finishedRun = true
+                    break
+                }
+                if !context.allowedTools.contains(call.name) {
+                    let error = "Tool '\(call.name)' is not in this run's allowed tools (\(context.allowedTools.sorted().joined(separator: ", ")))."
+                    if await rejectCall(call, offset: offset, recordStatus: .withheld, error: error) {
+                        break
+                    }
+                    continue
+                }
+                if call.argumentsMalformed {
+                    let error = "Malformed arguments JSON — this call was not executed."
+                    if await rejectCall(call, offset: offset, recordStatus: .error, error: error) {
+                        break
+                    }
+                    continue
+                }
+                if await AgentHarness.hasEmptyRequiredArguments(
+                    toolName: call.name,
+                    arguments: call.arguments,
+                    harness: context.harness
+                ) {
+                    let error = "Missing or empty required arguments for '\(call.name)' — this call was not executed."
+                    if await rejectCall(call, offset: offset, recordStatus: .error, error: error) {
+                        break
+                    }
+                    continue
+                }
+
+                // The wall-clock budget is a promise about the whole run, not
+                // just its model turns. Check before launching each call so
+                // subsequent calls in `turn.calls` do not start after the
+                // deadline has already passed.
+                let remainingBeforeTool = Double(input.budget.maxWallClockSeconds)
+                    - (CFAbsoluteTimeGetCurrent() - start)
+                if remainingBeforeTool <= 0 {
+                    status = .failed
+                    failure = "The run exceeded its \(input.budget.maxWallClockSeconds)-second wall-clock budget before '\(call.name)' could run."
+                    append(kind: .status, step: step, text: failure)
+                    recordAbandoned(
+                        turn.calls[offset...],
+                        reason: failure ?? "the run's wall-clock budget ran out.",
+                        recordStatus: .error
+                    )
+                    finishedRun = true
+                    break
+                }
+
+                let running = ToolCallRecord(
+                    name: call.name,
+                    arguments: call.arguments.mapValues { String(describing: $0) },
+                    rawArguments: call.rawArguments,
+                    status: .running
+                )
+                emit(.toolStarted(running))
+
+                let raced = await Self.runTool(
+                    context,
+                    call,
+                    remainingSeconds: remainingBeforeTool
+                )
+                // The deadline arm fires on CANCELLATION too (`Task.sleep`
+                // returns the moment the run's task is stopped), so a Stop
+                // racing the deadline otherwise reads as a wall-clock failure
+                // and drops the tool's record. Cancellation is the honest
+                // outcome, and a tool that managed to return before the Stop
+                // keeps its record in the transcript.
+                if Task.isCancelled {
+                    if let settled = raced.value {
+                        var record = settled.record
+                        record.id = running.id
+                        usage.toolCalls += 1
+                        await context.noteToolOutcome(record, call: call)
+                        append(kind: .toolResult, step: step, record: record)
+                        emit(.toolFinished(record))
+                    } else {
+                        append(kind: .status, step: step, text: "The run was stopped while '\(call.name)' was running.")
+                    }
+                    status = .cancelled
+                    failure = "The run was cancelled."
+                    recordAbandoned(
+                        turn.calls[(offset + 1)...],
+                        reason: "the run was cancelled."
+                    )
+                    finishedRun = true
+                    break
+                }
+                let execution: (resultJSON: String, record: ToolCallRecord, isCompleted: Bool)
+                if case .completed(let finishedExecution) = raced {
+                    execution = finishedExecution
+                } else {
+                    let settled = raced.value
+                    if let settled {
+                        var record = settled.record
+                        record.id = running.id
+                        usage.toolCalls += 1
+                        await context.noteToolOutcome(record, call: call)
+                        append(kind: .toolResult, step: step, record: record)
+                        emit(.toolFinished(record))
+                    }
+                    status = .failed
+                    failure = "The run exceeded its \(input.budget.maxWallClockSeconds)-second wall-clock budget while '\(call.name)' was running."
+                    append(kind: .status, step: step, text: failure)
+                    recordAbandoned(
+                        turn.calls[(settled == nil ? offset : offset + 1)...],
+                        reason: failure ?? "the run's wall-clock budget ran out.",
+                        recordStatus: .error
+                    )
+                    finishedRun = true
+                    break
+                }
+                var record = execution.record
+                record.id = running.id
+                usage.toolCalls += 1
+                await context.noteToolOutcome(record, call: call)
+                let rendered = AgentHarness.renderToolResultForModel(execution.resultJSON)
+                append(kind: .toolResult, step: step, record: record)
+                emit(.toolFinished(record))
+                messages.append(.toolResult(
+                    callId: call.id,
+                    name: call.name,
+                    content: rendered,
+                    isError: record.status == .error || record.status == .rejected || record.status == .withheld
+                ))
+
+                if record.status.endsAgentRun(toolName: call.name, isCompleted: execution.isCompleted) {
+                    let declared = (call.arguments["summary"] as? String)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if let declared, !declared.isEmpty {
+                        completionSummary = declared
+                    } else if call.name == "complete" {
+                        // The tool itself succeeds without a summary, so a run
+                        // that called it must not fail for having omitted the
+                        // argument — the previous `as? String` left this nil
+                        // and the run ended "no final answer".
+                        completionSummary = "Task completed."
+                    }
+                    // Calls the model emitted after the terminal one are still
+                    // output it expects to see recorded. Breaking silently made
+                    // them vanish from the transcript.
+                    recordAbandoned(
+                        turn.calls[(offset + 1)...],
+                        reason: "the run ended at '\(call.name)' before this call could execute."
+                    )
+                    finishedRun = true
+                    break
+                }
+            }
+            if finishedRun {
+                if status != .cancelled, failure == nil { status = .completed }
+                finished = true
+                break
+            }
+            if let tripped = await context.trippedGuard() {
+                status = .blocked
+                failure = "The run was stopped by its loop guard: \(tripped)."
+                append(kind: .status, step: step, text: failure)
+                finished = true
+                break
+            }
+        }
+
+        if status == .completed && !finished {
+            status = .failed
+            failure = "The run exhausted its \(input.budget.maxSteps)-step budget before finishing."
+        }
+        if status == .completed && finalText.isEmpty && completionSummary == nil {
+            status = .failed
+            failure = "The backend produced no final answer."
+        }
+
+        usage.merge(usageLedger.drain())
+        usage.wallClockSeconds = CFAbsoluteTimeGetCurrent() - start
+        // Derive what the run actually said. A `complete` call's summary is the
+        // run's considered answer; without one, a completed run's final text is
+        // the answer and a failed run's LONGEST text is the partial result it
+        // managed to produce (its last text is usually a preamble). Findings and
+        // open questions come from the transcript either way, so a read-only
+        // run's report is not an empty shell around one paragraph.
+        let derivedSummary = AgentReportBuilder.bestEffortSummary(in: transcript)
+        let summaryText: String
+        if let completionSummary, !completionSummary.isEmpty {
+            summaryText = completionSummary
+        } else if status == .completed, !finalText.isEmpty {
+            summaryText = finalText
+        } else {
+            summaryText = derivedSummary ?? finalText
+        }
+        let summary = Self.bounded(summaryText, limit: 6000)
+        // The findings cap drops everything past the twelfth, and a bare list
+        // reads as the whole story. The count is appended to `risks` (a field
+        // that already means "what the reader should know beyond the claims")
+        // rather than to a finding's claim, so each entry stays one assertion.
+        let findings = AgentReportBuilder.findings(from: transcript)
+        let totalFindings = AgentReportBuilder.findingCount(from: transcript)
+        var risks = failure.map { [$0] } ?? []
+        if totalFindings > findings.count {
+            risks.append("\(totalFindings - findings.count) more finding(s) were omitted from this report; the full transcript has them.")
+        }
+        let report = AgentReport(
+            status: status,
+            summary: summary,
+            findings: findings,
+            changedFiles: Self.changedFiles(in: transcript),
+            diff: nil,
+            tests: Self.testOutcomes(in: transcript),
+            risks: risks,
+            openQuestions: AgentReportBuilder.openQuestions(from: transcript),
+            usage: usage,
+            backend: backend.descriptor
+        )
+        emit(.usage(usage))
+        if status == .completed {
+            emit(.completed(report))
+        } else {
+            emit(.status(status, detail: failure ?? status.displayName))
+        }
+        return AgentLoopOutcome(
+            status: status,
+            transcript: transcript,
+            report: report,
+            usage: usage,
+            error: failure
+        )
+    }
+
+    /// Runs one backend turn under the wall-clock deadline. The timeout task
+    /// cancelling its sibling is what stops the HTTP stream or local decode;
+    /// the parent run is not cancelled, so the failure is a budget result, not
+    /// a Stop.
+    private static func runTurn(
+        _ backend: any AgentModelBackend,
+        _ request: AgentBackendRequest,
+        remainingSeconds: TimeInterval
+    ) async throws -> AgentBackendTurn {
+        try await withThrowingTaskGroup(of: AgentBackendTurn?.self) { group in
+            group.addTask { try await backend.runTurn(request) }
+            group.addTask {
+                do {
+                    try await Task.sleep(
+                        nanoseconds: Self.deadlineNanoseconds(remainingSeconds)
+                    )
+                } catch is CancellationError {
+                    // Parent cancellation (Stop) must let `backend.runTurn`
+                    // finish unwinding so its `cancelledAfterPartial` error is
+                    // collected rather than raced out by the timer.
+                    //
+                    // This is deliberately NOT a grace-then-throw backstop: a
+                    // structured group awaits its children at scope exit, so
+                    // throwing here would not bound a backend that ignores
+                    // cancellation — it would only replace the Stop's own
+                    // error with a wall-clock failure, losing the partial the
+                    // run had already earned. What bounds a stopped turn is
+                    // the BACKEND: both implementations check cancellation per
+                    // event (`LocalAgentBackend`, `CloudAgentBackend`), so a
+                    // responsive backend returns promptly and an unresponsive
+                    // one is a backend bug this group cannot paper over.
+                    return nil
+                }
+                throw AgentLoopError.wallClockExceeded
+            }
+            defer { group.cancelAll() }
+            do {
+                while let next = try await group.next() {
+                    if let turn = next {
+                        return turn
+                    }
+                }
+                throw AgentBackendError.malformedResponse("The backend produced no turn.")
+            } catch {
+                group.cancelAll()
+                // Drain BOTH children before leaving the group. A completed
+                // turn the deadline discarded is still billed, and a backend
+                // that unwinds as a cancellation carries the text the model
+                // had already streamed.
+                var partial: (text: String, thinking: String)?
+                while let result = await group.nextResult() {
+                    switch result {
+                    case .success(.some(let discardedTurn)):
+                        // If the deadline timer won the race right as
+                        // `backend.runTurn` returned a completed turn, the turn
+                        // itself is discarded, but the provider already billed
+                        // it. Record its usage into the ledger so the run's
+                        // spend accounting does not lose it.
+                        var billed = discardedTurn.usage
+                        billed.backendRequests += 1
+                        request.usageLedger?.add(billed)
+                    case .failure(let backendError):
+                        // The timer won and its cancellation reached the
+                        // backend mid-answer. The partial turn is the run's
+                        // work; dropping it here lost text the operator
+                        // watched stream, because `SubagentManager` replaces
+                        // the transcript with the loop's own.
+                        if let text = (backendError as? AgentBackendError)?.partialTurn {
+                            partial = text
+                        }
+                    case .success(.none):
+                        break
+                    }
+                }
+                if case AgentLoopError.wallClockExceeded = error, let partial {
+                    throw AgentLoopError.wallClockExceededAfterPartial(
+                        text: partial.text,
+                        thinking: partial.thinking
+                    )
+                }
+                throw error
+            }
+        }
+    }
+
+    /// A deadline converted to nanoseconds without trapping: a model-supplied
+    /// budget can name a `max_wall_clock_seconds` whose nanosecond form
+    /// overflows UInt64, and the conversion traps and kills the whole app.
+    /// Anything past a day is not a deadline a run can reach anyway.
+    private static func deadlineNanoseconds(_ seconds: TimeInterval) -> UInt64 {
+        let clamped = min(max(0, seconds), 86_400)
+        return UInt64(clamped * 1_000_000_000)
+    }
+
+    // MARK: In-loop context compaction
+
+    /// How many of the newest step blocks (an assistant turn plus its tool
+    /// results) keep their full text verbatim, thinking included.
+    static let keptRecentTurns = 2
+    /// Character budget for the whole in-loop history after folding. Sized
+    /// with the harness's own conservative ~2.5 characters-per-token
+    /// conversion, so a compacted history plus a turn's completion budget
+    /// stays inside the prompt ceilings of the local families (262k tokens)
+    /// and of the cloud models (128k-200k) with room for the system prompt.
+    /// The engine's own context refusal remains the final backstop; this
+    /// budget exists so a healthy run never reaches it.
+    static let contextCharacterBudget = 160_000
+    private static let agedAssistantTextLimit = 2_000
+    private static let agedToolResultLimit = 800
+
+    /// Bounds what the model re-reads each step — but only when the history is
+    /// LARGE ENOUGH that folding pays for what it costs. The newest
+    /// `keptRecentTurns` turns stay verbatim; every older turn loses its
+    /// thinking (it is scratch) and has its text and tool results folded; and
+    /// whole oldest blocks are dropped when folding alone cannot fit the
+    /// budget. The task (the first user message) and every steering note are
+    /// never compacted. The transcript and report are untouched: the operator
+    /// still sees everything the run did.
+    ///
+    /// The trigger is the CHARACTER BUDGET, not the turn count. Folding
+    /// REWRITES bytes in the middle of the prompt, so a step whose history was
+    /// folded renders a prompt that is not an extension of the previous
+    /// step's — and the local backend reuses its KV prefix exactly when each
+    /// step's prompt extends the last byte for byte (`renderPrompt`'s
+    /// deterministic-rendering contract). Folding on turn count made every
+    /// step from the third on rewrite the turn that had just aged, so no
+    /// multi-step local run ever reused its pin: each step re-prefilled the
+    /// aged tail. Under the budget the history comes back UNCHANGED, steps are
+    /// pure extensions and the pin holds; folding runs only when the budget
+    /// demands it, one deliberate re-prefill per fold cycle instead of one per
+    /// step.
+    static func compactContextIfNeeded(
+        _ messages: [AgentBackendMessage],
+        overheadCharacters: Int = 0
+    ) -> [AgentBackendMessage] {
+        let rawTotal = overheadCharacters + messages.reduce(0) { $0 + Self.contextCharacterCount(of: $1) }
+        guard rawTotal > contextCharacterBudget else { return messages }
+
+        let blockStarts = messages.indices.filter {
+            if case .assistant = messages[$0] { return true } else { return false }
+        }
+        // A history with too few blocks for a "recent window" used to be
+        // returned UNCHANGED, which is not a bound: two enormous turns blew the
+        // budget just as thoroughly as twenty. Everything after the task is
+        // foldable in that case; the hard-trim pass at the end still protects
+        // the newest message by working oldest-first.
+        let recentWindowStart: Int
+        if blockStarts.count > keptRecentTurns {
+            recentWindowStart = blockStarts[blockStarts.count - keptRecentTurns]
+        } else {
+            recentWindowStart = messages.isEmpty ? 0 : 1
+        }
+
+        var folded: [AgentBackendMessage] = []
+        folded.reserveCapacity(messages.count)
+        for index in messages.indices {
+            let message = messages[index]
+            if index == 0, case .user = message {
+                // The task itself is the one message the run may never lose.
+                folded.append(message)
+                continue
+            }
+            if index >= recentWindowStart {
+                folded.append(message)
+                continue
+            }
+            switch message {
+            case .user:
+                // A steering note; already bounded at render time.
+                folded.append(message)
+            case .assistant(let text, _, let calls):
+                // Aged thinking is dropped, not folded: it is the model's
+                // scratch space for a turn that ended, and keeping it costs
+                // context without informing any later decision.
+                folded.append(.assistant(
+                    text: Self.folded(text, to: agedAssistantTextLimit),
+                    thinking: "",
+                    calls: calls
+                ))
+            case .toolResult(let callId, let name, let content, let isError):
+                folded.append(.toolResult(
+                    callId: callId,
+                    name: name,
+                    content: Self.folded(content, to: agedToolResultLimit),
+                    isError: isError
+                ))
+            }
+        }
+
+        var total = overheadCharacters + folded.reduce(0) { $0 + Self.contextCharacterCount(of: $1) }
+        guard total > contextCharacterBudget else { return folded }
+
+        // Folding alone did not fit (many steps, or very large recent turns).
+        // Drop whole aged blocks, oldest first, until it does. The ranges
+        // collected never touch the task, a steering note, or the recent
+        // window: the search stops at `recentWindowStart`, and a block ENDS at
+        // the first `.user` because a steering note can arrive between two
+        // assistant turns. Ending only at the next assistant dropped that note
+        // with the block in front of it.
+        var droppedRanges: [Range<Int>] = []
+        // Index 0 is the run's TASK, the one message the loop may never lose;
+        // an assistant turn that somehow landed first is still not a block this
+        // pass may delete.
+        var searchFrom = 1
+        while total > contextCharacterBudget, searchFrom < recentWindowStart {
+            guard let blockStart = folded[searchFrom..<recentWindowStart].firstIndex(where: {
+                if case .assistant = $0 { return true } else { return false }
+            }) else { break }
+            var blockEnd = recentWindowStart
+            for index in (blockStart + 1)..<recentWindowStart {
+                if case .user = folded[index] { blockEnd = index; break }
+                if case .assistant = folded[index] { blockEnd = index; break }
+            }
+            let removed = folded[blockStart..<blockEnd].reduce(0) { $0 + Self.contextCharacterCount(of: $1) }
+            droppedRanges.append(blockStart..<blockEnd)
+            total -= removed
+            searchFrom = blockEnd
+        }
+        guard !droppedRanges.isEmpty else {
+            // Nothing could be dropped (a short history, or a window with no
+            // aged block): the hard trim is the only bound left, and skipping
+            // it would return a history over budget.
+            return hardTrimIfNeeded(folded, overheadCharacters: overheadCharacters)
+        }
+        var result: [AgentBackendMessage] = []
+        result.reserveCapacity(folded.count)
+        var cursor = 0
+        for range in droppedRanges {
+            result.append(contentsOf: folded[cursor..<range.lowerBound])
+            cursor = range.upperBound
+        }
+        result.append(contentsOf: folded[cursor...])
+        return hardTrimIfNeeded(result, overheadCharacters: overheadCharacters)
+    }
+
+    /// The last resort: a bound that is actually a bound.
+    ///
+    /// Folding and dropping both refuse to touch the window that has to be sent
+    /// verbatim, so a run whose recent window alone is over budget came back
+    /// over budget and the engine answered with its own context refusal. This
+    /// walks OLDEST first and shrinks each message's text until the total fits,
+    /// so the newest turn (the one the next decision reads) is the last thing
+    /// to lose anything. The task and a steering note's existence are never
+    /// removed, only shortened.
+    private static func hardTrimIfNeeded(
+        _ messages: [AgentBackendMessage],
+        overheadCharacters: Int
+    ) -> [AgentBackendMessage] {
+        var total = overheadCharacters + messages.reduce(0) { $0 + Self.contextCharacterCount(of: $1) }
+        guard total > contextCharacterBudget else { return messages }
+        var trimmed: [AgentBackendMessage] = []
+        trimmed.reserveCapacity(messages.count)
+        for (index, message) in messages.enumerated() {
+            guard total > contextCharacterBudget, index > 0 else {
+                trimmed.append(message)
+                continue
+            }
+            switch message {
+            case .user(let text):
+                let shortText = Self.folded(text, to: hardTrimTextLimit)
+                total -= text.count - shortText.count
+                trimmed.append(.user(shortText))
+            case .assistant(let text, let thinking, let calls):
+                let shortText = Self.folded(text, to: hardTrimTextLimit)
+                let shortThinking = Self.folded(thinking, to: hardTrimTextLimit)
+                // Tool-call ARGUMENTS are counted against the budget
+                // (`contextCharacterCount` says why: a `file_write` body can be
+                // the largest thing a turn carries) but used to be passed
+                // through untouched, so a run over budget on one call's
+                // arguments came back over budget and the engine refused the
+                // turn this pass exists to fit.
+                let shortCalls = Self.folded(calls, to: hardTrimTextLimit)
+                let replacement = AgentBackendMessage.assistant(
+                    text: shortText,
+                    thinking: shortThinking,
+                    calls: shortCalls
+                )
+                total -= Self.contextCharacterCount(of: message)
+                    - Self.contextCharacterCount(of: replacement)
+                trimmed.append(replacement)
+            case .toolResult(let callId, let name, let content, let isError):
+                let shortContent = Self.folded(content, to: hardTrimTextLimit)
+                total -= content.count - shortContent.count
+                trimmed.append(.toolResult(
+                    callId: callId,
+                    name: name,
+                    content: shortContent,
+                    isError: isError
+                ))
+            }
+        }
+        // If the history is STILL over budget after shrinking every later turn,
+        // the initial task message (`index == 0`) itself exceeds the remaining
+        // budget (e.g. a coordinator pasted a 200 KB file body into
+        // `task_description`). Fold it to fit so the bound is never a no-op.
+        if total > contextCharacterBudget,
+           let first = trimmed.first,
+           case .user(let taskText) = first {
+            let excess = total - contextCharacterBudget
+            let targetLimit = max(hardTrimTextLimit, taskText.count - excess)
+            let shortTask = Self.folded(taskText, to: targetLimit)
+            trimmed[0] = .user(shortTask)
+        }
+        return trimmed
+    }
+
+    /// The per-message ceiling the hard trim applies. Small enough that a
+    /// handful of messages fit any budget this loop uses, large enough that the
+    /// model still sees what each step did.
+    static let hardTrimTextLimit = 400
+
+    /// Folds one message into the ceiling INCLUDING the marker.
+    ///
+    /// The old form appended the marker to `prefix(limit)`, so a message just
+    /// over the ceiling (401 characters) came back LONGER than it went in,
+    /// while the caller's running total was reduced as if it had shrunk. The
+    /// result is now exactly at most `limit` and strictly shorter than the
+    /// input whenever it folds.
+    static func folded(_ text: String, to limit: Int) -> String {
+        guard text.count > limit else { return text }
+        let marker = "… [compacted: \(text.count) chars]"
+        guard marker.count < limit else { return String(text.prefix(limit)) }
+        return String(text.prefix(limit - marker.count)) + marker
+    }
+
+    /// Folds a JSON object's string VALUES to fit, keeping it parseable.
+    ///
+    /// The wire form of a call's arguments is JSON, and a cloud backend sends
+    /// it unchanged, so the one thing this must never return is a fragment. It
+    /// folds each oversized string value with `folded(_:to:)`, re-serializes,
+    /// and falls back to a single short object (`{"_compacted":true}`) when the
+    /// input did not parse or the result is still over the ceiling.
+    static func foldedJSON(_ json: String, to limit: Int) -> String {
+        let fallback = "{\"_compacted\":true}"
+        guard let data = json.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return fallback
+        }
+        var shortened: [String: Any] = [:]
+        for (key, value) in object {
+            if let text = value as? String, text.count > limit {
+                shortened[key] = folded(text, to: limit)
+            } else {
+                shortened[key] = value
+            }
+        }
+        // Per-value folding bounds each VALUE, not the object: several keys,
+        // or a key name of its own, can still put it over. Shrink the widest
+        // value again while it is, so the ceiling holds without ever cutting
+        // the JSON itself.
+        let ceiling = max(limit, fallback.count)
+        var attempt = shortened
+        for _ in 0..<8 {
+            guard let out = try? JSONSerialization.data(withJSONObject: attempt, options: [.sortedKeys]),
+                  let text = String(data: out, encoding: .utf8) else {
+                return fallback
+            }
+            if text.count <= ceiling { return text }
+            let excess = text.count - ceiling
+            guard let widest = attempt.compactMap({ key, value -> (String, Int)? in
+                guard let value = value as? String else { return nil }
+                return (key, value.count)
+            }).max(by: { $0.1 < $1.1 }), widest.1 > excess + 32 else {
+                return fallback
+            }
+            attempt[widest.0] = folded(attempt[widest.0] as? String ?? "", to: widest.1 - excess)
+        }
+        return fallback
+    }
+
+    /// Folds one assistant turn's tool-call arguments into the same ceiling.
+    ///
+    /// The paired half of `contextCharacterCount`: that function bills a turn
+    /// for its arguments (the `rawArguments` JSON when the wire carried one,
+    /// otherwise the rendered `key=value` form), so the hard trim has to be
+    /// able to shrink that same text or the budget it enforces is not one.
+    /// Folding `rawArguments` keeps the call structurally intact and leaves the
+    /// arguments dictionary alone, which is what a rebuilt history renders.
+    ///
+    /// `rawArguments` is JSON a cloud backend re-sends VERBATIM as the
+    /// function's `arguments`, so it cannot be cut at a character count: a
+    /// truncated object is invalid JSON and the next request is a 400. Its
+    /// string VALUES are folded instead and the object re-serialized, and when
+    /// even that cannot produce valid JSON the arguments become one short,
+    /// valid object rather than a fragment.
+    static func folded(_ calls: [AgentToolCall], to limit: Int) -> [AgentToolCall] {
+        calls.map { call in
+            if !call.rawArguments.isEmpty {
+                guard call.rawArguments.count > limit else { return call }
+                return AgentToolCall(
+                    id: call.id,
+                    name: call.name,
+                    arguments: call.arguments,
+                    rawArguments: foldedJSON(call.rawArguments, to: limit),
+                    rawText: call.rawText,
+                    argumentsMalformed: call.argumentsMalformed
+                )
+            }
+            // No wire JSON means the counted form is the rendered dictionary,
+            // so the STRING values are what has to shrink.
+            var shortened: [String: Any] = [:]
+            var changed = false
+            for (key, value) in call.arguments {
+                if let text = value as? String, text.count > limit {
+                    shortened[key] = folded(text, to: limit)
+                    changed = true
+                } else {
+                    shortened[key] = value
+                }
+            }
+            guard changed else { return call }
+            return AgentToolCall(
+                id: call.id,
+                name: call.name,
+                arguments: shortened,
+                rawArguments: call.rawArguments,
+                rawText: call.rawText,
+                argumentsMalformed: call.argumentsMalformed
+            )
+        }
+    }
+
+    /// A tool catalogue's contribution to the prompt, in characters. The
+    /// schemas are rendered into the system block every step, so a large
+    /// loaded set consumes the same context a history entry does.
+    static func toolSchemaCharacterCount(_ tools: [ToolDefinition]) -> Int {
+        tools.reduce(0) { total, tool in
+            let schema: String
+            if let data = try? JSONEncoder().encode(tool.function.parameters),
+               let text = String(data: data, encoding: .utf8) {
+                schema = text
+            } else {
+                schema = ""
+            }
+            return total + tool.function.name.count + tool.function.description.count + schema.count
+        }
+    }
+
+    private static func contextCharacterCount(of message: AgentBackendMessage) -> Int {
+        switch message {
+        case .user(let text): return text.count
+        case .assistant(let text, let thinking, let calls):
+            // Tool-call ARGUMENTS are part of the prompt, and a `file_write`
+            // body can be the largest single thing a turn carries. Counting
+            // only text and thinking let a run cross the budget on arguments
+            // alone, after the spend.
+            let callCost = calls.reduce(0) { total, call in
+                let arguments = call.rawArguments.isEmpty
+                    ? call.arguments.keys.sorted()
+                        .map { "\($0)=\(String(describing: call.arguments[$0] ?? ""))" }
+                        .joined(separator: "&")
+                    : call.rawArguments
+                return total + call.name.count + arguments.count
+            }
+            return text.count + thinking.count + callCost
+        case .toolResult(_, _, let content, _): return content.count
+        }
+    }
+
+    /// Runs one tool under whatever is left of the wall-clock budget. Nil means
+    /// the deadline won; the tool's task is cancelled and the group waits for
+    /// it to stop (a `shell_run` child is killed by `runProcess`'s own
+    /// cancellation handler).
+    enum RacedResult<T: Sendable>: Sendable {
+        case completed(T)
+        case timedOut(T?)
+
+        var value: T? {
+            switch self {
+            case .completed(let value): return value
+            case .timedOut(let value): return value
+            }
+        }
+    }
+
+    private static func runTool(
+        _ context: AgentRunContext,
+        _ call: AgentToolCall,
+        remainingSeconds: TimeInterval
+    ) async -> RacedResult<(resultJSON: String, record: ToolCallRecord, isCompleted: Bool)> {
+        await firstResult(
+            deadlineNanoseconds: Self.deadlineNanoseconds(remainingSeconds)
+        ) {
+            await context.execute(call)
+        }
+    }
+
+    /// Runs `work` against a deadline and tags whether `work` finished first
+    /// (`.completed`) or the deadline expired first (`.timedOut`, carrying
+    /// whatever `work` returned after being cancelled so its transcript record
+    /// is never silently dropped).
+    ///
+    /// The wall-clock promise is bounded for COOPERATIVE work only, and that
+    /// is a property of structured concurrency rather than of this function:
+    /// a task group joins its children before the scope returns, so a tool
+    /// that ignores cancellation (a long synchronous write, a child that
+    /// ignores SIGTERM, a backend that swallows `CancellationError`) keeps the
+    /// caller past its deadline while it still holds its scheduler ticket and
+    /// its engine slot. Abandoning it instead is NOT the fix: the leaked task
+    /// would keep using the engine beside the next turn, and the engine is
+    /// single-flight by design, so a hang that is visible and stops with the
+    /// process is preferable to two turns running at once. Every tool this
+    /// loop runs is expected to be cancellation-aware (`runProcess` kills its
+    /// child on cancel), so the case is a bug in the tool, not a budget to
+    /// redesign around.
+    ///
+    /// Internal rather than private so the deadline race can be tested without
+    /// a model or a real tool.
+    static func firstResult<T: Sendable>(
+        deadlineNanoseconds: UInt64,
+        _ work: @escaping @Sendable () async -> T
+    ) async -> RacedResult<T> {
+        await withTaskGroup(of: T?.self) { group in
+            group.addTask { await work() }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: deadlineNanoseconds)
+                return nil
+            }
+            let first = await group.next()
+            if let answer = first ?? nil {
+                group.cancelAll()
+                return .completed(answer)
+            }
+            group.cancelAll()
+            let remaining = (await group.next()) ?? nil
+            return .timedOut(remaining)
+        }
+    }
+
+    /// Why a run with a cost ceiling cannot enforce it because its cost is
+    /// unknown. Shared by the pre-step guard and `postTurnBudgetFailure` so
+    /// both name the same cause: a provider that omitted usage is NOT a missing
+    /// price, and sending the operator to record one would fix nothing.
+    private static func unpricedCeilingFailure(
+        maxCost: Double,
+        reason: AgentUnpricedReason?
+    ) -> String {
+        switch reason {
+        case .providerOmittedUsage:
+            return "The run has a \(currency(maxCost)) cost ceiling, but its provider billed a request and reported no usage for it, so neither the tokens nor the cost can be priced. The ceiling cannot be enforced. Clear the ceiling, or check the provider's dashboard for the spend."
+        case .noPriceRecorded, .none:
+            return "The run has a \(currency(maxCost)) cost ceiling, but no price is recorded for its model, so the ceiling cannot be enforced."
+        }
+    }
+
+    /// What a just-finished turn did to the run's budget, or nil. A cost of
+    /// exactly the ceiling is allowed for a turn that then stopped: the ceiling
+    /// is the most the run may SPEND, and the next step's pre-check would stop
+    /// it from spending more.
+    private static func postTurnBudgetFailure(
+        input: AgentLoopInput,
+        usage: AgentUsage,
+        elapsed: TimeInterval
+    ) -> String? {
+        if elapsed >= Double(input.budget.maxWallClockSeconds) {
+            return "The run exceeded its \(input.budget.maxWallClockSeconds)-second wall-clock budget."
+        }
+        if let maxCost = input.budget.maxCostUSD {
+            if usage.costIsUnpriced {
+                return unpricedCeilingFailure(maxCost: maxCost, reason: usage.costUnpricedReason)
+            }
+            if usage.costUSD > maxCost {
+                return "The run spent \(currency(usage.costUSD)), over its \(currency(maxCost)) cost budget."
+            }
+        }
+        if usage.completionTokens > input.budget.maxCompletionTokens {
+            return "The run exhausted its \(input.budget.maxCompletionTokens)-token completion budget."
+        }
+        return nil
+    }
+
+    static func finishReasonIsTruncated(_ reason: String) -> Bool {
+        let lowered = reason.lowercased()
+        if lowered == "length" || lowered == "lengthcapped" { return true }
+        if lowered.contains("max_tokens") || lowered.contains("max_output_tokens") { return true }
+        return false
+    }
+
+    private static func initialTaskText(task: String, context: String?) -> String {
+        // The coordinator's task and context are model-authored text that lands
+        // in the worker's prompt. A chat-template marker in either would open
+        // or close a turn and let the text speak as the system.
+        let task = AgentHarness.sanitizeText(task)
+        guard let context, !context.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return task
+        }
+        return task + "\n\nCoordinator context:\n" + AgentHarness.sanitizeText(context)
+    }
+
+    /// A steering note rendered as a user turn the model cannot mistake for
+    /// its own task: the sender is named, the content is sanitised (it is
+    /// model- or operator-authored text landing in a prompt) and bounded.
+    static func steeringText(sender: String, content: String) -> String {
+        let bounded = AgentHarness.truncateText(
+            AgentHarness.sanitizeText(content),
+            limit: 2_000
+        )
+        let who = AgentHarness.sanitizeText(sender)
+        return "[\(who)] sent while this run was working: \(bounded)"
+    }
+
+    private static func bounded(_ text: String, limit: Int) -> String {
+        AgentHarness.truncateText(AgentHarness.sanitizeText(text), limit: limit)
+    }
+
+    private static func currency(_ amount: Double) -> String {
+        String(format: "$%.2f", amount)
+    }
+
+    private static func changedFiles(in transcript: [AgentTranscriptEntry]) -> [String] {
+        var seen = Set<String>()
+        var files: [String] = []
+        for entry in transcript {
+            guard let record = entry.toolRecord else { continue }
+            guard record.name == "file_write" || record.name == "file_edit" else { continue }
+            // A failed or refused write changed nothing. Listing it told the
+            // operator (and the persisted report) that a file had been edited
+            // when the call had been rejected or had errored out.
+            guard record.status == .success else { continue }
+            guard let rawPath = record.arguments["path"], !rawPath.isEmpty else { continue }
+            // The path is model-supplied text that lands in the persisted
+            // report and on the apply card. One line, no template markers, and
+            // bounded, exactly like every other model-authored string that
+            // reaches the operator.
+            let path = Self.bounded(rawPath, limit: 300)
+            guard !path.isEmpty else { continue }
+            if seen.insert(path).inserted {
+                files.append(path)
+            }
+        }
+        return files
+    }
+
+    /// The test invocations a `shell_run` is allowed to count as an outcome.
+    ///
+    /// A word-boundary "test" arm used to stand in for a runner, so `ls tests/`
+    /// and `cat test.txt` were reported as PASSING tests: the command exited 0,
+    /// so the report showed a green check for work no runner performed. Only a
+    /// real runner's invocation is evidence; "test" in a path is not.
+    private static let testRunnerCommands = [
+        "xcodebuild test",
+        "swift test",
+        "pytest",
+        "python -m pytest",
+        "python3 -m pytest",
+        "npm test",
+        "npm run test",
+        "yarn test",
+        "pnpm test",
+        "cargo test",
+        "go test",
+        "make test",
+        "ctest",
+        "dotnet test",
+        "mvn test",
+        "gradlew test",
+        "jest",
+        "vitest",
+        "mocha",
+        "rspec",
+        "phpunit",
+        "mix test",
+        "bats"
+    ]
+
+    /// Whether a `shell_run` command names a test RUNNER. Internal so the rule
+    /// is pinned directly, without spawning a process.
+    nonisolated static func isTestRunnerInvocation(_ command: String) -> Bool {
+        let lowered = command.lowercased()
+        return testRunnerCommands.contains { lowered.contains($0) }
+    }
+
+    private static func testOutcomes(in transcript: [AgentTranscriptEntry]) -> [AgentTestOutcome] {
+        var outcomes: [AgentTestOutcome] = []
+        for entry in transcript {
+            guard let record = entry.toolRecord, record.name == "shell_run" else { continue }
+            guard let command = record.arguments["command"] else { continue }
+            guard isTestRunnerInvocation(command) else { continue }
+            // A command that never ran has no outcome. `withheld` (plan mode,
+            // not in this run's tools) and `rejected` (the operator or an
+            // approval card said no) used to be reported as a FAILED test,
+            // telling the operator a suite had failed when it had not run.
+            guard record.status != .withheld, record.status != .rejected else { continue }
+            let output = record.output ?? record.error ?? ""
+            let exitCode: Int32 = record.status == .success ? 0 : 1
+            outcomes.append(AgentTestOutcome(
+                // The command is model-authored and is persisted with the
+                // report; the same one-line + marker pass as every other
+                // model string keeps it from reshaping what it sits beside.
+                command: Self.bounded(command, limit: 512),
+                exitCode: exitCode,
+                passed: Self.count("passed", in: output),
+                failed: Self.count("failed", in: output),
+                summary: Self.bounded(output, limit: 600)
+            ))
+        }
+        return outcomes
+    }
+
+    private static func count(_ word: String, in text: String) -> Int? {
+        let lowerString = text.lowercased()
+        guard lowerString.contains(word) else { return nil }
+        let lower = lowerString as NSString
+        let pattern = "([0-9]+)\\s+" + word
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let range = NSRange(location: 0, length: lower.length)
+        var total = 0
+        for match in regex.matches(in: lowerString, options: [], range: range) {
+            let value = lower.substring(with: match.range(at: 1))
+            total += Int(value) ?? 0
+        }
+        return total
+    }
+}

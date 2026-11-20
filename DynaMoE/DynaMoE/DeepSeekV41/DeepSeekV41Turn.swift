@@ -278,6 +278,14 @@ nonisolated public enum DeepSeekV41TurnRunner {
     ///   - onText: `(text so far, tokens generated, elapsed seconds)` at most once
     ///     per token.
     ///   - isCancelled: consulted before every position and every sample.
+    ///   - onCacheWillChange: called at the ONE point this turn starts changing
+    ///     the executor's KV cache — after every gate that can refuse it
+    ///     (empty prompt, prompt past the position limit, an image row outside
+    ///     the prompt) and immediately before the resume/reset. A caller that
+    ///     has to invalidate app-wide state derived from the cache (the prefix
+    ///     pin) must do it here and not at launch: a refused turn overwrites
+    ///     nothing, and dropping the pin for one costs the next turn a full
+    ///     re-prefill.
     static func run(
         forward: any DeepSeekV41PositionForward,
         promptTokenIds: [UInt32],
@@ -290,7 +298,8 @@ nonisolated public enum DeepSeekV41TurnRunner {
         decode: ([UInt32]) -> String,
         onPrefill: (Int, Int) -> Void = { _, _ in },
         onText: (String, Int, Double) -> Void = { _, _, _ in },
-        isCancelled: () -> Bool = { false }
+        isCancelled: () -> Bool = { false },
+        onCacheWillChange: () -> Void = {}
     ) throws -> Output {
         let limit = forward.positionLimit
         guard !promptTokenIds.isEmpty else { throw DeepSeekV41TurnError.emptyPrompt }
@@ -321,6 +330,9 @@ nonisolated public enum DeepSeekV41TurnRunner {
         let resumeFrom = imageEmbeddings.isEmpty
             ? max(0, min(prefixTokens, promptTokenIds.count - 1))
             : 0
+        // Past every gate that can refuse this turn, so a refused one has left
+        // the cache — and anything derived from it — exactly as it was.
+        onCacheWillChange()
         if resumeFrom > 0 {
             try forward.resume(prefixTokenIds: promptTokenIds.prefix(resumeFrom).map { Int($0) })
         } else {

@@ -273,6 +273,14 @@ struct ContentView: View {
     @State private var statusSerial: UInt64 = 0
     @State private var statusDismissTask: Task<Void, Never>? = nil
     @State private var generationTask: Task<Void, Never>? = nil
+    /// The ENGINE turn this window launched for its own generation, as the id
+    /// `launchTurn` minted. Stop cancels by this id rather than by
+    /// `cancelActiveTurn()`, which names no owner and therefore aborted
+    /// whatever turn was current — a background subagent step or a server
+    /// request — when the chat generation had no engine turn at all (a cloud
+    /// turn, or a local turn still being prepared). A stale id is inert: the
+    /// engine only cancels when it still matches its current turn.
+    @State private var activeEngineTurnId: UInt64? = nil
     /// Monotonic id for the live generation. A cancelled task that has already
     /// been superseded (interrupt + replacement, or a scheduled continuation)
     /// must not clear this generation's task handle/UI flags, record a prefix,
@@ -284,6 +292,127 @@ struct ContentView: View {
     /// missing session silently resumed the coder in the middle of a plan turn.
     /// Resolved once at step 0 and carried by value for every later step.
     @State private var activeTurnMode: AgentMode? = nil
+
+    /// Deferred relaunches: a send that preempts a background turn, or waits
+    /// out a busy slot, queues itself on a `Task` that re-calls the send once
+    /// the engine is free. Nothing else cancelled those tasks, so a Stop left
+    /// them armed — a stopped turn could resurrect itself up to 120 s later.
+    /// Tracked here so `stopAutoregressiveGeneration` can reach them; a task
+    /// removes its own entry when it exits.
+    @State private var deferredRelaunchTasks: [UUID: Task<Void, Never>] = [:]
+    /// The conversation each queued relaunch would run in. Deleting a
+    /// conversation must cancel its own relaunches; cancelling every session's
+    /// would abort an unrelated send the operator is waiting on.
+    @State private var deferredRelaunchSessions: [UUID: UUID] = [:]
+    /// How long a queued send waits for the engine slot before it gives up: a
+    /// continuation ends its step, a fresh send falls back to preemption.
+    private static let queuedSlotWaitSeconds: TimeInterval = 120
+
+    /// Retires the placeholder a queued send appended, when that send never
+    /// became a turn.
+    ///
+    /// `handleSendMessage` appends the operator's message and an assistant
+    /// bubble marked `isThinking` BEFORE it knows whether the send will run
+    /// immediately, wait for the slot, or give up. Only a launched turn clears
+    /// that flag, so every abandoned relaunch used to leave an empty bubble
+    /// spinning for good. A bubble the launched turn owns is left alone: it is
+    /// identified by id, and a turn that started is still streaming into it.
+    private func clearThinkingPlaceholder(sessionId: UUID?, messageId: UUID?) {
+        guard let sessionId, let messageId,
+              let sIdx = sessions.firstIndex(where: { $0.id == sessionId }),
+              let mIdx = sessions[sIdx].messages.firstIndex(where: { $0.id == messageId }),
+              sessions[sIdx].messages[mIdx].isThinking,
+              sessions[sIdx].messages[mIdx].content.isEmpty else { return }
+        sessions[sIdx].messages[mIdx].isThinking = false
+    }
+
+    /// Cancels every queued relaunch. Called from Stop and from the paths that
+    /// tear a generation down before replacing it, so a superseded send cannot
+    /// come back after its caller has moved on.
+    private func cancelDeferredRelaunches() {
+        for relaunch in deferredRelaunchTasks.values {
+            relaunch.cancel()
+        }
+        deferredRelaunchTasks.removeAll()
+        deferredRelaunchSessions.removeAll()
+    }
+
+    /// Cancels only the relaunches belonging to one conversation. A deleted
+    /// conversation's queued send used to relaunch into a session that no
+    /// longer existed, running an invisible turn nothing could stop.
+    private func cancelDeferredRelaunches(sessionId: UUID) {
+        for (key, queuedSession) in deferredRelaunchSessions where queuedSession == sessionId {
+            deferredRelaunchTasks[key]?.cancel()
+            deferredRelaunchTasks[key] = nil
+            deferredRelaunchSessions[key] = nil
+        }
+        // A cancellation only reaches the task at its next suspension; the
+        // generating flag this send published would otherwise stay set with no
+        // turn behind it, and every composer would show a Stop that stops
+        // nothing while `handleSendMessage` refuses new sends.
+        //
+        // The live-task guard is deliberately skipped here. A coordinator
+        // continuation that deferred still had the PREVIOUS, finished step's
+        // task in `generationTask` (a continuation hands that handle to the
+        // next step), so the guard made this release a no-op and deleting the
+        // conversation left `isGeneratingText` true with `generatingSessionId`
+        // naming a session that no longer exists: every composer refused sends
+        // and none drew a Stop, because they all match on `generatingSessionId`.
+        // The conversation is gone either way, so nothing in it can still be
+        // generating.
+        releaseQueuedGenerationFlags(ifOwnedBy: sessionId, includingLiveTurn: true)
+    }
+
+    /// Publishes the generating state for a queued send, and names the
+    /// conversation that owns it.
+    ///
+    /// The owner used to be set only when it was nil, so after any completed
+    /// turn in conversation A a queued send in B set `isGeneratingText` but
+    /// left `generatingSessionId = A`. Its exit checks ownership against B,
+    /// so a relaunch that never launched (session deleted, launch refused,
+    /// retry budget spent) left the composer claiming a generation forever:
+    /// every composer refused sends while B drew a plain Send button.
+    /// A send behind a LIVE generation must not repoint what Stop reads, so
+    /// the pair is only taken over when nothing owns it; a stale flag with no
+    /// task and no queued owner is recovered here too.
+    private func publishQueuedGenerationFlags(sessionId: UUID?) {
+        let hasLiveOwner = generationTask != nil || !deferredRelaunchTasks.isEmpty
+        guard !isGeneratingText || !hasLiveOwner else { return }
+        isGeneratingText = true
+        generatingSessionId = sessionId
+    }
+
+    /// Clears the composer's generating state for a send that never became a
+    /// turn. Guarded on ownership: a live turn (`generationTask`) keeps its
+    /// flag, another conversation's run keeps its own, and a nested queued
+    /// relaunch has its own exit to clean up after.
+    ///
+    /// `includingLiveTurn` exists for the one case where the live handle is
+    /// stale rather than live: deleting the generating conversation. The turn
+    /// handle is left in place by a continuation (the next step publishes its
+    /// own), and a deleted conversation cannot still be generating, so the
+    /// session check alone is the honest guard there.
+    private func releaseQueuedGenerationFlags(ifOwnedBy sessionId: UUID?, includingLiveTurn: Bool = false) {
+        guard generatingSessionId == sessionId else { return }
+        guard includingLiveTurn || generationTask == nil else { return }
+        // Another queued send still needs the flag: repoint it rather than
+        // clearing it, or the composer loses its Stop control for the rest of
+        // that send's wait. When none remain, the state is genuinely idle.
+        if let next = deferredRelaunchSessions.values.first {
+            isGeneratingText = true
+            generatingSessionId = next
+            return
+        }
+        isGeneratingText = false
+        generatingSessionId = nil
+    }
+
+    /// The operator TURN whose generation is (or was last) active: minted on a
+    /// fresh send, carried by every continuation of that send. A Stop scopes
+    /// subagent-run cancellation to this turn, so background runs an earlier
+    /// turn spawned survive it with their unapplied work intact.
+    @State private var activeAgentTurnId: UUID? = nil
+    @State private var activeAgentTurnSessionId: UUID? = nil
 
     // Working Set & Dynamic SSD Expert Paging State. Memory settings persist via
     // @AppStorage so the local server reads the same policy the UI configured.
@@ -397,6 +526,10 @@ struct ContentView: View {
         }
     }
     @State private var selectedSessionId: UUID? = nil
+    /// A notification tap that names a conversation the history load has not
+    /// finished restoring. Dropping it left the drawer showing whichever
+    /// conversation happened to be selected; it is applied after the load.
+    @State private var pendingRevealSessionId: UUID? = nil
     /// Identity of the single empty conversation the view starts with, so a
     /// successful history load drops only that placeholder and not a user-created
     /// empty chat, which may already carry a chosen model or settings.
@@ -817,6 +950,13 @@ struct ContentView: View {
     /// The non-suspending half of a model switch. Runs only once no cancelled
     /// generation is still using the shared engine and buffers, and returns the
     /// load task so a caller can wait for that specific model to be ready.
+    ///
+    /// The state below is published OPTIMISTICALLY, before the load has an
+    /// engine to install. A load can still be refused after that (the swap
+    /// claim, or a newer request superseding this one), and leaving the state
+    /// pointed at the model that was refused made the conversation render B and
+    /// sample with B's profile while the engine kept serving A. The refusal path
+    /// is handed the state this switch replaced so it can put it back.
     @discardableResult
     private func completeModelSwitch(to model: DiscoveredModel, sessionId targetSessionId: UUID?) -> Task<Void, Never> {
         if model.isCloudModel {
@@ -825,8 +965,21 @@ struct ContentView: View {
         if model.isAppleFoundationModel {
             return coordinateAppleFoundationModelActivation(of: model, sessionId: targetSessionId)
         }
+        // Captured before anything below changes it.
+        let previousPath = activeLoadedModelPath
+        let previousLastUsedId = localModelManager.lastUsedModelId
+        let previousProfile = activeProfile
+        let previousProfileKey = previousPath.flatMap {
+            localModelManager.getModel(byId: $0)?.id ?? $0
+        }
+        let previousSessionModel: (id: String?, name: String?, path: String?)? = {
+            guard let sid = targetSessionId,
+                  let idx = sessions.firstIndex(where: { $0.id == sid }) else { return nil }
+            let session = sessions[idx]
+            return (session.selectedModelId, session.selectedModelName, session.selectedModelPath)
+        }()
+
         PrefixCacheManager.shared.invalidate()
-        let loadTask = loadAndBridgeToMetal(filePath: model.snapshotPath)
         activeLoadedModelPath = model.snapshotPath
         localModelManager.setLastUsedModel(id: model.id)
         if let sid = targetSessionId,
@@ -837,6 +990,24 @@ struct ContentView: View {
         }
         let preferredProfile = ModelProfileManager.shared.getActiveProfile(for: model.id)
         applyProfile(preferredProfile, for: model.id)
+        let loadTask = loadAndBridgeToMetal(filePath: model.snapshotPath) { [previousPath, previousLastUsedId, previousProfile, previousProfileKey, previousSessionModel, targetSessionId] in
+            // A newer switch (or an explicit selection) owns the state now.
+            guard self.activeLoadedModelPath == model.snapshotPath else { return }
+            self.activeLoadedModelPath = previousPath
+            self.localModelManager.lastUsedModelId = previousLastUsedId
+            if let key = previousProfileKey {
+                self.applyProfile(previousProfile, for: key)
+            } else {
+                self.applyProfile(previousProfile)
+            }
+            if let sid = targetSessionId,
+               let idx = self.sessions.firstIndex(where: { $0.id == sid }),
+               let previousSessionModel {
+                self.sessions[idx].selectedModelId = previousSessionModel.id
+                self.sessions[idx].selectedModelName = previousSessionModel.name
+                self.sessions[idx].selectedModelPath = previousSessionModel.path
+            }
+        }
         return loadTask
     }
 
@@ -981,6 +1152,21 @@ struct ContentView: View {
     /// weights load cannot install over this activation afterward, and its
     /// unguarded side effects cannot repopulate what this releases.
     private func activateAppleFoundationModel(_ model: DiscoveredModel, sessionId targetSessionId: UUID?) {
+        // HOLD the generation slot for the swap, exactly as the weights load
+        // path does. `awaitGenerationTeardown()` covers the turn that WAS
+        // running; the release below still replaces the shard buffers and
+        // retires the DeepSeek runtime, and a turn that starts in the hop
+        // between that wait and this call — a background run's 100 ms poller is
+        // enough — would compute on mappings that no longer exist. Refusing on
+        // a nil claim is the same answer the load gives: the operator can
+        // retry once the run finishes.
+        guard let swapClaim = CompletionEngine.shared.reserveTurnSlot() else {
+            let message = "⚠️ Engine busy: a turn or subagent run is using it. Select \(model.displayName) again once it finishes."
+            metalStatus = message
+            showStatus(message, kind: .warning)
+            return
+        }
+        defer { swapClaim.release() }
         PrefixCacheManager.shared.invalidate()
         ExpertIOThreadPool.shared.closeAllLayerFDs()
         WorkingSetManager.shared.releaseShardMappings()
@@ -1112,6 +1298,16 @@ struct ContentView: View {
             showStatus(message, kind: .warning)
             return
         }
+        // Same claim as the system-model activation and the weights load: the
+        // release below is a swap of shared engine state, and "the slot is
+        // free" read a moment earlier is not the same as holding it.
+        guard let swapClaim = CompletionEngine.shared.reserveTurnSlot() else {
+            let message = "⚠️ Engine busy: a turn or subagent run is using it. Select \(model.displayName) again once it finishes."
+            metalStatus = message
+            showStatus(message, kind: .warning)
+            return
+        }
+        defer { swapClaim.release() }
         PrefixCacheManager.shared.invalidate()
         ExpertIOThreadPool.shared.closeAllLayerFDs()
         WorkingSetManager.shared.releaseShardMappings()
@@ -1270,6 +1466,30 @@ struct ContentView: View {
             }
             ChatSessionStore.shared.delete(sessionIds: removedIds)
             ImageAttachmentStore.shared.delete(sessionIds: removedIds)
+            // A deleted conversation's subagent runs are its work; §10 keeps
+            // them only as long as the conversation that spawned them exists.
+            // They are stopped BEFORE the records go — the protected set
+            // above should mean no run is still live here, but a run that
+            // turned live between the plan and this loop must not become
+            // invisible, unstoppable work whose terminal write the store's
+            // tombstone then drops.
+            for id in removedIds {
+                // A live turn for this conversation would keep generating into
+                // a session that no longer exists, holding the engine and its
+                // subagents with no surface to stop it. The plan protects a
+                // generating session, so this is the backstop for a turn that
+                // went live between the plan and this loop.
+                stopGenerationIfOwned(byDeletedSession: id)
+                // A queued send for an evicted conversation must not relaunch
+                // into it later; the retention sweep removed the session the
+                // task would have run in.
+                cancelDeferredRelaunches(sessionId: id)
+                SubagentManager.shared.cancelSession(
+                    sessionId: id,
+                    reason: "The conversation was removed by chat retention."
+                )
+                AgentRunStore.shared.deleteSession(id)
+            }
         }
         // Run the orphan pass on every retention sweep, not only when a
         // conversation was evicted: deleting a message or a queued prompt by hand
@@ -1302,9 +1522,11 @@ struct ContentView: View {
         return paths
     }
 
-    /// Sessions retention must never evict: the one the user is viewing and the
+    /// Sessions retention must never evict: the one the user is viewing, the
     /// one actively generating (which may differ after switching chats mid-turn,
-    /// since the generation loop still appends to its own session).
+    /// since the generation loop still appends to its own session), and every
+    /// session with a subagent run still working — evicting one of those deletes
+    /// the run's record underneath a run that is still executing.
     private var chatRetentionProtectedIds: Set<UUID> {
         var ids: Set<UUID> = []
         if let selected = selectedSessionId {
@@ -1316,6 +1538,7 @@ struct ContentView: View {
             ids.insert(generating)
         }
         ids.formUnion(retentionProtectionCounts.keys)
+        ids.formUnion(SubagentManager.shared.liveRunSessionIds)
         return ids
     }
 
@@ -1455,6 +1678,14 @@ struct ContentView: View {
     /// conversation is withheld while another is on screen — the transcript's own
     /// progress row is keyed to the session for the same reason — while a notice
     /// about the app stays visible everywhere.
+    /// Whether the composer may send. One named property instead of a
+    /// three-way disjunction inline: the expression inside a large view
+    /// builder is what pushed the type checker over its budget.
+    private var isModelLoadedForComposer: Bool {
+        let weightsLoaded = tokenizer != nil && summary != nil
+        return weightsLoaded || isAppleFoundationModelActive || isCloudModelActive
+    }
+
     private var visibleStatusNotice: StatusNotice? {
         guard let statusNotice else { return nil }
         guard let statusNoticeSessionId else { return statusNotice }
@@ -1495,11 +1726,14 @@ struct ContentView: View {
                     isGenerating: isGeneratingText,
                     onNewChat: {
                         let defModel = localModelManager.getDefaultOrFirstModel()
+                        let defaultId: String? = defModel?.id
+                        let defaultName: String? = defModel?.displayName
+                        let defaultPath: String? = defModel?.snapshotPath
                         let newSession = ChatSession(
                             title: "New Chat",
-                            selectedModelId: defModel?.id,
-                            selectedModelName: defModel?.displayName,
-                            selectedModelPath: defModel?.snapshotPath
+                            selectedModelId: defaultId,
+                            selectedModelName: defaultName,
+                            selectedModelPath: defaultPath
                         )
                         sessions.insert(newSession, at: 0)
                         selectedSessionId = newSession.id
@@ -1510,6 +1744,18 @@ struct ContentView: View {
                     },
                     onDeleteSession: { id in
                         PrefixCacheManager.shared.invalidate(sessionId: id)
+                        // A turn still running in this conversation generates
+                        // into a session that is about to stop existing: it
+                        // wrote nothing anywhere an operator could see, held
+                        // the engine, and kept its subagents billing. The
+                        // weights loop had no vanished-session exit (only the
+                        // cloud loop did), so the delete has to stop it.
+                        stopGenerationIfOwned(byDeletedSession: id)
+                        // A send queued behind a preemption or a busy slot
+                        // belongs to this conversation. Left armed, it would
+                        // relaunch into a session that no longer exists and
+                        // run a turn nothing can see or stop.
+                        cancelDeferredRelaunches(sessionId: id)
                         // A manual compaction is a task, not a per-session view
                         // flag: deleting the conversation removed the session
                         // but left the task summarizing (and billing) it. The
@@ -1519,6 +1765,20 @@ struct ContentView: View {
                             run.task?.cancel()
                             manualCompactions.removeValue(forKey: id)
                         }
+                        // The conversation's runs are its work (§10): stop them
+                        // BEFORE the records go, or a run keeps executing tools
+                        // and billing while its record orphans on disk — and a
+                        // run whose record is deleted underneath it is
+                        // invisible, unstoppable, and its terminal write is
+                        // dropped by the store's tombstone. Unapplied isolated
+                        // survivors are re-scoped by the store rather than
+                        // destroyed, so their worktrees stay out of the 14-day
+                        // sweep's reach.
+                        SubagentManager.shared.cancelSession(
+                            sessionId: id,
+                            reason: "The conversation was deleted."
+                        )
+                        AgentRunStore.shared.deleteSession(id)
                         sessions.removeAll(where: { $0.id == id })
                         // The conversation JSON is cleaned by the next save pass's
                         // orphan sweep, but its asset directory is a separate tree.
@@ -1577,9 +1837,12 @@ struct ContentView: View {
                         ) else { return nil }
                         // An estimate, not a promise: the model behind it was
                         // measured on this machine class, and the chip says so.
-                        return estimate.seconds < 10
-                            ? String(format: "about %.1f s", estimate.seconds)
-                            : "about \(Int(estimate.seconds.rounded())) s"
+                        let seconds = estimate.seconds
+                        if seconds < 10 {
+                            return String(format: "about %.1f s", seconds)
+                        }
+                        let rounded = Int(seconds.rounded())
+                        return "about " + String(rounded) + " s"
                     },
                     isAgentToolsEnabled: isAgentToolsEnabledForActiveSession,
                     isModelLoaded: (tokenizer != nil && summary != nil) || isAppleFoundationModelActive || isCloudModelActive,
@@ -1607,13 +1870,16 @@ struct ContentView: View {
                         openSettingsWindow()
                     },
                     onSetThinking: { enabled, effort in
-                        let resolvedEffort = enabled ? effort : nil
+                        let resolvedEffort: ThinkingEffort? = enabled ? effort : nil
                         defaultThinkingEnabled = enabled
                         if let effort {
                             defaultThinkingEffort = effort.rawValue
                         }
-                        if let sid = selectedSessionId ?? sessions.first?.id,
-                           let idx = sessions.firstIndex(where: { $0.id == sid }) {
+                        let targetSessionId: UUID? = selectedSessionId ?? sessions.first?.id
+                        let targetIndex: Int? = targetSessionId.flatMap { id -> Int? in
+                            sessions.firstIndex(where: { $0.id == id })
+                        }
+                        if let sid = targetSessionId, let idx = targetIndex {
                             let changed = sessions[idx].isThinkingEnabled != enabled
                                 || sessions[idx].thinkingEffort != resolvedEffort
                             sessions[idx].isThinkingEnabled = enabled
@@ -1633,10 +1899,16 @@ struct ContentView: View {
                         // never runs. Turning the tools off therefore leaves the
                         // mode with them, and a live turn refuses the change for
                         // the same reason it refuses a mode flip.
-                        if !enabled,
-                           let sid = selectedSessionId ?? sessions.first?.id,
-                           let idx = sessions.firstIndex(where: { $0.id == sid }),
-                           (sessions[idx].agentMode ?? .code) == .plan {
+                        let targetSessionId: UUID? = selectedSessionId ?? sessions.first?.id
+                        var isPlanMode = false
+                        if let targetSessionId {
+                            let targetIndex: Int? = sessions.firstIndex { $0.id == targetSessionId }
+                            if let targetIndex {
+                                let mode: AgentMode = sessions[targetIndex].agentMode ?? .code
+                                isPlanMode = mode == .plan
+                            }
+                        }
+                        if !enabled, let sid = targetSessionId, isPlanMode {
                             guard !isModeChangeLocked, applyPlanMode(false, sessionId: sid) else {
                                 showStatus("⏳ Plan Mode is running — finish the turn before turning agent tools off.", kind: .warning)
                                 return
@@ -1773,13 +2045,15 @@ struct ContentView: View {
                 NSApp.keyWindow?.makeFirstResponder(nil)
             }
         }
-        .onChange(of: selectedSessionId) { newId in
+        .onChange(of: selectedSessionId) { (newId: UUID?) in
             // The session that was protected from pruning may have just changed,
             // so re-run retention before switching models.
             applyChatRetention()
             guard let newId = newId, let session = sessions.first(where: { $0.id == newId }) else { return }
             if let targetPath = session.selectedModelPath, !targetPath.isEmpty, activeLoadedModelPath != targetPath {
-                if let model = localModelManager.getModel(byId: targetPath) ?? localModelManager.getModel(byId: session.selectedModelId ?? "") {
+                let byPath = localModelManager.getModel(byId: targetPath)
+                let byId = byPath ?? localModelManager.getModel(byId: session.selectedModelId ?? "")
+                if let model = byId {
                     switchModel(to: model)
                 } else {
                     loadAndBridgeToMetal(filePath: targetPath)
@@ -1839,9 +2113,26 @@ struct ContentView: View {
             // flushSessionPersist only enqueues the write; block until the
             // utility queue drains so the process cannot exit first.
             ChatSessionStore.shared.flushPendingIO()
+            // No subagent outlives the app: a child's cloud stream, local step or
+            // pending approval card would otherwise be cut off without a report.
+            // `cancelAll` skips runs that already finished. Approvals are
+            // cancelled BEFORE the store flush (not after): a stopped run's
+            // approval resolves rejected immediately, and the record write that
+            // follows is what the flush is for. Cancelling them after the flush
+            // left the last state change unwritten on the way out.
+            SubagentManager.shared.cancelAll()
+            ActionApprovalManager.shared.cancelAll()
+            AgentRunStore.shared.flush()
+        }
+        // A notification tap names the conversation its run belongs to: the
+        // inspector is session-scoped, so the tap has to select that chat
+        // before the drawer opens, or it lands on a list the run is not in.
+        .onReceive(NotificationCenter.default.publisher(for: SubagentNotifier.revealRunNotification)) { note in
+            revealConversationForSubagentRun(note)
         }
         .task {
             await loadPersistedSessionsIfNeeded()
+            applyPendingReveal()
         }
         .task {
             while !Task.isCancelled {
@@ -2057,7 +2348,7 @@ struct ContentView: View {
             // engine.
             guard await ensureModelLoaded(forSession: targetSessionId) else { return false }
             guard !isGeneratingText else { return false }
-            return handleSendMessage(trimmed, preparedImages: preparedImages, sessionId: targetSessionId)
+            return await handleSendMessage(trimmed, preparedImages: preparedImages, sessionId: targetSessionId)
         }
         print("⏹ [INT] interrupt requested — cancelling current generation and sending a fresh turn")
         let previous = generationTask
@@ -2096,7 +2387,7 @@ struct ContentView: View {
             if isGeneratingText || !modelReady {
                 accepted = false
             } else {
-                accepted = handleSendMessage(trimmed, preparedImages: preparedImages, sessionId: targetSessionId)
+                accepted = await handleSendMessage(trimmed, preparedImages: preparedImages, sessionId: targetSessionId)
             }
         }
         if let targetSessionId {
@@ -2153,12 +2444,14 @@ struct ContentView: View {
                         count: queuedAttachments.count,
                         reason: "model has no vision support"
                     )].filter { !$0.isEmpty }.joined(separator: "\n\n"))
-                let accepted = !self.isGeneratingText && modelReady
-                    && self.handleSendMessage(
+                var accepted = false
+                if !self.isGeneratingText, modelReady {
+                    accepted = await self.handleSendMessage(
                         text,
                         attachmentRefs: attachmentsStillVisible ? queuedAttachments : [],
                         sessionId: currentSessionId
                     )
+                }
                 if !accepted {
                     self.requeuePromptFront(next, sessionId: currentSessionId)
                 }
@@ -2179,51 +2472,275 @@ struct ContentView: View {
 
     // MARK: - Subagent Result Auto-Relay
 
+    /// Writes this turn's unread subagent reports into the conversation as a
+    /// prompt-only directive, immediately before the user's message.
+    ///
+    /// This is the local-backend half of §11's "injected at the start of the
+    /// next coordinator turn". The cloud path rides its own trailing directive
+    /// because a leading turn would change the provider's cached prefix; a
+    /// locally rendered prompt has no such cost, and every family renders a
+    /// `.user` turn, so one hidden message reaches them all without touching a
+    /// template.
+    /// Appends the relay message and returns the reports it carries. The
+    /// caller marks them delivered only once the turn actually launches: a
+    /// launch refused here (or a quit before it starts) would otherwise drop
+    /// the hidden message on the next send while its reports were already
+    /// flagged as seen.
+    @discardableResult
+    private func insertStartOfTurnSubagentRelay(
+        sessionIdx: Int,
+        sessionId: UUID,
+        pending: [String]
+    ) -> (reports: [String], messageId: UUID?) {
+        // A directive belongs to exactly one turn; a later send must not find
+        // the previous one still in history and re-read reports it already saw.
+        sessions[sessionIdx].messages.removeAll { $0.isPromptOnly == true }
+        guard !pending.isEmpty else { return ([], nil) }
+        let message = ChatMessage(
+            role: .user,
+            content: LocalSubagentRelay.directive(reports: pending),
+            isPromptOnly: true
+        )
+        sessions[sessionIdx].messages.append(message)
+        return (pending, message.id)
+    }
+
     /// Collects final reports from this session's completed subagents that have not yet been
     /// surfaced into the conversation. The harness injects these as `[SUBAGENT_RESULT]` blocks
     /// after tool turns so the coordinator model can present them to the user — subagents run
     /// in isolation and the user has no other way to receive their results.
-    private func gatherCompletedSubagentRelayResponses(forSession sessionId: UUID?) -> [String] {
+    ///
+    /// A run can finish after the app quits, or after its live instance is gone,
+    /// so the durable record is read too: a terminal record whose
+    /// `summaryRelayed` is still false is exactly the report this relay exists
+    /// to deliver. Live instances come first and their ids suppress the stored
+    /// copy, so one run is never injected twice.
+    /// The send path's form: `handleSendMessage` is synchronous by contract,
+    /// so this cannot await. It reads the owed records in ONE hop onto the IO
+    /// queue (`load(runIds:sessionId:)`) rather than one `sync` per id, which
+    /// is the only cost this path can remove without going async. Every other
+    /// caller uses the async twin below and takes the read off the main actor.
+    private func gatherCompletedSubagentRelayResponsesSynchronously(forSession sessionId: UUID?) -> [String] {
         guard let sessionId else { return [] }
-        let pending = SubagentManager.shared.allSubagents.filter {
-            $0.parentSessionId == sessionId
-                && ($0.status == .completed || $0.status == .failed || $0.status == .cancelled)
-                && !$0.isSummaryRelayed
-                && !$0.finalSummary.isEmpty
+        var seen = Set<UUID>()
+        var entries: [(timestamp: Date, text: String)] = []
+        let budget = AgentHarness.charBudget(forTokenBudget: self.maxToolOutputLength)
+
+        func line(role: String, id: UUID, status: String, summary: String) -> String? {
+            let clean = AgentHarness.truncateText(
+                AgentHarness.sanitizeText(summary),
+                limit: budget
+            )
+            guard !clean.isEmpty else { return nil }
+            return "[SUBAGENT_RESULT] id=\(id.uuidString) status=\(status) role=\(Self.relayRole(role))\n\(clean)"
         }
-        guard !pending.isEmpty else { return [] }
-        return pending.map { s in
-            let clean = AgentHarness.truncateText(AgentHarness.sanitizeText(s.finalSummary), limit: AgentHarness.charBudget(forTokenBudget: self.maxToolOutputLength))
-            return "[SUBAGENT_RESULT] role=\(s.role) id=\(s.id.uuidString) status=\(s.status.rawValue)\n\(clean)"
+
+        for instance in SubagentManager.shared.allSubagents
+        where instance.parentSessionId == sessionId
+            && instance.status.isTerminal
+            && !instance.isSummaryRelayed
+            && !instance.finalSummary.isEmpty {
+            seen.insert(instance.id)
+            let summary: String
+            if instance.status == .cancelled {
+                let partial = instance.report?.summary
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                guard !partial.isEmpty, partial != instance.finalSummary else { continue }
+                summary = partial
+            } else {
+                summary = instance.finalSummary
+            }
+            if let text = line(
+                role: instance.role,
+                id: instance.id,
+                status: instance.status.rawValue,
+                summary: summary
+            ) {
+                let timestamp = instance.completedAt ?? instance.startedAt ?? instance.createdAt
+                entries.append((timestamp: timestamp, text: text))
+            }
         }
+
+        let owed = Set(AgentRunStore.shared.unrelayedRunIds(sessionId: sessionId)).subtracting(seen)
+        let restored = AgentRunStore.shared.load(
+            runIds: owed.sorted { $0.uuidString < $1.uuidString },
+            sessionId: sessionId
+        )
+        for id in owed.sorted(by: { $0.uuidString < $1.uuidString }) {
+            guard let record = restored[id],
+                  let summary = record.relaySummaryText else { continue }
+            if let text = line(
+                role: record.role,
+                id: record.id,
+                status: record.status.rawValue,
+                summary: summary
+            ) {
+                let timestamp = record.completedAt ?? record.startedAt ?? record.createdAt
+                entries.append((timestamp: timestamp, text: text))
+            }
+        }
+        return entries
+            .sorted { $0.timestamp < $1.timestamp }
+            .map(\.text)
+    }
+
+    private func gatherCompletedSubagentRelayResponses(forSession sessionId: UUID?) async -> [String] {
+        guard let sessionId else { return [] }
+        var seen = Set<UUID>()
+        var entries: [(timestamp: Date, text: String)] = []
+        let budget = AgentHarness.charBudget(forTokenBudget: self.maxToolOutputLength)
+
+        func line(role: String, id: UUID, status: String, summary: String) -> String? {
+            let clean = AgentHarness.truncateText(
+                AgentHarness.sanitizeText(summary),
+                limit: budget
+            )
+            guard !clean.isEmpty else { return nil }
+            // The role is model-supplied: a newline could forge a second
+            // [SUBAGENT_RESULT] block, and an `id=` inside it would make the
+            // mark-delivered pass parse the wrong identity and re-inject this
+            // report on every later send. One line, brackets neutralized, and
+            // the identity first so the trailer is ours.
+            return "[SUBAGENT_RESULT] id=\(id.uuidString) status=\(status) role=\(Self.relayRole(role))\n\(clean)"
+        }
+
+        for instance in SubagentManager.shared.allSubagents
+        where instance.parentSessionId == sessionId
+            && instance.status.isTerminal
+            && !instance.isSummaryRelayed
+            && !instance.finalSummary.isEmpty {
+            seen.insert(instance.id)
+            // A cancelled run's summary IS the stop reason, and injecting
+            // "the run was cancelled" into the next turn spends a request to
+            // say what the operator just did. Its partial report is the part
+            // worth relaying, and only when the loop managed to write one.
+            let summary: String
+            if instance.status == .cancelled {
+                let partial = instance.report?.summary
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                guard !partial.isEmpty, partial != instance.finalSummary else { continue }
+                summary = partial
+            } else {
+                summary = instance.finalSummary
+            }
+            if let text = line(
+                role: instance.role,
+                id: instance.id,
+                status: instance.status.rawValue,
+                summary: summary
+            ) {
+                let timestamp = instance.completedAt ?? instance.startedAt ?? instance.createdAt
+                entries.append((timestamp: timestamp, text: text))
+            }
+        }
+
+        // Only the records the store's relay index still owes this
+        // conversation are decoded. Reading every record on each send would
+        // parse a session's whole run history to find, usually, nothing.
+        let owed = Set(AgentRunStore.shared.unrelayedRunIds(sessionId: sessionId)).subtracting(seen)
+        // Off the main actor: each id is an `ioQueue.sync` plus a JSON decode,
+        // and the owed set is bounded only by retention. The store is
+        // nonisolated and Sendable, so the reads need no actor.
+        let restored: [(UUID, AgentRunRecord)] = await Task.detached(priority: .userInitiated) {
+            owed.sorted { $0.uuidString < $1.uuidString }.compactMap { id in
+                AgentRunStore.shared.load(runId: id, sessionId: sessionId).map { (id, $0) }
+            }
+        }.value
+        for (_, record) in restored {
+            // The record's own definition, so the send path, the store's
+            // index and the inspector cannot disagree about what is owed.
+            guard let summary = record.relaySummaryText else { continue }
+            if let text = line(
+                role: record.role,
+                id: record.id,
+                status: record.status.rawValue,
+                summary: summary
+            ) {
+                let timestamp = record.completedAt ?? record.startedAt ?? record.createdAt
+                entries.append((timestamp: timestamp, text: text))
+            }
+        }
+        // Sort live and restored reports together, oldest first, so one
+        // directive never mixes newest-first live runs with oldest-first
+        // restored records.
+        return entries
+            .sorted { $0.timestamp < $1.timestamp }
+            .map(\.text)
     }
 
     /// Marks the given subagent summaries as delivered so the auto-relay does not inject
     /// them into the conversation twice.
-    private func markSubagentSummariesRelayed(_ responses: [String]) {
+    ///
+    /// Delivered means a turn actually STARTED with them: every caller marks
+    /// only after its launch returned true. A restored run has no live instance
+    /// to carry the flag, so its record is rewritten as well; otherwise the
+    /// next turn would inject the same report again.
+    private func markSubagentSummariesRelayed(_ responses: [String], sessionId: UUID?) {
         guard !responses.isEmpty else { return }
-        for s in SubagentManager.shared.allSubagents {
-            if responses.contains(where: { $0.contains(s.id.uuidString) }) {
-                s.isSummaryRelayed = true
-            }
+        let ids = Set(responses.compactMap(Self.relayedRunId(inOutput:)))
+        guard !ids.isEmpty else { return }
+        for instance in SubagentManager.shared.allSubagents where ids.contains(instance.id) {
+            instance.isSummaryRelayed = true
+        }
+        for id in ids {
+            // Mutated against the CURRENT record on the store's IO queue, not
+            // a copy loaded here: an Apply completing mid-relay rewrites
+            // `appliedAt`/`appliedToBranch`/`changedFiles`, and a stale
+            // load-then-save would revert those fields and re-offer apply on
+            // work that already landed. This is the exact defect `mutate`'s own
+            // doc names.
+            //
+            // Queued rather than waited on: this runs on the main actor right
+            // after a send is accepted, and nobody reads the flag back
+            // synchronously. The blocking form paid an `ioQueue.sync` and a
+            // durable `fsync` per record before the next frame could draw.
+            AgentRunStore.shared.markRelayed(runId: id, sessionId: sessionId)
         }
     }
 
-    /// Waits until every running/pending subagent for the session reaches a terminal state
+    /// A role is model-supplied and must not be able to reshape the relay line:
+    /// no newlines (a second forged block), no brackets, bounded length.
+    nonisolated static func relayRole(_ role: String) -> String {
+        let singleLine = role
+            .replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+        let cleaned = AgentHarness.sanitizeText(singleLine)
+            .replacingOccurrences(of: "[", with: "(")
+            .replacingOccurrences(of: "]", with: ")")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? "subagent" : String(cleaned.prefix(80))
+    }
+
+    /// The run id a relay line carries (`id=<uuid>` is written by the gather
+    /// above). Parsing it is what lets a restored record be marked delivered
+    /// without a second lookup by role and task.
+    nonisolated static func relayedRunId(inOutput response: String) -> UUID? {
+        // The builder writes `id=` FIRST, so this finds our identity rather
+        // than anything the (now single-line, bracket-free) role contains. A
+        // value that is not a UUID is refused instead of being truncated into
+        // one, which is what made marking fail and the report repeat forever.
+        guard let key = response.range(of: "[SUBAGENT_RESULT] id=") else { return nil }
+        let tail = response[key.upperBound...].prefix(36)
+        guard tail.count == 36 else { return nil }
+        return UUID(uuidString: String(tail))
+    }
+
+    /// Waits until every active subagent for the session reaches a terminal state
     /// or the timeout elapses. Awaited at agent-run teardown so the coordinator's run can
     /// pick up results it would otherwise drop.
+    ///
+    /// `waitingForApproval` counts as active: a run parked on a card has not
+    /// reported yet and still holds the engine, so ending the turn there would
+    /// drop the result it is about to produce.
     ///
     /// Suspends between polls instead of sleeping: the harness state it reads is main-actor
     /// state, and the weights and cloud teardowns both reach this from a background turn.
     private func awaitSessionSubagents(sessionId: UUID?, timeout: TimeInterval) async {
         guard let sessionId else { return }
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            let stillRunning = SubagentManager.shared.allSubagents.contains {
-                $0.parentSessionId == sessionId && ($0.status == .running || $0.status == .pending)
+        await SubagentRelayWait.wait(sessionId: sessionId, timeout: timeout) { id in
+            SubagentManager.shared.allSubagents.contains {
+                $0.parentSessionId == id && !$0.status.isTerminal
             }
-            if !stillRunning { return }
-            try? await Task.sleep(nanoseconds: 250_000_000)
         }
     }
 
@@ -3510,6 +4027,44 @@ struct ContentView: View {
             return false
         }
         
+        // A background report that landed after the coordinator finished has no
+        // tool turn to ride. It becomes a prompt-only directive at the head of
+        // this turn so the report reaches the model the next time the user
+        // speaks, instead of staying unread forever. Cloud turns carry their
+        // reports as a trailing directive (`startCloudGeneration`), which keeps
+        // the provider's cached prefix intact; every other backend renders the
+        // transcript locally, so an extra hidden turn costs nothing.
+        //
+        // This path is synchronous by contract (`onSendMessage` is
+        // `(String, [PreparedImage]) -> Bool`), so it cannot await the
+        // off-actor read the async twin does. What it CAN avoid is paying a
+        // queue round trip per owed id: the store read below is one hop for
+        // the whole set, and every other caller is async and takes the read
+        // off the main actor entirely.
+        let relayCandidates: [String]
+        if !sendSessionUsesCloud {
+            relayCandidates = gatherCompletedSubagentRelayResponsesSynchronously(forSession: currentSessionId)
+        } else {
+            relayCandidates = []
+        }
+        let relay = insertStartOfTurnSubagentRelay(
+            sessionIdx: sessionIdx,
+            sessionId: currentSessionId,
+            pending: relayCandidates
+        )
+        let pendingSubagentRelay = relay.reports
+        // The directive is part of the turn's prompt, so it has to go in
+        // before the launch -- but a REFUSED send must not leave it behind:
+        // the request log and the prompt builder would see a hidden user
+        // message for a turn that never ran. Every return below that can
+        // refuse goes through this.
+        func unwindRelayIfRefused(_ accepted: Bool) -> Bool {
+            if !accepted, let messageId = relay.messageId {
+                sessions[sessionIdx].messages.removeAll { $0.id == messageId }
+            }
+            return accepted
+        }
+
         let userMsg = ChatMessage(
             role: .user,
             content: text,
@@ -3521,7 +4076,7 @@ struct ContentView: View {
         // already named this conversation before sending (the rename controls
         // are available on an empty chat), in which case their name wins. An
         // image-only turn has no text to title from, so it seeds "Image".
-        if sessions[sessionIdx].messages.filter({ $0.role == .user }).count == 1 {
+        if sessions[sessionIdx].messages.filter({ $0.role == .user && $0.isPromptOnly != true }).count == 1 {
             if sessions[sessionIdx].titleOrigin != .user {
                 let titleSeed = text.isEmpty && !attachmentRefs.isEmpty ? "Image" : text
                 sessions[sessionIdx].title = ChatSession.autoTitle(forFirstMessage: titleSeed)
@@ -3577,7 +4132,10 @@ struct ContentView: View {
                 sessions[sessionIdx].messages.removeLast(2)
                 let err = "⚠️ This message is too long for the on-device model's context window. Shorten it and try again."
                 showStatus(err, kind: .warning)
-                return false
+                // The relay directive was appended before this launch, and a
+                // refused send must not leave it in the transcript: the pair
+                // above is rolled back, so is it.
+                return unwindRelayIfRefused(false)
             }
             // History travels in the session instructions as context; only the
             // newest user message is the prompt. Feeding the speaker-labeled
@@ -3626,13 +4184,34 @@ struct ContentView: View {
                 historyTranscript: historyTranscript,
                 compactionContext: afmCompactionContext
             )
-            startAppleFoundationModelGeneration(
+            let afmStarted = startAppleFoundationModelGeneration(
                 sessionId: currentSessionId,
                 messageId: assistantMsgId,
                 userPrompt: text,
                 instructionsText: afmInstructions,
                 responseTokenCeiling: afmResponseTokens
             )
+            // Delivered means a turn actually STARTED with the reports, and an
+            // unavailable on-device model starts none: its failure is written
+            // into the placeholder instead (`startAppleFoundationModelGeneration`
+            // returns false there). A started turn is not enough either — the
+            // transcript drops the oldest turn whole when it does not fit, so
+            // the relay has to have survived the budget before its reports are
+            // consumed. Same gate the local path applies after `launchTurn`.
+            if afmStarted,
+               AppleFoundationModelService.transcriptDeliversRelay(
+                   historyTranscript,
+                   reports: pendingSubagentRelay
+               ) {
+                markSubagentSummariesRelayed(pendingSubagentRelay, sessionId: currentSessionId)
+            } else if !afmStarted {
+                // No turn started (the failure went into the placeholder), so
+                // the directive was never delivered: drop it rather than leave
+                // a hidden user message in the session. The send still reports
+                // true — the placeholder carries the error — so this cannot go
+                // through `unwindRelayIfRefused`.
+                unwindRelayIfRefused(false)
+            }
             return true
         }
 
@@ -3683,7 +4262,7 @@ struct ContentView: View {
                 AgentHarness.shared.beginAgentSearchGuard()
                 cloudSystemPrompt += "\n\n" + AgentHarness.shared.buildCloudToolGuidance(mode: sessionMode)
             }
-            return startCloudGeneration(
+            return unwindRelayIfRefused(startCloudGeneration(
                 sessionId: currentSessionId,
                 messageId: assistantMsgId,
                 provider: cloud.provider,
@@ -3693,7 +4272,7 @@ struct ContentView: View {
                 systemPrompt: cloudSystemPrompt,
                 mode: sessionMode,
                 isAgentTurn: cloudAgentMode
-            )
+            ))
         }
 
         // Runs BEFORE the system prompt is built: beginAgentSearchGuard (re)loads
@@ -4165,12 +4744,14 @@ struct ContentView: View {
         // the turn's messages, so a caller that treats the send as accepted
         // would be left in the new mode with nothing running. The plan handoff
         // unwinds those messages and rolls its mode change back on `false`.
-        return startAutoregressiveGeneration(
+        let launched = startAutoregressiveGeneration(
             customPrompt: promptString,
             images: turnImages,
             sessionId: currentSessionId,
-            messageId: assistantMsgId
+            messageId: assistantMsgId,
+            relayedReports: pendingSubagentRelay
         )
+        return unwindRelayIfRefused(launched)
     }
 
     // MARK: - Tokenizer Execution
@@ -4270,6 +4851,32 @@ struct ContentView: View {
     /// session from retention until the task exits. Generation only; the Stop
     /// control first offers a visible compaction to `stopVisibleCompaction`.
     private func stopAutoregressiveGeneration() {
+        stopGeneration(
+            cancellingQueuedRelaunches: { self.cancelDeferredRelaunches() },
+            statusText: "⏹ Generation stopped by user."
+        )
+    }
+
+    /// Stops the turn only when it belongs to the conversation being deleted.
+    ///
+    /// Deleting the conversation that is generating used to leave its turn
+    /// running with nowhere to write: the weights loop kept generating into a
+    /// session it could no longer find (only the cloud loop had a vanished-
+    /// session exit), kept the engine slot, and kept its subagents alive — work
+    /// nothing on screen could see or stop. The queued sends are cancelled for
+    /// that conversation only; another conversation's send is untouched.
+    private func stopGenerationIfOwned(byDeletedSession sessionId: UUID) {
+        guard generatingSessionId == sessionId else { return }
+        stopGeneration(
+            cancellingQueuedRelaunches: { self.cancelDeferredRelaunches(sessionId: sessionId) },
+            statusText: nil
+        )
+    }
+
+    private func stopGeneration(
+        cancellingQueuedRelaunches: () -> Void,
+        statusText: String?
+    ) {
         // Shield the generating session from retention *before* flipping
         // `isGeneratingText` false, since that flip can trigger a retention pass
         // while the cancelled task is still unwinding and appending to it. The
@@ -4294,17 +4901,81 @@ struct ContentView: View {
             }
             generationTeardownTask = teardown
         }
+        let hadActiveGenerationTask = generationTask != nil
+        // Captured before the flags are cleared: the subagent cancellation below
+        // is scoped to it.
+        let stoppedSessionId = generatingSessionId
+        // A continuation waiting for the engine slot has cleared
+        // `generationTask` (the queued relaunch installs its own) while
+        // `isGeneratingText` and the turn identity stay set. Gating delegated
+        // work on the task alone therefore let Stop skip the subagents a step 0
+        // had already spawned — including a local run holding the slot this
+        // continuation was waiting for. The TURN is the scope, and a fresh
+        // queued send mints a new turn id with no children, so it stays skipped.
+        let stoppedLiveTurn = hadActiveGenerationTask
+            || (isGeneratingText && activeAgentTurnId != nil
+                && activeAgentTurnSessionId == stoppedSessionId)
         isGeneratingText = false
-        // Cancel the engine's compute task too: the consumer task only relays
-        // events, the Metal/KV work lives in CompletionEngine's detached turn.
-        CompletionEngine.shared.cancelActiveTurn()
+        // Cancel the ENGINE turn this window launched, by the id the launch
+        // returned. The old priority-blind `cancelActiveTurn()` stopped
+        // whatever the engine was running: a cloud chat turn has a
+        // `generationTask` but no engine turn, so a Stop there aborted an
+        // unrelated background subagent step or server request. An id the
+        // engine no longer recognises is a no-op, so a stale handle is inert.
+        if hadActiveGenerationTask {
+            if let engineTurnId = activeEngineTurnId {
+                _ = CompletionEngine.shared.cancelTurn(id: engineTurnId)
+            }
+            activeEngineTurnId = nil
+        }
         generationTask?.cancel()
         generationTask = nil
+        // A send queued behind a cancellation or a busy slot is still THIS
+        // operator's intent to run, so Stop must reach it too: the preemption
+        // retry and the slot-wait tasks re-call the send when the engine comes
+        // free, and without this they resurrected a stopped turn.
+        cancellingQueuedRelaunches()
         // The turn is over, so a continuation that somehow arrives afterwards
         // must not inherit its mode. The next send resolves a fresh one at step 0.
         activeTurnMode = nil
-        ActionApprovalManager.shared.cancelAll()
-        showStatus("⏹ Generation stopped by user.")
+        // Approvals are cancelled by SCOPE, never process-wide. The old
+        // `cancelAll()` declined every parked card in every conversation,
+        // including a background run this Stop is written to spare. The
+        // coordinator's own cards belong to this session; a child run's card
+        // belongs to the run, and is declined just before its task is stopped.
+        if stoppedLiveTurn, let stoppedSessionId {
+            ActionApprovalManager.shared.cancel(scope: .session(stoppedSessionId))
+        }
+        // Delegation is part of the turn: a Stop must not leave a child working
+        // on work the operator has abandoned. Skip when no live turn was
+        // running (e.g. a queued fresh send aborted before launching), so Stop
+        // does not cancel an earlier turn's subagents or fall back to
+        // session-wide cancellation.
+        if stoppedLiveTurn, let stoppedSessionId {
+            // Cancellation is scoped to the TURN. The session-wide form reaches
+            // runs spawned by EARLIER turns of the same conversation, and a
+            // cancelled run's worktree is the only full copy of its work — a
+            // Stop must not destroy either. The minted turn id covers exactly
+            // what this send spawned (its continuations carry the same id); the
+            // session-wide cancel stays as the fallback for paths that never
+            // minted one.
+            if let turnId = activeAgentTurnId, activeAgentTurnSessionId == stoppedSessionId {
+                let runIds = SubagentManager.shared.liveRunIds(parentTurnId: turnId)
+                for runId in runIds {
+                    ActionApprovalManager.shared.cancel(scope: .subagentRun(runId))
+                }
+                SubagentManager.shared.cancelTurnRuns(parentTurnId: turnId)
+            } else {
+                let runIds = SubagentManager.shared.liveRunIds(sessionId: stoppedSessionId)
+                for runId in runIds {
+                    ActionApprovalManager.shared.cancel(scope: .subagentRun(runId))
+                }
+                SubagentManager.shared.cancelSession(sessionId: stoppedSessionId)
+            }
+        }
+        if let statusText {
+            showStatus(statusText)
+        }
     }
 
     /// True when the given generation still owns the shared generation state.
@@ -4314,6 +4985,36 @@ struct ContentView: View {
     /// replacement (Stop would no longer cancel it). Call from the main actor.
     private func ownsGeneration(_ id: UInt64) -> Bool {
         id == generationId
+    }
+
+    /// Selects the conversation a subagent notification tap names, so the
+    /// session-scoped inspector the tap is about to open lists that run.
+    /// A tap with no session, or one whose conversation is gone, only opens
+    /// the drawer (the delegate has already done that).
+    private func revealConversationForSubagentRun(_ note: Notification) {
+        guard let info = note.userInfo as? [String: Any],
+              let raw = info["sessionId"] as? String,
+              let sessionId = UUID(uuidString: raw) else { return }
+        if sessions.contains(where: { $0.id == sessionId }) {
+            selectedSessionId = sessionId
+            pendingRevealSessionId = nil
+        } else if !hasAttemptedInitialLoad {
+            // The tap can arrive while the history load is still decoding. Hold
+            // it rather than discarding it; `applyPendingReveal` runs after the
+            // load and selects it when the conversation exists.
+            pendingRevealSessionId = sessionId
+        }
+    }
+
+    private func applyPendingReveal() {
+        guard let pending = pendingRevealSessionId else { return }
+        if sessions.contains(where: { $0.id == pending }) {
+            selectedSessionId = pending
+            pendingRevealSessionId = nil
+        } else if hasAttemptedInitialLoad {
+            // Loaded and still absent: the conversation really is gone.
+            pendingRevealSessionId = nil
+        }
     }
 
     // MARK: - Apple Foundation Model (System On-Device) Generation
@@ -4326,8 +5027,13 @@ struct ContentView: View {
     /// machinery. Plain chat only: no tool parsing, grammar masking, JetSpec, or
     /// prefix caching. Token counts are character-based approximations because
     /// the macOS 26 streaming API does not report per-chunk token usage.
-    /// Returns true once the turn is started (or its failure was recorded into
-    /// the placeholder message), matching `handleSendMessage`'s contract.
+    /// Returns true once the turn is started, false when no turn ran (the
+    /// on-device model is unavailable and the reason was recorded into the
+    /// placeholder message instead). This is NOT `handleSendMessage`'s "was the
+    /// send accepted" answer: the caller keeps returning true for a recorded
+    /// failure, because the user/assistant pair is already in the conversation,
+    /// but it must not treat a started-less turn as delivery of a subagent
+    /// report.
     @discardableResult
     private func startAppleFoundationModelGeneration(
         sessionId: UUID,
@@ -4345,7 +5051,7 @@ struct ContentView: View {
                 sessions[sIdx].messages[mIdx].isThinking = false
             }
             showStatus(err, kind: .warning)
-            return true
+            return false
         }
 
         generationId &+= 1
@@ -4678,6 +5384,12 @@ struct ContentView: View {
         // last, so its report is relayed into the wrong transcript — or never
         // relayed at all, because the relay filters on `parentSessionId`.
         AgentHarness.shared.currentSessionId = sessionId
+        // A cloud turn spawns runs through the same tool surface, so it mints
+        // the same turn identity a local send does.
+        let cloudTurnId = UUID()
+        activeAgentTurnId = cloudTurnId
+        activeAgentTurnSessionId = sessionId
+        AgentHarness.shared.currentTurnId = cloudTurnId
         generatedStreamText = ""
         thinkingText = ""
         responseText = ""
@@ -4926,26 +5638,36 @@ struct ContentView: View {
             // trailing position is what keeps the leading system message — the
             // cached prefix — byte-identical between steps.
             var relayDirective = ""
+            /// The reports the pending directive carries. They stay unmarked
+            /// until a request that carried them actually reached the provider
+            /// (`stepReceipt.spentRequest == true`): marking at gather time
+            /// lost the report whenever the request was refused or failed
+            /// before submission.
+            var relayDirectiveReports: [String] = []
             // A directive belongs to the step that carries it, and both retries
             // below (an image rejection and a context overflow) re-enter this
-            // loop through `continue`. The relay it names was already marked
-            // delivered when it was gathered, so losing it on a retry dropped
-            // those subagent reports — or the forced-synthesis instruction —
-            // permanently. Holds the directive only BETWEEN a failed attempt and
-            // that attempt's retry.
+            // loop through `continue`. Holds the directive and its reports only
+            // BETWEEN a failed attempt and that attempt's retry.
             var carriedStepDirective: String?
+            var carriedStepReports: [String] = []
             // At most one tools-disabled synthesis turn per run, mirroring the
             // weights path's forced-synthesis pass. It also bounds the subagent
             // result-delivery relay below.
             var ranSynthesisTurn = false
 
-            @MainActor func takeSubagentRelayDirective() -> Bool {
-                let pending = self.gatherCompletedSubagentRelayResponses(forSession: sessionId)
+            @MainActor func takeSubagentRelayDirective() async -> Bool {
+                let pending = await self.gatherCompletedSubagentRelayResponses(forSession: sessionId)
                 guard !pending.isEmpty else { return false }
-                self.markSubagentSummariesRelayed(pending)
                 relayDirective = CloudSubagentRelay.directive(reports: pending)
+                relayDirectiveReports = pending
                 return true
             }
+
+            // §11's start-of-turn injection. A report that landed after the
+            // previous run ended has no step to ride, so the FIRST step of this
+            // turn carries it. The directive is appended to the request, never
+            // merged into the cached system message.
+            _ = await takeSubagentRelayDirective()
 
             while true {
                 // A superseded or stopped turn must not spend one more provider
@@ -5071,14 +5793,19 @@ struct ContentView: View {
                 // tool rounds continue told every later step to "write the final
                 // answer now" even though that answer was not due yet.
                 let stepDirective: String
+                let stepRelayReports: [String]
                 if let carried = carriedStepDirective {
                     // This iteration is a RETRY of the step that carried the
                     // directive; send the same request shape again.
                     stepDirective = carried
+                    stepRelayReports = carriedStepReports
                     carriedStepDirective = nil
+                    carriedStepReports = []
                 } else {
                     stepDirective = relayDirective
+                    stepRelayReports = relayDirectiveReports
                     relayDirective = ""
+                    relayDirectiveReports = []
                 }
                 // A coordinator directive is APPENDED, never merged into the
                 // system message: that is the prefix the provider cached.
@@ -5315,6 +6042,21 @@ struct ContentView: View {
                     if finishReason == nil { finishReason = recorded.finishReason }
                 }
 
+                // The reports the request carried are delivered only now, after
+                // the transport has said the provider processed the request AND
+                // an answer came back. A refusal or a failure before submission
+                // leaves them unmarked, so the next turn offers them again
+                // instead of losing them — and so does a request that was
+                // billed but produced nothing the operator can read (a 5xx, a
+                // dropped stream): the report was never relayed, so marking it
+                // here dropped unread findings on the retry.
+                if !stepRelayReports.isEmpty,
+                   stepReceipt.spentRequest == true,
+                   stepReceipt.failure == nil,
+                   !Task.isCancelled {
+                    markSubagentSummariesRelayed(stepRelayReports, sessionId: sessionId)
+                }
+
                 // Stop-button cancellation and superseded turns bypass the
                 // success finalizer: the replacement generation owns the UI
                 // flags. Partials already streamed stay in the message, and the
@@ -5391,8 +6133,10 @@ struct ContentView: View {
                         toolCalls: []
                     )
                     // The retry is the SAME step: its directive (a subagent
-                    // relay or the synthesis instruction) has to ride it again.
+                    // relay or the synthesis instruction) and the reports it
+                    // carries have to ride it again.
                     carriedStepDirective = stepDirective
+                    carriedStepReports = stepRelayReports
                     continue
                 }
 
@@ -5448,8 +6192,9 @@ struct ContentView: View {
                     )
                     // Same step, same directive, for the same reason the image
                     // retry keeps it: the report or instruction this attempt
-                    // carried was already marked delivered.
+                    // carried is still undelivered until a request is spent.
                     carriedStepDirective = stepDirective
+                    carriedStepReports = stepRelayReports
                     continue
                 }
 
@@ -5501,6 +6246,7 @@ struct ContentView: View {
                         // Same step, same directive: a compaction must not eat
                         // the report or the instruction this attempt carried.
                         carriedStepDirective = stepDirective
+                        carriedStepReports = stepRelayReports
                         continue
                     }
                     contextCompactionFailure = outcome.failure
@@ -5683,7 +6429,8 @@ struct ContentView: View {
                         mode: mode,
                         sessionId: sessionId,
                         messageId: stepMessageId,
-                        myGenerationId: myGenerationId
+                        myGenerationId: myGenerationId,
+                        turnId: cloudTurnId
                     )
                     if outcome.cancelled {
                         if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
@@ -5718,7 +6465,7 @@ struct ContentView: View {
                         // reports have not reached the conversation ride the next
                         // step's system message so the coordinator can present
                         // them instead of the run ending with the report dropped.
-                        _ = takeSubagentRelayDirective()
+                        _ = await takeSubagentRelayDirective()
                         let nextMessageId = UUID()
                         if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
                             self.sessions[sIdx].messages.append(ChatMessage(
@@ -5791,10 +6538,15 @@ struct ContentView: View {
                 if toolsEnabled, !ranComplete, !ranSynthesisTurn,
                    AgentStepBudget.allowsAnotherStep(step: step, cap: self.agentStepCap) {
                     await self.awaitSessionSubagents(sessionId: sessionId, timeout: 120)
+                    // The wait can last two minutes; a Stop or a replacement
+                    // send during it owns the turn now. The loop-top check
+                    // already ran, so without this the relay relabelled a
+                    // stopped generation as running again.
+                    guard !Task.isCancelled, self.ownsGeneration(myGenerationId) else { return }
                 }
                 if toolsEnabled, !ranComplete, !ranSynthesisTurn,
                    AgentStepBudget.allowsAnotherStep(step: step, cap: self.agentStepCap),
-                   takeSubagentRelayDirective() {
+                   await takeSubagentRelayDirective() {
                     ranSynthesisTurn = true
                     let nextMessageId = UUID()
                     if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
@@ -5896,7 +6648,8 @@ struct ContentView: View {
         mode: AgentMode,
         sessionId: UUID,
         messageId: UUID,
-        myGenerationId: UInt64
+        myGenerationId: UInt64,
+        turnId: UUID
     ) async -> (cancelled: Bool, ranComplete: Bool, failureLoop: Bool) {
         let agent = AgentHarness.shared
         var parsed: [ParsedToolCall?] = []
@@ -5990,6 +6743,15 @@ struct ContentView: View {
             // handed to the call below, so a `defaults write` between approval
             // and execution cannot send the key somewhere else.
             let subQEndpoint = call.name == "subq_decide" ? SubQDecisionSettings.endpoint() : nil
+            // The destination branch the apply card names is pinned the same
+            // way, so a `git checkout` while the card sits open is refused
+            // rather than landing the patch on a branch the operator never saw.
+            // Resolved before the card can be clicked; `nil` for any other tool
+            // and for a run whose record cannot be read, where the tool answers
+            // for itself.
+            let applyDestination = call.name == "apply_subagent_changes"
+                ? await ApplySubagentChangesTool.approvalExpectation(arguments: parsedCall.arguments)
+                : nil
             // A tool plan mode withholds is refused by `executeTool` without
             // running, so asking the user first offered them a write the mode had
             // already denied.
@@ -5997,23 +6759,30 @@ struct ContentView: View {
             // guards the SubQ key: a `defaults write` earlier in the same
             // assistant message could otherwise aim `subq_decide` off-host
             // with no card shown at all.
+            let turboBypasses = isTurbo && AgentHarness.turboModeMayBypassApproval(
+                toolName: call.name,
+                arguments: parsedCall.arguments,
+                mode: mode,
+                subQEndpoint: subQEndpoint
+            )
             if AgentHarness.requiresApproval(
                 toolName: call.name,
                 arguments: parsedCall.arguments,
                 mode: mode,
                 subQEndpoint: subQEndpoint
-            ), !(isTurbo && AgentHarness.turboModeMayBypassApproval(
-                toolName: call.name,
-                arguments: parsedCall.arguments,
-                mode: mode,
-                subQEndpoint: subQEndpoint
-            )) {
+            ), !turboBypasses {
                 updateRecord(record.id) { rec in
                     rec.status = .awaitingApproval
                     if let subQEndpoint { rec.pinnedEndpoint = subQEndpoint.absoluteString }
                 }
                 showStatus("🛡️ Action requires confirmation: \(call.name)")
-                let approved = await ActionApprovalManager.shared.waitForApproval(id: record.id)
+                // Registered before the card can be clicked, so a Stop in this
+                // conversation declines it and a Stop in another one does not.
+                ActionApprovalManager.shared.register(id: record.id, scope: .session(sessionId))
+                let approved = await ActionApprovalManager.shared.waitForApproval(
+                    id: record.id,
+                    scope: .session(sessionId)
+                )
                 if !approved {
                     let rejectJSON = AgentHarness.toolErrorJSON(tool: call.name, error: "Action rejected by user.")
                     agent.recordToolCallOutcome(toolName: call.name, outcome: .failed)
@@ -6043,7 +6812,13 @@ struct ContentView: View {
                 workingDirectory: baseWorkingDirectory,
                 maxOutputLength: maxToolOutputLength,
                 mode: mode,
-                approvedSubQEndpoint: subQEndpoint
+                turnId: turnId,
+                sessionId: sessionId,
+                approvedSubQEndpoint: subQEndpoint,
+                approvedApplyDestination: applyDestination,
+                // A bypassed card is not a reviewed command: this call's
+                // children get the allowlist, not the operator's credentials.
+                unreviewed: turboBypasses
             )
             agent.recordToolCallOutcome(
                 toolName: call.name,
@@ -6182,7 +6957,7 @@ struct ContentView: View {
     /// it, because a launch refused AFTER the messages were appended (lost slot,
     /// engine not ready) is otherwise reported to the caller as accepted work.
     @discardableResult
-    private func startAutoregressiveGeneration(customPrompt: String? = nil, promptTokens: [UInt32]? = nil, images: [TurnImage] = [], carriedImageSpans: [TurnImageSpan] = [], sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0, isInThinkingContinuation: Bool = false, forceSynthesis: Bool = false) -> Bool {
+    private func startAutoregressiveGeneration(customPrompt: String? = nil, promptTokens: [UInt32]? = nil, images: [TurnImage] = [], carriedImageSpans: [TurnImageSpan] = [], sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0, isInThinkingContinuation: Bool = false, forceSynthesis: Bool = false, preemptionRetry: Bool = false, slotCarry: TurnSlotClaim? = nil, relayedReports: [String] = []) -> Bool {
         guard let summary = summary,
               let tokenizer = tokenizer else {
             let err = "❌ Metal or Tokenizer not ready for text generation. Please load model and tokenizer in Settings."
@@ -6195,6 +6970,10 @@ struct ContentView: View {
                 sessions[sIdx].messages[mIdx].isThinking = false
             }
             showStatus(err, kind: .warning)
+            // A retry that brought a claim for the engine slot returns here
+            // before the `defer` that owns it exists; the slot would stay
+            // claimed with no turn to release it.
+            slotCarry?.release()
             return false
         }
 
@@ -6209,7 +6988,186 @@ struct ContentView: View {
             isGeneratingText = false
             generationTask = nil
             showStatus(err, kind: .warning)
+            // See the model-not-ready branch: a carried claim has no owner
+            // beyond this call.
+            slotCarry?.release()
             return false
+        }
+
+        // A step can arrive after its conversation was deleted: the turn loop
+        // is asynchronous, and the delete path stops the turn it can see, but a
+        // continuation already committed to the main actor gets here first. A
+        // turn for a session that no longer exists has nowhere to write, holds
+        // the engine and cannot be stopped from any composer.
+        if let sessionId, !sessions.contains(where: { $0.id == sessionId }) {
+            isGeneratingText = false
+            generationTask = nil
+            slotCarry?.release()
+            return false
+        }
+
+        // An operator's send outranks a subagent's step. The engine is
+        // single-flight, so the background turn is stopped rather than raced:
+        // cancel it at its next boundary, wait for it to drain, then run this
+        // send once. `preemptionRetry` bounds the retry to one attempt, and the
+        // "accepted" answer is honest — the work is queued behind a cancellation
+        // measured in milliseconds, not refused.
+        //
+        // FRESH SENDS ONLY: every continuation of the agent loop arrives here
+        // too, and preempting from a continuation killed the background run the
+        // coordinator's OWN turn had spawned, at the coordinator's next step.
+        // A continuation waits for the slot at the claim below instead.
+        //
+        // "Stopping" is the honest word: the preemption CANCELS the run (its
+        // report and, for an isolated writer, its unapplied worktree are kept),
+        // it does not pause it.
+        let isFreshOperatorSend = agentStep == 0 && !isInThinkingContinuation
+        // Computed here rather than beside `turnMode` below because the turn
+        // identity just below needs it, and the two MUST agree: this is the
+        // same predicate the mint block used when it sat with `turnMode`.
+        let isContinuation = agentStep > 0 || isInThinkingContinuation
+        // The TURN identity subagent-run cancellation is scoped to: minted on a
+        // fresh send, carried by every continuation of that send. A Stop then
+        // reaches only the runs THIS operator turn spawned — a background run
+        // an earlier turn left working survives it, with its unapplied
+        // worktree (the only full copy of its work) intact.
+        //
+        // Minted HERE, above BOTH queued-send branches, because each of them
+        // publishes the generating state that makes Stop read this identity.
+        // Minted at the launch instead, a Stop on a queued FRESH send read the
+        // identity the PREVIOUS turn left behind (`activeAgentTurnId` outlives
+        // a finished turn on purpose, so that turn's continuations can carry
+        // it) and cancelled that turn's background runs, destroying background
+        // work for a send that never launched. A fresh send therefore replaces
+        // the stale identity before anything can read it, and the identity it
+        // mints has spawned nothing, so a Stop during the wait reaches no run.
+        let agentTurnId: UUID
+        if isContinuation,
+           let existing = activeAgentTurnId,
+           activeAgentTurnSessionId == sessionId {
+            agentTurnId = existing
+        } else {
+            agentTurnId = UUID()
+            activeAgentTurnId = agentTurnId
+            activeAgentTurnSessionId = sessionId
+        }
+        if !preemptionRetry, isFreshOperatorSend, CompletionEngine.shared.hasActiveBackgroundTurn {
+            showStatus("⏸ Stopping a background subagent so this turn can run…")
+            // The send is ACCEPTED (this branch returns true) but nothing is
+            // generating yet, so without publishing the generating state the
+            // composer draws a plain Send button for the whole drain — seconds
+            // to tens of seconds on a large prefill — and the only control that
+            // can cancel the relaunch below is not drawn. This is the same
+            // guarded publication the slot wait further down makes; Stop then
+            // cancels exactly this task (`cancelDeferredRelaunches`), and a
+            // relaunch that is refused clears the flag itself.
+            publishQueuedGenerationFlags(sessionId: sessionId)
+            // The step that just deferred has FINISHED its work; this queued
+            // send now owns the generating state. Leaving the old handle in
+            // place made `releaseQueuedGenerationFlags` bail on its live-task
+            // guard forever, so a failed relaunch (deleted conversation, lost
+            // claim) could never clear the flag and every composer refused
+            // sends. The queued task installs its own handle when it launches.
+            generationTask = nil
+            // Tracked so Stop can cancel it: the operator pressed Stop while
+            // the send sat queued behind the preemption, and without this the
+            // task relaunched the stopped turn as soon as the engine drained.
+            let relaunchKey = UUID()
+            if let sessionId { deferredRelaunchSessions[relaunchKey] = sessionId }
+            deferredRelaunchTasks[relaunchKey] = Task { @MainActor in
+                // Whether the launch below actually started. Only an abandoned
+                // relaunch has a stranded placeholder to clear: a launch that
+                // succeeded set `isThinking` itself and its turn owns the
+                // bubble, so clearing it here (content is still empty at this
+                // point) killed the spinner of a turn that IS running, which
+                // is exactly what the sibling slot-wait branch guards with its
+                // own `launched`. A retry routed into that wait transfers
+                // ownership to the inner task, which clears on its own early
+                // exits.
+                var launched = false
+                defer {
+                    self.deferredRelaunchTasks[relaunchKey] = nil
+                    self.deferredRelaunchSessions[relaunchKey] = nil
+                    self.releaseQueuedGenerationFlags(ifOwnedBy: sessionId)
+                    // Every early exit below (a Stop, a lost claim, a deleted
+                    // conversation) leaves the placeholder this send appended
+                    // exactly as it was: an empty bubble spinning forever,
+                    // because the turn that would have cleared `isThinking`
+                    // never ran. A launch that DID start owns the message.
+                    if !launched {
+                        self.clearThinkingPlaceholder(sessionId: sessionId, messageId: messageId)
+                    }
+                }
+                // A Stop can land between the task being created and this
+                // line. Cancellation does not abort a `Task` body on its own,
+                // so without this check the preemption below would still
+                // cancel runs — and discard their worktrees — for a send the
+                // operator had already abandoned.
+                guard !Task.isCancelled else { return }
+                // Preemption is only honest while a BACKGROUND turn is what
+                // holds the slot, and the check in the branch above is a
+                // moment that this task hop can invalidate. Cancelling local
+                // runs to make room for a holder that cannot be cancelled —
+                // the API server's turn, a model load — destroys work and
+                // still does not free the engine, so the send gives up with a
+                // message instead.
+                guard let backgroundTurn = CompletionEngine.shared.activeBackgroundTurnToken else {
+                    self.showStatus("⏳ The engine is still busy with a turn this send cannot stop, so it was not sent. Try again once it finishes.")
+                    return
+                }
+                await AgentScheduler.shared.preemptLocalRuns()
+                // By TOKEN, not by priority: `preemptLocalRuns` above is an
+                // `await`, and the run it just stopped can unwind into a slot
+                // that a DIFFERENT background turn has already claimed. A
+                // priority-scoped cancel at that point would stop the
+                // successor instead of the turn this branch looked at.
+                if !CompletionEngine.shared.cancelBackgroundTurn(token: backgroundTurn),
+                   let current = CompletionEngine.shared.activeBackgroundTurnToken {
+                    // The holder changed under the await. That new holder is
+                    // still a background turn, which is the class a fresh send
+                    // may preempt, so stop exactly IT and nothing else.
+                    _ = CompletionEngine.shared.cancelBackgroundTurn(token: current)
+                }
+                // Bounded: cancellation is cooperative and a run's preparation
+                // (the DeepSeek runtime, an image span) can take seconds, but a
+                // wait that never returns leaves every composer locked behind a
+                // notice about a subagent that is already gone.
+                guard await CompletionEngine.shared.awaitIdle(boundedBy: 60) else {
+                    self.showStatus("⏳ The engine did not come free in time, so this message was not sent. Try again once the current turn finishes.")
+                    return
+                }
+                guard !Task.isCancelled else { return }
+                if let sessionId, !self.sessions.contains(where: { $0.id == sessionId }) {
+                    return
+                }
+                // The runs just cancelled release their claims as they unwind;
+                // taking the claim HERE means the retry cannot lose to another
+                // claimant the slot it paid for with their cancellation.
+                let reclaimed = CompletionEngine.shared.reserveTurnSlot()
+                // Losing the claim AFTER paying for it with a cancellation must
+                // not lose the operator's send too. Passing `preemptionRetry:
+                // false` when the claim is nil routes the retry into the normal
+                // wait branch instead of letting it launch with no authority.
+                launched = self.startAutoregressiveGeneration(
+                    customPrompt: customPrompt,
+                    promptTokens: promptTokens,
+                    images: images,
+                    carriedImageSpans: carriedImageSpans,
+                    sessionId: sessionId,
+                    messageId: messageId,
+                    agentStep: agentStep,
+                    isInThinkingContinuation: isInThinkingContinuation,
+                    forceSynthesis: forceSynthesis,
+                    preemptionRetry: reclaimed != nil,
+                    slotCarry: reclaimed,
+                    // The reports this send carries are marked delivered only
+                    // when the retry actually launches. Returning `true` here
+                    // used to let the caller mark them even if the retry was
+                    // refused, dropping them permanently.
+                    relayedReports: relayedReports
+                )
+            }
+            return true
         }
 
         // Derive model/thinking from the session this generation belongs to, not
@@ -6227,9 +7185,13 @@ struct ContentView: View {
         // (retention, a manual delete) while the turn is still running, and
         // re-deriving from a missing session would silently resume the coder.
         let resolvedMode: AgentMode = generationSession?.agentMode ?? .code
-        let isContinuation = agentStep > 0 || isInThinkingContinuation
         let turnMode: AgentMode = isContinuation ? (activeTurnMode ?? resolvedMode) : resolvedMode
         activeTurnMode = turnMode
+        // The identity minted above (before the queued-send branches, so that a
+        // Stop on a queued send cannot read the previous turn's) becomes the
+        // harness's current turn now that this send has actually reached the
+        // launch path.
+        AgentHarness.shared.currentTurnId = agentTurnId
         // Asserted BEFORE the slot claim below, deliberately. `setActiveMode`
         // skips its grammar re-sync while `CompletionEngine.isActive`, and the
         // claim is exactly that flag, so re-asserting after the claim meant the
@@ -6248,8 +7210,183 @@ struct ContentView: View {
         // Nil means somebody already holds the slot; the launch below then reports
         // it exactly the way it always has. See `EngineTurnSlot.swift` and
         // `Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #85".
-        let turnSlotClaim = CompletionEngine.shared.reserveTurnSlot()
+        let turnSlotClaim: TurnSlotClaim?
+        if let slotCarry {
+            // A retry delivering a claim its wait already won. Re-reserving
+            // would race whoever else wants the slot between the grant and the
+            // re-entry.
+            turnSlotClaim = slotCarry
+        } else {
+            turnSlotClaim = CompletionEngine.shared.reserveTurnSlot()
+        }
         defer { turnSlotClaim?.release() }
+        // A `tools_load` the engine could not apply while a previous turn was
+        // live stays deferred. Only rebuild while the claim is actually OURS:
+        // with no claim another generation (or a server turn's scoped mask) is
+        // live, and replacing the shared registry mid-generation is exactly
+        // what `syncGrammar`'s refusal exists to prevent.
+        if turnSlotClaim?.isHeld == true {
+            AgentHarness.shared.flushDeferredGrammarSyncForTurn()
+        }
+
+        // A send that lost the claim must not fail the way a launch error does.
+        // The holder is usually a run between two of its steps — the window
+        // where the ledger is claimed but no background turn task exists, so
+        // the preemption guard above cannot see it — but it can also be a
+        // server turn or a model load. Waiting is the honest answer for BOTH a
+        // continuation and a FRESH send: writing the refusal into the message
+        // dropped the step silently, and a fresh send that got "engine not
+        // ready" a moment after the operator pressed send was refused for
+        // engine state nobody had described to them. Wait for the slot,
+        // bounded; past the patience the operator's conversation outranks a
+        // background run, so it is cancelled and the send retries.
+        if turnSlotClaim == nil, slotCarry == nil, !preemptionRetry {
+            showStatus("⏳ Waiting for the engine so this turn can \(isFreshOperatorSend ? "run" : "continue")…")
+            // The send was ACCEPTED (this branch returns true), but nothing is
+            // generating yet, so the Stop button stayed invisible for the whole
+            // wait: the operator could not abort their own queued send for up
+            // to 120 s, and the preemption it eventually fires looked like an
+            // unexplained model stop. Publishing the generating state for the
+            // wait makes Stop visible — it cancels exactly the deferred
+            // relaunch below (`cancelDeferredRelaunches`), and the fresh turn
+            // identity minted above scopes its subagent cancellation to a turn
+            // that has spawned nothing yet. Guarded so a send queued behind
+            // ANOTHER session's live generation never repoints the state that
+            // Stop and retention read; a refused relaunch below clears the
+            // flag itself, and Stop clears it on the way in.
+            publishQueuedGenerationFlags(sessionId: sessionId)
+            // See the preemption branch: the deferring step is finished, so the
+            // stale handle is what made the flag's release impossible.
+            generationTask = nil
+            // Tracked so Stop can cancel it — see the preemption branch above.
+            let relaunchKey = UUID()
+            if let sessionId { deferredRelaunchSessions[relaunchKey] = sessionId }
+            deferredRelaunchTasks[relaunchKey] = Task { @MainActor in
+                // Whether the launch below actually started. Only an abandoned
+                // relaunch has a stranded placeholder to clear: a launch that
+                // succeeded set `isThinking` itself and its turn owns the
+                // bubble, so clearing it here (content is still empty at this
+                // point) would kill the spinner of a turn that is running.
+                var launched = false
+                defer {
+                    self.deferredRelaunchTasks[relaunchKey] = nil
+                    self.deferredRelaunchSessions[relaunchKey] = nil
+                    self.releaseQueuedGenerationFlags(ifOwnedBy: sessionId)
+                    // See the preemption branch: an early exit here strands an
+                    // empty spinning bubble, because no turn ever runs to clear
+                    // its `isThinking`.
+                    if !launched {
+                        self.clearThinkingPlaceholder(sessionId: sessionId, messageId: messageId)
+                    }
+                }
+                var held: TurnSlotClaim?
+                let deadline = Date().addingTimeInterval(Self.queuedSlotWaitSeconds)
+                while held == nil, Date() < deadline {
+                    // A Stop cancels exactly this task, and a cancelled
+                    // `Task.sleep` throws immediately. `try?` then swallowed
+                    // it, so the loop ran at full speed on the main actor,
+                    // taking the slot ledger's lock, until the holder drained
+                    // or the deadline expired. Bail before sleeping again.
+                    if Task.isCancelled {
+                        held?.release()
+                        return
+                    }
+                    held = CompletionEngine.shared.reserveTurnSlot()
+                    if held == nil {
+                        try? await Task.sleep(nanoseconds: 100_000_000)
+                    }
+                }
+                guard !Task.isCancelled else {
+                    // A claim won in a task the operator has stopped must go
+                    // back, or it wedges the engine for everyone.
+                    held?.release()
+                    return
+                }
+                if let sessionId, !self.sessions.contains(where: { $0.id == sessionId }) {
+                    held?.release()
+                    return
+                }
+                if let held {
+                    launched = self.startAutoregressiveGeneration(
+                        customPrompt: customPrompt,
+                        promptTokens: promptTokens,
+                        images: images,
+                        carriedImageSpans: carriedImageSpans,
+                        sessionId: sessionId,
+                        messageId: messageId,
+                        agentStep: agentStep,
+                        isInThinkingContinuation: isInThinkingContinuation,
+                        forceSynthesis: forceSynthesis,
+                        slotCarry: held,
+                        relayedReports: relayedReports
+                    )
+                } else {
+                    // A CONTINUATION never preempts. The run holding the slot
+                    // is usually the child this very turn spawned and is
+                    // waiting on, so "stop the background subagent" here kills
+                    // the work the step exists to collect — the same reason the
+                    // immediate preemption above is fresh-sends-only. The step
+                    // ends with the reason instead, and the reports it was
+                    // carrying stay undelivered so a later send relays them.
+                    guard isFreshOperatorSend else {
+                        self.showStatus("⏳ This agent step waited \(Int(Self.queuedSlotWaitSeconds))s for the engine and gave up. The run's work so far is kept; send a message to continue.")
+                        return
+                    }
+                    // Same notice the immediate preemption shows: the runs about
+                    // to be stopped belong to a background agent, and a kill
+                    // with no explanation reads as a crash.
+                    // As in the branch above: a task cancelled before it began
+                    // executing must not destroy another conversation's work.
+                    guard !Task.isCancelled else { return }
+                    // The predicate is re-read here for the reason the
+                    // immediate branch documents: the holder can change while
+                    // this task waits, and only a background turn may be
+                    // cancelled from here. The TOKEN is captured now and spent
+                    // after the await, so a successor cannot be stopped in the
+                    // place of the turn this branch looked at.
+                    guard let backgroundTurn = CompletionEngine.shared.activeBackgroundTurnToken else {
+                        self.showStatus("⏳ The engine is still busy with a turn this send cannot stop, so it was not sent. Try again once it finishes.")
+                        return
+                    }
+                    self.showStatus("⏸ Stopping a background subagent so this turn can run…")
+                    await AgentScheduler.shared.preemptLocalRuns()
+                    if !CompletionEngine.shared.cancelBackgroundTurn(token: backgroundTurn),
+                       let current = CompletionEngine.shared.activeBackgroundTurnToken {
+                        _ = CompletionEngine.shared.cancelBackgroundTurn(token: current)
+                    }
+                    guard await CompletionEngine.shared.awaitIdle(boundedBy: 60) else {
+                        self.showStatus("⏳ The engine did not come free in time, so this message was not sent. Try again once the current turn finishes.")
+                        return
+                    }
+                    guard !Task.isCancelled else { return }
+                    if let sessionId, !self.sessions.contains(where: { $0.id == sessionId }) {
+                        return
+                    }
+                    // Reclaimed here, not inside the retry, so the retry
+                    // cannot lose the slot the preemption paid for — the run
+                    // just cancelled is permanently gone; its slot must not
+                    // be lost to a race on top of that.
+                    let reclaimed = CompletionEngine.shared.reserveTurnSlot()
+                    // Same rule as the immediate preemption above: a nil
+                    // claim re-enters the wait instead of launching unauthorised.
+                    launched = self.startAutoregressiveGeneration(
+                        customPrompt: customPrompt,
+                        promptTokens: promptTokens,
+                        images: images,
+                        carriedImageSpans: carriedImageSpans,
+                        sessionId: sessionId,
+                        messageId: messageId,
+                        agentStep: agentStep,
+                        isInThinkingContinuation: isInThinkingContinuation,
+                        forceSynthesis: forceSynthesis,
+                        preemptionRetry: reclaimed != nil,
+                        slotCarry: reclaimed,
+                        relayedReports: relayedReports
+                    )
+                }
+            }
+            return true
+        }
 
         let generationDate: Date
         if let sId = sessionId, let sess = sessions.first(where: { $0.id == sId }) {
@@ -6373,6 +7510,18 @@ struct ContentView: View {
             showStatus(err, kind: .warning)
             return false
         }
+
+        // Stop cancels THIS turn by id. Recorded before the stream task exists,
+        // because the operator can press Stop the moment the generating state
+        // is published below; `cancelTurn(id:)` refuses an id that no longer
+        // matches the engine's current turn, so a stale handle cannot stop a
+        // successor.
+        activeEngineTurnId = launch.handle.generationId
+
+        // The turn that carries a relayed subagent report has actually started.
+        // Marking earlier (before the launch, or before a deferred retry that
+        // could still be refused) is what used to lose reports permanently.
+        markSubagentSummariesRelayed(relayedReports, sessionId: sessionId)
 
         // In-app turn log: one request-log row per chat/agent turn (source
         // chatUI; bodies follow the Store Request Content toggle, the rendered
@@ -6842,6 +7991,10 @@ struct ContentView: View {
             let fullyEmptyTurn = finalThink.isEmpty && finalResp.isEmpty && tokensGenerated <= 24
             if !isInThinkingContinuation && !willContinueAgent && !shouldForceSynthesis && (emptyReplyAfterThinking || fullyEmptyTurn) && !Task.isCancelled {
                 await MainActor.run {
+                    // The emptiness checks above are another suspension away
+                    // from this launch: a Stop landing in between would
+                    // otherwise regenerate a stopped turn.
+                    guard !Task.isCancelled, self.ownsGeneration(myGenerationId) else { return }
                     if let sId = sessionId,
                        let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
                        let mId = messageId,
@@ -7007,6 +8160,12 @@ struct ContentView: View {
                         // See the local path: the destination the card shows is
                         // pinned here and used by the call, not re-read later.
                         let subQEndpoint = call.name == "subq_decide" ? SubQDecisionSettings.endpoint() : nil
+                        // See the local path: the apply card's destination is
+                        // pinned before the operator can approve it, so a
+                        // `git checkout` while the card sits open is refused.
+                        let applyDestination = call.name == "apply_subagent_changes"
+                            ? await ApplySubagentChangesTool.approvalExpectation(arguments: call.arguments)
+                            : nil
                         // A call plan mode withholds is refused by `executeTool`
                         // without running, so it must not raise an approval
                         // prompt first.
@@ -7039,7 +8198,16 @@ struct ContentView: View {
                                 }
                             }
 
-                            let approved = await ActionApprovalManager.shared.waitForApproval(id: recordId)
+                            // Same scope the card was rendered under: the Stop
+                            // that owns this turn declines it, and no other.
+                            let approvalScope = sessionId.map(ActionApprovalScope.session)
+                            if let approvalScope {
+                                ActionApprovalManager.shared.register(id: recordId, scope: approvalScope)
+                            }
+                            let approved = await ActionApprovalManager.shared.waitForApproval(
+                                id: recordId,
+                                scope: approvalScope
+                            )
                             if !approved {
                                 await MainActor.run {
                                     if let sId = sessionId, let mId = messageId,
@@ -7080,7 +8248,12 @@ struct ContentView: View {
                             workingDirectory: baseWdURL,
                             maxOutputLength: self.maxToolOutputLength,
                             mode: turnMode,
-                            approvedSubQEndpoint: subQEndpoint
+                            turnId: agentTurnId,
+                            sessionId: sessionId,
+                            approvedSubQEndpoint: subQEndpoint,
+                            approvedApplyDestination: applyDestination,
+                            // See the local path: a Turbo bypass is not a review.
+                            unreviewed: turboBypasses
                         )
                         responseSlots[actionableCallIndices[idx]] = execResult.resultJSON
                         AgentHarness.shared.recordToolCallOutcome(
@@ -7142,10 +8315,16 @@ struct ContentView: View {
                     // A same-tool failure streak, too many failed calls overall, or one
                     // identical call re-issued past its limit means the model is stuck;
                     // stop spending steps and force a synthesis turn instead.
-                    let agent = AgentHarness.shared
-                    let toolFailureLoop = agent.consecutiveFailedToolCalls >= agent.failedToolCallLimit
-                        || agent.totalFailedToolCalls >= agent.failedToolCallTotalLimit
-                        || agent.maxRepeatedToolCallCount >= agent.repeatedToolCallLimit
+                    // Read on the main actor: the harness's failure counters and
+                    // limits are main-actor state, and this turn runs on a
+                    // detached task. The `||` operands are autoclosures, which
+                    // is where the isolation diagnostic was raised.
+                    let toolFailureLoop = await MainActor.run {
+                        let harness = AgentHarness.shared
+                        return harness.consecutiveFailedToolCalls >= harness.failedToolCallLimit
+                            || harness.totalFailedToolCalls >= harness.failedToolCallTotalLimit
+                            || harness.maxRepeatedToolCallCount >= harness.repeatedToolCallLimit
+                    }
 
                     // Resolve the cap once for this post-turn decision, so the
                     // status below names the budget that actually applied even
@@ -7158,11 +8337,10 @@ struct ContentView: View {
                         // Auto-relay: completed background subagents whose final reports have
                         // not yet reached the conversation get injected as SUBAGENT_RESULT
                         // blocks here, so the coordinator can present them to the user.
-                        let relayResponses = await MainActor.run {
-                            let r = self.gatherCompletedSubagentRelayResponses(forSession: sessionId)
-                            self.markSubagentSummariesRelayed(r)
-                            return r
-                        }
+                        // Marked only when the continuation this response turn
+                        // feeds actually launches; a launch refused between
+                        // here and there must leave them pending.
+                        let relayResponses = await self.gatherCompletedSubagentRelayResponses(forSession: sessionId)
                         let allResponses = toolResponses + relayResponses
 
                         let isGemma4Continuation = (modelConfig?.isGemma4Model == true)
@@ -7229,6 +8407,7 @@ struct ContentView: View {
                             encode: { try tokenizer.encode(text: $0) }
                         )
                         await MainActor.run {
+                            guard !Task.isCancelled, self.ownsGeneration(myGenerationId) else { return }
                             let nextAssistantMsgId = UUID()
                             if let sId = sessionId, let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
                                 if let mId = messageId, let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
@@ -7251,7 +8430,8 @@ struct ContentView: View {
                                 carriedImageSpans: promptImageSpans,
                                 sessionId: sessionId,
                                 messageId: nextAssistantMsgId,
-                                agentStep: agentStep + 1
+                                agentStep: agentStep + 1,
+                                relayedReports: relayResponses
                             )
                         }
                         return
@@ -7260,11 +8440,20 @@ struct ContentView: View {
                         // hard-stopped the run — or the model kept emitting tool calls with
                         // empty arguments — give the model one final synthesis turn with
                         // tool calling disabled so it actually answers instead of spinning.
-                        let escalateToSynthesis = AgentHarness.shared.consecutiveEmptyToolCalls >= 2
-                            || AgentHarness.shared.consecutiveFailedToolCalls >= AgentHarness.shared.failedToolCallLimit
-                            || AgentHarness.shared.totalFailedToolCalls >= AgentHarness.shared.failedToolCallTotalLimit
-                            || AgentHarness.shared.maxRepeatedToolCallCount >= AgentHarness.shared.repeatedToolCallLimit
-                        if (AgentHarness.shared.lastSearchGuardAction == .forceSynthesis || escalateToSynthesis) && !ranCompleteTool {
+                        // Resolved on the main actor for the same reason as the
+                        // post-turn loop check above: the harness's counters,
+                        // limits and guard action are main-actor state.
+                        let (shouldForceSynthesis, escalateToSynthesis) = await MainActor.run {
+                            let harness = AgentHarness.shared
+                            return (
+                                harness.lastSearchGuardAction == .forceSynthesis,
+                                harness.consecutiveEmptyToolCalls >= 2
+                                    || harness.consecutiveFailedToolCalls >= harness.failedToolCallLimit
+                                    || harness.totalFailedToolCalls >= harness.failedToolCallTotalLimit
+                                    || harness.maxRepeatedToolCallCount >= harness.repeatedToolCallLimit
+                            )
+                        }
+                        if (shouldForceSynthesis || escalateToSynthesis) && !ranCompleteTool {
                             let endTag = (modelConfig?.isGemma4Model == true) ? "<turn|>" : ((modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>") )
                             let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: endTag)
                             let toolResponseContext = toolResponses.map { AgentHarness.renderToolResultForModel($0) }.joined(separator: "\n")
@@ -7290,6 +8479,7 @@ struct ContentView: View {
                                 encode: { try tokenizer.encode(text: $0) }
                             )
                             await MainActor.run {
+                                guard !Task.isCancelled, self.ownsGeneration(myGenerationId) else { return }
                                 let synthesisMsgId = UUID()
                                 if let sId = sessionId, let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
                                     if let mId = messageId, let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
@@ -7328,11 +8518,18 @@ struct ContentView: View {
                         // them to the user instead of dropping them.
                         if !ranCompleteTool {
                             await self.awaitSessionSubagents(sessionId: sessionId, timeout: 120)
-                            let pendingRelay = await MainActor.run {
-                                let r = self.gatherCompletedSubagentRelayResponses(forSession: sessionId)
-                                self.markSubagentSummariesRelayed(r)
-                                return r
+                            // The wait above can last two minutes. A Stop (or a
+                            // replacement send that took the generation) during
+                            // it must win: relaunching here generated into a
+                            // conversation the operator had stopped.
+                            guard !Task.isCancelled else { return }
+                            let stillOwnsGeneration = await MainActor.run {
+                                self.ownsGeneration(myGenerationId)
                             }
+                            guard stillOwnsGeneration else { return }
+                            // Same rule as the mid-run relay: delivered only
+                            // once the relay turn launches.
+                            let pendingRelay = await self.gatherCompletedSubagentRelayResponses(forSession: sessionId)
                             if !pendingRelay.isEmpty {
                                 let endTag = (modelConfig?.isGemma4Model == true) ? "<turn|>" : ((modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>") )
                                 let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: endTag)
@@ -7355,6 +8552,12 @@ struct ContentView: View {
                                     encode: { try tokenizer.encode(text: $0) }
                                 )
                                 await MainActor.run {
+                                    // The splice above is another suspension.
+                                    // Re-check at the launch itself, so a Stop
+                                    // that lands during it cannot append an
+                                    // empty relay turn to a stopped generation.
+                                    guard !Task.isCancelled,
+                                          self.ownsGeneration(myGenerationId) else { return }
                                     let relayMsgId = UUID()
                                     if let sId = sessionId, let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
                                         let relayMsg = ChatMessage(
@@ -7375,7 +8578,8 @@ struct ContentView: View {
                                         sessionId: sessionId,
                                         messageId: relayMsgId,
                                         agentStep: agentStep + 1,
-                                        forceSynthesis: true
+                                        forceSynthesis: true,
+                                        relayedReports: pendingRelay
                                     )
                                 }
                                 return
@@ -7440,6 +8644,7 @@ struct ContentView: View {
                         encode: { try tokenizer.encode(text: $0) }
                     )
                     await MainActor.run {
+                        guard !Task.isCancelled, self.ownsGeneration(myGenerationId) else { return }
                         let nextAssistantMsgId = UUID()
                         if let sId = sessionId, let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
                             if let mId = messageId, let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
@@ -7502,6 +8707,7 @@ struct ContentView: View {
                         encode: { try tokenizer.encode(text: $0) }
                     )
                     await MainActor.run {
+                        guard !Task.isCancelled, self.ownsGeneration(myGenerationId) else { return }
                         let nextAssistantMsgId = UUID()
                         if let sId = sessionId, let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
                             if let mId = messageId, let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
@@ -7609,7 +8815,24 @@ struct ContentView: View {
         }
         // The engine's compute task can outlive the consumer relay task while
         // it unwinds cooperatively at a layer boundary; loads must wait it out.
-        await CompletionEngine.shared.awaitIdle()
+        //
+        // Bounded, and with a background holder stopped rather than waited on:
+        // a subagent step is allowed 600 s, so an operator who switched models
+        // could sit behind a spinner for ten minutes with nothing to click. A
+        // load is an operator action and a background turn is the one class it
+        // may preempt, so: a short wait for a turn that will finish on its own
+        // (a chat step, a server request), then a BY-TOKEN stop of a background
+        // one, then a bounded drain. If something unpreemptable still holds the
+        // slot, `reserveTurnSlot` below answers "engine busy" and the load
+        // refuses with a message instead of hanging.
+        if !(await CompletionEngine.shared.awaitIdle(boundedBy: 10)) {
+            if let backgroundTurn = CompletionEngine.shared.activeBackgroundTurnToken {
+                metalStatus = "⏸ Stopping a background subagent so the model can load…"
+                await AgentScheduler.shared.preemptLocalRuns()
+                _ = CompletionEngine.shared.cancelBackgroundTurn(token: backgroundTurn)
+            }
+            _ = await CompletionEngine.shared.awaitIdle(boundedBy: 60)
+        }
         if let teardown = generationTeardownTask {
             await teardown.value
             // A generation may have started while we waited: stop it and wait for
@@ -7627,7 +8850,10 @@ struct ContentView: View {
     /// load task so callers that must run against the new model can await the
     /// specific load instead of racing it; UI callers ignore the result.
     @discardableResult
-    private func loadAndBridgeToMetal(filePath: String) -> Task<Void, Never> {
+    private func loadAndBridgeToMetal(
+        filePath: String,
+        onRefusal: (@MainActor () -> Void)? = nil
+    ) -> Task<Void, Never> {
         // A load request for the system-model sentinel (a session restore racing
         // the registry scan, or a raw path hand-off) must not attempt to mmap a
         // fake path: activate the on-device backend directly instead.
@@ -7675,11 +8901,29 @@ struct ContentView: View {
             // replaces the shard buffers and retires the DeepSeek runtime, so a turn
             // that started in between would be computing on mappings that no longer
             // exist. The slot is the one thing both callers check, so the load takes
-            // it and gives it back once the new engine is installed. Nil means
-            // another caller got there first, which is no worse than the behaviour
-            // before the claim existed.
+            // it and gives it back once the new engine is installed.
             let swapClaim = CompletionEngine.shared.reserveTurnSlot()
-            defer { swapClaim?.release() }
+            // A load that lost the claim race must NOT proceed on a nil claim.
+            // The other claimant is most often a live subagent step (the PR's
+            // scheduler claims per step, so the awaitIdle→reserve gap above
+            // can lose to one), and proceeding anyway is what swaps the shard
+            // buffers under a turn that is computing on them. Refuse the load:
+            // the operator can retry once the run finishes, and a superseded
+            // token makes chained loads heal past the refusal.
+            guard let swapClaim else {
+                await MainActor.run {
+                    guard self.modelLoadToken == token else { return }
+                    self.metalStatus = "⚠️ Engine busy: a turn or subagent run is using it. Load the model again once it finishes."
+                    self.isLoadingModel = false
+                    // The switch published this model's identity before the
+                    // load had an engine. A refusal must not leave the
+                    // conversation rendering (and sampling with) a model the
+                    // engine is not serving.
+                    onRefusal?()
+                }
+                return
+            }
+            defer { swapClaim.release() }
             // The wait can be long: a newer load may have superseded this one, in
             // which case it must not touch the shared state the newer one owns.
             let superseded = await MainActor.run { self.modelLoadToken != token }

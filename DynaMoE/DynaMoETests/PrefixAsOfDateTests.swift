@@ -69,6 +69,33 @@ final class PrefixAsOfDateTests: XCTestCase {
                           "a cleared pin must not carry the old temporal context into the next prefill")
     }
 
+    /// `invalidateIfNotPreserved` is the only guard against a pin that claims
+    /// rows the KV reset did not carry. No direct test existed; a regression
+    /// here reuses rows that no longer hold the pinned tokens.
+    func testAPartialPreservationDropsThePinButAWholeOneKeepsIt() {
+        let session = UUID()
+        PrefixCacheManager.shared.recordTurn(
+            promptTokenIds: [1, 2, 3, 4],
+            generatedTokenIds: [5, 6],
+            sessionId: session
+        )
+        XCTAssertEqual(PrefixCacheManager.shared.currentPinnedCount, 6)
+
+        // A launch that preserved FEWER rows than the pin claims invalidates.
+        PrefixCacheManager.shared.invalidateIfNotPreserved(4)
+        XCTAssertEqual(PrefixCacheManager.shared.currentPinnedCount, 0)
+
+        // Re-record, then preserve the whole pin: it can only append, so the
+        // pin stays.
+        PrefixCacheManager.shared.recordTurn(
+            promptTokenIds: [1, 2, 3, 4],
+            generatedTokenIds: [5, 6],
+            sessionId: session
+        )
+        PrefixCacheManager.shared.invalidateIfNotPreserved(6)
+        XCTAssertEqual(PrefixCacheManager.shared.currentPinnedCount, 6)
+    }
+
     func testDisabledPinningAlwaysMintsFreshDates() {
         // With pinning off nothing is reusable, so there is no reason to serve
         // a growing-stale date; every ask renders the real current time.
