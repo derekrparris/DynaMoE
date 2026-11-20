@@ -257,13 +257,14 @@ final class SubagentPR104ReviewFixesTests: XCTestCase {
             SubagentManager.shared.tryReserveSpawnSlot(forSession: session, cap: 3),
             "4th spawn reservation must be refused at cap 3"
         )
+        // Released through a defer for the rest: an assertion failure in
+        // between used to leak the reservations for the whole process, quietly
+        // shrinking every later spawn in the suite.
+        defer { tokens.forEach { SubagentManager.shared.releaseSpawnSlot($0, forSession: session) } }
         SubagentManager.shared.releaseSpawnSlot(tokens.removeFirst(), forSession: session)
         let replacement = SubagentManager.shared.tryReserveSpawnSlot(forSession: session, cap: 3)
         XCTAssertNotNil(replacement)
         if let replacement { tokens.append(replacement) }
-        for token in tokens {
-            SubagentManager.shared.releaseSpawnSlot(token, forSession: session)
-        }
     }
 
     // MARK: - Must Fix #6: Aggregate per-conversation cloud spend budget

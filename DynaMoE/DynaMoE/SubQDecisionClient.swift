@@ -706,10 +706,15 @@ public nonisolated struct SubQImage: Sendable {
 
 // MARK: - Redirects
 
-/// Refuses a redirect to a different host. The request carries the API key as a
-/// Bearer token, so following a 3xx to somebody else's host would hand them the
-/// secret. A refused redirect is reported as the 3xx status it was.
-nonisolated final class SubQRedirectGuard: NSObject, URLSessionTaskDelegate {
+/// Refuses a redirect that would carry a credential somewhere it was not sent.
+///
+/// Requests to SubQ, to cloud providers and to the local server all carry the
+/// key as a Bearer token, and URLSession follows 3xx by default, so a redirect
+/// to another host, another port or a plaintext hop would hand the secret over.
+/// A refused redirect is reported as the 3xx status it was. Shared rather than
+/// duplicated per client: the rule is about the token, not about who receives
+/// it.
+nonisolated final class BearerRedirectGuard: NSObject, URLSessionTaskDelegate {
     func urlSession(
         _ session: URLSession,
         task: URLSessionTask,
@@ -729,7 +734,7 @@ nonisolated final class SubQRedirectGuard: NSObject, URLSessionTaskDelegate {
         guard originHost == destinationHost else { return false }
         // Host alone was not the origin: the same host on another PORT is a
         // different service, and the Bearer token would go with it.
-        guard SubQDecisionSettings.effectivePort(origin) == SubQDecisionSettings.effectivePort(destination) else {
+        guard effectivePort(origin) == effectivePort(destination) else {
             return false
         }
         // A same-host redirect is still a downgrade when it drops TLS: the
@@ -738,6 +743,17 @@ nonisolated final class SubQRedirectGuard: NSObject, URLSessionTaskDelegate {
         let destinationScheme = destination.scheme?.lowercased()
         if originScheme == "https", destinationScheme != "https" { return false }
         return true
+    }
+
+    /// The port a URL really reaches, so an omitted port compares equal to the
+    /// scheme's default rather than to `nil`.
+    static func effectivePort(_ url: URL) -> Int {
+        if let port = url.port { return port }
+        switch url.scheme?.lowercased() {
+        case "https": return 443
+        case "http": return 80
+        default: return -1
+        }
     }
 }
 
@@ -785,7 +801,7 @@ public nonisolated struct SubQDecisionClient: Sendable {
         configuration.urlCache = nil
         return URLSession(
             configuration: configuration,
-            delegate: SubQRedirectGuard(),
+            delegate: BearerRedirectGuard(),
             delegateQueue: nil
         )
     }()

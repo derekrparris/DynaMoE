@@ -139,7 +139,7 @@ SubagentManager                      coordinator-facing API + registry + relays
 | `Subagents/SubagentRelay.swift` / `Subagents/SubagentRelayWait.swift` | `[SUBAGENT_RESULT]` line format, relay marking, the bounded wait for in-flight runs |
 | `Subagents/SubagentNotifier.swift` | Finish notifications (banner, frontmost and permission rules) |
 | `Subagents/LocalSubagentCost.swift` | The local cost estimate and the pre-spawn refusal |
-| `Subagents/SubagentManager.swift` | Coordinator API (`spawn`, status, message, cancel, relays, apply, discard) plus the live→record projection |
+| `SubagentManager.swift` | Coordinator API (`spawn`, status, message, cancel, relays, apply, discard) plus the live→record projection. Lives at the app target's top level, not in `Subagents/` |
 | `Subagents/SubagentInspectorView.swift` | Inspector UI (replaces the drawer), worktree controls, conversation cost strip |
 | `AgentHarness.swift` | Tool implementations, including `spawn_subagent`, status/message/list and `apply_subagent_changes` |
 | `EngineTurnSlot.swift` | `TurnSlotClaim` / `TurnSlotLedger`, the single-flight slot the server queue, chat sends, loads and subagent steps share |
@@ -587,7 +587,9 @@ from a child is refused by name.
 - **Cloud capacity: N** (default 3 per provider, global fan-out 6, both
   overridable through `dynamoe_subagent_cloud_per_provider` /
   `dynamoe_subagent_cloud_global`).
-- **Apple FM: 1** (reserved; the backend is deferred, §16).
+- **Apple FM: 1** (reserved; the subagent backend is deferred, §16 — the
+  `AppleFoundationModelService` it would sit on is in the tree and is used
+  elsewhere, the backend is not).
 - **Queue:** FIFO within a priority class (interactive > user-requested >
   speculative), and priority ordering is per CLASS, so one class's head cannot
   starve a class that still has capacity. A queued run can be cancelled while
@@ -640,7 +642,7 @@ A preset is data, not a pipeline:
 | Explore | read/search/web/skills | none | 16 steps | findings + evidence |
 | Implementer | read + write/edit/shell/git | worktree | 40 steps | diff + tests |
 | Verifier | read + shell + lint | none | 24 steps | test outcomes + risks |
-| Reviewer | read + git_diff | none | 16 steps | findings + risks |
+| Reviewer | read + git (status, diff) | none | 16 steps | findings + risks |
 | General | read-only by default | none | 20 steps | report |
 
 Custom roles map to `general` with the task text supplying the specialization.
@@ -1192,9 +1194,9 @@ Append one line per session so the next session knows where work stopped.
 
 - Cloud provider defaults: Phase 3 shipped the Settings field
   (`dynamoe_subagent_cloud_model`, an upstream model id). The stored value is
-  the ONLY resolution: `AgentSpawn.resolveBackend` passes
-  `coordinateModelId: nil`, so there is no coordinator-model or
-  first-discovered fallback. An empty value refuses a cloud spawn by name
+  the ONLY resolution: `AgentSpawnResolver.resolveBackend` reads nothing else
+  for the model id, so there is no coordinator-model or first-discovered
+  fallback. An empty value refuses a cloud spawn by name
   (`noneConfigured`), and a stored value that does not name a configured cloud
   model is also refused by name (and flagged in Settings where it is typed),
   rather than silently substituted — the substituted run would be billed on a

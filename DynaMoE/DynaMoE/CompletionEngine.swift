@@ -864,11 +864,11 @@ public final class CompletionEngine: @unchecked Sendable {
                 // this turn's required-parameter gate.
                 let deepSeekGrammarToken = GrammarConstrainedSampler.shared.beginGeneration()
                 stateLock.lock()
-                // Continues the claim's ticket, like the generic path: a token
-                // taken before this launch must still name this turn after it.
-                generationCounter = max(generationCounter, held.ticket)
-                generationCounter &+= 1
-                let myGenerationId = generationCounter
+                // The turn's id IS the claim's ticket, like the generic path: a
+                // token taken before this launch must still name this turn
+                // after it, and an id one past the ticket named nothing.
+                generationCounter = held.ticket
+                let myGenerationId = held.ticket
                 currentGenerationId = myGenerationId
                 activeTurnCancelled = false
                 activeTurnPriority = request.turnPriority
@@ -2580,16 +2580,16 @@ public final class CompletionEngine: @unchecked Sendable {
         // Old ordering preserved: KV reset (above) -> grammar token -> turn id.
         let grammarGenerationToken = GrammarConstrainedSampler.shared.beginGeneration()
         stateLock.lock()
-        // The generation id CONTINUES the claim's ticket rather than coming
-        // from an independent counter. A preempting caller holds a token from
-        // before this launch (a claim's ticket) and compares it after, when the
-        // turn may already be a task (a generation id): two counters made that
-        // comparison refuse to stop the very turn it named. Tickets are unique
-        // and monotone in the ledger, so reusing one as an id keeps every id
-        // distinct without a second source.
-        generationCounter = max(generationCounter, held.ticket)
-        generationCounter &+= 1
-        let myGenerationId = generationCounter
+        // The generation id IS the claim's ticket, not a number derived from
+        // it. A preempting caller holds a token from before this launch (a
+        // claim's ticket) and compares it after, when the turn may already be a
+        // task (a generation id): two counters made that comparison refuse to
+        // stop the very turn it named. Tickets are unique in the ledger and
+        // never reused, so one doubles as an id without a second source — and
+        // an id must never be minted NEXT to a ticket, or a stale id would name
+        // the following turn's claim.
+        generationCounter = held.ticket
+        let myGenerationId = held.ticket
         currentGenerationId = myGenerationId
         activeTurnCancelled = false
         activeTurnPriority = request.turnPriority
@@ -11781,6 +11781,10 @@ if layer.attnGateProjTensor != nil,
             activeTurnCancelled = true
             return true
         }
+        // The same priority rule as the task branch: matching a ticket is not
+        // authority to stop an interactive preparation (a chat send, an API
+        // request, a model load).
+        guard turnSlotLedger.claimedPriority == .background else { return false }
         return turnSlotLedger.cancelClaim(ticket: token)
     }
 

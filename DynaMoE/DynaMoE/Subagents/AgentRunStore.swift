@@ -915,14 +915,49 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
             .compactMap { decodeRecord(at: directory.appendingPathComponent($0)) }
     }
 
+    /// Reads one record, or nil when this build cannot use the file.
+    ///
+    /// A nil is NOT the same as "no such run", and the difference matters: a
+    /// record written by an older schema stops decoding the moment a
+    /// non-optional field is added, and every reader here (`load`, `loadAll`,
+    /// `prune`, `reconcileInterruptedRuns`) treats nil as absence — so the run
+    /// would vanish from the inspector, be reconciled never (it stays
+    /// `.running` with no live instance to Stop) and be pruned never. The file
+    /// is therefore reported rather than silently skipped, and is deliberately
+    /// KEPT: it may be a record a newer build wrote, and deleting it would make
+    /// a downgrade-then-upgrade cycle destroy history. Only the operator can
+    /// decide to discard it, which they need to know it exists to do.
     private func decodeRecord(at url: URL) -> AgentRunRecord? {
         guard let data = try? Data(contentsOf: url) else { return nil }
         guard let record = try? JSONDecoder().decode(AgentRunRecord.self, from: data) else {
+            reportUnreadableRecord(url, why: "it does not decode")
             return nil
         }
-        guard record.schemaVersion <= AgentRunRecord.currentSchemaVersion else { return nil }
+        guard record.schemaVersion <= AgentRunRecord.currentSchemaVersion else {
+            // Written by a newer build: expected after a downgrade, and the
+            // sweep already surfaces the count.
+            return nil
+        }
         return record
     }
+
+    /// Logs an unreadable record once per path per process.
+    ///
+    /// Once, because the readers are per-send (`load(runId:sessionId:)` runs on
+    /// every send) and a warning per read would bury every other line.
+    private func reportUnreadableRecord(_ url: URL, why: String) {
+        signatureLock.lock()
+        let isNew = Self.reportedUnreadableRecords.insert(url.path).inserted
+        signatureLock.unlock()
+        guard isNew else { return }
+        DiagLog.warning(
+            "subagent.store",
+            "A stored run record at \(url.lastPathComponent) is being kept but not shown: \(why). It is left on disk untouched."
+        )
+    }
+
+    /// Paths already reported, so a per-send read logs once.
+    nonisolated(unsafe) private static var reportedUnreadableRecords: Set<String> = []
 
     // MARK: - Deletion and retention
 

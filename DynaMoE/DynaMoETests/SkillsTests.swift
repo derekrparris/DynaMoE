@@ -1406,23 +1406,23 @@ final class SubQDecisionTests: XCTestCase {
 
     func testRedirectsToAnotherHostAreRefused() {
         let origin = URL(string: "https://api.subq.ai/v1/systemone")
-        XCTAssertTrue(SubQRedirectGuard.isAllowedRedirect(
+        XCTAssertTrue(BearerRedirectGuard.isAllowedRedirect(
             from: origin,
             to: URL(string: "https://api.subq.ai/v1/other")
         ))
-        XCTAssertFalse(SubQRedirectGuard.isAllowedRedirect(
+        XCTAssertFalse(BearerRedirectGuard.isAllowedRedirect(
             from: origin,
             to: URL(string: "https://evil.example/collect")
         ))
-        XCTAssertFalse(SubQRedirectGuard.isAllowedRedirect(from: origin, to: nil))
-        XCTAssertFalse(SubQRedirectGuard.isAllowedRedirect(from: nil, to: origin))
+        XCTAssertFalse(BearerRedirectGuard.isAllowedRedirect(from: origin, to: nil))
+        XCTAssertFalse(BearerRedirectGuard.isAllowedRedirect(from: nil, to: origin))
         // A same-host redirect that drops TLS hands the Bearer key to the
         // network in clear.
-        XCTAssertFalse(SubQRedirectGuard.isAllowedRedirect(
+        XCTAssertFalse(BearerRedirectGuard.isAllowedRedirect(
             from: origin,
             to: URL(string: "http://api.subq.ai/v1/systemone")
         ))
-        XCTAssertTrue(SubQRedirectGuard.isAllowedRedirect(
+        XCTAssertTrue(BearerRedirectGuard.isAllowedRedirect(
             from: URL(string: "http://127.0.0.1:8787/v1/systemone"),
             to: URL(string: "http://127.0.0.1:8787/v1/other")
         ))
@@ -1495,7 +1495,7 @@ final class SubQDecisionTests: XCTestCase {
 
     func testARedirectToAnotherPortIsRefused() {
         let origin = URL(string: "https://api.subq.ai/v1/systemone")
-        XCTAssertFalse(SubQRedirectGuard.isAllowedRedirect(
+        XCTAssertFalse(BearerRedirectGuard.isAllowedRedirect(
             from: origin,
             to: URL(string: "https://api.subq.ai:8443/v1/systemone")
         ))

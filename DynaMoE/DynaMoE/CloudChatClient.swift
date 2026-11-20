@@ -260,7 +260,14 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
             configuration.httpShouldSetCookies = false
             let cacheKey = "\(chatURL.absoluteString)|\(requestTimeout)"
             self.session = CloudSessionCache.shared.session(for: cacheKey) {
-                URLSession(configuration: configuration)
+                // The delegate is what refuses a redirect that would carry the
+                // Bearer key to another host, another port or a plaintext hop;
+                // a plain URLSession follows 3xx and would hand it over.
+                URLSession(
+                    configuration: configuration,
+                    delegate: BearerRedirectGuard(),
+                    delegateQueue: nil
+                )
             }
         }
     }

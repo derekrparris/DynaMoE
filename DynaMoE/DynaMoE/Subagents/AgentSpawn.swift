@@ -289,15 +289,54 @@ enum AgentSpawnResolver {
         )
         budget = ceilingDecision.budget
         let usesOperatorCeiling = ceilingDecision.usesOperatorCeiling
+        // The conversation's cloud cap is checked against a number that must
+        // include THIS spawn's own commitment, or two concurrent spawns both
+        // read the same spend, both pass, and both register afterwards — the
+        // aggregate cap multiplied by the number of spawns in flight, which is
+        // exactly what it exists to stop. So the spend read, the check and the
+        // reservation happen together under `reserveCloudSpend`, and the
+        // reservation is what a later spawn's read counts while this one is
+        // still resolving. Released when the instance registers (it is live
+        // and priced then, so counting it twice would double it) or on every
+        // failure path.
+        var cloudSpendReservation: UUID?
         if descriptor.kind == .cloud {
-            let sessionSpent = SubagentManager.shared.sessionCloudSpendUSD(forSession: request.parentSessionId)
-            budget = try Self.applySessionCloudCeiling(
-                budget: budget,
-                descriptor: descriptor,
-                usesOperatorCeiling: usesOperatorCeiling,
-                sessionSpentUSD: sessionSpent,
-                defaults: defaults
+            let reservation = try SubagentManager.shared.reserveCloudSpend(
+                forSession: request.parentSessionId,
+                requestedUSD: budget.maxCostUSD
+                    ?? SubagentBackendSettings.sessionCloudCostCeiling(defaults: defaults)
+                    ?? 0
             )
+            do {
+                budget = try Self.applySessionCloudCeiling(
+                    budget: budget,
+                    descriptor: descriptor,
+                    usesOperatorCeiling: usesOperatorCeiling,
+                    sessionSpentUSD: reservation.spentUSD,
+                    defaults: defaults
+                )
+            } catch {
+                SubagentManager.shared.releaseCloudSpend(reservation.token, forSession: request.parentSessionId)
+                throw error
+            }
+            cloudSpendReservation = reservation.token
+            // The cap trims the budget it was checked against, so the
+            // reservation must cover what was actually committed.
+            SubagentManager.shared.adjustCloudSpend(
+                reservation.token,
+                to: budget.maxCostUSD ?? 0,
+                forSession: request.parentSessionId
+            )
+        }
+        defer {
+            // Released when `resolve` returns, which is safe because the
+            // caller registers the instance immediately after it with no
+            // suspension in between (both run on the main actor): from that
+            // moment the live instance is what the cap counts. Holding it
+            // longer would count one run twice.
+            if let cloudSpendReservation {
+                SubagentManager.shared.releaseCloudSpend(cloudSpendReservation, forSession: request.parentSessionId)
+            }
         }
         if let problem = Self.costCeilingProblem(
             budget: budget,
@@ -323,12 +362,14 @@ enum AgentSpawnResolver {
                 let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 throw AgentSpawnError.unsupportedIsolation(detail)
             }
-            // Re-read the conversation's spend after that await. The cap was
-            // checked against a number taken before it, and a concurrent
-            // spawn of the same conversation can have registered its own
-            // reservation in between — each would then pass a check neither
-            // passes alone, which is the multiplication the cap exists to
-            // stop. The tree is removed on refusal: this run will not start.
+            // Re-read the conversation's spend after that await, and keep
+            // this spawn's own reservation counted while doing it. The cap
+            // was checked against a number taken before the worktree was
+            // cut, and a concurrent spawn of the same conversation can have
+            // taken its own reservation in between — each would then pass a
+            // check neither passes alone, which is the multiplication the cap
+            // exists to stop. The tree is removed on refusal: this run will
+            // not start.
             if descriptor.kind == .cloud {
                 do {
                     budget = try Self.applySessionCloudCeiling(
@@ -338,6 +379,13 @@ enum AgentSpawnResolver {
                         sessionSpentUSD: SubagentManager.shared.sessionCloudSpendUSD(forSession: request.parentSessionId),
                         defaults: defaults
                     )
+                    if let cloudSpendReservation {
+                        SubagentManager.shared.adjustCloudSpend(
+                            cloudSpendReservation,
+                            to: budget.maxCostUSD ?? 0,
+                            forSession: request.parentSessionId
+                        )
+                    }
                 } catch {
                     _ = await WorkspaceIsolation.cleanup(
                         AgentWorktree(

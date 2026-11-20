@@ -1106,6 +1106,20 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
     /// whatever `work` returned after being cancelled so its transcript record
     /// is never silently dropped).
     ///
+    /// The wall-clock promise is bounded for COOPERATIVE work only, and that
+    /// is a property of structured concurrency rather than of this function:
+    /// a task group joins its children before the scope returns, so a tool
+    /// that ignores cancellation (a long synchronous write, a child that
+    /// ignores SIGTERM, a backend that swallows `CancellationError`) keeps the
+    /// caller past its deadline while it still holds its scheduler ticket and
+    /// its engine slot. Abandoning it instead is NOT the fix: the leaked task
+    /// would keep using the engine beside the next turn, and the engine is
+    /// single-flight by design, so a hang that is visible and stops with the
+    /// process is preferable to two turns running at once. Every tool this
+    /// loop runs is expected to be cancellation-aware (`runProcess` kills its
+    /// child on cancel), so the case is a bug in the tool, not a budget to
+    /// redesign around.
+    ///
     /// Internal rather than private so the deadline race can be tested without
     /// a model or a real tool.
     static func firstResult<T: Sendable>(

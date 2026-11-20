@@ -131,6 +131,11 @@ final class AgentSchedulerTests: XCTestCase {
             try await scheduler.acquire(providerA, priority: .userRequested, runId: UUID(), timeout: 5)
         }
         try await waitForWaiters(scheduler, 1)
+        // The cap is per PROVIDER: the second run on "a" must be waiting
+        // while "b" holds its own ticket, not admitted beside it.
+        var snapshot = await scheduler.snapshot()
+        XCTAssertEqual(snapshot.waiting, 1, "provider a's second run waits behind its own cap")
+        XCTAssertEqual(snapshot.tickets[providerA], 1, "provider a holds exactly one ticket")
 
         await scheduler.release(firstA)
         let secondATicket = try await secondA.value
@@ -156,11 +161,21 @@ final class AgentSchedulerTests: XCTestCase {
             )
         }
         try await waitForWaiters(scheduler, 1)
+        // Provider c's own quota (2) is untouched and it still waits: the
+        // GLOBAL cap (2) is what it is queued behind.
+        var snapshot = await scheduler.snapshot()
+        XCTAssertEqual(snapshot.waiting, 1, "a third cloud run waits on the global cap")
+        XCTAssertEqual(snapshot.tickets.count, 1, "only provider a holds tickets so far")
 
         await scheduler.release(first)
         let otherTicket = try await otherProvider.value
         await scheduler.release(second)
         await scheduler.release(otherTicket)
+        snapshot = await scheduler.snapshot()
+        XCTAssertEqual(snapshot.waiting, 0)
+        // Per-provider entries may outlive their last ticket, so the counts
+        // are what must be zero, not the keys.
+        XCTAssertTrue(snapshot.tickets.values.allSatisfy { $0 == 0 })
     }
 
     func testCancellingARunStopsItsDescendants() async {

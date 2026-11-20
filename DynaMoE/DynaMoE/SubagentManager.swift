@@ -2160,11 +2160,67 @@ public final class SubagentManager: ObservableObject {
         }
     }
 
+    /// In-flight cloud spend reservations keyed by parent session, so a spawn
+    /// still resolving counts against the conversation cap.
+    ///
+    /// Without them the check was read-then-act: two concurrent spawns read
+    /// the same spend, both passed, and both registered afterwards, exceeding
+    /// the aggregate cap by the number in flight — the multiplication the cap
+    /// exists to stop. The reservation holds this spawn's committed budget for
+    /// the window between the check and registration, and is released the
+    /// moment the instance is live (it is counted as a live instance from then
+    /// on, and counting it twice would shrink the cap instead).
+    private var pendingCloudSpend: [UUID?: [UUID: Double]] = [:]
+
+    /// Reads the conversation's spend, checks it and reserves this spawn's
+    /// commitment in one step. `spentUSD` is what the caller must check
+    /// against; adjust the reservation with `adjustCloudSpend` once the cap has
+    /// trimmed the budget, and release it when the run registers or fails.
+    public func reserveCloudSpend(
+        forSession sessionId: UUID?,
+        requestedUSD: Double
+    ) -> (token: UUID, spentUSD: Double) {
+        let token = UUID()
+        let requested = requestedUSD.isFinite ? max(0, requestedUSD) : 0
+        lock.lock()
+        pendingCloudSpend[sessionId, default: [:]][token] = requested
+        lock.unlock()
+        // Read AFTER the reservation lands, so this spawn's own commitment is
+        // part of the number it checks (conservative: it can refuse a spawn
+        // that would exactly fit, never admit one that would not).
+        let spent = sessionCloudSpendUSD(forSession: sessionId)
+        return (token, spent)
+    }
+
+    /// Sets a reservation's amount after the cap trimmed the budget.
+    public func adjustCloudSpend(_ token: UUID, to amountUSD: Double, forSession sessionId: UUID?) {
+        let amount = amountUSD.isFinite ? max(0, amountUSD) : 0
+        lock.lock()
+        defer { lock.unlock() }
+        guard pendingCloudSpend[sessionId]?[token] != nil else { return }
+        pendingCloudSpend[sessionId]?[token] = amount
+    }
+
+    /// Gives a reservation back. Idempotent, like a turn-slot claim's release.
+    public func releaseCloudSpend(_ token: UUID, forSession sessionId: UUID?) {
+        lock.lock()
+        defer { lock.unlock() }
+        pendingCloudSpend[sessionId]?.removeValue(forKey: token)
+        if pendingCloudSpend[sessionId]?.isEmpty == true {
+            pendingCloudSpend.removeValue(forKey: sessionId)
+        }
+    }
+
     /// Total cloud spend already billed or committed by subagent runs in
     /// `sessionId`. Combines live instances (with in-flight runs reserving
-    /// `max(actual, maxCostUSD)`) and persisted terminal records from disk
+    /// `max(actual, maxCostUSD)`), spawns still resolving (their reservation,
+    /// see `reserveCloudSpend`) and persisted terminal records from disk
     /// (deduped by run ID) so a conversation cannot multiply its per-run cap
     /// across sequential or parallel cloud spawns.
+    ///
+    /// It reads the run store, so it must not be called from the main actor
+    /// on a hot path: `load(sessionId:)` decodes every record in the
+    /// conversation.
     public func sessionCloudSpendUSD(forSession sessionId: UUID?) -> Double {
         var byRunId: [UUID: Double] = [:]
         for record in AgentRunStore.shared.load(sessionId: sessionId) {
@@ -2197,6 +2253,15 @@ public final class SubagentManager: ObservableObject {
                 let reserved = committed.isFinite ? max(0, committed) : 0
                 byRunId[instance.id] = max(actual, reserved)
             }
+        }
+        // Spawns between their cap check and their registration. Keyed by
+        // reservation token, so a token that was released (or belongs to
+        // another conversation) contributes nothing.
+        lock.lock()
+        let pendingSnapshot = pendingCloudSpend[sessionId] ?? [:]
+        lock.unlock()
+        for (token, amount) in pendingSnapshot {
+            byRunId[token] = amount
         }
         return byRunId.values.reduce(0, +)
     }

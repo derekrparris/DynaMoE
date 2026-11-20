@@ -1467,6 +1467,7 @@ nonisolated enum WorkspaceIsolation {
         let fileManager = FileManager.default
         guard let names = try? fileManager.contentsOfDirectory(atPath: root.path) else { return [] }
         var removed: [String] = []
+        var uncontained: [String] = []
         for name in names {
             let path = root.appendingPathComponent(name, isDirectory: true)
             var isDirectory: ObjCBool = false
@@ -1506,6 +1507,13 @@ nonisolated enum WorkspaceIsolation {
             }
 
             var removedTree = false
+            // Both branches below DELETE by this path, so containment is
+            // decided once, up front, and every removal is gated on it. The
+            // sweep found `path` through a stat (which follows symlinks), so a
+            // link planted in the root can name a checkout elsewhere: without
+            // this, `git worktree remove --force` on the detached-HEAD branch
+            // destroyed a repository that was never a run's.
+            let contained = isInsideRoot(path, root: root)
             if let repositoryRoot = await owningRepository(for: path),
                let (branchCode, branchOut, _) = try? await git(
                    ["rev-parse", "--abbrev-ref", "HEAD"],
@@ -1521,21 +1529,21 @@ nonisolated enum WorkspaceIsolation {
                         baseCommit: ""
                     )
                     removedTree = await cleanup(worktree, root: root)
-                } else {
+                } else if contained {
                     _ = try? await git(["worktree", "remove", "--force", path.path], in: repositoryRoot)
                     _ = try? await git(["worktree", "prune"], in: repositoryRoot)
-                    // Deleted only through the containment check: a path is
-                    // data, and this sweep is one of the two places that
-                    // deletes by it. A detached HEAD is still a real checkout
-                    // with the run's work in it, so the removal above is
-                    // scoped to the root it was found under.
-                    if isInsideRoot(path, root: root) {
-                        try? fileManager.removeItem(at: path)
-                    }
+                    // A detached HEAD is still a real checkout with the run's
+                    // work in it, so the containment check above is what makes
+                    // this removal safe to attempt at all.
+                    try? fileManager.removeItem(at: path)
                     removedTree = !fileManager.fileExists(atPath: path.path)
+                } else {
+                    // Outside the root: leave it, and say so once per sweep —
+                    // a silent skip reads as "handled".
+                    uncontained.append(path.path)
                 }
             } else {
-                if isInsideRoot(path, root: root) {
+                if contained {
                     try? fileManager.removeItem(at: path)
                 }
                 removedTree = !fileManager.fileExists(atPath: path.path)
@@ -1545,6 +1553,12 @@ nonisolated enum WorkspaceIsolation {
             if removedTree {
                 removed.append(name)
             }
+        }
+        if !uncontained.isEmpty {
+            DiagLog.warning(
+                "subagent.isolation",
+                "\(uncontained.count) stale entr\(uncontained.count == 1 ? "y" : "ies") in the worktree root resolve outside it and were left untouched: \(uncontained.joined(separator: ", "))"
+            )
         }
         return removed
     }
