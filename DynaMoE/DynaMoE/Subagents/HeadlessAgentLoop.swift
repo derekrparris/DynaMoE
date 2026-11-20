@@ -338,8 +338,17 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             // loop reports its own vocabulary (`eos`, `endTag`, `stoppedBySequence`)
             // which is never a cloud reason, so this classification is scoped
             // to cloud backends rather than read as universal.
-            let cloudHalted = backend.descriptor.isRemote
-                && (disposition == .halted || disposition == .unrecognized)
+            // The local loop's own vocabulary, which no cloud provider uses:
+            // it is the one set of spellings that is a legitimate completion on
+            // a local backend. Anything else unrecognised is not an answer —
+            // scoping the unknown check to cloud backends let a local turn end
+            // with `error` (a scripted backend running out of turns does) and
+            // report a successful run whose answer is an error sentence.
+            let localCompletionReasons: Set<String> = [
+                "eos", "endtag", "stoppedbysequence", "toolfreeze"
+            ]
+            let cloudHalted = disposition == .halted
+                || (disposition == .unrecognized && !localCompletionReasons.contains(loweredReason))
             let alwaysUnusable = Self.finishReasonIsTruncated(turn.finishReason)
                 || loweredReason == "degeneratecycle"
                 || loweredReason == "stopped"
@@ -361,10 +370,10 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                     failure = "The backend stopped because it began repeating itself, so its text is not a considered answer."
                 case "stopped":
                     failure = "The backend's decode loop stopped without reaching an end-of-turn reason, so its text is a fragment."
-                case _ where cloudHalted && disposition == .halted:
+                case _ where disposition == .halted:
                     failure = "The provider stopped the reply before it finished (finish reason '\(turn.finishReason)'), so its text is not the answer the task asked for."
                 case _ where cloudHalted:
-                    failure = "The provider reported a finish reason this app does not recognise ('\(turn.finishReason)'), so its text cannot be treated as a complete answer."
+                    failure = "The backend reported a finish reason this app does not recognise ('\(turn.finishReason)'), so its text cannot be treated as a complete answer."
                 default:
                     failure = "The backend stopped at its token limit (finish reason '\(turn.finishReason)') before the run finished, so its output is truncated rather than usable."
                 }

@@ -273,7 +273,6 @@ public final class CompletionEngine: @unchecked Sendable {
     private let stateLock = NSLock()
     private var currentGenerationTask: Task<Void, Never>?
     private var currentGenerationId: UInt64 = 0
-    private var generationCounter: UInt64 = 0
     /// Cooperative Stop for the work that runs on `runOnLargeStack`'s dedicated
     /// thread. That thread is a plain `Thread`, not an executor-managed one, so
     /// `Task.isCancelled` always reads false there and the layer loops would lose
@@ -864,10 +863,18 @@ public final class CompletionEngine: @unchecked Sendable {
                 // this turn's required-parameter gate.
                 let deepSeekGrammarToken = GrammarConstrainedSampler.shared.beginGeneration()
                 stateLock.lock()
+                // Committing and minting the id are one step. A preemption
+                // refuses a committed claim, so a turn that has become live
+                // can never have its id overwritten by the turn it preempted.
+                guard held.commit() else {
+                    stateLock.unlock()
+                    throw CompletionLaunchError.engineNotReady(
+                        "❌ This turn's reservation on the generation slot was given back before it could start. Try again in a moment."
+                    )
+                }
                 // The turn's id IS the claim's ticket, like the generic path: a
                 // token taken before this launch must still name this turn
                 // after it, and an id one past the ticket named nothing.
-                generationCounter = held.ticket
                 let myGenerationId = held.ticket
                 currentGenerationId = myGenerationId
                 activeTurnCancelled = false
@@ -2586,6 +2593,15 @@ public final class CompletionEngine: @unchecked Sendable {
         // Old ordering preserved: KV reset (above) -> grammar token -> turn id.
         let grammarGenerationToken = GrammarConstrainedSampler.shared.beginGeneration()
         stateLock.lock()
+        // Committing and minting the id are one step. A preemption refuses a
+        // committed claim, so a turn that has become live can never have its id
+        // overwritten by the turn it preempted (see `TurnSlotLedger.commit`).
+        guard held.commit() else {
+            stateLock.unlock()
+            throw CompletionLaunchError.engineNotReady(
+                "❌ This turn's reservation on the generation slot was given back before it could start. Try again in a moment."
+            )
+        }
         // The generation id IS the claim's ticket, not a number derived from
         // it. A preempting caller holds a token from before this launch (a
         // claim's ticket) and compares it after, when the turn may already be a
@@ -2594,7 +2610,6 @@ public final class CompletionEngine: @unchecked Sendable {
         // never reused, so one doubles as an id without a second source — and
         // an id must never be minted NEXT to a ticket, or a stale id would name
         // the following turn's claim.
-        generationCounter = held.ticket
         let myGenerationId = held.ticket
         currentGenerationId = myGenerationId
         activeTurnCancelled = false

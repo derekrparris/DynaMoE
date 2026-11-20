@@ -166,7 +166,17 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
                     // cache and moves the prefix pin, so a stopped run that
                     // still launched paid for a turn nobody would consume.
                     if Task.isCancelled { throw AgentBackendError.cancelled }
-                    return try CompletionEngine.shared.launchTurn(prepared.turn, claim: prepared.claim)
+                    do {
+                        return try CompletionEngine.shared.launchTurn(prepared.turn, claim: prepared.claim)
+                    } catch {
+                        // A claim dropped by an operator's preemption is a
+                        // cancelled run, not a broken engine: the refusal is
+                        // the cancel arriving through the slot. Reporting it as
+                        // a failure contradicts the "Stopping…" the operator was
+                        // shown and throws away the run's partial report.
+                        if prepared.claim.wasCancelled { throw AgentBackendError.cancelled }
+                        throw error
+                    }
                 }
                 return try await withTaskCancellationHandler {
                     try await Self.collect(launch: launch, request: request)
@@ -307,10 +317,14 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
         // prompt that can be 160k characters, so both run off the main actor;
         // the engine is a lock-guarded Sendable box, so the tokenize needs no
         // actor either. Only what touches UI state stays on it.
+        // The per-request flag is the caller's answer for THIS run; the stored
+        // one is only the backend's default. Ignoring it made a run that asked
+        // for thinking off think anyway, and pay for it.
+        let thinking = request.thinking && thinkingEnabled && info.supportsThinking
         let prompt = renderPrompt(
             systemPrompt: request.systemPrompt,
             messages: request.messages,
-            thinkingEnabled: thinkingEnabled && info.supportsThinking,
+            thinkingEnabled: thinking,
             modelSupportsThinking: info.supportsThinking,
             modelConfig: config,
             promptDialect: engine.promptDialect
@@ -342,7 +356,7 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
             ),
             memory: TurnMemorySettings.persisted(),
             agentToolsEnabled: !request.tools.isEmpty,
-            thinkingEnabled: thinkingEnabled && info.supportsThinking,
+            thinkingEnabled: thinking,
             agentStep: 0,
             forceSynthesis: false,
             isSplicedContinuation: false,
@@ -499,6 +513,13 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
         usage.promptTokens = result.promptTokenIds.count
         usage.completionTokens = result.generatedTokenIds.count
         usage.cachedTokens = result.prefixTokensReused
+        // A local turn spends the operator's own hardware, so nothing here can
+        // name a dollar figure — and leaving costUSD at 0 with costIsUnpriced
+        // false made a cost ceiling silently inert (it compared 0 >= maxCost
+        // forever). Marking it unpriced is what makes the loop REFUSE a ceiling
+        // it cannot enforce instead of pretending to.
+        usage.costIsUnpriced = true
+        usage.costUnpricedReason = .noPriceRecorded
         // `responseText` is the raw response channel, which still contains a
         // call's markup when the model emitted one. The markup is an
         // instruction, not prose: the report builder reads this text for

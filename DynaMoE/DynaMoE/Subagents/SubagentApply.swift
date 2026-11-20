@@ -759,7 +759,7 @@ enum SubagentApplyControl {
         // actual diff preview and bind the approval to both the destination
         // branch and the exact patch digest.
         var stat: String? = nil
-        var diffPreview: String? = record.report?.diff
+        var diffPreview: String? = nil
         var patchDigest: String? = nil
         var snapshotFailure: String? = nil
         do {
@@ -767,14 +767,17 @@ enum SubagentApplyControl {
                 path: path,
                 branch: branch,
                 repositoryRoot: destinationURL,
-                baseCommit: record.baseCommit
+                baseCommit: record.baseCommit,
+                runId: record.id
             )
             stat = await WorkspaceIsolation.diffStat(worktree)
             let preApprovalChanges = try await WorkspaceIsolation.snapshot(worktree, diffLimit: nil)
             patchDigest = SubagentApplyService.patchDigest(preApprovalChanges.diff)
-            if diffPreview == nil || diffPreview?.isEmpty == true {
-                diffPreview = preApprovalChanges.diff
-            }
+            // The LIVE snapshot is what the digest binds and what will land, so
+            // it is what the card must show. Preferring the run's reported diff
+            // asked the operator to approve text the run produced earlier while
+            // authorising the current bytes.
+            diffPreview = preApprovalChanges.diff
         } catch {
             // The card is bound to the patch it shows. Falling back to the
             // recorded report's diff while the digest stays nil leaves the
@@ -791,6 +794,9 @@ enum SubagentApplyControl {
         if let snapshotFailure {
             destinationNote = (destinationNote.map { $0 + " " } ?? "")
                 + "Could not snapshot the run's worktree, so this card cannot bind the apply to the exact patch: \(snapshotFailure)"
+            // Nothing was verified, so show the run's own report and say so:
+            // a stale preview with no digest is honest only if it is labelled.
+            diffPreview = record.report?.diff
         }
         guard let request = applyRequest(
             for: record,
@@ -815,9 +821,17 @@ enum SubagentApplyControl {
             )
         }
         guard await ask(request) else { throw SubagentApplyControlError.approvalDenied }
-        let expectation: SubagentApplyExpectation? = destinationBranchResolved
-            ? SubagentApplyExpectation(destinationBranch: destinationBranch, patchDigest: patchDigest)
-            : nil
+        // The digest is bound whenever there is one: it is what the operator
+        // approved, and it does not depend on knowing the destination branch.
+        // Dropping the whole expectation when the branch could not be resolved
+        // skipped BOTH checks in exactly the case where the destination is
+        // least certain.
+        let expectation: SubagentApplyExpectation? = patchDigest == nil && !destinationBranchResolved
+            ? nil
+            : SubagentApplyExpectation(
+                destinationBranch: destinationBranchResolved ? destinationBranch : nil,
+                patchDigest: patchDigest
+            )
         return try await SubagentApplyService.apply(runId: runId, expectation: expectation)
     }
 }

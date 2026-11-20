@@ -237,8 +237,27 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
             result.costUnpricedReason = .providerOmittedUsage
             return result
         }
-        result.promptTokens = usage.promptTokens ?? 0
-        result.completionTokens = usage.completionTokens ?? 0
+        // A provider may report only some of the counts, and a missing one used
+        // to decode as 0 — which reads as "this turn generated nothing" and
+        // silently disables the completion cap, the one budget that bounds a
+        // run by what it spends rather than by steps or the clock.
+        //
+        // Cache WRITES are prompt tokens the provider billed as input, so they
+        // belong in the prompt total (a cache read is already inside it on the
+        // providers that report both).
+        var prompt = usage.promptTokens
+        var completion = usage.completionTokens
+        if let total = usage.totalTokens {
+            // `total` is the only count some providers send. Derive whichever
+            // side is missing from it rather than dropping it.
+            if prompt == nil, let completion { prompt = max(0, total - completion) }
+            if completion == nil, let prompt { completion = max(0, total - prompt) }
+        }
+        if let writes = usage.cacheWriteTokens, writes > 0 {
+            prompt = (prompt ?? 0) + writes
+        }
+        result.promptTokens = prompt ?? 0
+        result.completionTokens = completion ?? 0
         result.cachedTokens = usage.cachedTokens ?? 0
         if let pricing, let cost = pricing.cost(for: usage) {
             result.costUSD = cost

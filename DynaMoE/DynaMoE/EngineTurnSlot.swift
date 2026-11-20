@@ -72,6 +72,25 @@ nonisolated final class TurnSlotClaim: @unchecked Sendable {
     var isHeld: Bool {
         ledger.holds(ticket)
     }
+
+    /// Marks this claim committed, i.e. past the point where a preemption may
+    /// still drop it. False when it was preempted first, which means the launch
+    /// must refuse itself rather than mint a generation id over another turn.
+    @discardableResult
+    func commit() -> Bool {
+        ledger.commit(ticket)
+    }
+
+    /// True when the ledger dropped this claim to make room for another turn.
+    ///
+    /// The holder needs to tell that from "somebody else holds the slot now":
+    /// the first means its work was preempted and should be reported as
+    /// cancelled, the second is an ordinary busy engine. `cancelClaim` is the
+    /// only writer, and it compares tickets, so a later claim's cancellation
+    /// can never make this one answer true.
+    var wasCancelled: Bool {
+        ledger.wasCancelled(ticket)
+    }
 }
 
 /// The generation slot's ownership, as a ledger of one outstanding claim.
@@ -86,6 +105,22 @@ nonisolated final class TurnSlotLedger: @unchecked Sendable {
     /// Why the outstanding claim was taken, so a prober can tell a background
     /// run's preparation from a chat turn's.
     private var outstandingPriority: TurnPriority = .interactive
+    /// Tickets that were dropped by a preemption rather than released by their
+    /// holder. Kept so the holder can tell "I was cancelled" from "I lost a
+    /// race": both leave it not holding the slot, and only the first means its
+    /// work should be reported as cancelled instead of failed.
+    ///
+    /// Bounded: an entry matters only until its holder looks, and a holder that
+    /// never looks would otherwise grow this for the process's life. The oldest
+    /// are dropped past `cancelledTicketLimit`, which can only lose a
+    /// distinction for a claim cancelled that long ago.
+    private var cancelledTickets: [UInt64] = []
+    private static let cancelledTicketLimit = 64
+    /// True once the holder has reached the point where its turn becomes the
+    /// live generation. Past it a preemption is refused rather than dropped:
+    /// the turn owns the KV cache by then, and dropping the claim would let a
+    /// second turn take the slot and overwrite the first one's generation id.
+    private var outstandingCommitted = false
     private var nextTicket: UInt64 = 0
 
     /// Takes the slot if nobody else holds it. Nil means somebody does.
@@ -94,8 +129,11 @@ nonisolated final class TurnSlotLedger: @unchecked Sendable {
         defer { lock.unlock() }
         guard outstanding == 0 else { return nil }
         nextTicket &+= 1
+        // 0 means "unclaimed", so a wrapped counter must never produce it.
+        if nextTicket == 0 { nextTicket = 1 }
         outstanding = nextTicket
         outstandingPriority = priority
+        outstandingCommitted = false
         return TurnSlotClaim(ledger: self, ticket: nextTicket, priority: priority)
     }
 
@@ -121,6 +159,27 @@ nonisolated final class TurnSlotLedger: @unchecked Sendable {
         guard ticket != 0, outstanding == ticket else { return }
         outstanding = 0
         outstandingPriority = .interactive
+        outstandingCommitted = false
+    }
+
+    /// Marks the claim as past its point of no return.
+    ///
+    /// `launchTurn` calls this in the same locked step that mints the turn's
+    /// generation id, so a preemption either lands before the turn is live (and
+    /// the launch refuses itself) or not at all. Without it a cancel could land
+    /// in the seconds a launch spends preparing — building a runtime, encoding
+    /// images, resetting the KV cache — after which the preparing turn would
+    /// still mint its id and overwrite the preemptor's.
+    ///
+    /// Returns false when the ticket is no longer held, i.e. it was preempted
+    /// first; the caller must then refuse the launch instead of committing.
+    @discardableResult
+    func commit(_ ticket: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard ticket != 0, outstanding == ticket else { return false }
+        outstandingCommitted = true
+        return true
     }
 
     /// Drops the outstanding claim when it belongs to `priority`.
@@ -135,7 +194,8 @@ nonisolated final class TurnSlotLedger: @unchecked Sendable {
     func cancelClaim(ifPriority priority: TurnPriority) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard outstanding != 0, outstandingPriority == priority else { return false }
+        guard outstanding != 0, outstandingPriority == priority, !outstandingCommitted else { return false }
+        noteCancelledLocked(outstanding)
         outstanding = 0
         outstandingPriority = .interactive
         return true
@@ -157,10 +217,26 @@ nonisolated final class TurnSlotLedger: @unchecked Sendable {
     func cancelClaim(ticket: UInt64) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard ticket != 0, outstanding == ticket else { return false }
+        guard ticket != 0, outstanding == ticket, !outstandingCommitted else { return false }
+        noteCancelledLocked(ticket)
         outstanding = 0
         outstandingPriority = .interactive
         return true
+    }
+
+    /// Whether `ticket` was dropped by a preemption rather than released.
+    func wasCancelled(_ ticket: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelledTickets.contains(ticket)
+    }
+
+    /// Records a dropped ticket. Caller holds the lock.
+    private func noteCancelledLocked(_ ticket: UInt64) {
+        cancelledTickets.append(ticket)
+        if cancelledTickets.count > Self.cancelledTicketLimit {
+            cancelledTickets.removeFirst(cancelledTickets.count - Self.cancelledTicketLimit)
+        }
     }
 
     func holds(_ ticket: UInt64) -> Bool {

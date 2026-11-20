@@ -11,9 +11,12 @@ final class AgentRunContext {
     nonisolated let runId: UUID
     /// The run's own id, used as its backend session. Not the conversation.
     nonisolated let sessionId: UUID
-    /// The coordinator turn/session that spawned this run, so a tool that
-    /// parents something (a nested spawn) stamps THAT identity rather than
-    /// whatever the process-global `currentTurnId` holds when it executes.
+    /// The coordinator turn/session that spawned this run, kept for the record
+    /// and for a delegation record that has to name its parent. Deliberately
+    /// NOT what tools execute under: a run is its own session, and handing a
+    /// tool the coordinator's identity would let it read and write the
+    /// coordinator's session-scoped state (todos, notes, the session log)
+    /// through a run that is supposed to be isolated from it.
     nonisolated let parentTurnId: UUID?
     nonisolated let parentSessionId: UUID?
     nonisolated let allowedTools: Set<String>
@@ -127,13 +130,16 @@ final class AgentRunContext {
             )
             return (json, record, false)
         }
+        // The run's OWN identity, not the coordinator's: `sessionId` is the run
+        // id (see the property above), and no turn id is passed because the run
+        // has no coordinator turn of its own to stamp. Nested spawn is
+        // forbidden, so nothing here needs the parent's identity.
         return await harness.executeTool(
             call: call.parsedCall,
             workingDirectory: workingDirectory,
             maxOutputLength: nil,
             mode: mode,
-            turnId: parentTurnId,
-            sessionId: parentSessionId
+            sessionId: sessionId
         )
     }
 

@@ -213,7 +213,7 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         let url = fileURL(runId: record.id, sessionId: record.parentSessionId)
         return await withCheckedContinuation { continuation in
             ioQueue.async { [self] in
-                let ok = writeNow(Self.bounded(record), to: url)
+                let ok = writeNow(Self.bounded(record), to: url) != nil
                 continuation.resume(returning: ok)
             }
         }
@@ -228,7 +228,7 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         let url = fileURL(runId: record.id, sessionId: record.parentSessionId)
         let bounded = Self.bounded(record)
         return onQueue { [self] in
-            writeNow(bounded, to: url)
+            writeNow(bounded, to: url) != nil
         }
     }
 
@@ -295,12 +295,15 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         guard var current = decodeRecord(at: url) else { return nil }
         change(&current)
         let bounded = Self.bounded(current)
-        guard writeNow(bounded, to: url) else { return nil }
         // `writeNow` may have redirected a tombstoned session's write to the
         // unscoped survivor, rewriting `parentSessionId` and `summaryRelayed`
         // on the way. Answer what was WRITTEN, not what was asked for, or a
-        // caller's next persistRecord puts the stale fields back.
-        return redirectedRecord(bounded, from: url)
+        // caller's next persistRecord puts the stale fields back -- and read
+        // it from the URL the write reports, never from a path re-derived
+        // here: a stale twin left by a crash between write-new and remove-old
+        // would decode as the survivor and clobber the real copy.
+        guard let writtenURL = writeNow(bounded, to: url) else { return nil }
+        return decodeRecord(at: writtenURL) ?? bounded
     }
 
     /// Marks a report delivered: the relay index learns it NOW, the durable
@@ -402,24 +405,12 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         return best?.url
     }
 
-    @discardableResult
-    /// The record as it now lives at `url`, after `writeNow`'s tombstone
-    /// redirect: the unscoped survivor when the session was deleted, otherwise
-    /// the record itself. Reads the file back rather than re-deriving the
-    /// redirect, so the two cannot disagree about which fields changed.
-    private func redirectedRecord(_ record: AgentRunRecord, from url: URL) -> AgentRunRecord {
-        let unscopedURL = fileURL(runId: record.id, sessionId: nil)
-        guard unscopedURL != url,
-              let survivor = decodeRecord(at: unscopedURL) else { return record }
-        return survivor
-    }
-
-    private func writeNow(_ record: AgentRunRecord, to url: URL) -> Bool {
+    private func writeNow(_ record: AgentRunRecord, to url: URL) -> URL? {
         signatureLock.lock()
         let runDeleted = deletedRunIds.contains(record.id)
         let sessionDeleted = record.parentSessionId.map { deletedSessionIds.contains($0) } ?? false
         signatureLock.unlock()
-        if runDeleted { return false }
+        if runDeleted { return nil }
 
         var record = record
         var url = url
@@ -431,7 +422,7 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
             // instead of dropping it.
             let unscopedURL = fileURL(runId: record.id, sessionId: nil)
             guard fileManager.fileExists(atPath: unscopedURL.path) else {
-                return false
+                return nil
             }
             record.parentSessionId = nil
             record.summaryRelayed = true
@@ -447,7 +438,7 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
             )
         } catch {
             DiagLog.warning("subagent.store", "could not create \(directory.lastPathComponent): \(error.localizedDescription)")
-            return false
+            return nil
         }
         let data: Data
         do {
@@ -456,7 +447,7 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
             data = try encoder.encode(record)
         } catch {
             DiagLog.warning("subagent.store", "failed to encode run \(record.id): \(error.localizedDescription)")
-            return false
+            return nil
         }
         let signature = SHA256.hash(data: data)
         let key = url.path
@@ -472,7 +463,7 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
             try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
             try? fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
             noteRelayMembership(record)
-            return true
+            return url
         }
         do {
             // A run's record carries the task, the conversation excerpt,
@@ -489,10 +480,10 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
             signatureLock.unlock()
             noteRelayMembership(record)
             postRecordsDidChange()
-            return true
+            return url
         } catch {
             DiagLog.warning("subagent.store", "failed to write run \(record.id): \(error.localizedDescription)")
-            return false
+            return nil
         }
     }
 
@@ -954,16 +945,26 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     /// decide to discard it, which they need to know it exists to do.
     private func decodeRecord(at url: URL) -> AgentRunRecord? {
         guard let data = try? Data(contentsOf: url) else { return nil }
-        guard let record = try? JSONDecoder().decode(AgentRunRecord.self, from: data) else {
-            reportUnreadableRecord(url, why: "it does not decode")
-            return nil
-        }
-        guard record.schemaVersion <= AgentRunRecord.currentSchemaVersion else {
+        // The version is read BEFORE the full decode: a newer build's record
+        // that adds a required field or an enum case fails `decode` first, and
+        // would be reported as corrupt when it is merely from the future.
+        if let version = try? JSONDecoder().decode(SchemaEnvelope.self, from: data),
+           version.schemaVersion > AgentRunRecord.currentSchemaVersion {
             // Written by a newer build: expected after a downgrade, and the
             // sweep already surfaces the count.
             return nil
         }
+        guard let record = try? JSONDecoder().decode(AgentRunRecord.self, from: data) else {
+            reportUnreadableRecord(url, why: "it does not decode")
+            return nil
+        }
+        guard record.schemaVersion <= AgentRunRecord.currentSchemaVersion else { return nil }
         return record
+    }
+
+    /// The one field a reader can trust before knowing the record's shape.
+    private struct SchemaEnvelope: Decodable {
+        let schemaVersion: Int
     }
 
     /// Logs an unreadable record once per path per process.
@@ -971,9 +972,12 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     /// Once, because the readers are per-send (`load(runId:sessionId:)` runs on
     /// every send) and a warning per read would bury every other line.
     private func reportUnreadableRecord(_ url: URL, why: String) {
-        signatureLock.lock()
+        // The set is process-wide, so it needs a lock of its own: `signatureLock`
+        // is per INSTANCE, and two stores over one root (the shared one and a
+        // test's) would race on a Set<String>.
+        Self.reportedLock.lock()
         let isNew = Self.reportedUnreadableRecords.insert(url.path).inserted
-        signatureLock.unlock()
+        Self.reportedLock.unlock()
         guard isNew else { return }
         DiagLog.warning(
             "subagent.store",
@@ -983,6 +987,7 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
 
     /// Paths already reported, so a per-send read logs once.
     nonisolated(unsafe) private static var reportedUnreadableRecords: Set<String> = []
+    private static let reportedLock = NSLock()
 
     // MARK: - Deletion and retention
 

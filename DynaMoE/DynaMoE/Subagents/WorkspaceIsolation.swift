@@ -398,13 +398,28 @@ nonisolated enum WorkspaceIsolation {
         path: String,
         branch: String,
         repositoryRoot recordedRoot: URL? = nil,
-        baseCommit recordedBase: String? = nil
+        baseCommit recordedBase: String? = nil,
+        runId: UUID? = nil
     ) async throws -> AgentWorktree {
         let worktreeURL = URL(fileURLWithPath: path, isDirectory: true)
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
               isDirectory.boolValue else {
             throw WorkspaceIsolationError.worktreeMissing(path)
+        }
+        // A run's worktree is always `root/<runId>`, and every check below
+        // proves only "some registered worktree of this repo". Without this
+        // one, a stale or tampered record naming a SIBLING run's worktree
+        // would pass them all: its diff would land under this run's identity,
+        // and the cleanup afterwards would delete the sibling's tree.
+        if let runId {
+            let expected = runId.uuidString
+            let actual = worktreeURL.standardizedFileURL.lastPathComponent
+            guard actual.caseInsensitiveCompare(expected) == .orderedSame else {
+                throw WorkspaceIsolationError.worktreeLinkageCompromised(
+                    "the worktree at '\(path)' belongs to a different run (expected '\(expected)', found '\(actual)')"
+                )
+            }
         }
         var repositoryRoot: URL?
         if let recordedRoot {
@@ -1512,10 +1527,32 @@ nonisolated enum WorkspaceIsolation {
                 // from under the patch. A discard owns it for the length of
                 // its removal, and the two must not race either. Both claims
                 // are MainActor state, so the question is asked there.
-                let owned = await MainActor.run {
-                    SubagentApplyService.isRunInFlight(runId) || SubagentApplyService.isBeingDiscarded(runId)
+                // Taken as a CLAIM, not just read: the git calls below await,
+                // so a discard or an apply starting in that window could delete
+                // or read the same tree concurrently. Holding the discard slot
+                // for the deletion makes the check and the removal one step;
+                // the apply claim is still only read (the sweep must never
+                // block an apply), so it is re-checked after each await below.
+                let owned = await MainActor.run { () -> Bool in
+                    if SubagentApplyService.isRunInFlight(runId) { return true }
+                    return !SubagentApplyService.beginDiscard(runId)
                 }
                 if owned { continue }
+                defer { Task { @MainActor in SubagentApplyService.endDiscard(runId) } }
+            }
+
+            // Nothing below may touch git in this tree until its `.git` is
+            // known to be the regular file git writes: a run can rewrite it
+            // (it is inside the sandbox), and a FIFO there blocks every git
+            // command for the whole process timeout, per call, at launch.
+            // `open` and `worktreeLinkageState` check this too; the sweep is
+            // the path that had no check at all.
+            switch await worktreeGitEntryState(path) {
+            case .regularFile, .missing:
+                break
+            case .unreadable(let why), .hostile(let why):
+                DiagLog.warning("workspace", "leaving the worktree at \(name) alone: \(why)")
+                continue
             }
 
             var removedTree = false
