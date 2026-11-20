@@ -550,8 +550,14 @@ nonisolated struct AgentRunRecord: Identifiable, Codable, Equatable, Sendable {
             guard !partial.isEmpty, partial != trimmedError else { return nil }
             return partial
         }
-        let summary = (report?.summary ?? error ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let recorded = report?.summary
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // An EMPTY summary is not an answer. `report?.summary ?? error` kept the
+        // empty string and never reached the error, so a failed or blocked run
+        // whose loop wrote no prose was treated as having nothing to relay: the
+        // store omitted it and the report was dropped once its instance was
+        // evicted.
+        let summary = recorded.isEmpty ? (trimmedError ?? "") : recorded
         return summary.isEmpty ? nil : summary
     }
 }

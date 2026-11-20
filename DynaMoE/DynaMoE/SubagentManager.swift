@@ -250,6 +250,11 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     /// caller is already watching the tool card, so only a run left in the
     /// background should bounce the Dock or post a banner.
     var notifiesOnFinish = true
+    /// Called once after the execution task has unwound. The manager uses it
+    /// to finish a drop it had to defer: a conversation delete removes the
+    /// runs it can, but a run still unwinding must stay reachable until it
+    /// stops touching its worktree.
+    var onExecutionUnwound: (() -> Void)?
     private var liveTextEntryId: UUID? = nil
     private var liveThinkingEntryId: UUID? = nil
 
@@ -401,6 +406,11 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         completedAt = Date()
         finalSummary = reason
         lastError = reason
+        // A stopped run spent real time. Leaving the duration at 0 made the
+        // drawer and the record report a cancellation as instantaneous.
+        if let startedAt {
+            executionDurationSeconds = Date().timeIntervalSince(startedAt)
+        }
         persistRecord()
 
         for c in continuations {
@@ -489,7 +499,11 @@ public final class SubagentInstance: Identifiable, ObservableObject {
                     timestamp: message.timestamp
                 )
             },
-            error: (status == .failed || status == .cancelled) ? (lastError ?? finalSummary) : nil,
+            // `blocked` is a terminal failure like any other: its reason is the
+            // only thing that explains the record, and the relay falls back to
+            // it when the loop wrote no prose.
+            error: (status == .failed || status == .cancelled || status == .blocked)
+                ? (lastError ?? finalSummary) : nil,
             depth: 0,
             summaryRelayed: isSummaryRelayed,
             appliedAt: appliedAt,
@@ -653,12 +667,48 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         if var current = report {
             current.openQuestions.append(note)
             report = current
+        } else {
+            // A scripted run (or a restored one) may have no report at all.
+            // Dropping the note left the operator with a kept branch nobody
+            // explained.
+            var synthesized = AgentReport(
+                status: Self.agentRunStatus(for: status),
+                summary: "",
+                findings: [],
+                changedFiles: [],
+                diff: nil,
+                tests: [],
+                risks: [],
+                openQuestions: [],
+                usage: usage,
+                backend: backendDescriptor
+                    ?? AgentBackendDescriptor(
+                        kind: .scripted,
+                        providerId: nil,
+                        modelId: nil,
+                        displayName: "Coordinator pipeline"
+                    )
+            )
+            synthesized.openQuestions.append(note)
+            report = synthesized
         }
         await AgentRunStore.shared.mutateAsync(runId: id, sessionId: parentSessionId) { current in
-            if var report = current.report {
-                report.openQuestions.append(note)
-                current.report = report
+            var updated = current.report ?? AgentReport(
+                status: current.status,
+                summary: "",
+                findings: [],
+                changedFiles: [],
+                diff: nil,
+                tests: [],
+                risks: [],
+                openQuestions: [],
+                usage: current.usage,
+                backend: current.backend
+            )
+            if !updated.openQuestions.contains(note) {
+                updated.openQuestions.append(note)
             }
+            current.report = updated
         }
         persistRecord()
     }
@@ -781,12 +831,14 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     private func markExecutionUnwound() {
         lock.lock()
         executionUnwound = true
+        let notify = onExecutionUnwound
         lock.unlock()
         // `canApplyChanges` and `canDiscard` in the inspector read
         // `isExecutionUnwound`, which is not `@Published`. Notify observers on
         // the MainActor so the Apply / Discard buttons appear as soon as a
         // stopped run finishes unwinding.
         objectWillChange.send()
+        notify?()
     }
 
     public func startExecution() {
@@ -1297,6 +1349,10 @@ public final class SubagentInstance: Identifiable, ObservableObject {
                 break
             }
         case .assistantDelta(let entryId, let text, let isThinking):
+            // A queued delta can land after a Stop latched the terminal state.
+            // Appending it kept a cancelled run's live text growing under its
+            // own final banner.
+            guard !hasFinished() else { return }
             if isThinking {
                 if liveThinkingEntryId != entryId {
                     liveThinkingEntryId = entryId
@@ -2202,6 +2258,12 @@ public final class SubagentManager: ObservableObject {
     /// `@Published` mutation on a run would not redraw anything that holds a
     /// value snapshot of it.
     private var instanceObservers: [UUID: AnyCancellable] = [:]
+    /// Instances a session drop had to leave in place because their execution
+    /// task was still unwinding. The instance reports its unwind through
+    /// `onExecutionUnwound`, and the id is removed from here in that step; a
+    /// terminal run of a deleted conversation must not stay in "All Runs"
+    /// forever just because the operator deleted the chat mid-unwind.
+    private var pendingEvictions: Set<UUID> = []
     /// In-flight spawn reservations keyed by parent session (nil = unscoped).
     /// Taken BEFORE `AgentSpawnResolver.resolve()` so concurrent `spawn_subagent`
     /// calls cannot race past the per-session cap and create excess worktrees.
@@ -2555,18 +2617,21 @@ public final class SubagentManager: ObservableObject {
         lock.lock()
         instanceObservers[instance.id] = observer
         lock.unlock()
+        instance.onExecutionUnwound = { [weak self, weak instance] in
+            guard let self, let instance else { return }
+            self.evictIfPending(instance)
+        }
 
+        // A spawn must not move the inspector's SELECTION. `selectedSubagentId`
+        // is a notification channel: the pane consumes it and clears it, so a
+        // `== nil` test here was true after every consumption and each new run
+        // dragged the pane out of whatever list or detail the operator was
+        // reading (and reset its draft and alert state).
         if Thread.isMainThread {
             self.subagents.insert(instance, at: 0)
-            if self.selectedSubagentId == nil {
-                self.selectedSubagentId = instance.id
-            }
         } else {
             DispatchQueue.main.async {
                 self.subagents.insert(instance, at: 0)
-                if self.selectedSubagentId == nil {
-                    self.selectedSubagentId = instance.id
-                }
             }
         }
         trimRetainedTerminalInstances()
@@ -2589,24 +2654,27 @@ public final class SubagentManager: ObservableObject {
         let candidates = subagentsOrder
         lock.unlock()
         var finishedSeen = 0
-        var removable: [UUID] = []
+        var removable: Set<UUID> = []
         for instance in candidates where instance.status.isTerminal {
             finishedSeen += 1
             guard finishedSeen > maximumRetainedTerminalInstances else { continue }
             guard instance.isExecutionUnwound else { continue }
-            removable.append(instance.id)
+            removable.insert(instance.id)
         }
-        guard !removable.isEmpty else { return }
+        removeInstances(ids: removable)
+    }
 
+    /// Drops instances from both stores, and moves a selection that pointed at
+    /// one of them to whatever is left.
+    private func removeInstances(ids: Set<UUID>) {
+        guard !ids.isEmpty else { return }
         lock.lock()
-        let removed = Set(removable)
-        subagentsOrder.removeAll { removed.contains($0.id) }
-        for id in removed {
+        subagentsOrder.removeAll { ids.contains($0.id) }
+        for id in ids {
             subagentsById.removeValue(forKey: id)
             instanceObservers.removeValue(forKey: id)?.cancel()
         }
         lock.unlock()
-        let ids = removed
         if Thread.isMainThread {
             subagents.removeAll { ids.contains($0.id) }
             if let selected = selectedSubagentId, ids.contains(selected) {
@@ -2620,6 +2688,17 @@ public final class SubagentManager: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Completes a deferred session drop. The instance reports its unwind
+    /// through `onExecutionUnwound`; anything not marked pending is an ordinary
+    /// terminal run and stays for the inspector.
+    private func evictIfPending(_ instance: SubagentInstance) {
+        lock.lock()
+        let wasPending = pendingEvictions.remove(instance.id) != nil
+        lock.unlock()
+        guard wasPending, instance.status.isTerminal, instance.isExecutionUnwound else { return }
+        removeInstances(ids: [instance.id])
     }
 
     // MARK: - Lookup & Management
@@ -2661,7 +2740,11 @@ public final class SubagentManager: ObservableObject {
     /// A Stop is the operator abandoning the turn, not just its current step:
     /// leaving a child working on it would spend tokens on work nobody asked
     /// for and could let it write after the conversation moved on.
-    public func cancelSession(sessionId: UUID, reason: String = "The coordinator turn was stopped.") {
+    public func cancelSession(
+        sessionId: UUID,
+        reason: String = "The coordinator turn was stopped.",
+        dropsRuns: Bool = false
+    ) {
         let children = allSubagents.filter {
             $0.parentSessionId == sessionId && !$0.status.isTerminal
         }
@@ -2677,26 +2760,34 @@ public final class SubagentManager: ObservableObject {
         // former leaves the object listed (and reachable by id through
         // `getSubagent`'s fallback) for a conversation the operator deleted.
         lock.lock()
-        // `status.isTerminal` is not enough to drop one: `cancel` above sets it
-        // immediately while `executionUnwound` is still false, and the apply
-        // path reads `isExecutionUnwound` through `getSubagent(byId:)` — a
-        // dropped instance answers `nil` there, which every caller reads as
-        // "unwound", so Apply could land a worktree while a child process is
-        // still being killed. Keep it until the unwind completes.
-        let terminal = subagentsOrder.filter {
-            $0.parentSessionId == sessionId && $0.status.isTerminal && $0.isExecutionUnwound
-        }.map(\.id)
-        if !terminal.isEmpty {
-            let dropped = Set(terminal)
-            subagentsOrder.removeAll { dropped.contains($0.id) }
-            for id in dropped {
-                subagentsById.removeValue(forKey: id)
-                instanceObservers.removeValue(forKey: id)?.cancel()
+        var dropped: Set<UUID> = []
+        var deferred: [SubagentInstance] = []
+        for instance in subagentsOrder where instance.parentSessionId == sessionId {
+            // `status.isTerminal` is not enough to drop one: `cancel` above
+            // sets it immediately while `executionUnwound` is still false, and
+            // the apply path reads `isExecutionUnwound` through
+            // `getSubagent(byId:)` — a dropped instance answers `nil` there,
+            // which every caller reads as "unwound", so Apply could land a
+            // worktree while a child process is still being killed. Keep it
+            // until the unwind completes.
+            if instance.status.isTerminal && instance.isExecutionUnwound {
+                dropped.insert(instance.id)
+            } else if dropsRuns {
+                // The conversation is gone, so there is nothing left to show
+                // the object to. Queue it for the moment its task lets go;
+                // leaving it out of the queue is what left cancelled runs of
+                // deleted chats in "All Runs" forever.
+                pendingEvictions.insert(instance.id)
+                deferred.append(instance)
             }
-            lock.unlock()
-            subagents.removeAll { dropped.contains($0.id) }
-        } else {
-            lock.unlock()
+        }
+        pendingEvictions.subtract(dropped)
+        lock.unlock()
+        removeInstances(ids: dropped)
+        // An instance that unwound between the snapshot and the insert above
+        // has already fired its callback, so nothing else would deliver it.
+        for instance in deferred where instance.isExecutionUnwound {
+            evictIfPending(instance)
         }
         Task { await AgentScheduler.shared.cancelRuns(parentSessionId: sessionId, reason: reason) }
     }

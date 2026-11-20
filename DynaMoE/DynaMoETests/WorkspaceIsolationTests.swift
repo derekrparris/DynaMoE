@@ -90,7 +90,7 @@ final class WorkspaceIsolationTests: XCTestCase {
                 [.posixPermissions: 0o700],
                 ofItemAtPath: worktreeRoot.path
             )
-            Task { await WorkspaceIsolation.cleanup(worktree) }
+            addTeardownBlock { _ = await WorkspaceIsolation.cleanup(worktree) }
         }
 
         let removed = await WorkspaceIsolation.cleanup(worktree)
@@ -734,7 +734,8 @@ final class WorkspaceIsolationTests: XCTestCase {
         store.saveImmediately(cancelled)
         defer {
             store.delete(runId: runId, sessionId: nil)
-            Task { await WorkspaceIsolation.cleanup(worktree) }
+            store.flush()
+            addTeardownBlock { _ = await WorkspaceIsolation.cleanup(worktree) }
         }
 
         let removed = await WorkspaceIsolation.pruneStaleWorktrees(
@@ -775,7 +776,8 @@ final class WorkspaceIsolationTests: XCTestCase {
         defer {
             SubagentApplyService.endApplyForTesting(runId)
             store.delete(runId: runId, sessionId: nil)
-            Task { await WorkspaceIsolation.cleanup(worktree) }
+            store.flush()
+            addTeardownBlock { _ = await WorkspaceIsolation.cleanup(worktree) }
         }
 
         SubagentApplyService.beginApplyForTesting(runId)
@@ -820,7 +822,8 @@ final class WorkspaceIsolationTests: XCTestCase {
         XCTAssertTrue(store.saveImmediately(applied))
         defer {
             store.delete(runId: runId, sessionId: nil)
-            Task { await WorkspaceIsolation.cleanup(worktree) }
+            store.flush()
+            addTeardownBlock { _ = await WorkspaceIsolation.cleanup(worktree) }
         }
 
         let removed = await WorkspaceIsolation.pruneStaleWorktrees(
@@ -850,7 +853,7 @@ final class WorkspaceIsolationTests: XCTestCase {
         try Data("not a run record".utf8).write(to: recordURL)
         defer {
             try? FileManager.default.removeItem(at: recordURL)
-            Task { await WorkspaceIsolation.cleanup(worktree) }
+            addTeardownBlock { _ = await WorkspaceIsolation.cleanup(worktree) }
         }
 
         let removed = await WorkspaceIsolation.pruneStaleWorktrees(
@@ -914,7 +917,7 @@ final class WorkspaceIsolationTests: XCTestCase {
             }
             AgentRunStore.shared.delete(runId: runId, sessionId: nil)
             AgentRunStore.shared.flush()
-            await WorkspaceIsolation.cleanup(worktree)
+            _ = await WorkspaceIsolation.cleanup(worktree)
         }
 
         // Wait until the run has actually produced its work before stopping it,
@@ -1082,7 +1085,8 @@ final class WorkspaceIsolationTests: XCTestCase {
         defer {
             SubagentManager.shared.clearCompleted(sessionId: session)
             AgentRunStore.shared.delete(runId: runId, sessionId: session)
-            Task { await WorkspaceIsolation.cleanup(worktree) }
+            AgentRunStore.shared.flush()
+            addTeardownBlock { _ = await WorkspaceIsolation.cleanup(worktree) }
         }
 
         _ = await subagent.waitForCompletion()
@@ -1214,7 +1218,8 @@ final class WorkspaceIsolationTests: XCTestCase {
         AgentRunStore.shared.saveImmediately(record)
         defer {
             AgentRunStore.shared.delete(runId: runId, sessionId: nil)
-            Task { await WorkspaceIsolation.cleanup(worktree) }
+            AgentRunStore.shared.flush()
+            addTeardownBlock { _ = await WorkspaceIsolation.cleanup(worktree) }
             try? FileManager.default.removeItem(at: repository.appendingPathComponent("from_agent.txt"))
         }
 
@@ -1784,7 +1789,7 @@ final class WorkspaceIsolationTests: XCTestCase {
             runId: UUID(),
             root: worktreeRoot
         )
-        defer { _ = Task { await WorkspaceIsolation.cleanup(worktree) } }
+        addTeardownBlock { _ = await WorkspaceIsolation.cleanup(worktree) }
 
         // A side branch with a different README, so the merge stays pending
         // under `--no-commit --no-ff`.
@@ -1869,7 +1874,7 @@ final class WorkspaceIsolationTests: XCTestCase {
             runId: UUID(),
             root: worktreeRoot
         )
-        defer { _ = Task { await WorkspaceIsolation.cleanup(worktree) } }
+        addTeardownBlock { _ = await WorkspaceIsolation.cleanup(worktree) }
 
         let big = String(repeating: "blob-bloat guard ", count: 6_400)
         try big.write(
@@ -2046,7 +2051,8 @@ final class WorkspaceIsolationTests: XCTestCase {
         AgentRunStore.shared.saveImmediately(record)
         defer {
             AgentRunStore.shared.delete(runId: runId, sessionId: nil)
-            Task { await WorkspaceIsolation.cleanup(worktree) }
+            AgentRunStore.shared.flush()
+            addTeardownBlock { _ = await WorkspaceIsolation.cleanup(worktree) }
             try? FileManager.default.removeItem(at: repository.appendingPathComponent("README.md"))
             try? mainReadme.write(to: mainReadmeURL, atomically: true, encoding: .utf8)
         }
@@ -2110,7 +2116,8 @@ final class WorkspaceIsolationTests: XCTestCase {
         AgentRunStore.shared.saveImmediately(record)
         defer {
             AgentRunStore.shared.delete(runId: runId, sessionId: nil)
-            Task { await WorkspaceIsolation.cleanup(worktree) }
+            AgentRunStore.shared.flush()
+            addTeardownBlock { _ = await WorkspaceIsolation.cleanup(worktree) }
         }
 
         do {
@@ -2271,7 +2278,7 @@ final class WorkspaceIsolationTests: XCTestCase {
             runId: runId,
             root: worktreeRoot
         )
-        addTeardownBlock { await WorkspaceIsolation.cleanup(worktree) }
+        addTeardownBlock { _ = await WorkspaceIsolation.cleanup(worktree) }
 
         let backend = ScriptedBackend(turns: [.init(text: "never runs")])
         let plan = AgentSpawnPlan(
@@ -2344,7 +2351,7 @@ final class WorkspaceIsolationTests: XCTestCase {
             runId: runId,
             root: worktreeRoot
         )
-        addTeardownBlock { await WorkspaceIsolation.cleanup(worktree) }
+        addTeardownBlock { _ = await WorkspaceIsolation.cleanup(worktree) }
 
         // Delete the worktree's `.git` pointer file inside the sandbox.
         let dotGit = worktree.path.appendingPathComponent(".git")

@@ -340,15 +340,24 @@ public final class CompletionEngine: @unchecked Sendable {
 
     private init() {}
 
-    /// True while a turn is running OR one is being prepared under a claim.
+    /// True while a turn is running, one is being prepared under a claim, or a
+    /// scoped tool mask still owns the grammar registry.
     ///
     /// The second half matters to the server queue: it asks this before deciding to
     /// launch, and a claim taken by another caller is exactly as busy as a running
     /// turn.
+    ///
+    /// The third is the tail of the same turn. The engine's task ends inside
+    /// `withTurnToolMask`'s body, so there is a window where the slot reads free
+    /// while the run's vocabulary is still installed; a launch there would
+    /// generate against another turn's tools and then have the base registry
+    /// restored underneath it. A scoped mask is therefore occupancy.
     public var isActive: Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return currentGenerationTask != nil || turnSlotLedger.isClaimed
+        return currentGenerationTask != nil
+            || turnSlotLedger.isClaimed
+            || GrammarConstrainedSampler.isScopedMaskInstalled
     }
 
     public var hasLoadedModel: Bool {
@@ -489,6 +498,11 @@ public final class CompletionEngine: @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         guard currentGenerationTask == nil else { return nil }
+        // A scoped tool mask outlives the engine task by the length of
+        // `withTurnToolMask`'s unwind. Reserving in that window would launch a
+        // turn into the run's vocabulary; treating the mask as occupancy makes
+        // the caller wait the few milliseconds instead.
+        guard !GrammarConstrainedSampler.isScopedMaskInstalled else { return nil }
         return turnSlotLedger.tryClaim(priority: priority)
     }
 
@@ -1159,9 +1173,13 @@ public final class CompletionEngine: @unchecked Sendable {
                         // ended the turn on an unforwarded token leaves the pin one
                         // longer than the cache, and the cut in `reusablePrefix` takes
                         // the shorter of the two. Recorded before the cancel check as
-                        // well, because a stopped turn still leaves a sequence behind.
+                        // well, because a stopped turn still leaves a sequence behind
+                        // — but only as far as that sequence actually reaches: a
+                        // cancellation during PREFILL pins the positions the executor
+                        // wrote, not the whole prompt, or the next spawn prices
+                        // re-prefill against tokens that were never resident.
                         PrefixCacheManager.shared.recordTurn(
-                            promptTokenIds: dsPromptIds,
+                            promptTokenIds: Array(dsPromptIds.prefix(output.storedPromptTokens)),
                             generatedTokenIds: output.generatedTokenIds,
                             sessionId: dsSessionId,
                             asOfDate: dsAsOfDate

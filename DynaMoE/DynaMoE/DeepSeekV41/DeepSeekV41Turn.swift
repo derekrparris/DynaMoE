@@ -239,6 +239,14 @@ nonisolated public enum DeepSeekV41TurnRunner {
         /// Prompt positions this turn did not have to run because the cache already
         /// held them.
         var prefixTokensReused: Int
+        /// Prompt positions the executor's cache ACTUALLY holds after this turn.
+        ///
+        /// Equal to `promptTokens` once prefill finishes, and SHORTER when a
+        /// cancellation stopped it partway. The caller pins exactly this many
+        /// ids: recording the whole prompt for a half-prefilled turn left the
+        /// app-wide prefix pin longer than the cache, so the next spawn priced
+        /// re-prefill against tokens that were never resident.
+        var storedPromptTokens: Int
         var prefillSeconds: Double
         var decodeSeconds: Double
         var tokensPerSecond: Double
@@ -365,6 +373,7 @@ nonisolated public enum DeepSeekV41TurnRunner {
                 return cancelledOutput(
                     generated: [], text: "", promptTokens: promptTokenIds.count,
                     prefixTokensReused: resumeFrom,
+                    storedPromptTokens: resumeFrom,
                     prefillSeconds: CFAbsoluteTimeGetCurrent() - prefillStart,
                     decodeSeconds: 0, firstToken: nil
                 )
@@ -388,6 +397,9 @@ nonisolated public enum DeepSeekV41TurnRunner {
                     return cancelledOutput(
                         generated: [], text: "", promptTokens: promptTokenIds.count,
                         prefixTokensReused: resumeFrom,
+                        // Positions before `offset` were forwarded; the rest
+                        // were never written, so the pin stops here.
+                        storedPromptTokens: offset,
                         prefillSeconds: CFAbsoluteTimeGetCurrent() - prefillStart,
                         decodeSeconds: 0, firstToken: nil
                     )
@@ -500,6 +512,7 @@ nonisolated public enum DeepSeekV41TurnRunner {
             tokensGenerated: generated.count,
             promptTokens: promptTokenIds.count,
             prefixTokensReused: resumeFrom,
+            storedPromptTokens: promptTokenIds.count,
             prefillSeconds: prefillSeconds,
             decodeSeconds: decodeSeconds,
             tokensPerSecond: decodeSeconds > 0 ? Double(generated.count) / decodeSeconds : 0,
@@ -513,6 +526,7 @@ nonisolated public enum DeepSeekV41TurnRunner {
         text: String,
         promptTokens: Int,
         prefixTokensReused: Int,
+        storedPromptTokens: Int,
         prefillSeconds: Double,
         decodeSeconds: Double,
         firstToken: Double?
@@ -525,6 +539,7 @@ nonisolated public enum DeepSeekV41TurnRunner {
             tokensGenerated: generated.count,
             promptTokens: promptTokens,
             prefixTokensReused: prefixTokensReused,
+            storedPromptTokens: storedPromptTokens,
             prefillSeconds: prefillSeconds,
             decodeSeconds: decodeSeconds,
             tokensPerSecond: 0,

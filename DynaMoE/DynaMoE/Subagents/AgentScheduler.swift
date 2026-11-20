@@ -409,17 +409,52 @@ actor AgentScheduler {
         }
     }
 
-    /// Lowest priority number first, then earliest enqueue — among waiters of
-    /// the SAME class. Ordering across classes would let one class's head starve
-    /// another class that has capacity, which is exactly what independent cloud
-    /// quotas are for.
+    /// Lowest priority number first, then earliest enqueue — within a class,
+    /// and across CLOUD classes that are both competing for the shared
+    /// `cloudGlobal` cap.
+    ///
+    /// Ordering every class against every other would let one class's head
+    /// starve another class that has capacity, which is exactly what
+    /// independent cloud quotas are for. But the cloud classes also share one
+    /// global ceiling, and comparing only within a class let a `.speculative`
+    /// run on one provider wake first and take a slot the `.interactive` waiter
+    /// on another provider had been waiting for. A class whose own provider is
+    /// full is not competing for anything, so it is excluded from the
+    /// comparison; everybody eligible for the shared slot is ordered by
+    /// priority and then enqueue time.
     private func isHeadWaiter(_ ticket: UUID) -> Bool {
         guard let mine = waiters[ticket] else { return false }
-        for other in waiters.values
-        where other.ticket != mine.ticket && other.schedulingClass == mine.schedulingClass {
+        let crossesCloudProviders = mine.schedulingClass.isCloud
+        for other in waiters.values where other.ticket != mine.ticket {
+            let competes: Bool
+            if other.schedulingClass == mine.schedulingClass {
+                competes = true
+            } else if crossesCloudProviders,
+                      other.schedulingClass.isCloud,
+                      perProviderHasRoom(other.schedulingClass) {
+                competes = true
+            } else {
+                competes = false
+            }
+            guard competes else { continue }
             if other.priority < mine.priority { return false }
             if other.priority == mine.priority, other.sequence < mine.sequence { return false }
         }
         return true
+    }
+
+    /// Whether `schedulingClass`'s own quota has room, ignoring the shared
+    /// cloud ceiling. A cloud waiter blocked by its provider's quota cannot be
+    /// granted even after a global slot frees, so it must not order the
+    /// waiters that can.
+    private func perProviderHasRoom(_ schedulingClass: AgentSchedulingClass) -> Bool {
+        switch schedulingClass {
+        case .local:
+            return (tickets[.local]?.count ?? 0) < limits.local
+        case .appleFoundationModel:
+            return (tickets[.appleFoundationModel]?.count ?? 0) < limits.appleFoundationModel
+        case .cloud(let providerId):
+            return (tickets[.cloud(providerId: providerId)]?.count ?? 0) < limits.cloudPerProvider
+        }
     }
 }

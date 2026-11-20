@@ -113,7 +113,13 @@ final class SubagentApprovalCenter: ObservableObject {
             }
         }
 
-        let timeout = min(overrideTimeout ?? Self.resolvedApprovalTimeout(), 86_400)
+        let requestedTimeout = overrideTimeout ?? Self.resolvedApprovalTimeout()
+        // The value reaches `UInt64(timeout * 1e9)`, which TRAPS on a negative
+        // or non-finite input. A caller-supplied or hand-edited timeout must
+        // degrade to the default instead of killing the app at a card.
+        let timeout = requestedTimeout.isFinite
+            ? min(max(0, requestedTimeout), 86_400)
+            : Self.defaultApprovalTimeout
         let approved = await withTaskGroup(of: Bool.self) { group in
             group.addTask {
                 await ActionApprovalManager.shared.waitForApproval(id: entry.id, scope: scope)
@@ -174,15 +180,28 @@ final class SubagentApprovalCenter: ObservableObject {
 
     /// The card's own description of what is at stake.
     static func confirmation(for request: AgentApprovalRequest) -> PendingActionConfirmation {
-        PendingActionConfirmation(
+        // `reason` is not always one line. An apply's carries the destination
+        // branch, a dirty-tree warning, the diff stat and the patch preview,
+        // separated by blank lines — and the card's target summary is drawn
+        // with a single-line truncation. Splitting at the first blank line
+        // keeps the identifying sentence where it belongs and gives the
+        // evidence the card's scrollable preview, which is the only place a
+        // multi-line warning or diff can actually be read.
+        let paragraphs = request.reason.components(separatedBy: "\n\n")
+        let summary = paragraphs.first ?? request.reason
+        let evidence = paragraphs.dropFirst()
+            .joined(separator: "\n\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return PendingActionConfirmation(
             toolName: request.toolName,
             arguments: request.arguments,
-            targetSummary: request.reason,
+            targetSummary: summary,
             destinationSummary: AgentHarness.approvalDestination(
                 toolName: request.toolName,
                 arguments: request.arguments,
                 workingDirectory: request.workingDirectory
             ),
+            diffPreview: evidence.isEmpty ? nil : evidence,
             commandPreview: request.arguments["command"]
         )
     }

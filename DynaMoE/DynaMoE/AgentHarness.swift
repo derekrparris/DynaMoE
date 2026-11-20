@@ -2504,9 +2504,15 @@ public final class SpawnSubagentTool: AgentTool {
         // run would be stamped with a turn that never asked for it (so Stop
         // cancelled the wrong runs). A run-scoped harness has no global turn to
         // fall back to; its identity was passed in, and nil there means nil.
+        //
+        // The SESSION has no fallback of its own: `executeTool` binds the one
+        // effective session (including the `currentSessionId` fallback) for the
+        // whole call, and `get_subagent_status`, `send_subagent_message`,
+        // `list_subagents` and `apply_subagent_changes` compare against that
+        // exact binding. Resolving a different value here spawned runs the
+        // sibling tools could not see.
         let inRunScope = AgentHarness.executingInRunScope
         let parentSessionId = AgentHarness.executingSessionId
-            ?? (inRunScope ? nil : AgentHarness.shared.currentSessionId)
         let parentTurnId = AgentHarness.executingTurnId
             ?? (inRunScope ? nil : AgentHarness.shared.currentTurnId)
 
@@ -2612,7 +2618,12 @@ public final class SpawnSubagentTool: AgentTool {
                     workingDirectory: spawnDirectory.path,
                     reason: message
                 )
-                guard await SubagentApprovalCenter.shared.request(approval, honorsTurbo: false) else {
+                // The card is cancellation-aware: a Stop resolves it as
+                // "not approved", which is NOT the operator declining. Reporting
+                // a decline for a stopped turn blamed a decision nobody made.
+                let costApproved = await SubagentApprovalCenter.shared.request(approval, honorsTurbo: false)
+                guard costApproved else {
+                    if Task.isCancelled { return Self.stoppedBeforeStartResult() }
                     let declined = "The operator declined this local run's estimated re-prefill cost. Send the task to a cloud backend, raise dynamoe_subagent_local_cost_limit in Settings, or give it a smaller task."
                     return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: declined), nil, declined, false)
                 }
@@ -3434,18 +3445,38 @@ public final class ApplySubagentChangesTool: AgentTool {
         }
         let record = SubagentManager.shared.getSubagent(byId: runId)?.snapshotRecord()
             ?? AgentRunStore.shared.loadAny(runId: runId)
-        guard let record, case .worktree = record.isolation else { return nil }
-        guard let root = record.repositoryRoot else { return nil }
-        let branch = await WorkspaceIsolation.currentBranch(
-            of: URL(fileURLWithPath: root, isDirectory: true)
-        )
-        // `resolved: true` even for a detached HEAD: the branch being nil is
-        // itself the answer, and a `git checkout main` while the card is open
-        // must be refused rather than read as "nothing to compare".
+        guard let record, case .worktree(let path, let branch) = record.isolation else { return nil }
+        // The destination branch AND the exact patch are bound HERE, before the
+        // operator can click. Resolving the digest at execute time bound bytes
+        // nobody had a chance to review: a worktree that changed while the card
+        // sat open still matched its own fresh snapshot, so
+        // `patchChangedSinceApproval` could never fire.
+        let destination = record.repositoryRoot.map {
+            URL(fileURLWithPath: $0, isDirectory: true)
+        }
+        var destinationBranch: String?
+        var destinationBranchResolved = false
+        if let destination {
+            destinationBranch = await WorkspaceIsolation.currentBranch(of: destination)
+            // `resolved: true` even for a detached HEAD: the branch being nil is
+            // itself the answer, and a `git checkout main` while the card is open
+            // must be refused rather than read as "nothing to compare".
+            destinationBranchResolved = true
+        }
+        var digest: String?
+        if let worktree = try? await WorkspaceIsolation.open(
+            path: path,
+            branch: branch,
+            repositoryRoot: destination,
+            baseCommit: record.baseCommit,
+            runId: record.id
+        ), let changes = try? await WorkspaceIsolation.snapshot(worktree, diffLimit: nil) {
+            digest = SubagentApplyService.patchDigest(changes.diff)
+        }
         return SubagentApplyExpectation(
-            destinationBranch: branch,
-            destinationBranchResolved: true,
-            patchDigest: nil
+            destinationBranch: destinationBranch,
+            destinationBranchResolved: destinationBranchResolved,
+            patchDigest: digest
         )
     }
 
@@ -3489,9 +3520,16 @@ public final class ApplySubagentChangesTool: AgentTool {
             return (AgentHarness.toolErrorJSON(tool: "apply_subagent_changes", error: err), nil, err, false)
         }
 
-        // Bound to the destination branch, then re-checked before a byte is
-        // written: a `git checkout` between the approval card and this call
-        // must not land the patch on a branch the operator never saw.
+        // Bound to the destination branch AND the patch digest at card time,
+        // then re-checked before a byte is written: a `git checkout` or a
+        // worktree edit between the approval card and this call must not land
+        // something the operator never saw.
+        //
+        // The digest is part of that pin (`approvalExpectation` snapshots the
+        // live worktree before the card is raised). Resolving it here instead
+        // made the check a tautology — the fresh digest always matched the
+        // snapshot it had just taken — so a card left open over a changed
+        // worktree authorised bytes the card never showed.
         //
         // The branch is PINNED by the caller that raised the card
         // (`approvalExpectation`, resolved next to the SubQ endpoint pin and
@@ -3500,14 +3538,6 @@ public final class ApplySubagentChangesTool: AgentTool {
         // can sit open while the operator works in the repository. A headless
         // caller raises no card, has nothing to be stale against, and pins
         // nothing; it resolves the branch below exactly as before.
-        //
-        // The PATCH digest is deliberately taken at execute time even when a
-        // pin exists. The card's preview is the run's RECORDED report
-        // (`SubagentApplyControl.approvalSummary` renders `record.report?.diff`,
-        // bounded and possibly truncated), not a live snapshot of the worktree,
-        // so a digest captured at card time would bind bytes that were never
-        // shown. `SubagentApplyService.apply` still re-snapshots immediately
-        // before writing, so what lands is the patch that was verified.
         //
         // Resolved HERE rather than through a card-raising helper: this tool's
         // own invocation IS the operator's decision (it is state-changing, so
@@ -3531,15 +3561,30 @@ public final class ApplySubagentChangesTool: AgentTool {
                 of: URL(fileURLWithPath: recordedRoot, isDirectory: true)
             )
         }
-        let preview = await SubagentApplyService.applyExpectation(
-            runId: runId,
-            destinationBranch: destinationBranch,
-            destinationBranchResolved: destinationBranchResolved
-        )
+        let expectation: SubagentApplyExpectation?
+        if let pinned = Self.pinnedDestination {
+            // The card's own pin, digest included. Re-snapshotting here would
+            // authorize whatever the worktree holds NOW — the exact TOCTOU the
+            // pin exists to close — because the fresh digest always matches the
+            // snapshot that produced it.
+            expectation = SubagentApplyExpectation(
+                destinationBranch: destinationBranch,
+                destinationBranchResolved: destinationBranchResolved,
+                patchDigest: pinned.patchDigest
+            )
+        } else {
+            // A headless caller raised no card, so there is nothing to be stale
+            // against: it resolves the live patch immediately before the apply.
+            expectation = await SubagentApplyService.applyExpectation(
+                runId: runId,
+                destinationBranch: destinationBranch,
+                destinationBranchResolved: destinationBranchResolved
+            ).expectation
+        }
         do {
             let outcome = try await SubagentApplyService.apply(
                 runId: runId,
-                expectation: preview.expectation
+                expectation: expectation
             )
             let formatter = ISO8601DateFormatter()
             formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -3917,7 +3962,15 @@ public final class AgentHarness {
         // it (the start of an in-app send) is refused a moment later by the
         // single-flight slot anyway. Nothing can then run on stale grammar, and
         // the next assertion made while the engine is idle heals the registry.
-        guard !CompletionEngine.shared.isActive else { return }
+        //
+        // A refusal still has to be RECORDED. Returning here without arming the
+        // deferral left the mode flip with no pending rebuild at all, so the next
+        // idle assertion had nothing to flush and the stale registry survived
+        // until some unrelated registration happened to sync it.
+        guard !CompletionEngine.shared.isActive else {
+            grammarSyncDeferred = true
+            return
+        }
         syncGrammar()
     }
 
@@ -6566,7 +6619,15 @@ public final class AgentHarness {
         // refused instead of landing the patch somewhere the operator never saw.
         return await AgentHarness.$executingTurnMode.withValue(effectiveMode) {
             await AgentHarness.$executingTurnId.withValue(turnId ?? AgentHarness.executingTurnId) {
-                await AgentHarness.$executingSessionId.withValue(sessionId ?? AgentHarness.executingSessionId) {
+                // ONE effective session for the whole call, fallbacks included.
+                // `spawn_subagent` used to fall back to `currentSessionId` on
+                // its own while the sibling lookup tools compared strictly
+                // against this binding, so an unscoped caller could spawn runs
+                // its own status/apply tools could not see. Binding the
+                // fallback here makes every tool agree by construction.
+                await AgentHarness.$executingSessionId.withValue(
+                    sessionId ?? AgentHarness.executingSessionId ?? AgentHarness.shared.currentSessionId
+                ) {
                     await AgentHarness.$executingInRunScope.withValue(isRunScoped) {
                         await AgentHarness.$executingUnreviewedToolCall.withValue(unreviewed) {
                             await SubQDecideTool.$pinnedEndpoint.withValue(approvedSubQEndpoint) {
@@ -8182,7 +8243,15 @@ public final class AgentHarness {
             var isFinished = false
             var isTimedOut = false
             var isCancelled = false
-            var timerWorkItem: DispatchWorkItem?
+            /// The timeout wait. A Task rather than a `DispatchWorkItem` +
+            /// `asyncAfter`: libdispatch retains a scheduled item — and
+            /// everything it captured, including the `Process` and both
+            /// `Pipe`s with their descriptors — until its deadline even after
+            /// `cancel()`. Every spawned child therefore leaked two file
+            /// descriptors for the length of the timeout, and a suite that
+            /// spawned a few hundred git processes exhausted the host's fd
+            /// limit. A cancelled sleeping Task releases its captures at once.
+            var timerTask: Task<Void, Never>?
             /// True once `process.run()` returned. `terminate()` raises an
             /// uncatchable ObjC exception on a process that never launched, so
             /// every kill path has to know whether there is anything to kill.
@@ -8193,8 +8262,21 @@ public final class AgentHarness {
             var killRequested = false
 
             func cancelTimer() {
-                timerWorkItem?.cancel()
-                timerWorkItem = nil
+                lock.lock()
+                let task = timerTask
+                timerTask = nil
+                lock.unlock()
+                task?.cancel()
+            }
+
+            /// Marks the turn timed out if it is still running. True means the
+            /// caller should kill the process tree.
+            func beginTimeoutIfRunning() -> Bool {
+                lock.lock()
+                defer { lock.unlock() }
+                guard !isFinished else { return false }
+                isTimedOut = true
+                return true
             }
 
             /// Records the launch; returns whether a kill was requested while
@@ -8209,36 +8291,42 @@ public final class AgentHarness {
 
         let state = ProcessState()
 
-        // Asynchronously drain stdout and stderr without blocking to prevent 64KB pipe buffer deadlocks
-        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
-            let chunk = handle.availableData
-            if !chunk.isEmpty {
-                state.lock.lock()
-                state.stdoutData.append(chunk)
-                state.lock.unlock()
-            }
+        // Two blocking readers, joined below, rather than `readabilityHandler`s.
+        // Clearing a handler does NOT wait for an invocation already in flight,
+        // so a handler that had taken bytes out of the pipe but not yet appended
+        // them let the call return an empty stdout for a command that wrote
+        // plenty (`WorkspaceIsolationTests` caught it as an empty `.git`
+        // pointer). A blocking read is only legal off the main actor, and
+        // reading to EOF is what keeps a 64KB pipe buffer from deadlocking.
+        let drainGroup = DispatchGroup()
+        drainGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            let data = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+            state.lock.lock()
+            state.stdoutData.append(data)
+            state.lock.unlock()
+            drainGroup.leave()
         }
-
-        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
-            let chunk = handle.availableData
-            if !chunk.isEmpty {
-                state.lock.lock()
-                state.stderrData.append(chunk)
-                state.lock.unlock()
-            }
+        drainGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            let data = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            state.lock.lock()
+            state.stderrData.append(data)
+            state.lock.unlock()
+            drainGroup.leave()
         }
 
         let cleanupPipes: @Sendable () -> Void = {
-            stdoutPipe.fileHandleForReading.readabilityHandler = nil
-            stderrPipe.fileHandleForReading.readabilityHandler = nil
-
-            let remOut = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-            let remErr = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-
-            state.lock.lock()
-            state.stdoutData.append(remOut)
-            state.stderrData.append(remErr)
-            state.lock.unlock()
+            // The process has exited, so both read ends are at EOF. Waiting is
+            // the join: whatever a reader has not yet appended is appended
+            // before this returns. Bounded, because a descendant that inherited
+            // the write end can hold it open after the parent exits, and a run
+            // must not hang forever on work it did not start.
+            if drainGroup.wait(timeout: .now() + 5) == .timedOut {
+                try? stdoutPipe.fileHandleForWriting.close()
+                try? stderrPipe.fileHandleForWriting.close()
+                _ = drainGroup.wait(timeout: .now() + 1)
+            }
         }
 
         let killProcessTree: @Sendable () -> Void = {
@@ -8269,19 +8357,22 @@ public final class AgentHarness {
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 if timeoutSeconds > 0 {
-                    let item = DispatchWorkItem {
-                        state.lock.lock()
-                        guard !state.isFinished else {
-                            state.lock.unlock()
-                            return
+                    // See `ProcessState.timerTask`: a scheduled
+                    // `DispatchWorkItem` would retain the process and its pipes
+                    // until the deadline even when cancelled.
+                    let bounded = timeoutSeconds.isFinite
+                        ? min(max(timeoutSeconds, 0.001), 86_400)
+                        : 86_400
+                    let timeoutTask = Task.detached(priority: .utility) {
+                        try? await Task.sleep(for: .seconds(bounded))
+                        guard !Task.isCancelled else { return }
+                        if state.beginTimeoutIfRunning() {
+                            killProcessTree()
                         }
-                        state.isTimedOut = true
-                        state.lock.unlock()
-
-                        killProcessTree()
                     }
-                    state.timerWorkItem = item
-                    DispatchQueue.global().asyncAfter(deadline: .now() + timeoutSeconds, execute: item)
+                    state.lock.lock()
+                    state.timerTask = timeoutTask
+                    state.lock.unlock()
                 }
 
                 DispatchQueue.global(qos: .userInitiated).async {
@@ -8317,10 +8408,12 @@ public final class AgentHarness {
                         }
                     } catch {
                         state.cancelTimer()
-                        stdoutPipe.fileHandleForReading.readabilityHandler = nil
-                        stderrPipe.fileHandleForReading.readabilityHandler = nil
+                        // Closing the parent's write end is what EOFs the
+                        // readers after a launch that never produced a child;
+                        // waiting joins them before the pipe deallocates.
                         try? stdoutPipe.fileHandleForWriting.close()
                         try? stderrPipe.fileHandleForWriting.close()
+                        _ = drainGroup.wait(timeout: .now() + 1)
 
                         state.lock.lock()
                         state.isFinished = true

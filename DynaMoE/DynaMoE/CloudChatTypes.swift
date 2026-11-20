@@ -1073,12 +1073,20 @@ public nonisolated enum CloudTurnFailure: Equatable, Sendable, LocalizedError {
 /// (`CloudStepPrompt.assemble`), which keeps the transcript free of synthetic
 /// turns and still leaves the leading cached prefix byte-identical.
 public nonisolated enum CloudSubagentRelay {
-    public static func directive(reports: [String]) -> String {
+    /// - Parameter allowsToolCalls: whether this step may still call tools.
+    ///   A relay that rides a step's own tool round is a final-answer pass and
+    ///   forbids them; the one injected at the START of a fresh operator turn
+    ///   must not, because the user's new message may need them and the request
+    ///   already offers them.
+    public static func directive(reports: [String], allowsToolCalls: Bool = false) -> String {
         let context = reports.joined(separator: "\n\n")
+        let instruction = allowsToolCalls
+            ? "Using the report below, continue the user's request above. Call tools if the request still needs them, and fold the report into your answer where it is relevant."
+            : "Using the report below, write your complete final answer to the user's original question NOW. Do not emit any tool calls."
         return """
         <system>
         A delegated subagent has finished its work. Its final report is below. You are the coordinator: the user only talks to you, and you are responsible for presenting subagent results.
-        Using the report below, write your complete final answer to the user's original question NOW. Do not emit any tool calls.
+        \(instruction)
 
         \(context)
         </system>

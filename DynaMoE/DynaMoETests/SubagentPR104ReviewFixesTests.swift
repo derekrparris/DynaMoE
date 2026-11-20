@@ -119,9 +119,10 @@ final class SubagentPR104ReviewFixesTests: XCTestCase {
             baseCommit: worktree.baseCommit
         )
         AgentRunStore.shared.saveImmediately(record)
-        defer {
+        addTeardownBlock {
             AgentRunStore.shared.delete(runId: runId, sessionId: nil)
-            Task { await WorkspaceIsolation.cleanup(worktree) }
+            AgentRunStore.shared.flush()
+            _ = await WorkspaceIsolation.cleanup(worktree, root: wtRoot)
         }
 
         let snap = try await WorkspaceIsolation.snapshot(worktree, diffLimit: nil)
@@ -173,7 +174,7 @@ final class SubagentPR104ReviewFixesTests: XCTestCase {
             runId: UUID(),
             root: wtRoot
         )
-        addTeardownBlock { await WorkspaceIsolation.cleanup(worktree) }
+        addTeardownBlock { _ = await WorkspaceIsolation.cleanup(worktree, root: wtRoot) }
 
         try "updated\n".write(
             to: worktree.path.appendingPathComponent("README.md"),
@@ -201,7 +202,7 @@ final class SubagentPR104ReviewFixesTests: XCTestCase {
             runId: UUID(),
             root: wtRoot
         )
-        addTeardownBlock { await WorkspaceIsolation.cleanup(worktree) }
+        addTeardownBlock { _ = await WorkspaceIsolation.cleanup(worktree, root: wtRoot) }
 
         let scratch = worktree.path.appendingPathComponent("temp_notes.txt")
         try "temporary\n".write(to: scratch, atomically: true, encoding: .utf8)
@@ -388,7 +389,10 @@ final class SubagentPR104ReviewFixesTests: XCTestCase {
             status: .completed
         )
         AgentRunStore.shared.saveImmediately(record)
-        defer { AgentRunStore.shared.delete(runId: runId, sessionId: sessionB) }
+        addTeardownBlock {
+            AgentRunStore.shared.delete(runId: runId, sessionId: sessionB)
+            AgentRunStore.shared.flush()
+        }
 
         let result = try await AgentHarness.$executingSessionId.withValue(sessionA) {
             try await tool.execute(
@@ -435,9 +439,10 @@ final class SubagentPR104ReviewFixesTests: XCTestCase {
             baseCommit: worktree.baseCommit
         )
         AgentRunStore.shared.saveImmediately(record)
-        defer {
+        addTeardownBlock {
             AgentRunStore.shared.delete(runId: runId, sessionId: nil)
-            Task { await WorkspaceIsolation.cleanup(worktree) }
+            AgentRunStore.shared.flush()
+            _ = await WorkspaceIsolation.cleanup(worktree, root: wtRoot)
         }
 
         let resolved = await ApplySubagentChangesTool.approvalExpectation(
@@ -446,9 +451,9 @@ final class SubagentPR104ReviewFixesTests: XCTestCase {
         let pinned = try XCTUnwrap(resolved)
         XCTAssertEqual(pinned.destinationBranch, "main")
         XCTAssertTrue(pinned.destinationBranchResolved)
-        XCTAssertNil(
+        XCTAssertNotNil(
             pinned.patchDigest,
-            "the card previews the run's recorded report, not a live snapshot, so no digest is bound at card time"
+            "the card must bind the live patch before the operator can click"
         )
 
         // The operator switches branch while the card sits open.
@@ -469,6 +474,31 @@ final class SubagentPR104ReviewFixesTests: XCTestCase {
         XCTAssertFalse(
             FileManager.default.fileExists(atPath: repo.appendingPathComponent("change.txt").path),
             "a refused apply must write nothing"
+        )
+
+        // Back on the branch the card named, but the WORKTREE changed while the
+        // card sat open: the digest must refuse it instead of authorising bytes
+        // nobody reviewed.
+        try await runGit(["checkout", "main"], in: repo)
+        try "tampered while the card was open\n".write(
+            to: worktree.path.appendingPathComponent("change.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let tampered = try await ApplySubagentChangesTool.$pinnedDestination.withValue(pinned) {
+            try await tool.execute(
+                arguments: ["subagent_id": runId.uuidString],
+                workingDirectory: nil,
+                maxOutputLength: 4_000
+            )
+        }
+        XCTAssertTrue(
+            tampered.resultJSON.contains("patch changed after the approval card was shown"),
+            "expected a patch refusal, got: \(tampered.resultJSON)"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: repo.appendingPathComponent("change.txt").path),
+            "a refused patch must write nothing"
         )
     }
 

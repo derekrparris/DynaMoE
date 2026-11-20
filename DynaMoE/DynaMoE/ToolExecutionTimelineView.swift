@@ -256,8 +256,28 @@ struct TimelineStepCardView: View {
             return call.arguments["summary"] ?? "Completed"
         case "spawn_subagent":
             let role = call.arguments["role"] ?? "Subagent"
-            let backend = (call.arguments["backend"] ?? "").lowercased()
-            return backend == "cloud" ? "\(role) · off-device" : "\(role)"
+            let preference = (call.arguments["backend"] ?? "").lowercased()
+            // The card must name the backend the SPAWN will actually use.
+            // Reading only the explicit argument said "on-device" for an
+            // `auto` spawn that Settings had pointed at Cloud, or for one on a
+            // machine with no checkpoint loaded.
+            let usesCloud: Bool
+            switch preference {
+            case "cloud":
+                usesCloud = true
+            case "local":
+                usesCloud = false
+            default:
+                let engine = CompletionEngine.shared
+                usesCloud = !(engine.loadedModelInfo != nil && engine.promptModelConfig != nil)
+            }
+            if usesCloud {
+                if case .configured(let address) = SubagentBackendSettings.preferredCloudModel() {
+                    return "\(role) · off-device · \(address)"
+                }
+                return "\(role) · off-device"
+            }
+            return role
         case "apply_subagent_changes":
             let raw = call.arguments["subagent_id"] ?? call.arguments["run_id"]
             if let raw,

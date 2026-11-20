@@ -185,13 +185,14 @@ enum AgentRolePreset: String {
 
 struct AgentBudget {
     var maxSteps: Int             // `.standard` is 24; a preset may raise it
-    var maxCompletionTokens: Int  // completion tokens of the LAST request
+    var maxCompletionTokens: Int  // CUMULATIVE completion tokens across every step
     var maxWallClockSeconds: Int  // `.standard` is 600
     var maxCostUSD: Double?       // cloud only
 }
 
 struct AgentRunRecord: Identifiable {
     var id: UUID
+    var schemaVersion: Int          // decoded with a default for older records
     var parentSessionId: UUID?
     var parentTurnId: UUID?
     var role: String
@@ -236,6 +237,7 @@ enum AgentTranscriptEntryKind {
 struct AgentTranscriptEntry: Identifiable {
     var id: UUID
     var index: Int
+    var stepIndex: Int
     var timestamp: Date
     var kind: AgentTranscriptEntryKind
     var text: String?
@@ -251,6 +253,8 @@ struct AgentUsage {
     /// A billed token count the app had no price for. Never a reason to report
     /// $0: the merge keeps "unpriced" distinct from "free".
     var costIsUnpriced: Bool
+    /// WHY it could not be priced, so a refusal names something actionable.
+    var costUnpricedReason: AgentUnpricedReason?
     /// The size of the LAST request, i.e. what the run's context window was
     /// carrying — not the sum of every step's prompt, which is not a context
     /// size and read absurdly high.
@@ -271,6 +275,7 @@ struct AgentReport {
     var risks: [String]
     var openQuestions: [String]
     var usage: AgentUsage
+    var backend: AgentBackendDescriptor
 }
 
 struct AgentFinding {
@@ -357,20 +362,25 @@ protocol AgentModelBackend: Sendable {
 }
 
 struct AgentBackendRequest {
+    var systemPrompt: String
     var messages: [AgentBackendMessage]
     var tools: [ToolDefinition]
-    var systemPrompt: String
     var sampling: AgentSampling
     var maxTokens: Int
     var stopSequences: [String]
     var thinking: Bool
     var sessionId: UUID
+    /// Live deltas for the drawer. `isThinking` selects the channel.
+    var onDelta: (@Sendable (String, Bool) -> Void)?
+    /// Spend a backend incurred on an attempt that never returned a turn (a
+    /// failed or cancelled cloud request can still be invoiced).
+    var usageLedger: AgentUsageLedger?
 }
 
 struct AgentBackendTurn {
     var text: String
     var thinking: String
-    var toolCalls: [ParsedToolCall]
+    var calls: [AgentToolCall]
     var rawText: String
     var finishReason: String
     var usage: AgentUsage
@@ -403,7 +413,10 @@ struct AgentBackendTurn {
   (reuse `ChatPromptFormatter.formatConversation` and the family flags the
   server path uses).
 - Installs the run's tool schemas into `GrammarConstrainedSampler` around the
-  turn (snapshot + restore), exactly as `ServerController.withTurnToolMask` does.
+  turn, through the same `withTurnToolMask` call `ServerController` uses. Scopes
+  are tracked by identity and the registry is rebuilt from every scope still
+  live (the UNION of their names); the base snapshot returns only when the last
+  scope ends, so overlapping turns cannot restore over each other.
 - Calls `CompletionEngine.launchTurn` with the run's own `sessionId` and the
   rendered prompt; consumes the stream; uses `TurnResult.parsedToolCalls` for
   calls and `generatedTokenIds` for history.
@@ -421,9 +434,13 @@ struct AgentBackendTurn {
   approval card.
 - Tool calls are read from the family's rendered dialect by the same parser the
   chat turn uses; there is no separate pre-spawn capability gate. A family
-  whose output the parser cannot recognise yields no calls (a final answer),
-  and a `toolfreeze` turn that produced no complete call fails the run by name
-  in `HeadlessAgentLoop`.
+  whose output the parser cannot recognise yields no calls (a final answer).
+  `actionableCallIndices` drops the parser's non-executable calls (a gesture
+  such as `echo`, whose notice is already in the text); a gesture-only
+  `toolFreeze` is reported as a normal `.eos` turn, so it finishes the run
+  rather than failing `HeadlessAgentLoop`'s `emptyToolFreeze` guard. A
+  `toolFreeze` WITH no executable call and no gesture, and a truncated or
+  `degenerateCycle`/`stopped` turn, still fail by name.
 
 ### AppleFMBackend
 
@@ -743,7 +760,8 @@ not a file name.
 | `SubagentRelayWaitTests` | the bounded wait for in-flight runs (deadline, empty set, Stop) |
 | `SubagentRecordProjectionTests` / `SubagentRunLinkTests` / `LocalSubagentRelayTests` | record projection (including the terminal-record guard against a lagging event), run links, the relay line format |
 | `WorkspaceIsolationTests` | worktree create/snapshot/apply/cleanup, committed work included, conflicts refused, non-git refusal, the apply tool and a scripted isolated run end to end, and the operator's Apply Changes path (offer gate, one approval request, declined card, applied-then-nothing) |
-| Opt-in | one real local turn, one real cloud turn, one real local writer run + operator apply, and the full `spawn_subagent` → model-backed run happy path (it needs a loaded engine, which the pure suites deliberately do not have; `AgentRunIntegrationTests` covers the same manager path with a scripted backend) |
+| `SubagentPR104ReviewFixesTests` / `SubagentRelayLineTests` | the PR review's regressions: the apply card's destination/limit rules, relay line framing, the writability preflight and the review's UI edges |
+| Opt-in | one real local turn, one real cloud turn, and one real local writer run + operator apply. The model-backed path is driven through `SubagentManager.shared.spawnModelBacked` directly (it needs a loaded engine, which the pure suites deliberately do not have); `AgentRunIntegrationTests` covers the same manager path with a scripted backend. |
 
 Headless invocation (from `AGENTS.md`):
 
@@ -842,8 +860,13 @@ Implemented in Phase 1, with the reasoning recorded:
   call whose markup is not in the text is echoed with the server's plain-text
   call record.
 - **The tool mask is one implementation.** `GrammarConstrainedSampler.withTurnToolMask`
-  now owns the snapshot/install/restore that `ServerController` used privately,
-  and the local backend uses the same call for its turn.
+  owns install/restore for `ServerController` and the local backend. A scope is
+  tracked by identity: an exit rebuilds the registry from every scope still
+  live (the UNION of their names), and the base snapshot comes back only when
+  the last one ends — so a run mask that outlives its engine task and a server
+  mask installed in the freed-slot window cannot restore over each other.
+  `reserveTurnSlot` treats a live scoped mask as occupancy for the same reason:
+  the engine's task ends before `withTurnToolMask` unwinds.
 - A test caught a real defect in `maskSchemas`: encoding the parameters
   dictionary inside a second `AnyCodable` has no encoding of its own, so every
   schema decoded as `{}` and the mask constrained nothing. It now encodes the

@@ -581,7 +581,7 @@ public final class SymbolIntelligenceEngine {
         var result: [URL] = []
         guard let enumerator = FileManager.default.enumerator(
             at: directory,
-            includingPropertiesForKeys: [.isRegularFileKey],
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
             options: [.skipsHiddenFiles, .skipsPackageDescendants]
         ) else { return [] }
 
@@ -592,6 +592,13 @@ public final class SymbolIntelligenceEngine {
             if forbiddenSubstrings.contains(where: { path.contains($0) }) {
                 continue
             }
+            // A symlink INSIDE the workspace can point anywhere. Reading one
+            // here leaked a file outside it through find_references and
+            // find_symbol_definition without ever passing the containment gate
+            // the read tools use, so links are skipped: their targets are not
+            // the workspace's source.
+            let values = try? url.resourceValues(forKeys: [.isSymbolicLinkKey])
+            if values?.isSymbolicLink == true { continue }
             if supportedExtensions.contains(url.pathExtension.lowercased()) {
                 result.append(url)
             }

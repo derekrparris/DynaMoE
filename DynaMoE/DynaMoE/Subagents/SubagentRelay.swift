@@ -37,7 +37,13 @@ nonisolated enum LocalSubagentRelay {
     /// Joins reports up to the budget, then says how many were elided rather
     /// than truncating mid-report: a coordinator that reads a cut-off report as
     /// whole is worse off than one told to fetch the rest.
-    static func boundedContext(_ reports: [String]) -> String {
+    ///
+    /// `carriedReports` is the same budget decision as a SET, so the caller
+    /// marks exactly the reports this directive delivered. Marking every
+    /// pending report as relayed while the string had elided some dropped those
+    /// permanently: tools may be off, and the model may never poll
+    /// `get_subagent_status`.
+    static func carriedReports(_ reports: [String]) -> [String] {
         var kept: [String] = []
         var total = 0
         for report in reports {
@@ -46,6 +52,11 @@ nonisolated enum LocalSubagentRelay {
             kept.append(report)
             total += cost
         }
+        return kept
+    }
+
+    static func boundedContext(_ reports: [String]) -> String {
+        let kept = carriedReports(reports)
         let omitted = reports.count - kept.count
         var context = kept.joined(separator: "\n\n")
         if omitted > 0 {

@@ -272,7 +272,9 @@ nonisolated enum WorkspaceIsolation {
             ["rev-parse", "--path-format=absolute", "--git-common-dir"],
             in: candidate
         ), candidateCode == 0 else { return false }
-        let b = URL(fileURLWithPath: candidateOut.trimmingCharacters(in: .whitespacesAndNewlines))
+        let candidateCommon = candidateOut.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !candidateCommon.isEmpty else { return false }
+        let b = URL(fileURLWithPath: candidateCommon)
             .resolvingSymlinksInPath().standardizedFileURL
 
         // The repository's OWN admin directory must name this worktree, and
@@ -291,9 +293,12 @@ nonisolated enum WorkspaceIsolation {
             ["rev-parse", "--path-format=absolute", "--git-common-dir"],
             in: worktree
         ), worktreeCode == 0 {
-            let a = URL(fileURLWithPath: worktreeOut.trimmingCharacters(in: .whitespacesAndNewlines))
-                .resolvingSymlinksInPath().standardizedFileURL
-            return a == b
+            let worktreeCommon = worktreeOut.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !worktreeCommon.isEmpty {
+                let a = URL(fileURLWithPath: worktreeCommon)
+                    .resolvingSymlinksInPath().standardizedFileURL
+                return a == b
+            }
         }
         // The worktree's `.git` is gone (or unreadable), so git inside it
         // cannot answer; the back-pointer above is the only remaining link and
@@ -586,7 +591,14 @@ nonisolated enum WorkspaceIsolation {
             // authoritative to repair towards.
             return .compromised("the recorded repository at '\(worktree.repositoryRoot.path)' could not be read")
         }
-        let commonPath = URL(fileURLWithPath: rootOut.trimmingCharacters(in: .whitespacesAndNewlines), isDirectory: true)
+        // An EMPTY answer is not the current directory. `URL(fileURLWithPath: "")`
+        // resolves to "/", which used to turn a silent git failure into a linkage
+        // report against the filesystem root.
+        let commonOut = rootOut.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !commonOut.isEmpty else {
+            return .compromised("the recorded repository at '\(worktree.repositoryRoot.path)' answered with no git directory")
+        }
+        let commonPath = URL(fileURLWithPath: commonOut, isDirectory: true)
             .standardizedFileURL.resolvingSymlinksInPath().path
         guard let (gitDirCode, gitDirOut, _) = try? await git(
             ["rev-parse", "--path-format=absolute", "--git-dir"],
@@ -594,7 +606,11 @@ nonisolated enum WorkspaceIsolation {
         ), gitDirCode == 0 else {
             return .repairable("its .git linkage cannot be resolved, so git does not treat '\(worktree.path.path)' as a working tree")
         }
-        let gitDir = URL(fileURLWithPath: gitDirOut.trimmingCharacters(in: .whitespacesAndNewlines), isDirectory: true)
+        let gitDirPath = gitDirOut.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !gitDirPath.isEmpty else {
+            return .repairable("its .git linkage resolved to no git directory, so git does not treat '\(worktree.path.path)' as a working tree")
+        }
+        let gitDir = URL(fileURLWithPath: gitDirPath, isDirectory: true)
             .standardizedFileURL.resolvingSymlinksInPath()
         let worktreesRoot = commonPath.hasSuffix("/") ? commonPath + "worktrees/" : commonPath + "/worktrees/"
         guard gitDir.path.hasPrefix(worktreesRoot) else {
@@ -1113,7 +1129,13 @@ nonisolated enum WorkspaceIsolation {
             }
             let kind = entryKind(target)
             if kind.exists {
-                guard !kind.isDirectory, fileManager.isWritableFile(atPath: target.path) else {
+                // A symlink is replaced at the DIRECTORY level (unlink + create),
+                // so its target's writability is irrelevant — and
+                // `isWritableFile` follows the link, which refused a tracked
+                // DANGLING symlink the patch was about to replace. A directory
+                // is still refused: a patch names file paths.
+                guard !kind.isDirectory,
+                      kind.isSymlink || fileManager.isWritableFile(atPath: target.path) else {
                     throw WorkspaceIsolationError.applyFailed(
                         "'\(path)' exists and is not a writable file, so the patch cannot land there."
                     )
@@ -1132,12 +1154,20 @@ nonisolated enum WorkspaceIsolation {
         }
     }
 
+    /// The nearest existing ancestor DIRECTORY.
+    ///
+    /// A path where a same-patch change replaces a file with a directory
+    /// (`foo` deleted, `foo/bar` created) has a regular file in its ancestor
+    /// chain at preflight time. That is not a reason to refuse: the patch
+    /// removes it before the directory exists. Climbing past a non-directory is
+    /// safe because `git apply --check` — which runs before this refusal — is
+    /// what rejects a path the patch never clears.
     private static func existingAncestor(of url: URL, fileManager: FileManager) -> URL? {
         var candidate = url.deletingLastPathComponent()
         while candidate.path != "/" {
             var isDirectory: ObjCBool = false
             if fileManager.fileExists(atPath: candidate.path, isDirectory: &isDirectory) {
-                return isDirectory.boolValue ? candidate : nil
+                if isDirectory.boolValue { return candidate }
             }
             candidate = candidate.deletingLastPathComponent()
         }
@@ -1880,6 +1910,12 @@ nonisolated enum WorkspaceIsolation {
         arguments.insert(
             contentsOf: [
                 "-c", "diff.noprefix=false",
+                // The default prefix is what `diffDestination` parses, and a
+                // user's `diff.mnemonicPrefix=true` replaces it with letters
+                // keyed to the invocation (`c/`, `w/`, …). Pinning it keeps a
+                // personal gitconfig from making an apply look like a
+                // different patch.
+                "-c", "diff.mnemonicPrefix=false",
                 "-c", "core.fsmonitor=false",
                 "-c", "core.hooksPath=/dev/null",
                 "-c", "core.untrackedCache=false",

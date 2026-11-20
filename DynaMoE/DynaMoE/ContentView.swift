@@ -1486,7 +1486,8 @@ struct ContentView: View {
                 cancelDeferredRelaunches(sessionId: id)
                 SubagentManager.shared.cancelSession(
                     sessionId: id,
-                    reason: "The conversation was removed by chat retention."
+                    reason: "The conversation was removed by chat retention.",
+                    dropsRuns: true
                 )
                 AgentRunStore.shared.deleteSession(id)
             }
@@ -1776,7 +1777,8 @@ struct ContentView: View {
                         // sweep's reach.
                         SubagentManager.shared.cancelSession(
                             sessionId: id,
-                            reason: "The conversation was deleted."
+                            reason: "The conversation was deleted.",
+                            dropsRuns: true
                         )
                         AgentRunStore.shared.deleteSession(id)
                         sessions.removeAll(where: { $0.id == id })
@@ -2502,7 +2504,14 @@ struct ContentView: View {
             isPromptOnly: true
         )
         sessions[sessionIdx].messages.append(message)
-        return (pending, message.id)
+        // Only the reports that FIT are delivered. The directive names the
+        // elided ones and points at `get_subagent_status`, and returning the
+        // whole list here marked them relayed and dropped them permanently
+        // whenever tools were off or the model never polled.
+        let delivered = LocalSubagentRelay.carriedReports(
+            pending.map { PromptMarkers.sanitizeControlMarkers($0) }
+        )
+        return (delivered, message.id)
     }
 
     /// Collects final reports from this session's completed subagents that have not yet been
@@ -4211,6 +4220,12 @@ struct ContentView: View {
                 // true — the placeholder carries the error — so this cannot go
                 // through `unwindRelayIfRefused`.
                 unwindRelayIfRefused(false)
+            } else {
+                // The turn started, but the history budget dropped the directive
+                // whole. Nothing was delivered, so the hidden message must not
+                // stay in a transcript that never carried it; the reports stay
+                // unread and relay on the next send.
+                unwindRelayIfRefused(false)
             }
             return true
         }
@@ -5058,6 +5073,15 @@ struct ContentView: View {
         let myGenerationId = generationId
         isGeneratingText = true
         generatingSessionId = sessionId
+        // The same turn identity the weights and cloud paths mint. The
+        // on-device model has no tool loop, but `Stop` scopes delegated work by
+        // this id: leaving the PREVIOUS turn's identity in place let a Stop on
+        // an AFM turn cancel subagents an earlier turn had spawned.
+        let afmTurnId = UUID()
+        activeAgentTurnId = afmTurnId
+        activeAgentTurnSessionId = sessionId
+        AgentHarness.shared.currentSessionId = sessionId
+        AgentHarness.shared.currentTurnId = afmTurnId
         generatedStreamText = ""
         thinkingText = ""
         responseText = ""
@@ -5655,10 +5679,13 @@ struct ContentView: View {
             // result-delivery relay below.
             var ranSynthesisTurn = false
 
-            @MainActor func takeSubagentRelayDirective() async -> Bool {
+            @MainActor func takeSubagentRelayDirective(allowsToolCalls: Bool = false) async -> Bool {
                 let pending = await self.gatherCompletedSubagentRelayResponses(forSession: sessionId)
                 guard !pending.isEmpty else { return false }
-                relayDirective = CloudSubagentRelay.directive(reports: pending)
+                relayDirective = CloudSubagentRelay.directive(
+                    reports: pending,
+                    allowsToolCalls: allowsToolCalls
+                )
                 relayDirectiveReports = pending
                 return true
             }
@@ -5666,8 +5693,10 @@ struct ContentView: View {
             // §11's start-of-turn injection. A report that landed after the
             // previous run ended has no step to ride, so the FIRST step of this
             // turn carries it. The directive is appended to the request, never
-            // merged into the cached system message.
-            _ = await takeSubagentRelayDirective()
+            // merged into the cached system message. A fresh operator turn may
+            // still need tools — the request offers them — so this directive
+            // continues the user's request rather than forbidding a call.
+            _ = await takeSubagentRelayDirective(allowsToolCalls: true)
 
             while true {
                 // A superseded or stopped turn must not spend one more provider

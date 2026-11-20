@@ -384,12 +384,21 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
         var emittedThinking = ""
         // A Stop can land after part of the answer streamed. The loop appends
         // whatever a cancelled turn produced, so the text travels with the
-        // error instead of being discarded with it.
+        // error instead of being discarded with it. Tool-call markup is removed
+        // first: a turn frozen mid-call leaves raw `<tool_call>`/DSML bytes that
+        // are not prose and used to be appended to the run's partial report.
+        func partialText() -> (text: String, thinking: String) {
+            (
+                Self.strippingToolCallBlocks(emittedText),
+                Self.strippingToolCallBlocks(emittedThinking)
+            )
+        }
         func cancellationError() -> AgentBackendError {
-            if emittedText.isEmpty && emittedThinking.isEmpty {
+            let partial = partialText()
+            if partial.text.isEmpty && partial.thinking.isEmpty {
                 return .cancelled
             }
-            return .cancelledAfterPartial(text: emittedText, thinking: emittedThinking)
+            return .cancelledAfterPartial(text: partial.text, thinking: partial.thinking)
         }
         for await event in launch.stream {
             // The run's task is cancelled from outside this loop. The stream
@@ -428,11 +437,14 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
                 // `partialTurn` for a cancelled turn; a failed one deserves the
                 // same, or the run's report fell back to an earlier step.
                 if !emittedText.isEmpty || !emittedThinking.isEmpty {
-                    throw AgentBackendError.failedAfterPartial(
-                        text: emittedText,
-                        thinking: emittedThinking,
-                        message: failure.message
-                    )
+                    let partial = partialText()
+                    if !partial.text.isEmpty || !partial.thinking.isEmpty {
+                        throw AgentBackendError.failedAfterPartial(
+                            text: partial.text,
+                            thinking: partial.thinking,
+                            message: failure.message
+                        )
+                    }
                 }
                 throw AgentBackendError.transport(failure.message)
             case .finished(let result):
@@ -460,11 +472,14 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
         // tool mask this call is nested in.
         await launch.handle.task.value
         if !emittedText.isEmpty || !emittedThinking.isEmpty {
-            throw AgentBackendError.failedAfterPartial(
-                text: emittedText,
-                thinking: emittedThinking,
-                message: "The local engine's stream closed without a result."
-            )
+            let partial = partialText()
+            if !partial.text.isEmpty || !partial.thinking.isEmpty {
+                throw AgentBackendError.failedAfterPartial(
+                    text: partial.text,
+                    thinking: partial.thinking,
+                    message: "The local engine's stream closed without a result."
+                )
+            }
         }
         throw AgentBackendError.malformedResponse("The local engine's stream closed without a result.")
     }
@@ -652,7 +667,8 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
     /// half-call is not prose either. Paired tags are handled generically
     /// (`<tool_call>`/`</tool_call>`, the DSML `calls` container, Gemma's
     /// `<|tool_call>`/`<tool_call|>`), then the bare openers that carry no
-    /// container (Llama's `<|python_tag|>`, a stray `<tool_call>`).
+    /// container (Llama's `<|python_tag|>`, a stray `<tool_call>`, a DSML
+    /// `invoke` the freeze stopped before its container closed).
     static func strippingToolCallBlocks(_ text: String) -> String {
         nonisolatedMarkupStrip(text)
     }
@@ -662,7 +678,11 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
         let pairs: [(open: String, close: String)] = [
             (StreamingToolParser.qwenToolCallOpen, StreamingToolParser.qwenToolCallClose),
             (DeepSeekV41ToolDialect.dsmlCallsOpen, DeepSeekV41ToolDialect.dsmlCallsClose),
-            (StreamingToolParser.gemmaToolCallOpen, StreamingToolParser.gemmaToolCallClose)
+            (StreamingToolParser.gemmaToolCallOpen, StreamingToolParser.gemmaToolCallClose),
+            // The dialect's plain-tag call has no container: a bare
+            // name/arguments pair was left in a cancelled run's partial text.
+            (DeepSeekV41ToolDialect.callNameOpen, DeepSeekV41ToolDialect.callNameClose),
+            (DeepSeekV41ToolDialect.callArgumentsOpen, DeepSeekV41ToolDialect.callArgumentsClose)
         ]
         for pair in pairs {
             while let open = out.range(of: pair.open) {
@@ -671,6 +691,19 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
                 } else {
                     out.removeSubrange(open.lowerBound..<out.endIndex)
                 }
+            }
+        }
+        // A DSML `invoke` with no `calls` around it is the shape the
+        // pre-execution freeze can leave behind, and the container loop above
+        // never sees it.
+        while let open = out.range(of: DeepSeekV41ToolDialect.dsmlInvokeOpen) {
+            if let close = out.range(
+                of: DeepSeekV41ToolDialect.dsmlInvokeClose,
+                range: open.upperBound..<out.endIndex
+            ) {
+                out.removeSubrange(open.lowerBound..<close.upperBound)
+            } else {
+                out.removeSubrange(open.lowerBound..<out.endIndex)
             }
         }
         for bare in [StreamingToolParser.llamaTagOpen] {
@@ -719,10 +752,11 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
     /// when the run was given no tools, which leaves the sampler's registry
     /// untouched (see `GrammarConstrainedSampler.withTurnToolMask`).
     ///
-    /// A schema that cannot be encoded returns NO mask at all. Installing a
-    /// schema-less entry told the sampler the tool existed but constrains
-    /// nothing about its arguments, so generation could produce a call the
-    /// tool then refuses — a mask that looks active and is not.
+    /// A schema that cannot be encoded must NOT drop the whole mask: an empty
+    /// mask installs nothing, so the coordinator's global vocabulary stayed
+    /// active for a run that has its own tools. The fallback is a strict empty
+    /// object — the tool is callable with no arguments — which constrains more
+    /// than the real schema, never less.
     @MainActor
     static func maskSchemas(for tools: [ToolDefinition]) -> [GrammarToolSchema] {
         var schemas: [GrammarToolSchema] = []
@@ -733,13 +767,19 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
             // second one gives it no encoding of its own (every branch in
             // `AnyCodable.encode` misses), so the schema would decode as an empty
             // object and the mask would constrain nothing.
-            guard let schemaData = try? JSONEncoder().encode(tool.function.parameters) else {
-                return []
-            }
+            let schemaData = (try? JSONEncoder().encode(tool.function.parameters))
+                ?? Self.emptyObjectSchema
             schemas.append(GrammarToolSchema(name: tool.function.name, schemaJSON: schemaData))
         }
         return schemas
     }
+
+    /// `{"type":"object","properties":{}}`, the strict fallback for a tool
+    /// whose schema cannot be encoded: callable with no arguments, nothing
+    /// else.
+    private static let emptyObjectSchema = Data(
+        #"{"type":"object","properties":{}}"#.utf8
+    )
 
     /// The worker prompt with the family's own tool-call syntax. The spawn path
     /// builds this before the run starts; the flags are the loaded checkpoint's.

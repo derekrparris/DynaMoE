@@ -18,7 +18,9 @@ import SwiftUI
 /// A chat's Stop cancels the cards ITS turn raised, including the ones a
 /// background subagent it spawned is parked on. `cancelAll` is for a process
 /// shutdown, where every card really is going away.
-public struct ActionApprovalScope: Hashable, Sendable {
+/// `nonisolated` because Stop and cancellation reach it from the tool loop and
+/// background run tasks, neither of which shares the main actor.
+public nonisolated struct ActionApprovalScope: Hashable, Sendable {
     let rawValue: String
 
     public static func session(_ id: UUID) -> ActionApprovalScope {
@@ -100,6 +102,16 @@ public nonisolated final class ActionApprovalManager: @unchecked Sendable {
         return pendingDecisions[id]
     }
 
+    /// Drops an id whose waiter has left. Synchronous on purpose: calling
+    /// `lock.lock()` from an `async` frame's `defer` is a Swift 6 error, so the
+    /// deferred cleanup goes through this helper.
+    private func finishWaiting(id: UUID) {
+        lock.lock()
+        cancelledWaits.remove(id)
+        scopes.removeValue(forKey: id)
+        lock.unlock()
+    }
+
     public func waitForApproval(
         id: UUID,
         scope: ActionApprovalScope? = nil
@@ -113,10 +125,7 @@ public nonisolated final class ActionApprovalManager: @unchecked Sendable {
             // it below with nobody left to consume it. The handler cannot run
             // once `withTaskCancellationHandler` returns, so dropping the id
             // here is what keeps this set bounded.
-            lock.lock()
-            cancelledWaits.remove(id)
-            scopes.removeValue(forKey: id)
-            lock.unlock()
+            finishWaiting(id: id)
         }
         if let scope {
             register(id: id, scope: scope)

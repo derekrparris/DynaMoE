@@ -202,7 +202,7 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         // allocation over every entry) there charged the UI for work that is
         // only needed at write time.
         ioQueue.async { [self] in
-            writeNow(Self.bounded(record), to: url)
+            _ = writeNow(Self.bounded(record), to: url)
         }
     }
 
@@ -1217,6 +1217,21 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         let url = directory(for: sessionId)
         ioQueue.async { [self] in
             var rescueFailed = false
+            // A rescue earlier in this batch is a real disk mutation, so
+            // listeners must be told even if a LATER one fails. Returning
+            // silently left the inspector drawing rows this pass had already
+            // moved or removed.
+            var didMutate = false
+            /// Removes every copy of one run except its unscoped survivor.
+            func removeStaleCopies(of runId: UUID, keeping survivor: URL) {
+                for stale in recordFileURLs(runId: runId) where stale.path != survivor.path {
+                    try? fileManager.removeItem(at: stale)
+                    didMutate = true
+                    signatureLock.lock()
+                    writtenSignatures[stale.path] = nil
+                    signatureLock.unlock()
+                }
+            }
             let decoded = load(sessionId: sessionId)
             for var record in decoded where record.holdsWorktreeWork {
                 if !record.status.isTerminal {
@@ -1228,6 +1243,7 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
                 }
                 record.parentSessionId = nil
                 record.summaryRelayed = true
+                let original = fileURL(runId: record.id, sessionId: sessionId)
                 // Write-new before remove-old: a crash between the two leaves a
                 // duplicate the sweep still protects, while the reverse order
                 // leaves the worktree unprotected. If the rescue write FAILS,
@@ -1238,36 +1254,41 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
                 // holds `ioQueue` (see `onQueue`); before that, this line
                 // `sync`-ed the queue it was executing on and libdispatch
                 // aborted the process.
-                guard saveImmediately(record) else {
-                    // The rescue write failed, so the ORIGINAL is the only
-                    // record. Removing the directory or tombstoning the
-                    // session below would delete or hide it, which is exactly
-                    // the disposal this branch exists to prevent: leave the
-                    // whole conversation's files where they are.
-                    rescueFailed = true
-                    continue
+                //
+                // A survivor a PREVIOUS delete already wrote is left alone. It
+                // is the current record — it may have been applied since —
+                // and this session copy is the pre-delete snapshot, so
+                // overwriting it reverted `appliedAt` and re-offered an apply
+                // that had already landed.
+                let survivor = fileURL(runId: record.id, sessionId: nil)
+                if !fileManager.fileExists(atPath: survivor.path) {
+                    guard saveImmediately(record) else {
+                        // The rescue write failed, so the ORIGINAL is the only
+                        // record. Removing the directory or tombstoning the
+                        // session below would delete or hide it, which is
+                        // exactly the disposal this branch exists to prevent:
+                        // leave the whole conversation's files where they are.
+                        rescueFailed = true
+                        continue
+                    }
+                    didMutate = true
                 }
-                let original = fileURL(runId: record.id, sessionId: sessionId)
                 try? fileManager.removeItem(at: original)
                 signatureLock.lock()
                 writtenSignatures[original.path] = nil
                 signatureLock.unlock()
                 // A PREVIOUS delete that crashed between its two writes (or a
                 // save that landed in the unscoped bucket) can leave another
-                // copy of this run behind. The rescue copy just written is the
-                // current one; every other file for this id is stale and must
-                // not outlive the record it duplicates, or the next launch
-                // reads work the operator just deleted. The keep copy lives in
-                // the unscoped bucket, so it is named explicitly.
-                let survivor = fileURL(runId: record.id, sessionId: nil)
-                for stale in recordFileURLs(runId: record.id) where stale.path != survivor.path {
-                    try? fileManager.removeItem(at: stale)
-                    signatureLock.lock()
-                    writtenSignatures[stale.path] = nil
-                    signatureLock.unlock()
-                }
+                // copy of this run behind. The survivor is the current one;
+                // every other file for this id is stale and must not outlive
+                // the record it duplicates, or the next launch reads work the
+                // operator just deleted.
+                removeStaleCopies(of: record.id, keeping: survivor)
             }
-            guard !rescueFailed else { return }
+            guard !rescueFailed else {
+                if didMutate { postRecordsDidChange() }
+                return
+            }
             // A record this build cannot decode is kept, not deleted with the
             // conversation. `pruneStaleWorktrees` asks `hasRecordFile` before
             // disposing of a UUID-named worktree precisely because that file
@@ -1303,6 +1324,7 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
                             try? fileManager.removeItem(at: target)
                         }
                         try fileManager.moveItem(at: file, to: target)
+                        didMutate = true
                     } catch {
                         // Moving failed, so the file is still the only copy of
                         // whatever it says. Leave the whole directory alone.
@@ -1311,14 +1333,20 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
                     }
                 }
             }
-            guard !rescueFailed else { return }
+            guard !rescueFailed else {
+                if didMutate { postRecordsDidChange() }
+                return
+            }
             // Removal BEFORE the tombstone, like `deleteLocked`: a tombstone
             // written first is never lifted, so a failed removal would leave a
             // directory every later write refuses to touch. A session that had
             // no directory is still tombstoned, so a save already in flight
             // cannot recreate it.
             if fileManager.fileExists(atPath: url.path) {
-                guard (try? fileManager.removeItem(at: url)) != nil else { return }
+                guard (try? fileManager.removeItem(at: url)) != nil else {
+                    if didMutate { postRecordsDidChange() }
+                    return
+                }
             }
             noteDeletedSession(sessionId)
             signatureLock.lock()

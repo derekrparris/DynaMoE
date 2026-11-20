@@ -261,6 +261,7 @@ enum AgentSpawnResolver {
         let (backend, schedulingClass, descriptor) = try resolveBackend(
             request,
             task: task,
+            contextSummary: contextSummary,
             runId: runId,
             sessionId: sessionId,
             defaults: defaults
@@ -622,6 +623,7 @@ enum AgentSpawnResolver {
     static func resolveBackend(
         _ request: AgentSpawnRequest,
         task: String,
+        contextSummary: String?,
         runId: UUID,
         sessionId: UUID,
         defaults: UserDefaults
@@ -631,9 +633,13 @@ enum AgentSpawnResolver {
         let cloudPreference = SubagentBackendSettings.preferredCloudModel(defaults: defaults)
 
         func makeLocal() throws -> (any AgentModelBackend, AgentSchedulingClass, AgentBackendDescriptor) {
+            // The BOUNDED summary, not the request's raw field: the price the
+            // card shows has to describe the prompt the run will actually
+            // build, and a 200 KB paste was priced as its full size while the
+            // plan shipped 16 KB of it.
             let estimate = LocalAgentBackend.spawnPromptTokenEstimate(
                 task: task,
-                contextSummary: request.contextSummary
+                contextSummary: contextSummary
             )
             let backend = try LocalAgentBackend.make(
                 runId: runId,

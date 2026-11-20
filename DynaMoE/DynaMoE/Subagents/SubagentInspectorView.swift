@@ -100,6 +100,7 @@ struct SubagentInspectorView: View {
                     onReject: { approvalCenter.reject($0) },
                     onBack: {
                         manager.selectedSubagentId = nil
+                        discardFailure = nil
                         withAnimation(.easeInOut(duration: 0.15)) { self.selectedRunId = nil }
                     },
                     onClose: onClose,
@@ -161,6 +162,7 @@ struct SubagentInspectorView: View {
         // Clear both before loading the new session's records.
         .onChange(of: sessionId) { _, _ in
             selectedRunId = nil
+            discardFailure = nil
             stored = []
             reloadStored()
             consumeManagerSelection()
@@ -201,6 +203,7 @@ struct SubagentInspectorView: View {
         // `selectedRunId` with the manager's selection already gone.
         guard detailRecord(for: id) != nil else { return }
         selectedRunId = id
+        discardFailure = nil
         manager.selectedSubagentId = nil
     }
 
@@ -253,7 +256,12 @@ struct SubagentInspectorView: View {
                 ? "Showing runs from every conversation"
                 : "Show runs from every conversation (including API turns)")
 
-            if !terminalRuns.isEmpty {
+            // The rows the action would actually delete, not every terminal
+            // row on screen: `showsAllSessions` lists other conversations' runs
+            // and `clearCompleted` leaves those (and any run holding worktree
+            // work) alone, so the button offered a bulk delete it would not
+            // perform.
+            if !clearableRuns.isEmpty {
                 Button(action: {
                     confirmClear = true
                 }) {
@@ -470,6 +478,7 @@ struct SubagentInspectorView: View {
     private func row(for record: AgentRunRecord) -> some View {
         Button(action: {
             manager.selectedSubagentId = nil
+            discardFailure = nil
             withAnimation(.easeInOut(duration: 0.15)) { selectedRunId = record.id }
         }) {
             SubagentRunRow(
@@ -828,6 +837,13 @@ private struct SubagentRunDetailView: View {
 
     private var hasKeptIgnoredFiles: Bool {
         !(record.keptIgnoredFiles?.isEmpty ?? true) || !keptIgnoredHere.isEmpty
+    }
+
+    /// An apply this pane started, OR one the service still owns. The pane is
+    /// recreated when the selection moves (`.id(record.id)`), which reset the
+    /// local flag and re-enabled Apply while the first apply was still writing.
+    private var isApplyInFlight: Bool {
+        isApplying || SubagentApplyService.isRunInFlight(record.id)
     }
 
     private var canApplyChanges: Bool {
@@ -1337,12 +1353,12 @@ private struct SubagentRunDetailView: View {
 
                 if canApplyChanges {
                     Button(action: applyChanges) {
-                        Label(isApplying ? "Applying…" : "Apply Changes", systemImage: "arrow.down.doc")
+                        Label(isApplyInFlight ? "Applying…" : "Apply Changes", systemImage: "arrow.down.doc")
                             .font(.system(size: 10, weight: .medium))
                     }
                     .buttonStyle(.bordered)
                     .tint(.purple)
-                    .disabled(isApplying)
+                    .disabled(isApplyInFlight)
                     .help("Land this run's worktree changes on the main working tree, unstaged. You will be asked to confirm first.")
                 }
 
@@ -1402,7 +1418,7 @@ private struct SubagentRunDetailView: View {
     }
 
     private func applyChanges() {
-        guard !isApplying else { return }
+        guard !isApplyInFlight else { return }
         isApplying = true
         applyError = nil
         applyNotice = nil
@@ -1528,6 +1544,14 @@ struct SubagentInlineRunCard: View {
     @State private var storeRevision = 0
     @State private var storeReload: Task<Void, Never>?
 
+    /// The task's identity includes the RUN, not only the revision counter:
+    /// SwiftUI reuses the view when a transcript row is re-identified, and a
+    /// revision-keyed task then kept showing the previous run's record.
+    private struct ReloadKey: Equatable {
+        let runId: UUID
+        let revision: Int
+    }
+
     var body: some View {
         // The task is attached HERE, not to the card: when neither a live
         // instance nor a stored record is present the card branch renders the
@@ -1545,7 +1569,7 @@ struct SubagentInlineRunCard: View {
                 missingCard
             }
         }
-        .task(id: storeRevision) {
+        .task(id: ReloadKey(runId: runId, revision: storeRevision)) {
             let record = await Task.detached(priority: .utility) {
                 AgentRunStore.shared.loadAny(runId: runId)
             }.value
