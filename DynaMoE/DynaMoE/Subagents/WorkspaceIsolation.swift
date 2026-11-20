@@ -58,7 +58,10 @@ nonisolated enum WorkspaceIsolationError: LocalizedError, Equatable {
 
 /// One run's worktree, with the commit it was branched from.
 nonisolated struct AgentWorktree: Equatable, Sendable {
-    var runId: UUID
+    /// The run that owns this tree, when the caller knows it. `open` derives it
+    /// from the directory name and leaves it nil rather than inventing one: a
+    /// fabricated identity is a value something later trusts.
+    var runId: UUID?
     var repositoryRoot: URL
     var path: URL
     var branch: String
@@ -448,7 +451,7 @@ nonisolated enum WorkspaceIsolation {
             baseCommit = baseResult.1.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         return AgentWorktree(
-            runId: UUID(uuidString: worktreeURL.lastPathComponent) ?? UUID(),
+            runId: UUID(uuidString: worktreeURL.lastPathComponent),
             repositoryRoot: repositoryRoot,
             path: worktreeURL,
             branch: branch,
@@ -1440,14 +1443,23 @@ nonisolated enum WorkspaceIsolation {
             }
     }
 
+    /// Whether the worktree holds nothing the operator could lose, checked
+    /// without WRITING to it.
+    ///
+    /// It used to `git reset -q -- .` first, to clear intent-to-add entries an
+    /// earlier `snapshot` or `diffStat` left behind (`git add -N .`: a removed
+    /// intent-to-add file reports ` D <file>` though the tree matches HEAD).
+    /// That reset also unstages real staged work, and since `snapshot` diffs
+    /// base against the WORKING TREE, a run whose only work was staged is
+    /// invisible to the patch — so the reset erased it, this read clean, and
+    /// the apply's "no changes" path deleted the worktree and branch.
+    ///
+    /// The index is now left alone, which means a leftover intent-to-add entry
+    /// can make a genuinely clean tree read as dirty. That is the safe
+    /// direction: the caller throws and KEEPS the worktree, costing an
+    /// operator one manual clear, where the old false "clean" cost them the
+    /// run's only copy of its work.
     static func hasNoWorkingTreeChanges(_ worktree: AgentWorktree) async -> Bool {
-        // Clear any intent-to-add index entries left by an earlier `snapshot` or
-        // `diffStat` (`git add -N .`). If a file registered as intent-to-add was
-        // later removed, `git status` reports ` D <file>` even though the tree
-        // matches HEAD; resetting the index first turns real changes into
-        // normal unstaged/untracked entries while clearing stale intent-to-add
-        // entries.
-        _ = try? await git(["reset", "-q", "--", "."], in: worktree.path)
         guard let (code, stdout, _) = try? await git(
             ["status", "--porcelain", "-z"],
             in: worktree.path

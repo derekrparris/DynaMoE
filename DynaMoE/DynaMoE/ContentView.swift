@@ -1678,6 +1678,14 @@ struct ContentView: View {
     /// conversation is withheld while another is on screen — the transcript's own
     /// progress row is keyed to the session for the same reason — while a notice
     /// about the app stays visible everywhere.
+    /// Whether the composer may send. One named property instead of a
+    /// three-way disjunction inline: the expression inside a large view
+    /// builder is what pushed the type checker over its budget.
+    private var isModelLoadedForComposer: Bool {
+        let weightsLoaded = tokenizer != nil && summary != nil
+        return weightsLoaded || isAppleFoundationModelActive || isCloudModelActive
+    }
+
     private var visibleStatusNotice: StatusNotice? {
         guard let statusNotice else { return nil }
         guard let statusNoticeSessionId else { return statusNotice }
@@ -1718,11 +1726,14 @@ struct ContentView: View {
                     isGenerating: isGeneratingText,
                     onNewChat: {
                         let defModel = localModelManager.getDefaultOrFirstModel()
+                        let defaultId: String? = defModel?.id
+                        let defaultName: String? = defModel?.displayName
+                        let defaultPath: String? = defModel?.snapshotPath
                         let newSession = ChatSession(
                             title: "New Chat",
-                            selectedModelId: defModel?.id,
-                            selectedModelName: defModel?.displayName,
-                            selectedModelPath: defModel?.snapshotPath
+                            selectedModelId: defaultId,
+                            selectedModelName: defaultName,
+                            selectedModelPath: defaultPath
                         )
                         sessions.insert(newSession, at: 0)
                         selectedSessionId = newSession.id
@@ -1826,9 +1837,12 @@ struct ContentView: View {
                         ) else { return nil }
                         // An estimate, not a promise: the model behind it was
                         // measured on this machine class, and the chip says so.
-                        return estimate.seconds < 10
-                            ? String(format: "about %.1f s", estimate.seconds)
-                            : "about \(Int(estimate.seconds.rounded())) s"
+                        let seconds = estimate.seconds
+                        if seconds < 10 {
+                            return String(format: "about %.1f s", seconds)
+                        }
+                        let rounded = Int(seconds.rounded())
+                        return "about " + String(rounded) + " s"
                     },
                     isAgentToolsEnabled: isAgentToolsEnabledForActiveSession,
                     isModelLoaded: (tokenizer != nil && summary != nil) || isAppleFoundationModelActive || isCloudModelActive,
@@ -1856,13 +1870,16 @@ struct ContentView: View {
                         openSettingsWindow()
                     },
                     onSetThinking: { enabled, effort in
-                        let resolvedEffort = enabled ? effort : nil
+                        let resolvedEffort: ThinkingEffort? = enabled ? effort : nil
                         defaultThinkingEnabled = enabled
                         if let effort {
                             defaultThinkingEffort = effort.rawValue
                         }
-                        if let sid = selectedSessionId ?? sessions.first?.id,
-                           let idx = sessions.firstIndex(where: { $0.id == sid }) {
+                        let targetSessionId: UUID? = selectedSessionId ?? sessions.first?.id
+                        let targetIndex: Int? = targetSessionId.flatMap { id -> Int? in
+                            sessions.firstIndex(where: { $0.id == id })
+                        }
+                        if let sid = targetSessionId, let idx = targetIndex {
                             let changed = sessions[idx].isThinkingEnabled != enabled
                                 || sessions[idx].thinkingEffort != resolvedEffort
                             sessions[idx].isThinkingEnabled = enabled
@@ -1882,10 +1899,16 @@ struct ContentView: View {
                         // never runs. Turning the tools off therefore leaves the
                         // mode with them, and a live turn refuses the change for
                         // the same reason it refuses a mode flip.
-                        if !enabled,
-                           let sid = selectedSessionId ?? sessions.first?.id,
-                           let idx = sessions.firstIndex(where: { $0.id == sid }),
-                           (sessions[idx].agentMode ?? .code) == .plan {
+                        let targetSessionId: UUID? = selectedSessionId ?? sessions.first?.id
+                        var isPlanMode = false
+                        if let targetSessionId {
+                            let targetIndex: Int? = sessions.firstIndex { $0.id == targetSessionId }
+                            if let targetIndex {
+                                let mode: AgentMode = sessions[targetIndex].agentMode ?? .code
+                                isPlanMode = mode == .plan
+                            }
+                        }
+                        if !enabled, let sid = targetSessionId, isPlanMode {
                             guard !isModeChangeLocked, applyPlanMode(false, sessionId: sid) else {
                                 showStatus("⏳ Plan Mode is running — finish the turn before turning agent tools off.", kind: .warning)
                                 return
@@ -2022,13 +2045,15 @@ struct ContentView: View {
                 NSApp.keyWindow?.makeFirstResponder(nil)
             }
         }
-        .onChange(of: selectedSessionId) { newId in
+        .onChange(of: selectedSessionId) { (newId: UUID?) in
             // The session that was protected from pruning may have just changed,
             // so re-run retention before switching models.
             applyChatRetention()
             guard let newId = newId, let session = sessions.first(where: { $0.id == newId }) else { return }
             if let targetPath = session.selectedModelPath, !targetPath.isEmpty, activeLoadedModelPath != targetPath {
-                if let model = localModelManager.getModel(byId: targetPath) ?? localModelManager.getModel(byId: session.selectedModelId ?? "") {
+                let byPath = localModelManager.getModel(byId: targetPath)
+                let byId = byPath ?? localModelManager.getModel(byId: session.selectedModelId ?? "")
+                if let model = byId {
                     switchModel(to: model)
                 } else {
                     loadAndBridgeToMetal(filePath: targetPath)
@@ -2323,7 +2348,7 @@ struct ContentView: View {
             // engine.
             guard await ensureModelLoaded(forSession: targetSessionId) else { return false }
             guard !isGeneratingText else { return false }
-            return handleSendMessage(trimmed, preparedImages: preparedImages, sessionId: targetSessionId)
+            return await handleSendMessage(trimmed, preparedImages: preparedImages, sessionId: targetSessionId)
         }
         print("⏹ [INT] interrupt requested — cancelling current generation and sending a fresh turn")
         let previous = generationTask
@@ -2362,7 +2387,7 @@ struct ContentView: View {
             if isGeneratingText || !modelReady {
                 accepted = false
             } else {
-                accepted = handleSendMessage(trimmed, preparedImages: preparedImages, sessionId: targetSessionId)
+                accepted = await handleSendMessage(trimmed, preparedImages: preparedImages, sessionId: targetSessionId)
             }
         }
         if let targetSessionId {
@@ -2419,12 +2444,14 @@ struct ContentView: View {
                         count: queuedAttachments.count,
                         reason: "model has no vision support"
                     )].filter { !$0.isEmpty }.joined(separator: "\n\n"))
-                let accepted = !self.isGeneratingText && modelReady
-                    && self.handleSendMessage(
+                var accepted = false
+                if !self.isGeneratingText, modelReady {
+                    accepted = await self.handleSendMessage(
                         text,
                         attachmentRefs: attachmentsStillVisible ? queuedAttachments : [],
                         sessionId: currentSessionId
                     )
+                }
                 if !accepted {
                     self.requeuePromptFront(next, sessionId: currentSessionId)
                 }
@@ -2464,7 +2491,7 @@ struct ContentView: View {
         // A directive belongs to exactly one turn; a later send must not find
         // the previous one still in history and re-read reports it already saw.
         sessions[sessionIdx].messages.removeAll { $0.isPromptOnly == true }
-        let pending = gatherCompletedSubagentRelayResponses(forSession: sessionId)
+        let pending = gatherCompletedSubagentRelayResponsesSynchronously(forSession: sessionId)
         guard !pending.isEmpty else { return [] }
         sessions[sessionIdx].messages.append(
             ChatMessage(
@@ -2486,7 +2513,81 @@ struct ContentView: View {
     /// `summaryRelayed` is still false is exactly the report this relay exists
     /// to deliver. Live instances come first and their ids suppress the stored
     /// copy, so one run is never injected twice.
-    private func gatherCompletedSubagentRelayResponses(forSession sessionId: UUID?) -> [String] {
+    /// The send path's form. `handleSendMessage` is synchronous (a view
+    /// builder calls it), so it cannot await the off-actor read the async
+    /// version does: this keeps the blocking store read, on the main actor,
+    /// exactly as before. Every other caller is async and takes the read off
+    /// the main actor; this one is the send's own first frame, where the read
+    /// is bounded by what the conversation still owes.
+    private func gatherCompletedSubagentRelayResponsesSynchronously(forSession sessionId: UUID?) -> [String] {
+        guard let sessionId else { return [] }
+        var seen = Set<UUID>()
+        var entries: [(timestamp: Date, text: String)] = []
+        let budget = AgentHarness.charBudget(forTokenBudget: self.maxToolOutputLength)
+
+        func line(role: String, id: UUID, status: String, summary: String) -> String? {
+            let clean = AgentHarness.truncateText(
+                AgentHarness.sanitizeText(summary),
+                limit: budget
+            )
+            guard !clean.isEmpty else { return nil }
+            return "[SUBAGENT_RESULT] id=\(id.uuidString) status=\(status) role=\(Self.relayRole(role))\n\(clean)"
+        }
+
+        for instance in SubagentManager.shared.allSubagents
+        where instance.parentSessionId == sessionId
+            && instance.status.isTerminal
+            && !instance.isSummaryRelayed
+            && !instance.finalSummary.isEmpty {
+            seen.insert(instance.id)
+            let summary: String
+            if instance.status == .cancelled {
+                let partial = instance.report?.summary
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                guard !partial.isEmpty, partial != instance.finalSummary else { continue }
+                summary = partial
+            } else {
+                summary = instance.finalSummary
+            }
+            if let text = line(
+                role: instance.role,
+                id: instance.id,
+                status: instance.status.rawValue,
+                summary: summary
+            ) {
+                let timestamp = instance.completedAt ?? instance.startedAt ?? instance.createdAt
+                entries.append((timestamp: timestamp, text: text))
+            }
+        }
+
+        let owed = Set(AgentRunStore.shared.unrelayedRunIds(sessionId: sessionId)).subtracting(seen)
+        for id in owed.sorted(by: { $0.uuidString < $1.uuidString }) {
+            guard let record = AgentRunStore.shared.load(runId: id, sessionId: sessionId) else { continue }
+            let summary: String
+            if record.status == .cancelled {
+                let partial = record.report?.summary
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                guard !partial.isEmpty, partial != record.error else { continue }
+                summary = partial
+            } else {
+                summary = record.report?.summary ?? record.error ?? ""
+            }
+            if let text = line(
+                role: record.role,
+                id: record.id,
+                status: record.status.rawValue,
+                summary: summary
+            ) {
+                let timestamp = record.completedAt ?? record.startedAt ?? record.createdAt
+                entries.append((timestamp: timestamp, text: text))
+            }
+        }
+        return entries
+            .sorted { $0.timestamp < $1.timestamp }
+            .map(\.text)
+    }
+
+    private func gatherCompletedSubagentRelayResponses(forSession sessionId: UUID?) async -> [String] {
         guard let sessionId else { return [] }
         var seen = Set<UUID>()
         var entries: [(timestamp: Date, text: String)] = []
@@ -2539,12 +2640,15 @@ struct ContentView: View {
         // Only the records the store's relay index still owes this
         // conversation are decoded. Reading every record on each send would
         // parse a session's whole run history to find, usually, nothing.
-        let owed = AgentRunStore.shared.unrelayedRunIds(sessionId: sessionId)
-        let restored = owed
-            .filter { !seen.contains($0) }
-            .compactMap { id in
+        let owed = Set(AgentRunStore.shared.unrelayedRunIds(sessionId: sessionId)).subtracting(seen)
+        // Off the main actor: each id is an `ioQueue.sync` plus a JSON decode,
+        // and the owed set is bounded only by retention. The store is
+        // nonisolated and Sendable, so the reads need no actor.
+        let restored: [(UUID, AgentRunRecord)] = await Task.detached(priority: .userInitiated) {
+            owed.sorted { $0.uuidString < $1.uuidString }.compactMap { id in
                 AgentRunStore.shared.load(runId: id, sessionId: sessionId).map { (id, $0) }
             }
+        }.value
         for (_, record) in restored {
             let summary: String
             if record.status == .cancelled {
@@ -5522,8 +5626,8 @@ struct ContentView: View {
             // result-delivery relay below.
             var ranSynthesisTurn = false
 
-            @MainActor func takeSubagentRelayDirective() -> Bool {
-                let pending = self.gatherCompletedSubagentRelayResponses(forSession: sessionId)
+            @MainActor func takeSubagentRelayDirective() async -> Bool {
+                let pending = await self.gatherCompletedSubagentRelayResponses(forSession: sessionId)
                 guard !pending.isEmpty else { return false }
                 relayDirective = CloudSubagentRelay.directive(reports: pending)
                 relayDirectiveReports = pending
@@ -5534,7 +5638,7 @@ struct ContentView: View {
             // previous run ended has no step to ride, so the FIRST step of this
             // turn carries it. The directive is appended to the request, never
             // merged into the cached system message.
-            _ = takeSubagentRelayDirective()
+            _ = await takeSubagentRelayDirective()
 
             while true {
                 // A superseded or stopped turn must not spend one more provider
@@ -6332,7 +6436,7 @@ struct ContentView: View {
                         // reports have not reached the conversation ride the next
                         // step's system message so the coordinator can present
                         // them instead of the run ending with the report dropped.
-                        _ = takeSubagentRelayDirective()
+                        _ = await takeSubagentRelayDirective()
                         let nextMessageId = UUID()
                         if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
                             self.sessions[sIdx].messages.append(ChatMessage(
@@ -6413,7 +6517,7 @@ struct ContentView: View {
                 }
                 if toolsEnabled, !ranComplete, !ranSynthesisTurn,
                    AgentStepBudget.allowsAnotherStep(step: step, cap: self.agentStepCap),
-                   takeSubagentRelayDirective() {
+                   await takeSubagentRelayDirective() {
                     ranSynthesisTurn = true
                     let nextMessageId = UUID()
                     if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
@@ -8149,9 +8253,7 @@ struct ContentView: View {
                         // Marked only when the continuation this response turn
                         // feeds actually launches; a launch refused between
                         // here and there must leave them pending.
-                        let relayResponses = await MainActor.run {
-                            self.gatherCompletedSubagentRelayResponses(forSession: sessionId)
-                        }
+                        let relayResponses = await self.gatherCompletedSubagentRelayResponses(forSession: sessionId)
                         let allResponses = toolResponses + relayResponses
 
                         let isGemma4Continuation = (modelConfig?.isGemma4Model == true)
@@ -8338,9 +8440,7 @@ struct ContentView: View {
                             guard stillOwnsGeneration else { return }
                             // Same rule as the mid-run relay: delivered only
                             // once the relay turn launches.
-                            let pendingRelay = await MainActor.run {
-                                self.gatherCompletedSubagentRelayResponses(forSession: sessionId)
-                            }
+                            let pendingRelay = await self.gatherCompletedSubagentRelayResponses(forSession: sessionId)
                             if !pendingRelay.isEmpty {
                                 let endTag = (modelConfig?.isGemma4Model == true) ? "<turn|>" : ((modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>") )
                                 let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: endTag)

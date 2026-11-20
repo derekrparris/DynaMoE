@@ -322,6 +322,15 @@ nonisolated public final class GrammarConstrainedSampler {
     /// turn must not be able to emit an in-app tool name). The base comes back
     /// only when the last scope ends.
     ///
+    /// The union is deliberate and it means overlapping scopes can SEE each
+    /// other's tool names: while a subagent run and an API client overlap, the
+    /// run's model can emit a name only the client declared. That is a
+    /// vocabulary leak, not an execution one — each scope decides its own calls
+    /// against its own loaded tools, so a name it did not get is refused. It is
+    /// the price of the restore fix above: intersecting instead would hide a
+    /// turn's own tools whenever another turn were live, which is the bug this
+    /// replaced.
+    ///
     /// `registrationLock` is held across the WHOLE rebuild. Each replacement
     /// is a multi-field write and a token's mask read takes the same lock, so
     /// rebuilding one scope at a time exposed the intermediate registry (one

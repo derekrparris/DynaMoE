@@ -301,11 +301,12 @@ enum AgentSpawnResolver {
         // failure path.
         var cloudSpendReservation: UUID?
         if descriptor.kind == .cloud {
-            let reservation = try SubagentManager.shared.reserveCloudSpend(
+            let requestedReservation = budget.maxCostUSD
+                ?? SubagentBackendSettings.sessionCloudCostCeiling(defaults: defaults)
+                ?? 0
+            let reservation = await SubagentManager.shared.reserveCloudSpend(
                 forSession: request.parentSessionId,
-                requestedUSD: budget.maxCostUSD
-                    ?? SubagentBackendSettings.sessionCloudCostCeiling(defaults: defaults)
-                    ?? 0
+                requestedUSD: requestedReservation
             )
             do {
                 budget = try Self.applySessionCloudCeiling(
@@ -313,6 +314,7 @@ enum AgentSpawnResolver {
                     descriptor: descriptor,
                     usesOperatorCeiling: usesOperatorCeiling,
                     sessionSpentUSD: reservation.spentUSD,
+                    ownReservationUSD: requestedReservation,
                     defaults: defaults
                 )
             } catch {
@@ -376,7 +378,8 @@ enum AgentSpawnResolver {
                         budget: budget,
                         descriptor: descriptor,
                         usesOperatorCeiling: usesOperatorCeiling,
-                        sessionSpentUSD: SubagentManager.shared.sessionCloudSpendUSD(forSession: request.parentSessionId),
+                        sessionSpentUSD: await SubagentManager.shared.sessionCloudSpendUSD(forSession: request.parentSessionId),
+                        ownReservationUSD: budget.maxCostUSD ?? 0,
                         defaults: defaults
                     )
                     if let cloudSpendReservation {
@@ -533,18 +536,27 @@ enum AgentSpawnResolver {
     /// Enforces the per-conversation aggregate cloud spend cap so a coordinator
     /// cannot multiply the per-run cap across arbitrarily many read-only cloud
     /// spawns. Pure so unit tests can pin the rule directly.
+    /// `ownReservationUSD` is this spawn's commitment, already counted in
+    /// `sessionSpentUSD` by `reserveCloudSpend`. It is subtracted before the
+    /// check: leaving it in makes `remaining` shrink by the very budget being
+    /// trimmed, so an exhausted-looking figure can be reported (even a
+    /// negative one) for a conversation with room left, and the trim branch
+    /// becomes unreachable exactly when it is needed.
     nonisolated static func applySessionCloudCeiling(
         budget: AgentBudget,
         descriptor: AgentBackendDescriptor,
         usesOperatorCeiling: Bool,
         sessionSpentUSD: Double,
+        ownReservationUSD: Double = 0,
         defaults: UserDefaults = .standard
     ) throws -> AgentBudget {
         guard descriptor.kind == .cloud,
               let sessionCeiling = SubagentBackendSettings.sessionCloudCostCeiling(defaults: defaults) else {
             return budget
         }
-        let spent = max(0, sessionSpentUSD.isFinite ? sessionSpentUSD : 0)
+        let total = max(0, sessionSpentUSD.isFinite ? sessionSpentUSD : 0)
+        let own = ownReservationUSD.isFinite ? max(0, ownReservationUSD) : 0
+        let spent = max(0, total - own)
         let remaining = sessionCeiling - spent
         guard remaining > 1e-6 else {
             throw AgentSpawnError.sessionCloudBudgetExhausted(spent: spent, ceiling: sessionCeiling)

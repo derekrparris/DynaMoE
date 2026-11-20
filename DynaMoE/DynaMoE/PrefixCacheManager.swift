@@ -251,10 +251,27 @@ nonisolated public final class PrefixCacheManager: @unchecked Sendable {
     /// resetting the cache, which is the same state arriving by a different
     /// route. A launch that preserves the whole pin is left alone: it can only
     /// append, so the pinned rows stay valid even if that turn never finishes.
-    public func invalidateIfNotPreserved(_ preservedCount: Int) {
+    ///
+    /// `matchedPrefixCount` is the length `findCommonPrefix` answered for THIS
+    /// turn, when the caller has it. The pin can be replaced between that match
+    /// and this reset — an interleaved turn recording its own — and comparing
+    /// against the pin as it is NOW would drop a sequence whose rows are still
+    /// resident, because a freshly recorded pin is longer than what this turn
+    /// preserved. Matching against what was actually matched keeps that
+    /// replacement: it is a superset of what this turn kept only if it starts
+    /// with it, and a pin that no longer shares this turn's prefix is dropped
+    /// either way.
+    public func invalidateIfNotPreserved(_ preservedCount: Int, matchedPrefixCount: Int? = nil) {
         lock.lock()
         defer { lock.unlock() }
-        guard !pinnedTokenIds.isEmpty, preservedCount < pinnedTokenIds.count else { return }
+        let claimed = pinnedTokenIds.count
+        guard claimed > 0, preservedCount < claimed else { return }
+        // The pin grew after the match, so it is not the one this turn is
+        // preserving a prefix OF, and dropping it would cost a re-prefill for
+        // a sequence that is still resident.
+        if let matchedPrefixCount, matchedPrefixCount == preservedCount, claimed > matchedPrefixCount {
+            return
+        }
         pinnedTokenIds.removeAll(keepingCapacity: true)
         activeSessionId = nil
         pinnedAsOfDate = nil

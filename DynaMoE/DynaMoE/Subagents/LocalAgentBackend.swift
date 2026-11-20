@@ -226,7 +226,7 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
                         "A local subagent run needs a loaded model. Load a checkpoint in Settings first."
                     )
                 }
-                return try prepare(
+                return try await prepare(
                     request,
                     thinkingEnabled: thinkingEnabled,
                     engine: engine,
@@ -250,11 +250,11 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
     @MainActor
     static func withStepClaim(
         acquire: () async throws -> TurnSlotClaim,
-        prepare: (TurnSlotClaim) throws -> Prepared
+        prepare: (TurnSlotClaim) async throws -> Prepared
     ) async throws -> Prepared {
         let claim = try await acquire()
         do {
-            return try prepare(claim)
+            return try await prepare(claim)
         } catch {
             claim.release()
             throw error
@@ -302,7 +302,11 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
         info: CompletionEngine.LoadedModelInfo,
         config: ModelConfig,
         claim: TurnSlotClaim
-    ) throws -> Prepared {
+    ) async throws -> Prepared {
+        // The render is pure and the tokenize is a long serial pass over a
+        // prompt that can be 160k characters, so both run off the main actor;
+        // the engine is a lock-guarded Sendable box, so the tokenize needs no
+        // actor either. Only what touches UI state stays on it.
         let prompt = renderPrompt(
             systemPrompt: request.systemPrompt,
             messages: request.messages,
@@ -313,7 +317,9 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
         )
         let promptTokenIds: [UInt32]
         do {
-            promptTokenIds = try engine.tokenize(prompt)
+            promptTokenIds = try await Task.detached(priority: .userInitiated) {
+                try engine.tokenize(prompt)
+            }.value
         } catch {
             throw AgentBackendError.malformedResponse(
                 "The tokenizer could not encode the subagent prompt: \(error.localizedDescription)"

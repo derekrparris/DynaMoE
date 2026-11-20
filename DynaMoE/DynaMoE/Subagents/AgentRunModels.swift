@@ -112,6 +112,9 @@ nonisolated struct AgentBudget: Codable, Equatable, Sendable {
     static let maximumCompletionTokens = 10_000_000
     static let maximumWallClockSeconds = 86_400
 
+    /// Whether a budget still promises anything after clamping: a spawn whose
+    /// overrides clamp to a zero step, token or time budget would start and
+    /// stop immediately, so it is refused rather than run.
     var isValid: Bool {
         maxSteps > 0 && maxCompletionTokens > 0 && maxWallClockSeconds > 0
     }

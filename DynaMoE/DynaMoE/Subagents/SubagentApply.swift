@@ -206,9 +206,14 @@ enum SubagentApplyService {
         ), let changes = try? await WorkspaceIsolation.snapshot(worktree, diffLimit: nil) else {
             return (nil, nil)
         }
-        let expectation = destinationBranch.map {
-            SubagentApplyExpectation(destinationBranch: $0, patchDigest: patchDigest(changes.diff))
-        }
+        // Built even when the destination is a detached HEAD (`nil` branch):
+        // there the branch check cannot help, so the patch digest is the only
+        // binding left and dropping the whole expectation would discard it.
+        // Both fields are optional and a nil one simply checks less.
+        let expectation = SubagentApplyExpectation(
+            destinationBranch: destinationBranch,
+            patchDigest: patchDigest(changes.diff)
+        )
         return (expectation, changes.diff)
     }
 
@@ -296,9 +301,16 @@ enum SubagentApplyService {
         // approval window cannot land unreviewed bytes on the wrong branch.
         let destinationBranch = await WorkspaceIsolation.currentBranch(of: worktree.repositoryRoot)
         if let expectation {
-            if destinationBranch != expectation.destinationBranch {
+            // Only a branch the card RESOLVED can be checked. A nil expected
+            // branch means "detached HEAD", but it is also what a caller that
+            // built the expectation without resolving one passes, and those
+            // must not be refused when the destination is on a branch — the
+            // earlier code dropped the whole expectation in that case, and
+            // failing here instead would turn a permissive path strict.
+            if let expectedBranch = expectation.destinationBranch,
+               destinationBranch != expectedBranch {
                 throw SubagentApplyError.destinationBranchChanged(
-                    expected: expectation.destinationBranch,
+                    expected: expectedBranch,
                     actual: destinationBranch
                 )
             }
@@ -749,25 +761,37 @@ enum SubagentApplyControl {
         var stat: String? = nil
         var diffPreview: String? = record.report?.diff
         var patchDigest: String? = nil
-        if let worktree = try? await WorkspaceIsolation.open(
-            path: path,
-            branch: branch,
-            repositoryRoot: destinationURL,
-            baseCommit: record.baseCommit
-        ) {
+        var snapshotFailure: String? = nil
+        do {
+            let worktree = try await WorkspaceIsolation.open(
+                path: path,
+                branch: branch,
+                repositoryRoot: destinationURL,
+                baseCommit: record.baseCommit
+            )
             stat = await WorkspaceIsolation.diffStat(worktree)
-            if let preApprovalChanges = try? await WorkspaceIsolation.snapshot(worktree, diffLimit: nil) {
-                patchDigest = SubagentApplyService.patchDigest(preApprovalChanges.diff)
-                if diffPreview == nil || diffPreview?.isEmpty == true {
-                    diffPreview = preApprovalChanges.diff
-                }
+            let preApprovalChanges = try await WorkspaceIsolation.snapshot(worktree, diffLimit: nil)
+            patchDigest = SubagentApplyService.patchDigest(preApprovalChanges.diff)
+            if diffPreview == nil || diffPreview?.isEmpty == true {
+                diffPreview = preApprovalChanges.diff
             }
+        } catch {
+            // The card is bound to the patch it shows. Falling back to the
+            // recorded report's diff while the digest stays nil leaves the
+            // operator approving a stale preview with nothing checking the
+            // bytes that will land, so say so on the card instead of
+            // downgrading silently.
+            snapshotFailure = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
         // The patch lands on whatever the destination has checked out, and a
         // dirty destination is the usual reason an apply conflicts. Saying so
         // on the card is what lets the operator stash or commit first instead
         // of approving an apply that cannot land.
-        let destinationNote = await Self.destinationNote(for: destination)
+        var destinationNote = await Self.destinationNote(for: destination)
+        if let snapshotFailure {
+            destinationNote = (destinationNote.map { $0 + " " } ?? "")
+                + "Could not snapshot the run's worktree, so this card cannot bind the apply to the exact patch: \(snapshotFailure)"
+        }
         guard let request = applyRequest(
             for: record,
             destination: destination,

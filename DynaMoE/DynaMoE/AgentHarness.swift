@@ -206,12 +206,24 @@ public final class ShellRunTool: AgentTool {
             targetDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         }
 
-        let (exitCode, stdout, stderr) = try await AgentHarness.runProcess(
-            executableURL: URL(fileURLWithPath: "/bin/zsh"),
-            arguments: ["-c", command],
-            currentDirectory: targetDir,
-            timeoutSeconds: 120.0
-        )
+        let exitCode: Int32
+        let stdout: String
+        let stderr: String
+        do {
+            (exitCode, stdout, stderr) = try await AgentHarness.runProcess(
+                executableURL: URL(fileURLWithPath: "/bin/zsh"),
+                arguments: ["-c", command],
+                currentDirectory: targetDir,
+                timeoutSeconds: 120.0
+            )
+        } catch is CancellationError {
+            // `runProcess` refuses to spawn for an already-cancelled task, and a
+            // bare CancellationError carries no message, so the tool loop would
+            // record an empty error string. Report the stop the way a killed
+            // child reports it (130 is SIGINT's shell status).
+            let err = "Command was cancelled by user."
+            return (AgentHarness.toolErrorJSON(tool: "shell_run", error: err), nil, err, false)
+        }
 
         var rawStdout = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         if AgentHarness.looksLikeHTML(rawStdout), rawStdout.utf8.count > 2048 {
@@ -2992,17 +3004,25 @@ public final class GetSubagentStatusTool: AgentTool {
             "steps_count": subagent.usage.steps,
             "tool_calls_count": subagent.transcript.count,
             "steps_summary": stepsSummary,
-            "summary": subagent.finalSummary,
+            "summary": AgentHarness.sanitizeText(subagent.finalSummary),
             "duration_seconds": subagent.executionDurationSeconds
         ]
         if let report = subagent.report {
+            // The structured half is fed back verbatim by the local tool loop, so
+            // it needs the marker pass the readable half already gets: a report
+            // is model-authored and could otherwise smuggle a turn marker into
+            // the coordinator's context through a JSON field.
             if !report.findings.isEmpty {
                 data["findings"] = report.findings.map {
-                    ["claim": $0.claim, "evidence": $0.evidence, "confidence": $0.confidence]
+                    [
+                        "claim": AgentHarness.sanitizeText($0.claim),
+                        "evidence": AgentHarness.sanitizeText($0.evidence),
+                        "confidence": $0.confidence
+                    ]
                 }
             }
             if !report.openQuestions.isEmpty {
-                data["open_questions"] = report.openQuestions
+                data["open_questions"] = report.openQuestions.map { AgentHarness.sanitizeText($0) }
             }
             if report.usage.costIsUnpriced {
                 data["cost_is_unpriced"] = true
@@ -6608,7 +6628,14 @@ public final class AgentHarness {
         return contains(resolved, in: workspace) ? nil : resolved.path
     }
 
-    private func runScopeDecision(for call: ParsedToolCall, workingDirectory: URL?) -> RunScopeDecision {
+    /// `mode` is the TURN's effective mode, not the process's: a run's own mode
+    /// is what its card is judged under, and `activeMode` is whichever turn
+    /// happened to be current.
+    private func runScopeDecision(
+        for call: ParsedToolCall,
+        workingDirectory: URL?,
+        mode effectiveMode: AgentMode
+    ) -> RunScopeDecision {
         guard isRunScoped else { return .allow }
         if Self.runScopedForbiddenToolNames.contains(call.name) {
             return .deny("'\(call.name)' is not available inside a subagent run")
@@ -6626,7 +6653,7 @@ public final class AgentHarness {
         let subQNeedsApproval = call.name == "subq_decide" && Self.requiresApproval(
             toolName: call.name,
             arguments: call.arguments,
-            mode: activeMode,
+            mode: effectiveMode,
             subQEndpoint: SubQDecideTool.pinnedEndpoint ?? SubQDecisionSettings.endpoint(),
             rawArguments: call.rawArguments
         )
@@ -6833,7 +6860,7 @@ public final class AgentHarness {
             )
             return (json, rec, false)
         }
-        switch runScopeDecision(for: call, workingDirectory: wd) {
+        switch runScopeDecision(for: call, workingDirectory: wd, mode: effectiveMode) {
         case .allow:
             break
         case .deny(let reason):

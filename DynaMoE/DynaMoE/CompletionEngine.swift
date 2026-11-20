@@ -1117,7 +1117,10 @@ public final class CompletionEngine: @unchecked Sendable {
                             // at launch instead dropped a still-valid pin for a
                             // turn the runner went on to refuse.
                             onCacheWillChange: {
-                                PrefixCacheManager.shared.invalidateIfNotPreserved(runnerReused)
+                                PrefixCacheManager.shared.invalidateIfNotPreserved(
+                                    runnerReused,
+                                    matchedPrefixCount: reusablePrefix
+                                )
                             }
                         )
                         emit(.prefillProgress(status: nil, speed: nil, rssGB: nil))
@@ -2561,7 +2564,10 @@ public final class CompletionEngine: @unchecked Sendable {
         // machine cannot hold, and a refused launch overwrites no rows —
         // invalidating the pin on the way to a 400 dropped a still-valid pin
         // for a refusal the operator could fix by lowering the prompt.
-        PrefixCacheManager.shared.invalidateIfNotPreserved(prefixTokensReused)
+        PrefixCacheManager.shared.invalidateIfNotPreserved(
+            prefixTokensReused,
+            matchedPrefixCount: reuseCandidate
+        )
 
         KVCacheManager.shared.reset(
             device: device,

@@ -63,13 +63,18 @@ enum SubagentNotifier {
 
         // A finish notice exists for a run the operator is not watching. While
         // DynaMoE is frontmost the inspector is one click away, and a banner
-        // over the app is noise the doc never promised. The Dock bounce sits
-        // behind the same gate as the banner: an app-hosted test run has a real
-        // NSApp, so bouncing first made `xcodebuild test` bounce the Dock once
-        // per finished run.
+        // over the app is noise the doc never promised. The Dock bounce shares
+        // that inactivity gate but NOT the banner's opt-in: it is not a
+        // permission and does not survive the moment, so it is the only signal
+        // a run gets when notifications are off (the default). It is skipped
+        // under test because an app-hosted test run has a real NSApp and would
+        // bounce the Dock once per finished run.
         let isInactive = !NSApp.isActive
-        guard isInactive, isEnabled, !isRunningTests, Bundle.main.bundleIdentifier != nil else { return }
+        guard isInactive, !isRunningTests, Bundle.main.bundleIdentifier != nil else { return }
         NSApp.requestUserAttention(.informationalRequest)
+
+        // The banner is opt-IN, so everything below is the operator's choice.
+        guard isEnabled else { return }
 
         let content = UNMutableNotificationContent()
         // The role is model-supplied text on a surface outside the app. A

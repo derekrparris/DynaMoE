@@ -27,11 +27,18 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     /// that finishes a run would otherwise leave a record in the operator's
     /// real history, which is the same class of leak the request-log recorder
     /// guards against.
+    ///
+    /// One directory per PROCESS: `shared` is process-wide and cases run in
+    /// parallel, so a fixed shared path let them see each other's records (and
+    /// kept every earlier launch's files forever), which made `loadAll`,
+    /// `prune` and the retention counts order-dependent. The pid is enough to
+    /// separate concurrent test processes, and the files stay in the temp
+    /// directory where the system can reap them.
     static var processRootURL: URL {
         if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
             || ProcessInfo.processInfo.environment["XCTestBundlePath"] != nil {
             return FileManager.default.temporaryDirectory
-                .appendingPathComponent("dynamoe-agent-runs-tests", isDirectory: true)
+                .appendingPathComponent("dynamoe-agent-runs-tests-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
         }
         return defaultRootURL
     }
@@ -289,7 +296,11 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         change(&current)
         let bounded = Self.bounded(current)
         guard writeNow(bounded, to: url) else { return nil }
-        return bounded
+        // `writeNow` may have redirected a tombstoned session's write to the
+        // unscoped survivor, rewriting `parentSessionId` and `summaryRelayed`
+        // on the way. Answer what was WRITTEN, not what was asked for, or a
+        // caller's next persistRecord puts the stale fields back.
+        return redirectedRecord(bounded, from: url)
     }
 
     /// Marks a report delivered: the relay index learns it NOW, the durable
@@ -392,6 +403,17 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     }
 
     @discardableResult
+    /// The record as it now lives at `url`, after `writeNow`'s tombstone
+    /// redirect: the unscoped survivor when the session was deleted, otherwise
+    /// the record itself. Reads the file back rather than re-deriving the
+    /// redirect, so the two cannot disagree about which fields changed.
+    private func redirectedRecord(_ record: AgentRunRecord, from url: URL) -> AgentRunRecord {
+        let unscopedURL = fileURL(runId: record.id, sessionId: nil)
+        guard unscopedURL != url,
+              let survivor = decodeRecord(at: unscopedURL) else { return record }
+        return survivor
+    }
+
     private func writeNow(_ record: AgentRunRecord, to url: URL) -> Bool {
         signatureLock.lock()
         let runDeleted = deletedRunIds.contains(record.id)
@@ -896,7 +918,10 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
             if record.error == nil {
                 record.error = "The app quit before this run finished. Its last recorded state is kept below."
             }
-            saveImmediately(record)
+            // Only a record actually written is reconciled: a failed write
+            // leaves it non-terminal on disk, and reporting it repaired sends
+            // the coordinator looking for a run that is still "live".
+            guard saveImmediately(record) else { continue }
             reconciled.append(record.id)
         }
         return reconciled

@@ -463,8 +463,18 @@ struct SubagentInspectorView: View {
         }
     }
 
+    /// Runs that are actually working. Non-terminal is not enough on its own:
+    /// a record from a process that is gone stays non-terminal until
+    /// `reconcileInterruptedRuns` reaches it, and counting it as active makes
+    /// the header promise work that is not happening.
     private var activeRuns: [AgentRunRecord] {
-        allRecords.filter { !$0.status.isTerminal }
+        allRecords.filter { !$0.status.isTerminal && liveInstance($0.id) != nil }
+    }
+
+    /// Non-terminal records with no live instance behind them: shown, but as
+    /// what they are — a run whose process is gone.
+    private var orphanedRuns: [AgentRunRecord] {
+        allRecords.filter { !$0.status.isTerminal && liveInstance($0.id) == nil }
     }
 
     private var terminalRuns: [AgentRunRecord] {
@@ -536,7 +546,7 @@ struct SubagentInspectorView: View {
         }
     }
 
-    private func liveInstance(_ runId: UUID) -> SubagentInstance? {
+    func liveInstance(_ runId: UUID) -> SubagentInstance? {
         liveInstances.first { $0.id == runId }
     }
 
@@ -624,7 +634,7 @@ private struct SubagentRunRow: View {
                         .help("The coordinator has not received this report yet")
                 }
 
-                SubagentStatusPill(status: record.status)
+                SubagentStatusPill(status: record.status, isLive: isLive)
             }
 
             Text(record.task)
@@ -682,8 +692,14 @@ private struct SubagentRunRow: View {
         if let completed = record.completedAt, let started = record.startedAt {
             return String(format: "%.1fs", completed.timeIntervalSince(started))
         }
-        if let started = record.startedAt {
+        // A live clock only while something is live: a non-terminal record
+        // whose process is gone would otherwise tick forever against a start
+        // time nothing is advancing.
+        if isLive, let started = record.startedAt {
             return String(format: "%.0fs…", Date().timeIntervalSince(started))
+        }
+        if let started = record.startedAt {
+            return String(format: "%.0fs (not running)", Date().timeIntervalSince(started))
         }
         return record.usage.compactDescription
     }
@@ -693,10 +709,15 @@ private struct SubagentRunRow: View {
 
 private struct SubagentStatusPill: View {
     let status: AgentRunStatus
+    /// Whether a live instance exists for this run. A stored record left
+    /// non-terminal (a crashed or still-reconciling process) reads as active
+    /// from its status alone, and drawing it as live shows an indeterminate
+    /// spinner for a run that is gone.
+    var isLive: Bool = true
 
     var body: some View {
         HStack(spacing: 4) {
-            if status.isActive {
+            if status.isActive && isLive {
                 ProgressView()
                     .scaleEffect(0.5)
                     .frame(width: 11, height: 11)
@@ -865,7 +886,7 @@ private struct SubagentRunDetailView: View {
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundColor(.primary)
                 Spacer()
-                SubagentStatusPill(status: record.status)
+                SubagentStatusPill(status: record.status, isLive: live != nil)
             }
             HStack(spacing: 6) {
                 Text(record.preset.displayName + " preset")

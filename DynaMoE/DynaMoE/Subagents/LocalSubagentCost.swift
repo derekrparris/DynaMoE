@@ -77,8 +77,11 @@ nonisolated struct LocalSubagentCostEstimate: Equatable, Sendable {
     static let limitDefaultsKey = "dynamoe_subagent_local_cost_limit"
 
     static func configuredLimitSeconds(defaults: UserDefaults = .standard) -> Double {
-        let stored = defaults.object(forKey: limitDefaultsKey) as? Double
-        guard let stored, stored > 0 else { return defaultLimitSeconds }
+        // `as? Double` alone drops an integer-typed NSNumber, which is what a
+        // `defaults write ... -int 300` (or any non-@AppStorage writer) stores,
+        // and the operator's limit would be silently replaced by the default.
+        let stored = (defaults.object(forKey: limitDefaultsKey) as? NSNumber)?.doubleValue
+        guard let stored, stored.isFinite, stored > 0 else { return defaultLimitSeconds }
         return stored
     }
 

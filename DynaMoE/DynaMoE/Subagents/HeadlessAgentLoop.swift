@@ -412,7 +412,18 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 usage.toolCalls += 1
                 await context.noteToolOutcome(record, call: call)
                 append(kind: .toolResult, step: step, record: record)
-                messages.append(.toolResult(callId: call.id, name: call.name, content: error, isError: true))
+                // The same renderer every other tool result goes through: the
+                // error text can quote a model-authored tool name, and the marker
+                // pass in it is this app's prompt-injection defense for tool
+                // output. Appending the raw string skipped both.
+                messages.append(.toolResult(
+                    callId: call.id,
+                    name: call.name,
+                    content: AgentHarness.renderToolResultForModel(
+                        AgentHarness.toolErrorJSON(tool: call.name, error: error)
+                    ),
+                    isError: true
+                ))
                 emit(.toolFinished(record))
                 if let tripped = await context.trippedGuard() {
                     status = .blocked

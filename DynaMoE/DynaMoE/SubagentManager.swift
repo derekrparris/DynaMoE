@@ -2179,7 +2179,7 @@ public final class SubagentManager: ObservableObject {
     public func reserveCloudSpend(
         forSession sessionId: UUID?,
         requestedUSD: Double
-    ) -> (token: UUID, spentUSD: Double) {
+    ) async -> (token: UUID, spentUSD: Double) {
         let token = UUID()
         let requested = requestedUSD.isFinite ? max(0, requestedUSD) : 0
         lock.lock()
@@ -2187,8 +2187,11 @@ public final class SubagentManager: ObservableObject {
         lock.unlock()
         // Read AFTER the reservation lands, so this spawn's own commitment is
         // part of the number it checks (conservative: it can refuse a spawn
-        // that would exactly fit, never admit one that would not).
-        let spent = sessionCloudSpendUSD(forSession: sessionId)
+        // that would exactly fit, never admit one that would not). The read is
+        // suspended off the caller's actor because it decodes the
+        // conversation's run records from disk — a MainActor caller (every
+        // spawn resolves on one) would otherwise park the UI for it.
+        let spent = await sessionCloudSpendUSD(forSession: sessionId)
         return (token, spent)
     }
 
@@ -2218,12 +2221,16 @@ public final class SubagentManager: ObservableObject {
     /// (deduped by run ID) so a conversation cannot multiply its per-run cap
     /// across sequential or parallel cloud spawns.
     ///
-    /// It reads the run store, so it must not be called from the main actor
-    /// on a hot path: `load(sessionId:)` decodes every record in the
-    /// conversation.
-    public func sessionCloudSpendUSD(forSession sessionId: UUID?) -> Double {
+    /// It reads the run store, so it must not block the main actor on a hot
+    /// path: `load(sessionId:)` decodes every record in the conversation. It is
+    /// `async` and does that read in a detached task for exactly that reason —
+    /// the store is `nonisolated` and Sendable, so the decode needs no actor.
+    public func sessionCloudSpendUSD(forSession sessionId: UUID?) async -> Double {
+        let stored = await Task.detached(priority: .userInitiated) {
+            AgentRunStore.shared.load(sessionId: sessionId)
+        }.value
         var byRunId: [UUID: Double] = [:]
-        for record in AgentRunStore.shared.load(sessionId: sessionId) {
+        for record in stored {
             guard record.backend.kind == .cloud else { continue }
             let cost = record.usage.costUSD
             if cost.isFinite, cost > 0 {

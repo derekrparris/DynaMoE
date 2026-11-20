@@ -95,7 +95,17 @@ nonisolated enum AgentRolePresetCatalog {
     /// but the run behind it is a real agent loop rather than a canned pipeline.
     static func match(role: String) -> AgentRolePreset {
         let lowered = role.lowercased()
-        if lowered.contains("test") || lowered.contains("runner") || lowered.contains("verif") || lowered.contains("qa") {
+        // Whole words where the stem is short enough to hide inside another one:
+        // a plain `contains("test")` also matches "latest" and "contest", so a
+        // role titled "Contest judge" resolved to a verifier. The longer stems
+        // ("verif", "investigat") are prefixes by intent and stay substring tests.
+        func has(_ word: String) -> Bool {
+            let pattern = "(^|[^a-z0-9_])" + word + "([^a-z0-9_]|$)"
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { return false }
+            let range = NSRange(location: 0, length: (lowered as NSString).length)
+            return regex.firstMatch(in: lowered, options: [], range: range) != nil
+        }
+        if has("test") || has("runner") || lowered.contains("verif") || has("qa") {
             return .verifier
         }
         if lowered.contains("review") || lowered.contains("audit") {
