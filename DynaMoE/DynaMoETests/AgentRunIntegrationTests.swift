@@ -13,16 +13,16 @@ import XCTest
 @MainActor
 final class AgentRunIntegrationTests: XCTestCase {
     private var workingDirectory: URL!
-    /// Turbo Mode is the operator's process-wide preference and this target is
-    /// hosted inside the app, so a developer who left it on would have the
-    /// per-change cards below bypassed. Saved and restored with the switch's
-    /// own API (it is the key's only owner).
-    private var savedTurbo: Any?
 
     override func setUp() async throws {
         try await super.setUp()
-        savedTurbo = TurboModeSettings.rawValue
-        TurboModeSettings.set(false, from: #function)
+        // Turbo Mode is deliberately NOT touched here. It is the operator's
+        // process-wide preference and this target is hosted inside the app
+        // (same bundle id, same defaults domain), so setting it would turn a
+        // running app's Turbo off mid-turn — and leave it off if the run were
+        // interrupted. The cards these cases park on come from requests that
+        // are never Turbo-bypassable (a containment escape), so the switch
+        // cannot change their outcome either way.
         workingDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("SubagentRunTest_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: workingDirectory, withIntermediateDirectories: true)
@@ -38,7 +38,6 @@ final class AgentRunIntegrationTests: XCTestCase {
         await AgentScheduler.shared.cancelAll(reason: "test teardown")
         SubagentManager.shared.clearCompleted()
         AgentRunStore.shared.flush()
-        TurboModeSettings.restore(savedTurbo, from: #function)
         if let workingDirectory {
             try? FileManager.default.removeItem(at: workingDirectory)
         }
@@ -416,11 +415,17 @@ final class AgentRunIntegrationTests: XCTestCase {
     /// outstanding continuation at the same time. Both transitions used to be
     /// exercised only against running or finished runs.
     private func parkedWriteRun(sessionId: UUID) -> SubagentInstance {
+        // A CONTAINMENT ESCAPE, not an ordinary in-workspace write. Turbo Mode
+        // is the operator's process-wide preference and this target is hosted
+        // inside the app, so an ordinary write's card is bypassable when they
+        // left Turbo on — the fixture would then never park, and the cases
+        // below would fail for a setting they must not depend on. An escape is
+        // never Turbo-bypassable, so the card is guaranteed either way.
         let backend = ScriptedBackend(turns: [
             .init(
-                text: "writing the file",
+                text: "writing outside the workspace",
                 calls: [AgentToolCall(name: "file_write", arguments: [
-                    "path": "parked.txt",
+                    "path": "../parked.txt",
                     "content": "parked\n"
                 ])]
             )

@@ -1355,6 +1355,26 @@ public final class SubQDecideTool: AgentTool {
         return !images.isEmpty
     }
 
+    /// The same question asked of the decoded arguments, for a family whose
+    /// wire form is not JSON.
+    ///
+    /// A local model can emit a call as XML/DSML/Gemma markup, where
+    /// `rawArguments` is not JSON at all and `uploadsImages` answers false for
+    /// every call — so Turbo Mode waved a local run's image upload off-Mac
+    /// with no card. `arguments["images"]` is the decoded value in that case
+    /// (`[[String: Any]]`, or a described string in a display copy), so the
+    /// typed dictionary is the only form that survives every dialect.
+    public static func uploadsImages(arguments: [String: Any]) -> Bool {
+        if let images = arguments["images"] as? [Any] { return !images.isEmpty }
+        // A display copy renders the array as a string; a non-empty one that
+        // names no empty array is an upload.
+        if let described = arguments["images"] as? String {
+            let trimmed = described.trimmingCharacters(in: .whitespacesAndNewlines)
+            return !trimmed.isEmpty && trimmed != "[]" && trimmed != "nil"
+        }
+        return false
+    }
+
     /// What the approval card must show: the ORIGIN the state (and any image
     /// bytes) go to, plus the files themselves. `endpointString` is the
     /// destination the turn loop pinned beside the record, which is what the

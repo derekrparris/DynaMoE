@@ -323,6 +323,35 @@ enum AgentSpawnResolver {
                 let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 throw AgentSpawnError.unsupportedIsolation(detail)
             }
+            // Re-read the conversation's spend after that await. The cap was
+            // checked against a number taken before it, and a concurrent
+            // spawn of the same conversation can have registered its own
+            // reservation in between — each would then pass a check neither
+            // passes alone, which is the multiplication the cap exists to
+            // stop. The tree is removed on refusal: this run will not start.
+            if descriptor.kind == .cloud {
+                do {
+                    budget = try Self.applySessionCloudCeiling(
+                        budget: budget,
+                        descriptor: descriptor,
+                        usesOperatorCeiling: usesOperatorCeiling,
+                        sessionSpentUSD: SubagentManager.shared.sessionCloudSpendUSD(forSession: request.parentSessionId),
+                        defaults: defaults
+                    )
+                } catch {
+                    _ = await WorkspaceIsolation.cleanup(
+                        AgentWorktree(
+                            runId: runId,
+                            repositoryRoot: repositoryRoot,
+                            path: workingDirectory,
+                            branch: WorkspaceIsolation.branchPrefix
+                                + String(runId.uuidString.prefix(12)).lowercased(),
+                            baseCommit: worktreeBaseCommit ?? ""
+                        )
+                    )
+                    throw error
+                }
+            }
         }
 
         let approvalPolicy = AgentRolePresetCatalog.approvalPolicy(

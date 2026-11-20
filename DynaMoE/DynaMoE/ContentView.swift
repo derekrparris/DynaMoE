@@ -308,6 +308,24 @@ struct ContentView: View {
     /// continuation ends its step, a fresh send falls back to preemption.
     private static let queuedSlotWaitSeconds: TimeInterval = 120
 
+    /// Retires the placeholder a queued send appended, when that send never
+    /// became a turn.
+    ///
+    /// `handleSendMessage` appends the operator's message and an assistant
+    /// bubble marked `isThinking` BEFORE it knows whether the send will run
+    /// immediately, wait for the slot, or give up. Only a launched turn clears
+    /// that flag, so every abandoned relaunch used to leave an empty bubble
+    /// spinning for good. A bubble the launched turn owns is left alone: it is
+    /// identified by id, and a turn that started is still streaming into it.
+    private func clearThinkingPlaceholder(sessionId: UUID?, messageId: UUID?) {
+        guard let sessionId, let messageId,
+              let sIdx = sessions.firstIndex(where: { $0.id == sessionId }),
+              let mIdx = sessions[sIdx].messages.firstIndex(where: { $0.id == messageId }),
+              sessions[sIdx].messages[mIdx].isThinking,
+              sessions[sIdx].messages[mIdx].content.isEmpty else { return }
+        sessions[sIdx].messages[mIdx].isThinking = false
+    }
+
     /// Cancels every queued relaunch. Called from Stop and from the paths that
     /// tear a generation down before replacing it, so a superseded send cannot
     /// come back after its caller has moved on.
@@ -5892,10 +5910,17 @@ struct ContentView: View {
                 }
 
                 // The reports the request carried are delivered only now, after
-                // the transport has said the provider processed the request. A
-                // refusal or a failure before submission leaves them unmarked,
-                // so the next turn offers them again instead of losing them.
-                if !stepRelayReports.isEmpty, stepReceipt.spentRequest == true {
+                // the transport has said the provider processed the request AND
+                // an answer came back. A refusal or a failure before submission
+                // leaves them unmarked, so the next turn offers them again
+                // instead of losing them — and so does a request that was
+                // billed but produced nothing the operator can read (a 5xx, a
+                // dropped stream): the report was never relayed, so marking it
+                // here dropped unread findings on the retry.
+                if !stepRelayReports.isEmpty,
+                   stepReceipt.spentRequest == true,
+                   stepReceipt.failure == nil,
+                   !Task.isCancelled {
                     markSubagentSummariesRelayed(stepRelayReports, sessionId: sessionId)
                 }
 
@@ -6882,6 +6907,12 @@ struct ContentView: View {
                     self.deferredRelaunchTasks[relaunchKey] = nil
                     self.deferredRelaunchSessions[relaunchKey] = nil
                     self.releaseQueuedGenerationFlags(ifOwnedBy: sessionId)
+                    // Every early exit below (a Stop, a lost claim, a deleted
+                    // conversation) leaves the placeholder this send appended
+                    // exactly as it was: an empty bubble spinning forever,
+                    // because the turn that would have cleared `isThinking`
+                    // never ran. A launch that DID start owns the message.
+                    self.clearThinkingPlaceholder(sessionId: sessionId, messageId: messageId)
                 }
                 // A Stop can land between the task being created and this
                 // line. Cancellation does not abort a `Task` body on its own,
@@ -7063,6 +7094,10 @@ struct ContentView: View {
                     self.deferredRelaunchTasks[relaunchKey] = nil
                     self.deferredRelaunchSessions[relaunchKey] = nil
                     self.releaseQueuedGenerationFlags(ifOwnedBy: sessionId)
+                    // See the preemption branch: an early exit here strands an
+                    // empty spinning bubble, because no turn ever runs to clear
+                    // its `isThinking`.
+                    self.clearThinkingPlaceholder(sessionId: sessionId, messageId: messageId)
                 }
                 var held: TurnSlotClaim?
                 let deadline = Date().addingTimeInterval(Self.queuedSlotWaitSeconds)

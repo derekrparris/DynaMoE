@@ -214,11 +214,24 @@ public final class GitController {
         target: String? = nil,
         maxLines: Int = 500
     ) async throws -> GitDiffResult {
-        var args = ["diff"]
+        // `--no-ext-diff --no-textconv`: a repository's own `.git/config` can
+        // name a `diff.external` command (or a textconv driver), and this tool
+        // is cardless in auto mode and in Plan Mode — running an arbitrary
+        // configured program from it would be a cardless execution.
+        var args = ["diff", "--no-ext-diff", "--no-textconv"]
         if staged {
             args.append("--staged")
         }
         if let target = target, !target.isEmpty {
+            // A target is a commit or branch, never an option. `--output=<path>`
+            // here would write any user-writable file on the Mac, cardless.
+            guard !target.hasPrefix("-") else {
+                throw NSError(
+                    domain: "GitController",
+                    code: 400,
+                    userInfo: [NSLocalizedDescriptionKey: "Safety Rail: 'target' must be a commit or branch name, not an option ('\(target)')."]
+                )
+            }
             args.append(target)
         }
         if let path = path, !path.isEmpty {
@@ -336,9 +349,20 @@ public final class GitController {
         }
 
         // 3. Create the commit
+        //
+        // No hooks inside a subagent run: a repository's `pre-commit` (or a
+        // `core.hooksPath` pointing into the tree, `.husky` and `.githooks` do)
+        // is arbitrary shell, and in an isolated writer both `file_write` in
+        // the worktree and this commit are cardless — so a hook would be a
+        // cardless execution channel around `shell_run`'s per-call card. The
+        // operator's own commits keep their hooks.
+        var commitArgs = ["commit", "-m", cleanMessage]
+        if AgentHarness.executingInRunScope {
+            commitArgs.insert(contentsOf: ["-c", "core.hooksPath=/dev/null"], at: 0)
+        }
         let (commitCode, commitOut, commitErr) = try await AgentHarness.runProcess(
             executableURL: gitURL,
-            arguments: ["commit", "-m", cleanMessage],
+            arguments: commitArgs,
             currentDirectory: workingDirectory,
             timeoutSeconds: 30,
             environment: Self.gitEnvironment()

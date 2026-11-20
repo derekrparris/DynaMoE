@@ -329,23 +329,34 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         cancel(reason: "Cancelled by user or coordinator.")
     }
 
+    /// Takes ownership of the run's terminal transition, or nil when somebody
+    /// already has it.
+    ///
+    /// The lock is confined to this SYNCHRONOUS helper on purpose: `cancel` and
+    /// `finishRun` are the two claimers, and both are `async` callers — an
+    /// `NSLock` touched from an `async` context is an error in Swift 6 mode.
+    /// Returning the parked continuations lets each caller resume them after
+    /// it has written the state they were waiting for.
+    private func claimFinish(requireNotTerminal: Bool = false) -> [CheckedContinuation<String, Never>]? {
+        lock.lock()
+        defer { lock.unlock() }
+        if isFinished { return nil }
+        if requireNotTerminal, status.isTerminal { return nil }
+        executionTask?.cancel()
+        executionTask = nil
+        isFinished = true
+        let continuations = completionContinuations
+        completionContinuations.removeAll()
+        return continuations
+    }
+
     /// Stops the run with a reason it can report. The scheduler's cancellation
     /// tree, the Stop button and the run's own preemption all land here.
     public func cancel(reason: String) {
         // A finished run has already written its report. Cancelling it on the
         // way out (Quit calls `cancelAll`) must not rewrite a completed record
         // as `.cancelled`, or erase the summary the operator waited for.
-        lock.lock()
-        guard !isFinished, !status.isTerminal else {
-            lock.unlock()
-            return
-        }
-        executionTask?.cancel()
-        executionTask = nil
-        isFinished = true
-        let continuations = completionContinuations
-        completionContinuations.removeAll()
-        lock.unlock()
+        guard let continuations = claimFinish(requireNotTerminal: true) else { return }
 
         // Synchronous, not dispatched: a caller that cancels and then asks for
         // the summary must not observe `isFinished` with an empty report.
@@ -527,6 +538,13 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             }
             self.report = report
         }
+        // The synthesized report is kept in MEMORY too, not only written to disk
+        // by the mutation: the trailing `persistRecord()` re-snapshots this
+        // instance, so a `self.report` left nil wrote `report: nil` straight
+        // over the synthesized one (and over any concurrent `summaryRelayed`
+        // update). A cancelled run is exactly the case — it has no report yet
+        // has ignored files to name.
+        var synthesized: AgentReport?
         let written = await AgentRunStore.shared.mutateAsync(runId: id, sessionId: parentSessionId) { current in
             current.appliedAt = date
             current.appliedToBranch = appliedTo
@@ -555,11 +573,14 @@ public final class SubagentInstance: Identifiable, ObservableObject {
                     report.openQuestions.append(ignoredNote)
                 }
                 current.report = report
+                synthesized = report
             }
         } != nil
+        if let synthesized { report = synthesized }
         // Keeps the rest of the live state fresh in the normal case. A dropped
         // write here cannot lose `appliedAt` or `keptIgnoredFiles`: the
-        // mutation above already wrote both atomically.
+        // mutation above already wrote both atomically, and `report` now holds
+        // what it wrote.
         persistRecord()
         return written
     }
@@ -730,10 +751,21 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         executionUnwound = false
         executionTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self = self else { return }
-            if let plan {
-                await self.runModelBackedExecution(plan)
-            } else {
-                await self.runAutonomousPipeline()
+            // A detached task inherits no task-local state, so the run's own
+            // identity is re-bound here: without it a nested spawn stamps the
+            // app's current turn, and a legacy pipeline's direct
+            // `AgentHarness.runProcess` gets the operator's environment
+            // instead of the run-scoped allowlist.
+            await AgentHarness.$executingInRunScope.withValue(true) {
+                await AgentHarness.$executingSessionId.withValue(self.parentSessionId) {
+                    await AgentHarness.$executingTurnId.withValue(self.parentTurnId) {
+                        if let plan {
+                            await self.runModelBackedExecution(plan)
+                        } else {
+                            await self.runAutonomousPipeline()
+                        }
+                    }
+                }
             }
         }
         lock.unlock()
@@ -1261,15 +1293,10 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         // `isFinished` is the ownership flag, not `status`: the event pump also
         // publishes a terminal status just before this runs, and treating that
         // as "already finished" left every waiter parked forever.
-        lock.lock()
-        guard !isFinished else {
-            lock.unlock()
-            return
-        }
-        isFinished = true
-        let continuations = completionContinuations
-        completionContinuations.removeAll()
-        lock.unlock()
+        // Synchronous helper: `NSLock` must not be touched from an `async`
+        // context, which is an error in Swift 6 mode.
+        guard let continuations = claimFinish() else { return }
+        _ = continuations
 
         self.status = status
         completedAt = Date()
@@ -2145,6 +2172,16 @@ public final class SubagentManager: ObservableObject {
             let cost = record.usage.costUSD
             if cost.isFinite, cost > 0 {
                 byRunId[record.id] = cost
+            } else if record.status.isTerminal, record.usage.costIsUnpriced {
+                // A terminal run whose model had no recorded price reports 0
+                // for every token it billed, so summing `costUSD` alone let a
+                // loop of read-only cloud spawns against a usage-omitting
+                // proxy run one billed turn each forever without ever moving
+                // the session cap. Charge the budget it committed instead.
+                let committed = record.budget.maxCostUSD ?? 0
+                if committed.isFinite, committed > 0 {
+                    byRunId[record.id] = committed
+                }
             }
         }
         lock.lock()
@@ -2437,6 +2474,23 @@ public final class SubagentManager: ObservableObject {
         for child in children {
             child.cancel(reason: reason)
         }
+        // A TERMINAL instance of a deleted conversation is dropped too, not
+        // only a live one cancelled: its record is gone, so keeping the object
+        // lets the "All Runs" list resurrect a run the operator deleted and
+        // overwrite the unscoped record a delete rescued.
+        lock.lock()
+        let terminal = subagentsOrder.filter {
+            $0.parentSessionId == sessionId && $0.status.isTerminal
+        }.map(\.id)
+        if !terminal.isEmpty {
+            let dropped = Set(terminal)
+            subagentsOrder.removeAll { dropped.contains($0.id) }
+            for id in dropped {
+                subagentsById.removeValue(forKey: id)
+                instanceObservers.removeValue(forKey: id)?.cancel()
+            }
+        }
+        lock.unlock()
         Task { await AgentScheduler.shared.cancelRuns(parentSessionId: sessionId, reason: reason) }
     }
 

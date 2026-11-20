@@ -320,10 +320,16 @@ struct TimelineStepCardView: View {
     }
 
     /// The run this card would apply, when it is one.
+    ///
+    /// Trimmed exactly as the tool trims it: a padded id (`" <uuid>"`) parses
+    /// here and in `ApplySubagentChangesTool.execute` or neither, because the
+    /// Approve gate keys on this being non-nil — an untrimmed parse made it nil
+    /// and enabled Approve with no destination shown, and the tool then trimmed
+    /// and landed the patch blind.
     private var applyRunId: UUID? {
         guard call.name == "apply_subagent_changes",
               let raw = call.arguments["subagent_id"] ?? call.arguments["run_id"] else { return nil }
-        return UUID(uuidString: raw)
+        return UUID(uuidString: raw.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     /// The expanded arguments. Each value is chunked rather than drawn as one

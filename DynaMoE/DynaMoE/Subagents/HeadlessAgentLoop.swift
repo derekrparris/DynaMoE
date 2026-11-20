@@ -939,6 +939,51 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
         return String(text.prefix(limit - marker.count)) + marker
     }
 
+    /// Folds a JSON object's string VALUES to fit, keeping it parseable.
+    ///
+    /// The wire form of a call's arguments is JSON, and a cloud backend sends
+    /// it unchanged, so the one thing this must never return is a fragment. It
+    /// folds each oversized string value with `folded(_:to:)`, re-serializes,
+    /// and falls back to a single short object (`{"_compacted":true}`) when the
+    /// input did not parse or the result is still over the ceiling.
+    static func foldedJSON(_ json: String, to limit: Int) -> String {
+        let fallback = "{\"_compacted\":true}"
+        guard let data = json.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return fallback
+        }
+        var shortened: [String: Any] = [:]
+        for (key, value) in object {
+            if let text = value as? String, text.count > limit {
+                shortened[key] = folded(text, to: limit)
+            } else {
+                shortened[key] = value
+            }
+        }
+        // Per-value folding bounds each VALUE, not the object: several keys,
+        // or a key name of its own, can still put it over. Shrink the widest
+        // value again while it is, so the ceiling holds without ever cutting
+        // the JSON itself.
+        let ceiling = max(limit, fallback.count)
+        var attempt = shortened
+        for _ in 0..<8 {
+            guard let out = try? JSONSerialization.data(withJSONObject: attempt, options: [.sortedKeys]),
+                  let text = String(data: out, encoding: .utf8) else {
+                return fallback
+            }
+            if text.count <= ceiling { return text }
+            let excess = text.count - ceiling
+            guard let widest = attempt.compactMap({ key, value -> (String, Int)? in
+                guard let value = value as? String else { return nil }
+                return (key, value.count)
+            }).max(by: { $0.1 < $1.1 }), widest.1 > excess + 32 else {
+                return fallback
+            }
+            attempt[widest.0] = folded(attempt[widest.0] as? String ?? "", to: widest.1 - excess)
+        }
+        return fallback
+    }
+
     /// Folds one assistant turn's tool-call arguments into the same ceiling.
     ///
     /// The paired half of `contextCharacterCount`: that function bills a turn
@@ -947,6 +992,13 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
     /// able to shrink that same text or the budget it enforces is not one.
     /// Folding `rawArguments` keeps the call structurally intact and leaves the
     /// arguments dictionary alone, which is what a rebuilt history renders.
+    ///
+    /// `rawArguments` is JSON a cloud backend re-sends VERBATIM as the
+    /// function's `arguments`, so it cannot be cut at a character count: a
+    /// truncated object is invalid JSON and the next request is a 400. Its
+    /// string VALUES are folded instead and the object re-serialized, and when
+    /// even that cannot produce valid JSON the arguments become one short,
+    /// valid object rather than a fragment.
     static func folded(_ calls: [AgentToolCall], to limit: Int) -> [AgentToolCall] {
         calls.map { call in
             if !call.rawArguments.isEmpty {
@@ -955,7 +1007,7 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                     id: call.id,
                     name: call.name,
                     arguments: call.arguments,
-                    rawArguments: folded(call.rawArguments, to: limit),
+                    rawArguments: foldedJSON(call.rawArguments, to: limit),
                     rawText: call.rawText,
                     argumentsMalformed: call.argumentsMalformed
                 )

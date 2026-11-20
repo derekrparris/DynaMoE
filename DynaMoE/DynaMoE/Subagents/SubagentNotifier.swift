@@ -61,15 +61,15 @@ enum SubagentNotifier {
         // silence (no banner, no Dock bounce).
         guard status == .completed || status == .failed || status == .blocked else { return }
 
-        let isInactive = !NSApp.isActive
-        if isInactive {
-            NSApp.requestUserAttention(.informationalRequest)
-        }
-
         // A finish notice exists for a run the operator is not watching. While
         // DynaMoE is frontmost the inspector is one click away, and a banner
-        // over the app is noise the doc never promised.
+        // over the app is noise the doc never promised. The Dock bounce sits
+        // behind the same gate as the banner: an app-hosted test run has a real
+        // NSApp, so bouncing first made `xcodebuild test` bounce the Dock once
+        // per finished run.
+        let isInactive = !NSApp.isActive
         guard isInactive, isEnabled, !isRunningTests, Bundle.main.bundleIdentifier != nil else { return }
+        NSApp.requestUserAttention(.informationalRequest)
 
         let content = UNMutableNotificationContent()
         // The role is model-supplied text on a surface outside the app. A
@@ -179,9 +179,24 @@ enum SubagentNotifier {
         // The in-memory queue is the window between a finish and the
         // authorization answer. A banner still queued there was posted after
         // the record had already been deleted, and its tap selected a dead id.
-        Task { @MainActor in
+        //
+        // No `Task { @MainActor }`: a queued hop can land AFTER a delivery
+        // already drained the queue, and then it would drop a request posted in
+        // between. `deliverPendingNotifications` mutates the same array from a
+        // `DispatchQueue.main.async`, so this stays on that queue — ordered
+        // with it — and skips it entirely in a test run or an unbundled build,
+        // where no notice was ever queued.
+        guard !isRunningTestsInThisProcess, Bundle.main.bundleIdentifier != nil else { return }
+        DispatchQueue.main.async {
             pendingRequests.removeAll { $0.identifier == identifier }
         }
+    }
+
+    /// The test check as a `nonisolated` fact, for callers that are not on the
+    /// main actor (`withdraw` runs from the store's IO queue).
+    nonisolated static var isRunningTestsInThisProcess: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+            || ProcessInfo.processInfo.environment["XCTestBundlePath"] != nil
     }
 
 }

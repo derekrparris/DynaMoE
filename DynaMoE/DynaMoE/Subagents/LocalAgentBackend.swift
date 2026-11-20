@@ -204,7 +204,7 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
     @MainActor
     static func prepare(_ request: AgentBackendRequest, thinkingEnabled: Bool) async throws -> Prepared {
         let engine = CompletionEngine.shared
-        guard let info = engine.loadedModelInfo, let config = engine.promptModelConfig else {
+        guard engine.loadedModelInfo != nil, engine.promptModelConfig != nil else {
             throw AgentBackendError.unavailable(
                 "A local subagent run needs a loaded model. Load a checkpoint in Settings first."
             )
@@ -498,7 +498,15 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
         // instruction, not prose: the report builder reads this text for
         // findings and the summary, and was quoting `<parameter=content>` as
         // an assertion the run made. The calls themselves travel separately.
-        var visibleText = result.responseText
+        //
+        // Removing each call's own `rawText` is not enough, and the two ways it
+        // fails both hurt the NEXT prompt: the Qwen dialect's rawText is the
+        // inner `<function=…>` without the outer `<tool_call>` shell, so the
+        // shell survived and `carriesCallMarkup` then skipped the echo of the
+        // calls in this run's own history; and a canonicalized call (DSML,
+        // Ling) has a rawText that no longer appears in the text at all, so the
+        // dialect markup leaked into the report. Strip whole blocks.
+        var visibleText = Self.strippingToolCallBlocks(result.responseText)
         for call in result.parsedToolCalls where !call.rawText.isEmpty {
             visibleText = visibleText.replacingOccurrences(of: call.rawText, with: "")
         }
@@ -595,6 +603,41 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
                 )
             }
         }
+    }
+
+    /// Removes whole tool-call blocks, across the dialects a local family can
+    /// emit, so what is left is prose.
+    ///
+    /// A block runs from its opener to its closer; an opener with no closer is
+    /// the pre-execution freeze's shape, and the tail is dropped because a
+    /// half-call is not prose either. Paired tags are handled generically
+    /// (`<tool_call>`/`</tool_call>`, the DSML `calls` container, Gemma's
+    /// `<|tool_call>`/`<tool_call|>`), then the bare openers that carry no
+    /// container (Llama's `<|python_tag|>`, a stray `<tool_call>`).
+    static func strippingToolCallBlocks(_ text: String) -> String {
+        nonisolatedMarkupStrip(text)
+    }
+
+    private static func nonisolatedMarkupStrip(_ text: String) -> String {
+        var out = text
+        let pairs: [(open: String, close: String)] = [
+            (StreamingToolParser.qwenToolCallOpen, StreamingToolParser.qwenToolCallClose),
+            (DeepSeekV41ToolDialect.dsmlCallsOpen, DeepSeekV41ToolDialect.dsmlCallsClose),
+            (StreamingToolParser.gemmaToolCallOpen, StreamingToolParser.gemmaToolCallClose)
+        ]
+        for pair in pairs {
+            while let open = out.range(of: pair.open) {
+                if let close = out.range(of: pair.close, range: open.upperBound..<out.endIndex) {
+                    out.removeSubrange(open.lowerBound..<close.upperBound)
+                } else {
+                    out.removeSubrange(open.lowerBound..<out.endIndex)
+                }
+            }
+        }
+        for bare in [StreamingToolParser.llamaTagOpen] {
+            out = out.replacingOccurrences(of: bare, with: "")
+        }
+        return out
     }
 
     @MainActor

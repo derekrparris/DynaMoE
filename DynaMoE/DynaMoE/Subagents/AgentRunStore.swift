@@ -553,6 +553,11 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
                     offset += written
                     continue
                 }
+                // `write` returning -1 with EINTR wrote NOTHING and is not an
+                // error: a signal (a timer, a cancellation) interrupted the
+                // call before any byte moved. Treating it as fatal failed a
+                // durable save at random under load, so retry it.
+                if written < 0, errno == EINTR { continue }
                 // A zero return on a blocking descriptor is not progress:
                 // nothing was written and the loop would spin. It used to
                 // break WITHOUT an error, so a "successful" write could leave
@@ -1132,10 +1137,18 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
                             attributes: [.posixPermissions: 0o700]
                         )
                         try? fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: destination.path)
-                        try fileManager.moveItem(
-                            at: file,
-                            to: destination.appendingPathComponent(file.lastPathComponent)
-                        )
+                        // Not a bare `moveItem`: a previous rescue (or a save
+                        // that landed in the unscoped bucket) can already hold
+                        // this name, and `moveItem` throws EEXIST — which
+                        // aborted the loop partway and left `<sessionId>/` on
+                        // disk after the UI had already deleted the
+                        // conversation. The rescued copy is the current one,
+                        // so an existing file of the same id is stale.
+                        let target = destination.appendingPathComponent(file.lastPathComponent)
+                        if fileManager.fileExists(atPath: target.path) {
+                            try? fileManager.removeItem(at: target)
+                        }
+                        try fileManager.moveItem(at: file, to: target)
                     } catch {
                         // Moving failed, so the file is still the only copy of
                         // whatever it says. Leave the whole directory alone.

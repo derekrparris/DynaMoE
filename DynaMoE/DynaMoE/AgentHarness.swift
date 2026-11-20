@@ -2506,7 +2506,19 @@ public final class SpawnSubagentTool: AgentTool {
             let err = "This conversation already has \(SubagentManager.defaultMaxActiveSubagentsPerSession) active subagent runs (the per-conversation limit). Wait for an active run to finish or stop one before spawning another."
             return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: err), nil, err, false)
         }
-        defer { SubagentManager.shared.releaseSpawnSlot(spawnSlot, forSession: parentSessionId) }
+        // Released as soon as the instance is REGISTERED, not when this call
+        // returns: a synchronous spawn then waits for the run's completion, and
+        // holding the reservation across that wait counted the same run twice
+        // (once as active, once as pending) for its whole lifetime — six slots
+        // behaved like three. `defer` is the error path; `released` makes it
+        // once-only.
+        var released = false
+        func releaseSlot() {
+            guard !released else { return }
+            released = true
+            SubagentManager.shared.releaseSpawnSlot(spawnSlot, forSession: parentSessionId)
+        }
+        defer { releaseSlot() }
         if backendSelection.error == nil, backendSelection.modelBacked {
             let runId = UUID()
             // Priced ONCE, from the same pin and measured rate the backend
@@ -2560,6 +2572,7 @@ public final class SpawnSubagentTool: AgentTool {
                     id: runId,
                     notifiesOnFinish: runInBackground
                 )
+                releaseSlot()
                 return await Self.respond(
                     subagent: subagent,
                     runInBackground: runInBackground,
@@ -2615,6 +2628,7 @@ public final class SpawnSubagentTool: AgentTool {
                         id: runId,
                         notifiesOnFinish: runInBackground
                     )
+                    releaseSlot()
                     return await Self.respond(
                         subagent: subagent,
                         runInBackground: runInBackground,
@@ -2675,6 +2689,7 @@ public final class SpawnSubagentTool: AgentTool {
             // pipelines were the one spawn path that never said so.
             notifiesOnFinish: runInBackground
         )
+        releaseSlot()
         return await Self.respond(
             subagent: subagent,
             runInBackground: runInBackground,
@@ -3396,13 +3411,47 @@ public final class ApplySubagentChangesTool: AgentTool {
             ownerSessionId = nil
             runExists = false
         }
-        if runExists, ownerSessionId != AgentHarness.executingSessionId {
+        // `nil` is not a match: an unscoped caller has no conversation
+        // identity to compare, and `nil == nil` would reach a rescued record
+        // whose parent is also unknown.
+        if runExists,
+           let ownerSessionId,
+           ownerSessionId != AgentHarness.executingSessionId {
             let err = "No subagent run with id \(runId.uuidString) was found."
             return (AgentHarness.toolErrorJSON(tool: "apply_subagent_changes", error: err), nil, err, false)
         }
 
+        // Bound to the destination branch and the exact patch digest, then
+        // re-checked before a byte is written: a `git checkout` or a worktree
+        // edit during the window between this call and the apply must not land
+        // unreviewed bytes on the wrong branch.
+        //
+        // Taken HERE rather than inside a card-raising helper: this tool's own
+        // invocation IS the operator's decision (it is state-changing, so it
+        // was approved before it ran), and asking a second time through
+        // `SubagentApplyControl` parked every headless caller on a card it
+        // never asked for. The inspector's button, which no tool call
+        // preceded, is the path that still needs one.
+        let recordedRoot = SubagentManager.shared.getSubagent(byId: runId)?.snapshotRecord().repositoryRoot
+            ?? AgentRunStore.shared.loadAny(runId: runId)?.repositoryRoot
+        // The branch is read from the root the RECORD names, which is the one
+        // the apply resolves too (the worktree's `.git` pointer is sandbox-
+        // writable and is deliberately not trusted for this).
+        var destinationBranch: String?
+        if let recordedRoot {
+            destinationBranch = await WorkspaceIsolation.currentBranch(
+                of: URL(fileURLWithPath: recordedRoot, isDirectory: true)
+            )
+        }
+        let preview = await SubagentApplyService.applyExpectation(
+            runId: runId,
+            destinationBranch: destinationBranch
+        )
         do {
-            let outcome = try await SubagentApplyService.apply(runId: runId)
+            let outcome = try await SubagentApplyService.apply(
+                runId: runId,
+                expectation: preview.expectation
+            )
             let formatter = ISO8601DateFormatter()
             formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
             let message: String
@@ -3445,6 +3494,9 @@ public final class ApplySubagentChangesTool: AgentTool {
             }
             let json = AgentHarness.toolSuccessJSON(tool: "apply_subagent_changes", data: jsonData)
             return (json, message, nil, false)
+        } catch let error as SubagentApplyControlError where error == .approvalDenied {
+            let err = "The changes were not applied: the operator declined the apply."
+            return (AgentHarness.toolErrorJSON(tool: "apply_subagent_changes", error: err), nil, err, false)
         } catch {
             let err = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             return (AgentHarness.toolErrorJSON(tool: "apply_subagent_changes", error: err), nil, err, false)
@@ -3856,7 +3908,13 @@ public final class AgentHarness {
     // streak lets the harness escalate to a forced synthesis turn instead of looping.
 
     /// Required argument keys per tool (from each tool's JSON schema).
+    ///
+    /// An entry lists every key that satisfies the tool, not only the schema's
+    /// `required`: `apply_subagent_changes` declares `subagent_id` required but
+    /// also accepts the `run_id` alias, and a call carrying only the alias is
+    /// not an empty scaffold.
     public static let requiredValueArgumentKeys: [String: [String]] = [
+        "apply_subagent_changes": ["subagent_id", "run_id"],
         "shell_run": ["command"],
         "file_read": ["path"],
         "file_write": ["path", "content"],
@@ -4224,7 +4282,11 @@ public final class AgentHarness {
         // Same `path` argument and the same `resolvePath` call as `file_read`:
         // it opens the file it names and returns its contents in diagnostics,
         // so leaving it out of this set was a cardless read of any path.
-        "lint_diagnostics"
+        "lint_diagnostics",
+        // `git_diff` reads the repository it is pointed at, and its `path`
+        // argument is confined by the same rule — a diff of a file outside the
+        // workspace shows that file's contents.
+        "git_diff"
     ]
     /// Tools whose purpose is to send bytes off this Mac. `subq_decide` uploads
     /// its `state` (and any image bytes) to the decisions API.
@@ -4872,6 +4934,17 @@ public final class AgentHarness {
         case "file_write", "file_edit":
             guard let path = arguments["path"] as? String else { return false }
             return pathWritesApplicationPreferences(path)
+        case "spawn_subagent", "send_subagent_message":
+            // Delegation is not a way around this: a legacy Test Runner lifts
+            // a backticked command out of the task text and runs it through
+            // `zsh -c`, and a message steers a run that is already doing so.
+            // The free-text arguments are the only place a command can hide.
+            let fields = toolName == "spawn_subagent"
+                ? ["task_description", "context_summary"]
+                : ["message"]
+            return fields.contains { key in
+                (arguments[key] as? String).map(shellCommandWritesApplicationPreferences) ?? false
+            }
         default:
             return false
         }
@@ -4934,7 +5007,12 @@ public final class AgentHarness {
         endpoint: URL,
         rawArguments: String? = nil
     ) -> Bool {
-        if let images = arguments["images"] as? [Any], !images.isEmpty { return true }
+        // Both forms, because neither alone covers every dialect: a local
+        // model's XML/DSML/Gemma call has non-JSON `rawArguments` (so the raw
+        // check answers false) while `arguments` is the decoded dictionary,
+        // and a `[String: String]` display copy loses the array's type (so the
+        // typed check answers false where the raw one parses).
+        if SubQDecideTool.uploadsImages(arguments: arguments) { return true }
         if SubQDecideTool.uploadsImages(rawArguments: rawArguments) { return true }
         // Origin, not host: `https://api.subq.ai:8443` is a different service
         // and must not ride in on the official host's approval.
@@ -6540,11 +6618,17 @@ public final class AgentHarness {
         }
         let stateChanging = Self.isStateChanging(toolName: call.name)
         let appPreferences = Self.targetsApplicationPreferences(toolName: call.name, arguments: call.arguments)
+        // The endpoint the call will USE, not the stored setting: `executeTool`
+        // pins the approved one for this call, and a verdict computed from a
+        // different URL could clear a custom host the call then sends to (or
+        // card an official one it never touches) if the operator moved the
+        // setting while the card was up.
         let subQNeedsApproval = call.name == "subq_decide" && Self.requiresApproval(
             toolName: call.name,
             arguments: call.arguments,
             mode: activeMode,
-            subQEndpoint: SubQDecisionSettings.endpoint()
+            subQEndpoint: SubQDecideTool.pinnedEndpoint ?? SubQDecisionSettings.endpoint(),
+            rawArguments: call.rawArguments
         )
         let strArgs = call.arguments.mapValues { String(describing: $0) }
         func ask(_ reason: String, containmentEscape: Bool = false) -> RunScopeDecision {

@@ -509,7 +509,11 @@ public final class MCPStdioTransport: MCPTransport, @unchecked Sendable {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = [launchCommand] + arguments
 
-        var env = ControlledProcessRunner.toolEnvironment()
+        // An MCP server is a long-lived child the OPERATOR configured, not a
+        // command a model chose: its `env` block may rely on an ambient
+        // `GITHUB_TOKEN` / `AWS_*` it never re-declares, so the credential
+        // filter is off here while the app's own key is still removed.
+        var env = ControlledProcessRunner.toolEnvironment(stripCredentials: false)
         for (key, value) in environment {
             env[key] = value
         }

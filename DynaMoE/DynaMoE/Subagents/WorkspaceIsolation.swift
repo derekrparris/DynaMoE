@@ -143,6 +143,40 @@ nonisolated enum WorkspaceIsolation {
         await repositoryRoot(for: directory) != nil
     }
 
+    /// What `<worktree>/.git` is on disk, decided without running git.
+    ///
+    /// A linked worktree's `.git` is a FILE holding `gitdir: <path>`, but it
+    /// sits inside a directory the run can write, so a carded `shell_run` can
+    /// replace it. Both replacements are hostile in ways git itself cannot
+    /// report: a DANGLING SYMLINK makes `git rev-parse` fail (which reads as
+    /// "repairable"), and `git worktree repair` then opens the path with
+    /// `O_WRONLY | O_CREAT | O_TRUNC` and clobbers whatever the link names
+    /// OUTSIDE the sandbox; a FIFO makes `git rev-parse` block on open for the
+    /// whole process timeout. Only a missing entry is repairable — a symlink,
+    /// directory, FIFO or anything else is a pointer this app must not follow.
+    static func worktreeGitEntryState(_ worktree: URL) async -> WorktreeGitEntryState {
+        let path = worktree.appendingPathComponent(".git").path
+        var info = stat()
+        if lstat(path, &info) != 0 {
+            return errno == ENOENT ? .missing : .unreadable(String(cString: strerror(errno)))
+        }
+        let mode = info.st_mode & S_IFMT
+        switch mode {
+        case S_IFREG: return .regularFile
+        case S_IFLNK: return .hostile("its .git is a symlink, which is not how git writes a linked worktree")
+        case S_IFDIR: return .hostile("its .git is a directory, so it is not a linked worktree of this repository")
+        case S_IFIFO: return .hostile("its .git is a FIFO, which would block every git command in it")
+        default: return .hostile("its .git is not a regular file")
+        }
+    }
+
+    enum WorktreeGitEntryState: Equatable {
+        case regularFile
+        case missing
+        case unreadable(String)
+        case hostile(String)
+    }
+
     /// The main repository that owns a linked worktree.
     ///
     /// The parent of `--git-common-dir` is the repository root only for an
@@ -299,7 +333,15 @@ nonisolated enum WorkspaceIsolation {
             throw WorkspaceIsolationError.worktreeExists(worktreeURL.path)
         }
         do {
-            try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+            // 0700: a worktree holds the run's whole working copy, including
+            // whatever it read, and `createDirectory` otherwise makes it 0755
+            // readable by every account on the machine.
+            try fileManager.createDirectory(
+                at: root,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            try? fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
         } catch {
             throw WorkspaceIsolationError.worktreeCreationFailed(error.localizedDescription)
         }
@@ -481,6 +523,20 @@ nonisolated enum WorkspaceIsolation {
     }
 
     private static func worktreeLinkageState(_ worktree: AgentWorktree) async -> WorktreeLinkageState {
+        // Before any git command runs in the worktree: its `.git` entry is in a
+        // directory the run can write, and git would FOLLOW a symlink or BLOCK
+        // on a FIFO there. Only a missing entry is repairable; see
+        // `worktreeGitEntryState`.
+        switch await worktreeGitEntryState(worktree.path) {
+        case .regularFile:
+            break
+        case .missing:
+            return .repairable("it has no .git pointer, so git does not treat '\(worktree.path.path)' as a working tree")
+        case .unreadable(let reason):
+            return .compromised("its .git entry could not be inspected (\(reason))")
+        case .hostile(let reason):
+            return .compromised(reason)
+        }
         guard let (rootCode, rootOut, _) = try? await git(
             ["rev-parse", "--path-format=absolute", "--git-common-dir"],
             in: worktree.repositoryRoot
@@ -967,15 +1023,28 @@ nonisolated enum WorkspaceIsolation {
     /// Refuses a patch whose destination the process could not write BEFORE a
     /// byte is touched. `git apply --check` only reads, so a read-only target
     /// passes it and fails during the real apply.
+    /// The entry's own type, never the type of what it points at.
+    ///
+    /// `FileManager.fileExists` is `stat`, which FOLLOWS symlinks: a tracked
+    /// directory symlink (`120000`) read as a directory and was refused as
+    /// unwritable, and a dangling symlink read as absent, so the rollback
+    /// neither backed it up nor removed it.
+    static func entryKind(_ url: URL) -> (exists: Bool, isDirectory: Bool, isSymlink: Bool) {
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else { return (false, false, false) }
+        let mode = info.st_mode & S_IFMT
+        return (true, mode == S_IFDIR, mode == S_IFLNK)
+    }
+
     private static func refuseIfTargetsAreNotWritable(_ paths: [String], in root: URL) throws {
         let fileManager = FileManager.default
         for path in paths {
             guard let target = safeURL(for: path, in: root) else {
                 throw WorkspaceIsolationError.applyFailed("the patch names an unsafe path: \(path)")
             }
-            var isDirectory: ObjCBool = false
-            if fileManager.fileExists(atPath: target.path, isDirectory: &isDirectory) {
-                guard !isDirectory.boolValue, fileManager.isWritableFile(atPath: target.path) else {
+            let kind = entryKind(target)
+            if kind.exists {
+                guard !kind.isDirectory, fileManager.isWritableFile(atPath: target.path) else {
                     throw WorkspaceIsolationError.applyFailed(
                         "'\(path)' exists and is not a writable file, so the patch cannot land there."
                     )
@@ -1068,16 +1137,19 @@ nonisolated enum WorkspaceIsolation {
                     continue
                 }
                 do {
+                    // `entryKind`, not `fileExists`: a dangling symlink the
+                    // failed patch created reports absent to `stat`, so it was
+                    // never removed and the tree was not "as it was".
                     if let original = entry.original {
                         try fileManager.createDirectory(
                             at: target.deletingLastPathComponent(),
                             withIntermediateDirectories: true
                         )
-                        if fileManager.fileExists(atPath: target.path) {
+                        if WorkspaceIsolation.entryKind(target).exists {
                             try fileManager.removeItem(at: target)
                         }
                         try fileManager.copyItem(at: original, to: target)
-                    } else if fileManager.fileExists(atPath: target.path) {
+                    } else if WorkspaceIsolation.entryKind(target).exists {
                         try fileManager.removeItem(at: target)
                         // A patch that failed partway may also have created
                         // the DIRECTORIES its new files lived in, and removing
@@ -1130,7 +1202,7 @@ nonisolated enum WorkspaceIsolation {
                 try? fileManager.removeItem(at: directory)
                 throw WorkspaceIsolationError.applyFailed("the patch names an unsafe path: \(path)")
             }
-            guard fileManager.fileExists(atPath: target.path) else {
+            guard entryKind(target).exists else {
                 entries.append((path, nil))
                 continue
             }
@@ -1345,6 +1417,29 @@ nonisolated enum WorkspaceIsolation {
     /// empty `WorkspaceChangeSet` is not proof: it is also what a decode
     /// failure produces (see `snapshot`). Anything other than a successful,
     /// empty status is treated as "do not delete".
+    /// The worktree's untracked entries that a patch cannot carry, so deleting
+    /// the tree after an apply would destroy them.
+    ///
+    /// `ignoredFiles` is not enough: an untracked NESTED GIT REPOSITORY (a run
+    /// that did `git init subrepo`) is not ignored, and `git add -N .` skips it
+    /// because it has its own (possibly unborn) HEAD — so it never enters the
+    /// patch, and the apply's cleanup deleted it after landing the tracked
+    /// diff. Anything left under `?? ` after the snapshot was taken is work
+    /// only this directory holds.
+    static func untrackedLeftovers(_ worktree: AgentWorktree) async -> [String] {
+        guard let (code, stdout, _) = try? await git(
+            ["status", "--porcelain", "-z", "--untracked-files=normal"],
+            in: worktree.path
+        ), code == 0 else { return [] }
+        return stdout
+            .split(separator: "\0", omittingEmptySubsequences: true)
+            .compactMap { entry -> String? in
+                guard entry.hasPrefix("?? ") else { return nil }
+                let path = String(entry.dropFirst(3))
+                return isDisposableBuildArtifact(path) ? nil : path
+            }
+    }
+
     static func hasNoWorkingTreeChanges(_ worktree: AgentWorktree) async -> Bool {
         // Clear any intent-to-add index entries left by an earlier `snapshot` or
         // `diffStat` (`git add -N .`). If a file registered as intent-to-add was
@@ -1399,6 +1494,15 @@ nonisolated enum WorkspaceIsolation {
                 } else if AgentRunStore.shared.hasRecordFile(runId: runId) {
                     continue
                 }
+                // An apply that is running RIGHT NOW has opened this tree and
+                // is reading it; a sweep under it would delete the files out
+                // from under the patch. A discard owns it for the length of
+                // its removal, and the two must not race either. Both claims
+                // are MainActor state, so the question is asked there.
+                let owned = await MainActor.run {
+                    SubagentApplyService.isRunInFlight(runId) || SubagentApplyService.isBeingDiscarded(runId)
+                }
+                if owned { continue }
             }
 
             var removedTree = false
@@ -1420,11 +1524,20 @@ nonisolated enum WorkspaceIsolation {
                 } else {
                     _ = try? await git(["worktree", "remove", "--force", path.path], in: repositoryRoot)
                     _ = try? await git(["worktree", "prune"], in: repositoryRoot)
-                    try? fileManager.removeItem(at: path)
+                    // Deleted only through the containment check: a path is
+                    // data, and this sweep is one of the two places that
+                    // deletes by it. A detached HEAD is still a real checkout
+                    // with the run's work in it, so the removal above is
+                    // scoped to the root it was found under.
+                    if isInsideRoot(path, root: root) {
+                        try? fileManager.removeItem(at: path)
+                    }
                     removedTree = !fileManager.fileExists(atPath: path.path)
                 }
             } else {
-                try? fileManager.removeItem(at: path)
+                if isInsideRoot(path, root: root) {
+                    try? fileManager.removeItem(at: path)
+                }
                 removedTree = !fileManager.fileExists(atPath: path.path)
             }
             // Reporting a tree that survived makes the sweep's log say work

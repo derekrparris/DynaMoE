@@ -2459,6 +2459,35 @@ final class SubagentLoopTests: XCTestCase {
         XCTAssertEqual(HeadlessAgentLoop.folded(short, to: HeadlessAgentLoop.hardTrimTextLimit), short)
     }
 
+    /// A tool call's wire arguments are re-sent verbatim by a cloud backend, so
+    /// folding them must keep the JSON parseable: a character-count cut
+    /// produced `{"content":"import… [compacted: 2040 chars]` and the next
+    /// request was a 400.
+    func testFoldingToolArgumentsKeepsThemValidJSON() throws {
+        let long = String(repeating: "a", count: 5_000)
+        let raw = try JSONSerialization.data(
+            withJSONObject: ["path": "Foo.swift", "content": long],
+            options: [.sortedKeys]
+        )
+        let original = String(decoding: raw, as: UTF8.self)
+        let call = AgentToolCall(name: "file_write", arguments: ["path": "Foo.swift"], rawArguments: original)
+        let foldedCalls = HeadlessAgentLoop.folded([call], to: HeadlessAgentLoop.hardTrimTextLimit)
+        let foldedRaw = try XCTUnwrap(foldedCalls.first?.rawArguments)
+        XCTAssertLessThan(foldedRaw.count, original.count)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(foldedRaw.utf8)) as? [String: Any],
+            "the folded arguments must still parse: \(foldedRaw.prefix(80))"
+        )
+        XCTAssertEqual(object["path"] as? String, "Foo.swift")
+
+        let unparseable = HeadlessAgentLoop.folded(
+            [AgentToolCall(name: "file_write", arguments: [:], rawArguments: String(repeating: "{", count: 5_000))],
+            to: HeadlessAgentLoop.hardTrimTextLimit
+        )
+        let fallback = try XCTUnwrap(unparseable.first?.rawArguments)
+        XCTAssertNotNil(try? JSONSerialization.jsonObject(with: Data(fallback.utf8)))
+    }
+
     private func makeRunScopedHarness(
         tools: [String],
         workspace: URL,

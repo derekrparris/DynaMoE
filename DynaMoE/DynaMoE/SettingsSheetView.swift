@@ -194,6 +194,11 @@ struct SettingsSheetView: View {
     @AppStorage(SubagentBackendSettings.backendKey) private var subagentBackend: String = ""
     @AppStorage(SubagentBackendSettings.cloudModelKey) private var subagentCloudModel: String = ""
     @AppStorage(SubagentBackendSettings.cloudCostCeilingKey) private var subagentCloudCostCeiling: Double = SubagentBackendSettings.defaultCloudCostUSD
+    /// The per-conversation aggregate cap. Stored as 0 when it has never been
+    /// set, which is what `sessionCloudCostCeiling` reads as "derive it from
+    /// the per-run cap" — the field therefore shows the derived number rather
+    /// than an empty box.
+    @AppStorage(SubagentBackendSettings.sessionCloudCostCeilingKey) private var subagentCloudSessionCostCeiling: Double = 0
     @AppStorage(LocalSubagentCostEstimate.limitDefaultsKey) private var subagentLocalCostLimit: Double = LocalSubagentCostEstimate.defaultLimitSeconds
     @AppStorage("dynamoe_subagent_notifications") private var subagentNotifications: Bool = false
     @AppStorage("dynamoe_subagent_cloud_per_provider") private var subagentCloudPerProvider: Int = 3
@@ -287,6 +292,21 @@ struct SettingsSheetView: View {
                         if clamped != value { subagentCloudCostCeiling = clamped }
                     }
                 Text("USD per cloud run, applied whenever a spawn does not set max_cost_usd. 0 means no cap. While a cap is set, a cloud run on a model with no recorded price is refused rather than run unbounded.")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            subagentSettingRow("Session spend cap") {
+                TextField("auto", value: $subagentCloudSessionCostCeiling, format: .number.precision(.fractionLength(0...2)))
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11, design: .monospaced))
+                    .frame(maxWidth: 90)
+                    .onChange(of: subagentCloudSessionCostCeiling) { _, value in
+                        let capped = min(max(0, value), SubagentBackendSettings.maximumSessionCloudCostUSD)
+                        if capped != value { subagentCloudSessionCostCeiling = capped }
+                    }
+                Text("USD across every cloud run in one conversation, so a coordinator cannot multiply the per-run cap by spawning many. 0 derives it from the per-run cap (4x); it is capped at \(Int(SubagentBackendSettings.maximumSessionCloudCostUSD)).")
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

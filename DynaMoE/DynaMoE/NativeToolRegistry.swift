@@ -182,9 +182,16 @@ public final class ControlledProcessRunner {
     /// the toolchain variables a real command needs (`SSH_AUTH_SOCK`, proxies,
     /// `SDKROOT`, `KUBECONFIG`, `VIRTUAL_ENV`) are not credential-shaped and
     /// stay.
+    /// `stripCredentials` exists for one caller: a long-lived child the
+    /// OPERATOR configured (`MCPStdioTransport`), whose `env` block may rely on
+    /// an ambient `GITHUB_TOKEN` or `AWS_*` it never re-declares. A per-call
+    /// child is a command the model chose, so it keeps the stricter default;
+    /// an operator-configured server is the operator's own process. The app's
+    /// own key is removed either way.
     nonisolated public static func toolEnvironment(
         scoped: Bool = false,
         unreviewed: Bool = false,
+        stripCredentials: Bool = true,
         inherited: [String: String] = ProcessInfo.processInfo.environment,
         userHome: String = FileManager.default.homeDirectoryForCurrentUser.path
     ) -> [String: String] {
@@ -217,7 +224,9 @@ public final class ControlledProcessRunner {
             // real command needs (SSH agent, proxies, toolchains) is the
             // operator's own — except credentials, which a reviewed command is
             // still not entitled to read.
-            env = inherited.filter { !isCredentialShaped($0.key) }
+            env = stripCredentials
+                ? inherited.filter { !isCredentialShaped($0.key) }
+                : inherited
             env.removeValue(forKey: SubQDecisionKeySource.environmentName)
         }
         env["PATH"] = (extraPaths + [currentPath]).joined(separator: ":")

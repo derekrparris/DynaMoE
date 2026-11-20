@@ -45,7 +45,11 @@ nonisolated enum TurnPriority: Sendable, Equatable {
 /// would become a main-actor type crossed on the generation path.
 nonisolated final class TurnSlotClaim: @unchecked Sendable {
     private let ledger: TurnSlotLedger
-    private let ticket: UInt64
+    /// The ledger's ticket for this claim. `launchTurn` CONTINUES it as the
+    /// turn's generation id, because a caller that preempted a background turn
+    /// holds a token from before the launch and compares it after: the two
+    /// must name the same turn.
+    let ticket: UInt64
     /// Why the slot was taken. A claim is the ONLY evidence a turn in
     /// PREPARATION leaves: the ledger can say the slot is spoken for, and an
     /// operator's send must be able to tell a background run's preparation (a

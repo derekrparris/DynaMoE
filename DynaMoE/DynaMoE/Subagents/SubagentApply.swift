@@ -180,6 +180,38 @@ enum SubagentApplyService {
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
+    /// What an apply would be bound to, read before it runs: the live worktree
+    /// diff (the bytes the digest authorizes) and the branch the patch lands on.
+    ///
+    /// The recorded report's diff is NOT a substitute for the preview. It is
+    /// what the run said when it stopped, and the worktree can have changed
+    /// since — reviewing the stale diff while `patchDigest` authorizes the
+    /// current one is exactly the mismatch the expectation exists to prevent.
+    /// Nil pieces simply drop out of the expectation, which then checks less.
+    static func applyExpectation(
+        runId: UUID,
+        destinationBranch: String?
+    ) async -> (expectation: SubagentApplyExpectation?, diffPreview: String?) {
+        let record = SubagentManager.shared.getSubagent(byId: runId)?.snapshotRecord()
+            ?? AgentRunStore.shared.loadAny(runId: runId)
+        guard let record, case .worktree(let path, let branch) = record.isolation else {
+            return (nil, nil)
+        }
+        let destination = record.repositoryRoot.map { URL(fileURLWithPath: $0, isDirectory: true) }
+        guard let worktree = try? await WorkspaceIsolation.open(
+            path: path,
+            branch: branch,
+            repositoryRoot: destination,
+            baseCommit: record.baseCommit
+        ), let changes = try? await WorkspaceIsolation.snapshot(worktree, diffLimit: nil) else {
+            return (nil, nil)
+        }
+        let expectation = destinationBranch.map {
+            SubagentApplyExpectation(destinationBranch: $0, patchDigest: patchDigest(changes.diff))
+        }
+        return (expectation, changes.diff)
+    }
+
     static func apply(
         runId: UUID,
         expectation: SubagentApplyExpectation? = nil
@@ -324,9 +356,12 @@ enum SubagentApplyService {
         } else {
             let result = try await WorkspaceIsolation.apply(worktree, changeSet: changes)
             files = result.changedFiles
-            // The tracked patch does not remove the run's ignored files; check
-            // AFTER the apply so the names describe what is still in the tree.
-            let ignored = await WorkspaceIsolation.ignoredFiles(worktree)
+            // The tracked patch does not remove the run's ignored files, nor
+            // an untracked nested repository it never staged; check AFTER the
+            // apply so the names describe what is still in the tree.
+            let ignoredIgnored = await WorkspaceIsolation.ignoredFiles(worktree)
+            let leftovers = await WorkspaceIsolation.untrackedLeftovers(worktree)
+            let ignored = ignoredIgnored + leftovers
             if !ignored.isEmpty {
                 keptIgnoredFiles = Array(ignored.prefix(10))
             }

@@ -864,6 +864,9 @@ public final class CompletionEngine: @unchecked Sendable {
                 // this turn's required-parameter gate.
                 let deepSeekGrammarToken = GrammarConstrainedSampler.shared.beginGeneration()
                 stateLock.lock()
+                // Continues the claim's ticket, like the generic path: a token
+                // taken before this launch must still name this turn after it.
+                generationCounter = max(generationCounter, held.ticket)
                 generationCounter &+= 1
                 let myGenerationId = generationCounter
                 currentGenerationId = myGenerationId
@@ -2577,6 +2580,14 @@ public final class CompletionEngine: @unchecked Sendable {
         // Old ordering preserved: KV reset (above) -> grammar token -> turn id.
         let grammarGenerationToken = GrammarConstrainedSampler.shared.beginGeneration()
         stateLock.lock()
+        // The generation id CONTINUES the claim's ticket rather than coming
+        // from an independent counter. A preempting caller holds a token from
+        // before this launch (a claim's ticket) and compares it after, when the
+        // turn may already be a task (a generation id): two counters made that
+        // comparison refuse to stop the very turn it named. Tickets are unique
+        // and monotone in the ledger, so reusing one as an id keeps every id
+        // distinct without a second source.
+        generationCounter = max(generationCounter, held.ticket)
         generationCounter &+= 1
         let myGenerationId = generationCounter
         currentGenerationId = myGenerationId
@@ -11758,6 +11769,12 @@ if layer.attnGateProjTensor != nil,
     public func cancelBackgroundTurn(token: UInt64) -> Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
+        // One token space, one comparison. A caller's token can come from
+        // either accessor, and the two used to be different counters (a
+        // claim's ticket, then the generation id), so a turn whose preparation
+        // finished during the caller's `await` was answered "not that one" and
+        // never stopped. `launchTurn` continues the ledger's ticket as the
+        // generation id, so a token stays valid across that handover.
         if let task = currentGenerationTask {
             guard activeTurnPriority == .background, currentGenerationId == token else { return false }
             task.cancel()
