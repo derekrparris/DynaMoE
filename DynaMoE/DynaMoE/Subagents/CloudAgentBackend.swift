@@ -452,12 +452,17 @@ nonisolated enum SubagentBackendSettings {
     static let defaultSessionCloudCostMultiplier: Double = 4
     static let maximumSessionCloudCostUSD: Double = 500
 
-    /// `nil` means "no per-conversation aggregate ceiling".
+    /// `nil` means "no per-conversation aggregate ceiling", which happens only
+    /// when the per-run cap is itself cleared: a cap derived from a per-run cap
+    /// that does not exist has no value to derive.
     ///
     /// A stored 0 is the Settings field's "derive it" value, which is what the
     /// field has always documented and what `@AppStorage` writes when the
-    /// operator types 0 — so it must derive, not disable the cap. Only an
-    /// absent key (the operator cleared it) means no ceiling.
+    /// operator types 0 — so it must derive, not disable the cap. An ABSENT key
+    /// is the SAME answer, not a different one: it is what
+    /// `setSessionCloudCostCeiling(nil)` writes and what a never-touched
+    /// `@AppStorage` field leaves behind, so this getter cannot (and need not)
+    /// tell "never set" from "explicitly cleared" — both derive.
     static func sessionCloudCostCeiling(defaults: UserDefaults = .standard) -> Double? {
         if let stored = defaults.object(forKey: sessionCloudCostCeilingKey) as? NSNumber {
             let ceiling = stored.doubleValue

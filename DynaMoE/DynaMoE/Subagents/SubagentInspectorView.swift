@@ -507,10 +507,15 @@ struct SubagentInspectorView: View {
     /// removes this conversation's rows plus the UNSCOPED ones (a run started
     /// by an API turn belongs to no chat and rides every inspector), so the
     /// confirmation used to promise to delete rows the button leaves alone.
+    ///
+    /// The predicate must therefore be the STORE's own selection in both the
+    /// scoped and the `nil` case: `load(sessionId:) + load(sessionId: nil)`.
+    /// A `sessionId == nil ||` short-circuit made the nil case true for every
+    /// conversation's rows, so a chat with no saved session and "All Runs" on
+    /// promised to delete runs the store never selects.
     private var clearableRuns: [AgentRunRecord] {
         terminalRuns.filter { record in
-            let ownedByThisConversation = sessionId == nil
-                || record.parentSessionId == sessionId
+            let ownedByThisConversation = record.parentSessionId == sessionId
                 || record.parentSessionId == nil
             return ownedByThisConversation && !record.holdsWorktreeWork
         }
@@ -558,10 +563,14 @@ struct SubagentInspectorView: View {
     /// Runs started outside a conversation (an API/agent turn with no chat
     /// session) have no bucket of their own, so they ride every inspector
     /// rather than becoming invisible in the one that happens to be open.
+    ///
+    /// The same selection `clearableRuns` uses: a `sessionId == nil ||` here
+    /// gave a chat with no saved session every OTHER conversation's live runs,
+    /// which the stored half (a `load(sessionId: nil)`) does not.
     private var liveInstances: [SubagentInstance] {
         if showsAllSessions { return manager.allSubagents }
         return manager.allSubagents.filter {
-            sessionId == nil || $0.parentSessionId == sessionId || $0.parentSessionId == nil
+            $0.parentSessionId == sessionId || $0.parentSessionId == nil
         }
     }
 

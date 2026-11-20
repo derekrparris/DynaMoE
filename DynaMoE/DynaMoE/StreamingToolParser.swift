@@ -30,16 +30,21 @@ public enum ToolCallFormat: String, CaseIterable, Codable {
 public final class StreamingToolParser {
     public static let shared = StreamingToolParser()
 
-    // Structural Delimiters
-    public static let qwenToolCallOpen = "<tool_call>"
-    public static let qwenToolCallClose = "</tool_call>"
-    public static let qwenFunctionOpen = "<function="
-    public static let qwenFunctionClose = "</function>"
-    public static let llamaTagOpen = "<|python_tag|>"
-    public static let llamaTagClose = "</|python_tag|>"
+    // Structural Delimiters.
+    //
+    // `nonisolated` because the markup-stripping helper below runs OFF the
+    // actor (a subagent backend strips a finished turn's prose from a detached
+    // task), and these are immutable `String` constants with nothing to
+    // isolate. Without it that read is a Swift 6 isolation error.
+    public nonisolated static let qwenToolCallOpen = "<tool_call>"
+    public nonisolated static let qwenToolCallClose = "</tool_call>"
+    public nonisolated static let qwenFunctionOpen = "<function="
+    public nonisolated static let qwenFunctionClose = "</function>"
+    public nonisolated static let llamaTagOpen = "<|python_tag|>"
+    public nonisolated static let llamaTagClose = "</|python_tag|>"
     // Gemma 4 native tool call: <|tool_call>call:name{key:value,...}<tool_call|>
-    public static let gemmaToolCallOpen = "<|tool_call>"
-    public static let gemmaToolCallClose = "<tool_call|>"
+    public nonisolated static let gemmaToolCallOpen = "<|tool_call>"
+    public nonisolated static let gemmaToolCallClose = "<tool_call|>"
     // Gemma 4 string-quote delimiter used inside tool-call arguments.
     fileprivate static let gemmaQuote = "<|\"|>"
 

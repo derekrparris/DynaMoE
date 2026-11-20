@@ -313,10 +313,13 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
         config: ModelConfig,
         claim: TurnSlotClaim
     ) async throws -> Prepared {
-        // The render is pure and the tokenize is a long serial pass over a
-        // prompt that can be 160k characters, so both run off the main actor;
-        // the engine is a lock-guarded Sendable box, so the tokenize needs no
-        // actor either. Only what touches UI state stays on it.
+        // The render is pure; the tokenize is a long serial pass over a prompt
+        // that can be 160k characters. BOTH stay on this actor: the tokenizer
+        // bindings `CompletionEngine.tokenize` calls are themselves MainActor
+        // isolated (the generated code is unannotated, so this target's default
+        // isolation applies), and a `Task.detached` around the call was an
+        // isolation violation that could not have moved the work off the actor
+        // anyway. Moving it would have to start at the bindings.
         // The per-request flag is the caller's answer for THIS run; the stored
         // one is only the backend's default. Ignoring it made a run that asked
         // for thinking off think anyway, and pay for it.
@@ -331,9 +334,11 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
         )
         let promptTokenIds: [UInt32]
         do {
-            promptTokenIds = try await Task.detached(priority: .userInitiated) {
-                try engine.tokenize(prompt)
-            }.value
+            // A direct call, NOT `Task.detached`: `tokenize` is MainActor
+            // isolated (as are the tokenizer bindings it calls), so a detached
+            // call was an isolation violation, and this method is already on
+            // that actor — the encoding always ran there.
+            promptTokenIds = try engine.tokenize(prompt)
         } catch {
             throw AgentBackendError.malformedResponse(
                 "The tokenizer could not encode the subagent prompt: \(error.localizedDescription)"

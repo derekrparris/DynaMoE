@@ -280,6 +280,15 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     private var recordedIsolation: AgentIsolation?
     private let lock = NSLock()
 
+    /// Synchronous helpers for the fields above, because `NSLock` may not be
+    /// touched from an `async` context (an error in the Swift 6 language mode)
+    /// and the run's lifecycle methods are `async`.
+    private func installSchedulerTicket(_ ticket: UUID) {
+        lock.lock()
+        defer { lock.unlock() }
+        schedulerTicket = ticket
+    }
+
     public init(
         id: UUID = UUID(),
         role: String,
@@ -569,8 +578,12 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         // over the synthesized one (and over any concurrent `summaryRelayed`
         // update). A cancelled run is exactly the case — it has no report yet
         // has ignored files to name.
-        var synthesized: AgentReport?
-        let written = await AgentRunStore.shared.mutateAsync(runId: id, sessionId: parentSessionId) { current in
+        //
+        // Read back from the mutation's ANSWER rather than hoisting it out in a
+        // captured `var`: that closure is `@Sendable` (it runs on the store's
+        // IO queue), so mutating a local from it is a data race the compiler
+        // reports, and the record the store wrote already carries the report.
+        let writtenRecord = await AgentRunStore.shared.mutateAsync(runId: id, sessionId: parentSessionId) { current in
             current.appliedAt = date
             current.appliedToBranch = appliedTo
             if !keptIgnoredFiles.isEmpty {
@@ -598,10 +611,10 @@ public final class SubagentInstance: Identifiable, ObservableObject {
                     report.openQuestions.append(ignoredNote)
                 }
                 current.report = report
-                synthesized = report
             }
-        } != nil
-        if let synthesized { report = synthesized }
+        }
+        let written = writtenRecord != nil
+        if let writtenReport = writtenRecord?.report { report = writtenReport }
         // Keeps the rest of the live state fresh in the normal case. A dropped
         // write here cannot lose `appliedAt` or `keptIgnoredFiles`: the
         // mutation above already wrote both atomically, and `report` now holds
@@ -922,9 +935,10 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         // terminal transition instead — `claimFinish` takes it, `finishRun`
         // awaits the release, `cancel` re-queues it — so every exit path
         // releases exactly once and in order.
-        lock.lock()
-        schedulerTicket = ticket
-        lock.unlock()
+        // `NSLock` may not be touched from an `async` context (an error in the
+        // Swift 6 language mode), so every one of these reads/writes goes
+        // through a SYNCHRONOUS helper; the same shape `MCPClient` uses.
+        installSchedulerTicket(ticket)
 
         // A Stop can land between the scheduler's last cancellation read and
         // this MainActor continuation. The `defer` above still releases the
@@ -2194,6 +2208,30 @@ public final class SubagentManager: ObservableObject {
     private var pendingSpawnSlots: [UUID?: Set<UUID>] = [:]
     private let lock = NSLock()
 
+    /// Synchronous lock helpers for the spend/reservation state.
+    ///
+    /// `NSLock` may not be touched from an `async` context (an error in the
+    /// Swift 6 language mode) and every reader/writer of `pendingCloudSpend`
+    /// is `async`, so each one goes through a helper that takes and releases
+    /// the lock in a non-async frame — the same shape `MCPClient` uses.
+    private func reserveCloudSpendLocked(token: UUID, sessionId: UUID?, amount: Double) {
+        lock.lock()
+        defer { lock.unlock() }
+        pendingCloudSpend[sessionId, default: [:]][token] = amount
+    }
+
+    private func liveInstancesLocked(sessionId: UUID?) -> [SubagentInstance] {
+        lock.lock()
+        defer { lock.unlock() }
+        return subagentsOrder.filter { $0.parentSessionId == sessionId }
+    }
+
+    private func pendingCloudSpendLocked(sessionId: UUID?) -> [UUID: Double] {
+        lock.lock()
+        defer { lock.unlock() }
+        return pendingCloudSpend[sessionId] ?? [:]
+    }
+
     /// Maximum number of active (non-terminal) + in-flight subagent runs one
     /// conversation may hold at once.
     public static let defaultMaxActiveSubagentsPerSession = 6
@@ -2251,9 +2289,7 @@ public final class SubagentManager: ObservableObject {
     ) async -> (token: UUID, spentUSD: Double) {
         let token = UUID()
         let requested = requestedUSD.isFinite ? max(0, requestedUSD) : 0
-        lock.lock()
-        pendingCloudSpend[sessionId, default: [:]][token] = requested
-        lock.unlock()
+        reserveCloudSpendLocked(token: token, sessionId: sessionId, amount: requested)
         // Read AFTER the reservation lands, so this spawn's own commitment is
         // part of the number it checks (conservative: it can refuse a spawn
         // that would exactly fit, never admit one that would not). The read is
@@ -2316,9 +2352,7 @@ public final class SubagentManager: ObservableObject {
                 }
             }
         }
-        lock.lock()
-        let liveSnapshot = subagentsOrder.filter { $0.parentSessionId == sessionId }
-        lock.unlock()
+        let liveSnapshot = liveInstancesLocked(sessionId: sessionId)
         for instance in liveSnapshot {
             guard instance.backendDescriptor?.kind == .cloud else { continue }
             let actual = instance.usage.costUSD.isFinite ? max(0, instance.usage.costUSD) : 0
@@ -2340,9 +2374,7 @@ public final class SubagentManager: ObservableObject {
         // Spawns between their cap check and their registration. Keyed by
         // reservation token, so a token that was released (or belongs to
         // another conversation) contributes nothing.
-        lock.lock()
-        let pendingSnapshot = pendingCloudSpend[sessionId] ?? [:]
-        lock.unlock()
+        let pendingSnapshot = pendingCloudSpendLocked(sessionId: sessionId)
         for (token, amount) in pendingSnapshot {
             byRunId[token] = amount
         }
@@ -2708,7 +2740,14 @@ public final class SubagentManager: ObservableObject {
         lock.lock()
         terminal = subagentsOrder.filter {
             $0.status.isTerminal
-                && (sessionId == nil || $0.parentSessionId == sessionId || $0.parentSessionId == nil)
+                // The same selection `deleteClearableRecords` makes below, so
+                // the instances and the records agree. A `sessionId == nil ||`
+                // here removed every conversation's terminal runs from the
+                // PUBLISHED array while the store half left their records
+                // alone, so the dialog's "rows from other conversations are
+                // left alone" was true on disk and false on screen until the
+                // next reload put them back.
+                && ($0.parentSessionId == sessionId || $0.parentSessionId == nil)
                 && !$0.holdsUnappliedWorktreeWork
         }
         let clearedIds = Set(terminal.map(\.id))

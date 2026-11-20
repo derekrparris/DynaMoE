@@ -133,7 +133,7 @@ final class AgentSchedulerTests: XCTestCase {
         try await waitForWaiters(scheduler, 1)
         // The cap is per PROVIDER: the second run on "a" must be waiting
         // while "b" holds its own ticket, not admitted beside it.
-        var snapshot = await scheduler.snapshot()
+        let snapshot = await scheduler.snapshot()
         XCTAssertEqual(snapshot.waiting, 1, "provider a's second run waits behind its own cap")
         XCTAssertEqual(snapshot.tickets[providerA], 1, "provider a holds exactly one ticket")
 

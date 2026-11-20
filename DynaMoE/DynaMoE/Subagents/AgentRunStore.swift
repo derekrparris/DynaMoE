@@ -895,16 +895,27 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
             guard let directories = try? fileManager.contentsOfDirectory(atPath: rootURL.path) else {
                 return []
             }
-            var records: [AgentRunRecord] = []
+            // Decoded here rather than through `load(sessionId:)` because the
+            // dedup below needs each file's MODIFICATION DATE, which those
+            // readers discard. Both spellings of a directory (a conversation id,
+            // and the unscoped bucket's name) hold plain `*.json` records, so
+            // one loop covers them.
+            var entries: [(modified: Date, record: AgentRunRecord)] = []
             for name in directories {
                 var isDirectory: ObjCBool = false
                 let path = rootURL.appendingPathComponent(name).path
                 guard fileManager.fileExists(atPath: path, isDirectory: &isDirectory),
                       isDirectory.boolValue else { continue }
-                if let sessionId = UUID(uuidString: name) {
-                    records.append(contentsOf: load(sessionId: sessionId))
-                } else {
-                    records.append(contentsOf: loadSessionDirectory(named: name))
+                let directory = rootURL.appendingPathComponent(name, isDirectory: true)
+                guard let names = try? fileManager.contentsOfDirectory(atPath: directory.path) else {
+                    continue
+                }
+                for file in names where file.hasSuffix(".json") {
+                    let candidate = directory.appendingPathComponent(file)
+                    guard let record = decodeRecord(at: candidate) else { continue }
+                    let modified = (try? candidate.resourceValues(forKeys: [.contentModificationDateKey]))?
+                        .contentModificationDate ?? .distantPast
+                    entries.append((modified, record))
                 }
             }
             // A conversation delete rescues a run into the unscoped bucket
@@ -914,15 +925,29 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
             // twice, and the inspector show whichever it read last. One record
             // per run id, keeping the newest — the rescued copy carries the
             // later write, and a genuinely newer scoped one wins on its own.
-            var newestByRun: [UUID: AgentRunRecord] = [:]
-            for record in records {
-                if let existing = newestByRun[record.id],
-                   Self.sortDate(existing) >= Self.sortDate(record) {
+            //
+            // "Newest" is the FILE's modification date, the rule `loadAny` and
+            // `existingRecordURL` already use. It used to be `sortDate`
+            // (`completedAt ?? startedAt ?? createdAt`), which cannot separate
+            // the crash this dedup exists for: a rescue of an already-terminal
+            // run rewrites only `parentSessionId`/`summaryRelayed`, so both
+            // files carry a BIT-IDENTICAL `completedAt` and the winner fell
+            // back to directory iteration order. `sortDate` survives as the
+            // tie-break for the one case an mtime cannot order (two copies
+            // written in the same instant), where it is as good as anything.
+            var newestByRun: [UUID: (modified: Date, record: AgentRunRecord)] = [:]
+            for entry in entries {
+                if let existing = newestByRun[entry.record.id],
+                   existing.modified > entry.modified
+                    || (existing.modified == entry.modified
+                        && Self.sortDate(existing.record) >= Self.sortDate(entry.record)) {
                     continue
                 }
-                newestByRun[record.id] = record
+                newestByRun[entry.record.id] = entry
             }
-            return newestByRun.values.sorted { Self.sortDate($0) > Self.sortDate($1) }
+            return newestByRun.values
+                .map(\.record)
+                .sorted { Self.sortDate($0) > Self.sortDate($1) }
         }
     }
 
@@ -964,17 +989,9 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     }
 
     /// A directory whose name is not a UUID still belongs to some run (an
-    /// unscoped bucket, or a session deleted while its runs were not). It is
-    /// read so retention can prune it, never attributed to a conversation.
-    private func loadSessionDirectory(named name: String) -> [AgentRunRecord] {
-        let directory = rootURL.appendingPathComponent(name, isDirectory: true)
-        guard let names = try? fileManager.contentsOfDirectory(atPath: directory.path) else {
-            return []
-        }
-        return names
-            .filter { $0.hasSuffix(".json") }
-            .compactMap { decodeRecord(at: directory.appendingPathComponent($0)) }
-    }
+    /// unscoped bucket, or a session deleted while its runs were not). `loadAll`
+    /// reads it with every other bucket so retention can prune it; it is never
+    /// attributed to a conversation.
 
     /// Reads one record, or nil when this build cannot use the file.
     ///

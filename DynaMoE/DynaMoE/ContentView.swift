@@ -6760,6 +6760,15 @@ struct ContentView: View {
             // handed to the call below, so a `defaults write` between approval
             // and execution cannot send the key somewhere else.
             let subQEndpoint = call.name == "subq_decide" ? SubQDecisionSettings.endpoint() : nil
+            // The destination branch the apply card names is pinned the same
+            // way, so a `git checkout` while the card sits open is refused
+            // rather than landing the patch on a branch the operator never saw.
+            // Resolved before the card can be clicked; `nil` for any other tool
+            // and for a run whose record cannot be read, where the tool answers
+            // for itself.
+            let applyDestination = call.name == "apply_subagent_changes"
+                ? await ApplySubagentChangesTool.approvalExpectation(arguments: parsedCall.arguments)
+                : nil
             // A tool plan mode withholds is refused by `executeTool` without
             // running, so asking the user first offered them a write the mode had
             // already denied.
@@ -6823,6 +6832,7 @@ struct ContentView: View {
                 turnId: turnId,
                 sessionId: sessionId,
                 approvedSubQEndpoint: subQEndpoint,
+                approvedApplyDestination: applyDestination,
                 // A bypassed card is not a reviewed command: this call's
                 // children get the allowlist, not the operator's credentials.
                 unreviewed: turboBypasses
@@ -7029,6 +7039,35 @@ struct ContentView: View {
         // report and, for an isolated writer, its unapplied worktree are kept),
         // it does not pause it.
         let isFreshOperatorSend = agentStep == 0 && !isInThinkingContinuation
+        // Computed here rather than beside `turnMode` below because the turn
+        // identity just below needs it, and the two MUST agree: this is the
+        // same predicate the mint block used when it sat with `turnMode`.
+        let isContinuation = agentStep > 0 || isInThinkingContinuation
+        // The TURN identity subagent-run cancellation is scoped to: minted on a
+        // fresh send, carried by every continuation of that send. A Stop then
+        // reaches only the runs THIS operator turn spawned — a background run
+        // an earlier turn left working survives it, with its unapplied
+        // worktree (the only full copy of its work) intact.
+        //
+        // Minted HERE, above BOTH queued-send branches, because each of them
+        // publishes the generating state that makes Stop read this identity.
+        // Minted at the launch instead, a Stop on a queued FRESH send read the
+        // identity the PREVIOUS turn left behind (`activeAgentTurnId` outlives
+        // a finished turn on purpose, so that turn's continuations can carry
+        // it) and cancelled that turn's background runs, destroying background
+        // work for a send that never launched. A fresh send therefore replaces
+        // the stale identity before anything can read it, and the identity it
+        // mints has spawned nothing, so a Stop during the wait reaches no run.
+        let agentTurnId: UUID
+        if isContinuation,
+           let existing = activeAgentTurnId,
+           activeAgentTurnSessionId == sessionId {
+            agentTurnId = existing
+        } else {
+            agentTurnId = UUID()
+            activeAgentTurnId = agentTurnId
+            activeAgentTurnSessionId = sessionId
+        }
         if !preemptionRetry, isFreshOperatorSend, CompletionEngine.shared.hasActiveBackgroundTurn {
             showStatus("⏸ Stopping a background subagent so this turn can run…")
             // The send is ACCEPTED (this branch returns true) but nothing is
@@ -7151,24 +7190,12 @@ struct ContentView: View {
         // (retention, a manual delete) while the turn is still running, and
         // re-deriving from a missing session would silently resume the coder.
         let resolvedMode: AgentMode = generationSession?.agentMode ?? .code
-        let isContinuation = agentStep > 0 || isInThinkingContinuation
         let turnMode: AgentMode = isContinuation ? (activeTurnMode ?? resolvedMode) : resolvedMode
         activeTurnMode = turnMode
-        // The TURN identity subagent-run cancellation is scoped to: minted on a
-        // fresh send, carried by every continuation of that send. A Stop then
-        // reaches only the runs THIS operator turn spawned — a background run
-        // an earlier turn left working survives it, with its unapplied
-        // worktree (the only full copy of its work) intact.
-        let agentTurnId: UUID
-        if isContinuation,
-           let existing = activeAgentTurnId,
-           activeAgentTurnSessionId == sessionId {
-            agentTurnId = existing
-        } else {
-            agentTurnId = UUID()
-            activeAgentTurnId = agentTurnId
-            activeAgentTurnSessionId = sessionId
-        }
+        // The identity minted above (before the queued-send branches, so that a
+        // Stop on a queued send cannot read the previous turn's) becomes the
+        // harness's current turn now that this send has actually reached the
+        // launch path.
         AgentHarness.shared.currentTurnId = agentTurnId
         // Asserted BEFORE the slot claim below, deliberately. `setActiveMode`
         // skips its grammar re-sync while `CompletionEngine.isActive`, and the
@@ -8138,6 +8165,12 @@ struct ContentView: View {
                         // See the local path: the destination the card shows is
                         // pinned here and used by the call, not re-read later.
                         let subQEndpoint = call.name == "subq_decide" ? SubQDecisionSettings.endpoint() : nil
+                        // See the local path: the apply card's destination is
+                        // pinned before the operator can approve it, so a
+                        // `git checkout` while the card sits open is refused.
+                        let applyDestination = call.name == "apply_subagent_changes"
+                            ? await ApplySubagentChangesTool.approvalExpectation(arguments: call.arguments)
+                            : nil
                         // A call plan mode withholds is refused by `executeTool`
                         // without running, so it must not raise an approval
                         // prompt first.
@@ -8223,6 +8256,7 @@ struct ContentView: View {
                             turnId: agentTurnId,
                             sessionId: sessionId,
                             approvedSubQEndpoint: subQEndpoint,
+                            approvedApplyDestination: applyDestination,
                             // See the local path: a Turbo bypass is not a review.
                             unreviewed: turboBypasses
                         )

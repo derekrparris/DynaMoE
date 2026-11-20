@@ -3408,6 +3408,47 @@ public final class ApplySubagentChangesTool: AgentTool {
         ]
     )
 
+    /// The destination the approval card displayed, pinned by the caller that
+    /// raised it (the turn loop, next to the SubQ endpoint pin).
+    ///
+    /// `nil` for a headless caller: no card was shown, so there is no displayed
+    /// destination for the apply to be stale against, and `execute` resolves
+    /// the live branch itself.
+    @TaskLocal public static var pinnedDestination: SubagentApplyExpectation?
+
+    /// The destination an `apply_subagent_changes` card will name, for the
+    /// caller that raises it to pin before the operator can approve.
+    ///
+    /// Reads the same record and the same branch `execute` would, but WITHOUT
+    /// the patch digest: the card previews the run's recorded report rather
+    /// than a live snapshot, so a card-time digest would bind bytes that were
+    /// never displayed (see `execute`).
+    ///
+    /// Answers `nil` when the run is unknown or not isolated, where the tool
+    /// itself will refuse; a caller must not turn that into an error here.
+    public static func approvalExpectation(arguments: [String: Any]) async -> SubagentApplyExpectation? {
+        let raw = (arguments["subagent_id"] as? String) ?? (arguments["run_id"] as? String)
+        guard let raw,
+              let runId = UUID(uuidString: raw.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            return nil
+        }
+        let record = SubagentManager.shared.getSubagent(byId: runId)?.snapshotRecord()
+            ?? AgentRunStore.shared.loadAny(runId: runId)
+        guard let record, case .worktree = record.isolation else { return nil }
+        guard let root = record.repositoryRoot else { return nil }
+        let branch = await WorkspaceIsolation.currentBranch(
+            of: URL(fileURLWithPath: root, isDirectory: true)
+        )
+        // `resolved: true` even for a detached HEAD: the branch being nil is
+        // itself the answer, and a `git checkout main` while the card is open
+        // must be refused rather than read as "nothing to compare".
+        return SubagentApplyExpectation(
+            destinationBranch: branch,
+            destinationBranchResolved: true,
+            patchDigest: nil
+        )
+    }
+
     public func execute(
         arguments: [String: Any],
         workingDirectory: URL?,
@@ -3435,25 +3476,42 @@ public final class ApplySubagentChangesTool: AgentTool {
             ownerSessionId = nil
             runExists = false
         }
-        // `nil` is not a match: an unscoped caller has no conversation
-        // identity to compare, and `nil == nil` would reach a rescued record
-        // whose parent is also unknown. Compared through the optional on
-        // purpose — `let ownerSessionId` would skip the check entirely when
-        // the owner is nil, which is the wildcard this guard exists to close.
+        // Same predicate as `get_subagent_status` / `send_subagent_message` /
+        // `runs(ownedBySession:)`: the owner must EQUAL the caller's session,
+        // and `nil` is a session of its own (an API/agent turn with no chat),
+        // not a wildcard — so a scoped caller can never reach a rescued record,
+        // whose owner is nil. Compared through the optional on purpose: a
+        // `let ownerSessionId` would skip the check whenever the id is unknown,
+        // which is the wildcard this guard exists to close.
         if runExists,
            ownerSessionId != AgentHarness.executingSessionId {
             let err = "No subagent run with id \(runId.uuidString) was found."
             return (AgentHarness.toolErrorJSON(tool: "apply_subagent_changes", error: err), nil, err, false)
         }
 
-        // Bound to the destination branch and the exact patch digest, then
-        // re-checked before a byte is written: a `git checkout` or a worktree
-        // edit during the window between this call and the apply must not land
-        // unreviewed bytes on the wrong branch.
+        // Bound to the destination branch, then re-checked before a byte is
+        // written: a `git checkout` between the approval card and this call
+        // must not land the patch on a branch the operator never saw.
         //
-        // Taken HERE rather than inside a card-raising helper: this tool's own
-        // invocation IS the operator's decision (it is state-changing, so it
-        // was approved before it ran), and asking a second time through
+        // The branch is PINNED by the caller that raised the card
+        // (`approvalExpectation`, resolved next to the SubQ endpoint pin and
+        // handed through `executeTool`), so what is verified is the
+        // destination the CARD displayed rather than one read here — the card
+        // can sit open while the operator works in the repository. A headless
+        // caller raises no card, has nothing to be stale against, and pins
+        // nothing; it resolves the branch below exactly as before.
+        //
+        // The PATCH digest is deliberately taken at execute time even when a
+        // pin exists. The card's preview is the run's RECORDED report
+        // (`SubagentApplyControl.approvalSummary` renders `record.report?.diff`,
+        // bounded and possibly truncated), not a live snapshot of the worktree,
+        // so a digest captured at card time would bind bytes that were never
+        // shown. `SubagentApplyService.apply` still re-snapshots immediately
+        // before writing, so what lands is the patch that was verified.
+        //
+        // Resolved HERE rather than through a card-raising helper: this tool's
+        // own invocation IS the operator's decision (it is state-changing, so
+        // it was approved before it ran), and asking a second time through
         // `SubagentApplyControl` parked every headless caller on a card it
         // never asked for. The inspector's button, which no tool call
         // preceded, is the path that still needs one.
@@ -3464,7 +3522,10 @@ public final class ApplySubagentChangesTool: AgentTool {
         // writable and is deliberately not trusted for this).
         var destinationBranch: String?
         var destinationBranchResolved = false
-        if let recordedRoot {
+        if let pinned = Self.pinnedDestination, pinned.destinationBranchResolved {
+            destinationBranch = pinned.destinationBranch
+            destinationBranchResolved = true
+        } else if let recordedRoot {
             destinationBranchResolved = true
             destinationBranch = await WorkspaceIsolation.currentBranch(
                 of: URL(fileURLWithPath: recordedRoot, isDirectory: true)
@@ -4990,7 +5051,7 @@ public final class AgentHarness {
 
     /// The bundle id, lowercased: it is both the `defaults` domain and the
     /// preference plist's own file name.
-    private static let applicationPreferencesDomain = "drp.dynamoe"
+    private nonisolated static let applicationPreferencesDomain = "drp.dynamoe"
 
     /// True for a shell command that would rewrite this app's preferences.
     ///
@@ -5004,7 +5065,7 @@ public final class AgentHarness {
     /// tools are not inspected at all. It exists to stop the ordinary case (an
     /// agent composing a `defaults write`), which is what the Turbo self-revert
     /// was, and is not a sandbox.
-    static func shellCommandWritesApplicationPreferences(_ command: String) -> Bool {
+    nonisolated static func shellCommandWritesApplicationPreferences(_ command: String) -> Bool {
         let lowered = command.lowercased()
         if lowered.contains("cfprefsd"),
            lowered.contains("killall") || lowered.contains("pkill") {
@@ -5100,7 +5161,10 @@ public final class AgentHarness {
     /// `spawn_subagent` must inherit the RUN's parent identity, and reading
     /// `AgentHarness.shared.currentTurnId` would stamp it with whichever
     /// operator turn happens to be current.
-    @TaskLocal static var executingInRunScope = false
+    /// Read from `nonisolated` git/process helpers, which have no actor and no
+    /// global turn to consult: the value is a `@TaskLocal`, so reading it
+    /// anywhere is safe and is exactly what those call sites need.
+    @TaskLocal nonisolated static var executingInRunScope = false
 
     /// True while the tool being executed ran WITHOUT a human decision.
     ///
@@ -6442,7 +6506,7 @@ public final class AgentHarness {
     /// every child this call spawns then gets the allowlist instead of the
     /// operator's environment. It defaults to false because a caller that does
     /// not know is a caller that showed the card.
-    public func executeTool(call: ParsedToolCall, workingDirectory: URL? = nil, maxOutputLength: Int? = nil, mode: AgentMode? = nil, turnId: UUID? = nil, sessionId: UUID? = nil, approvedSubQEndpoint: URL? = nil, unreviewed: Bool = false) async -> (resultJSON: String, record: ToolCallRecord, isCompleted: Bool) {
+    public func executeTool(call: ParsedToolCall, workingDirectory: URL? = nil, maxOutputLength: Int? = nil, mode: AgentMode? = nil, turnId: UUID? = nil, sessionId: UUID? = nil, approvedSubQEndpoint: URL? = nil, approvedApplyDestination: SubagentApplyExpectation? = nil, unreviewed: Bool = false) async -> (resultJSON: String, record: ToolCallRecord, isCompleted: Bool) {
         // A tool runs between steps, with the engine idle. That is the one
         // moment a registry rebuild deferred during a generation can land.
         flushDeferredGrammarSync()
@@ -6458,18 +6522,24 @@ public final class AgentHarness {
         // The SubQ endpoint is bound for the same reason: the approval card
         // displays a destination, and the call must use THAT one rather than
         // re-read `UserDefaults` after the operator approved a different host.
+        //
+        // The apply destination is the third: the card names the branch the
+        // patch will land on, so a `git checkout` while the card sat open is
+        // refused instead of landing the patch somewhere the operator never saw.
         return await AgentHarness.$executingTurnMode.withValue(effectiveMode) {
             await AgentHarness.$executingTurnId.withValue(turnId ?? AgentHarness.executingTurnId) {
                 await AgentHarness.$executingSessionId.withValue(sessionId ?? AgentHarness.executingSessionId) {
                     await AgentHarness.$executingInRunScope.withValue(isRunScoped) {
                         await AgentHarness.$executingUnreviewedToolCall.withValue(unreviewed) {
                             await SubQDecideTool.$pinnedEndpoint.withValue(approvedSubQEndpoint) {
-                                await self.runToolInTurn(
-                                    call: call,
-                                    workingDirectory: workingDirectory,
-                                    maxOutputLength: maxOutputLength,
-                                    effectiveMode: effectiveMode
-                                )
+                                await ApplySubagentChangesTool.$pinnedDestination.withValue(approvedApplyDestination) {
+                                    await self.runToolInTurn(
+                                        call: call,
+                                        workingDirectory: workingDirectory,
+                                        maxOutputLength: maxOutputLength,
+                                        effectiveMode: effectiveMode
+                                    )
+                                }
                             }
                         }
                     }
@@ -7372,6 +7442,12 @@ public final class AgentHarness {
     /// `cwd`, and a containment card exists precisely so the operator can see
     /// where a call leaves the sandbox. Rendering the sandbox for an absolute
     /// path outside it told the operator the opposite of what is at stake.
+    ///
+    /// The path readers are matched through `pathReadToolNames` rather than a
+    /// second hand-written list: the three that array gained later
+    /// (`lint_diagnostics`, `git_diff`, `git_status`) raise a containment card
+    /// on the same `path` argument and were still naming the sandbox on it,
+    /// which is the one thing this function exists to stop.
     public static func approvalDestination(
         toolName: String,
         arguments: [String: String],
@@ -7379,8 +7455,12 @@ public final class AgentHarness {
     ) -> String? {
         let base = workingDirectory.map { URL(fileURLWithPath: $0, isDirectory: true) }
         switch toolName {
-        case "file_write", "file_edit", "file_read", "find_files", "grep_search",
-             "find_symbol_definition", "find_references":
+        case "file_write", "file_edit":
+            guard let path = arguments["path"], !path.isEmpty else {
+                return workingDirectory
+            }
+            return resolvePath(path, workingDirectory: base).path
+        case _ where pathReadToolNames.contains(toolName):
             // A read's path is the reason its card exists, so the card must
             // name where it points rather than the sandbox it leaves.
             guard let path = arguments["path"], !path.isEmpty else {

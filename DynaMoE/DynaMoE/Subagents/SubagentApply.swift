@@ -56,7 +56,12 @@ nonisolated enum SubagentApplyError: LocalizedError, Equatable {
 
 /// What the operator approved on the apply card, verified right before `git apply`
 /// writes a byte to the destination tree.
-nonisolated struct SubagentApplyExpectation: Sendable, Equatable {
+///
+/// `public` only because `AgentHarness.executeTool` is public and carries one as
+/// a parameter (the approval-time destination pin). Its members stay internal:
+/// nothing outside this module constructs one, and the memberwise initializer is
+/// not part of a contract.
+nonisolated public struct SubagentApplyExpectation: Sendable, Equatable {
     /// The destination branch (or `nil` for detached HEAD) that was checked out
     /// when the card was built.
     var destinationBranch: String?

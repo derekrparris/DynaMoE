@@ -424,6 +424,12 @@ public final class CompletionEngine: @unchecked Sendable {
 
     /// Tokenizer bridge for API callers that build their own prompts
     /// (the server owns templating via ChatPromptFormatter).
+    ///
+    /// Main-actor isolated, like `DynaMoeTokenizer.encode`/`decode` themselves
+    /// (the generated bindings are unannotated, so this target's default
+    /// isolation applies to them too). A caller that wants the encoding off the
+    /// main actor would have to start at the bindings; making THIS method
+    /// `nonisolated` only moves the warning one level down.
     public func tokenize(_ text: String) throws -> [UInt32] {
         stateLock.lock()
         let tok = tokenizer
