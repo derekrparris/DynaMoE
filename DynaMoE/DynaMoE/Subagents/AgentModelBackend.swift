@@ -81,7 +81,13 @@ nonisolated struct AgentBackendTurn: @unchecked Sendable {
 
 nonisolated protocol AgentModelBackend: AnyObject, Sendable {
     var descriptor: AgentBackendDescriptor { get }
-    func runTurn(_ request: AgentBackendRequest) async throws -> AgentBackendTurn
+    /// `@concurrent` because this target defaults to MainActor isolation: a
+    /// plain async requirement runs on the CALLER's actor, so a run started
+    /// from the main actor would do its HTTP stream, tokenize and decode
+    /// there, serializing concurrent runs against each other and the UI.
+    /// A backend that needs the main actor (the local launch hop) says so
+    /// itself with `MainActor.run` around exactly that part.
+    @concurrent func runTurn(_ request: AgentBackendRequest) async throws -> AgentBackendTurn
 }
 
 nonisolated enum AgentBackendError: LocalizedError, Equatable {
@@ -199,7 +205,7 @@ nonisolated final class ScriptedBackend: AgentModelBackend, @unchecked Sendable 
         return turns.removeFirst()
     }
 
-    func runTurn(_ request: AgentBackendRequest) async throws -> AgentBackendTurn {
+    @concurrent func runTurn(_ request: AgentBackendRequest) async throws -> AgentBackendTurn {
         let turn = takeTurn(for: request)
 
         if turn.delayNanoseconds > 0 {

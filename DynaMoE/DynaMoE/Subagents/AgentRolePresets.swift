@@ -167,6 +167,15 @@ nonisolated enum AgentRolePresetCatalog {
             // disable the guard. A $0 ceiling fails the loop at step 0 with
             // "exhausted its cost budget", which is not a ceiling anyone meant.
             budget.maxCostUSD = value.isFinite && value > 0 ? value : nil
+            if budget.maxCostUSD == nil {
+                // Dropped, but not silently: "no ceiling" is not what was
+                // asked for, and the operator is the only one who can fix the
+                // number.
+                DiagLog.warning(
+                    "subagent.budget",
+                    "ignoring a cost ceiling of \(value): a ceiling must be finite and positive, so this run has none"
+                )
+            }
         }
         return budget
     }

@@ -58,7 +58,7 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
         }
     }
 
-    func runTurn(_ request: AgentBackendRequest) async throws -> AgentBackendTurn {
+    @concurrent func runTurn(_ request: AgentBackendRequest) async throws -> AgentBackendTurn {
         var attempt = 0
         while true {
             attempt += 1

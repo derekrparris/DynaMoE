@@ -11873,8 +11873,23 @@ if layer.attnGateProjTensor != nil,
     /// guards is a multi-second operation on the main actor and the poll yields,
     /// which is what lets the preparation it is waiting for finish.
     public func awaitIdle() async {
-        _ = await awaitIdle(boundedBy: nil)
+        // Bounded even here. A claim is released by its holder, and a holder
+        // that reserved and then threw on a path missing its `defer` would
+        // wedge this loop forever — a leaked claim must degrade to a timeout,
+        // not to a hang, for every later caller. Long enough to never cut a
+        // real turn short (a DeepSeek launch alone is ~17 s), short enough
+        // that a wedge is reported rather than waited out.
+        if !(await awaitIdle(boundedBy: Self.unboundedIdleWaitSeconds)) {
+            DiagLog.warning(
+                "engine.slot",
+                "awaitIdle gave up after \(Int(Self.unboundedIdleWaitSeconds)) s with the slot still held; proceeding"
+            )
+        }
     }
+
+    /// The cap `awaitIdle()` applies when its caller named no deadline: a
+    /// backstop against a leaked claim, not a budget for real work.
+    nonisolated static let unboundedIdleWaitSeconds: TimeInterval = 120
 
     /// The same wait with a deadline, for a caller that must not block forever.
     ///

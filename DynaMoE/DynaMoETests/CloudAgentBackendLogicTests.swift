@@ -641,7 +641,17 @@ final class CloudAgentBackendLogicTests: XCTestCase {
                 throw error
             }
         }
-        throw XCTSkip("every configured cloud model refused this turn: \(refusals.suffix(2).joined(separator: " | "))")
+        // Every candidate that reached the provider was refused. After an
+        // explicit opt-in that is a FAILURE, not a skip: a skip here reports
+        // green when the backend has regressed for every configured model,
+        // which is exactly the state worth knowing about. One model refusing
+        // this shape is still a legitimate skip-inducing outcome, so only
+        // "all of them refused" fails.
+        if !refusals.isEmpty {
+            XCTFail("every configured cloud model refused this turn: \(refusals.joined(separator: " | "))")
+            return
+        }
+        throw XCTSkip("no configured cloud model could be reached")
     }
 
     /// One real CLOUD subagent RUN through `SubagentManager`.
@@ -737,7 +747,14 @@ final class CloudAgentBackendLogicTests: XCTestCase {
             XCTFail("cloud run failed: \(summary)")
             return
         }
-        throw XCTSkip("every configured cloud model refused this run: \(refusals.suffix(2).joined(separator: " | "))")
+        // Same rule as the turn test: after opting in, every model refusing is
+        // a failure (the backend regressed), while one refusal among several is
+        // a legitimate skip-inducing outcome.
+        if !refusals.isEmpty {
+            XCTFail("every configured cloud model refused this run: \(refusals.joined(separator: " | "))")
+            return
+        }
+        throw XCTSkip("no configured cloud model could be reached")
     }
 
     func testTheDescriptorCarriesTheModelIdentityAndKind() {

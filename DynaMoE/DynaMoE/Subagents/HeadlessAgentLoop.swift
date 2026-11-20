@@ -70,7 +70,13 @@ nonisolated struct AgentLoopOutcome: Sendable {
 nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
     typealias EventSink = @Sendable (AgentRunEvent) -> Void
 
-    func run(
+    /// `@concurrent` because this target defaults to MainActor isolation: the
+    /// loop is started from the main actor (and from tests on it), and a plain
+    /// async func would run there, so every tool call, tokenize and file read
+    /// of every run would serialize on the UI's actor. Nothing in the loop
+    /// touches UI state; what does (the event sink's consumer) hops itself,
+    /// and the local backend wraps its single launch in `MainActor.run`.
+    @concurrent func run(
         input: AgentLoopInput,
         backend: any AgentModelBackend,
         context: AgentRunContext,
@@ -220,8 +226,12 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 // A step is bounded, not merely checked between steps: a
                 // provider that stops responding would otherwise run past the
                 // wall-clock budget with the scheduler ticket still held.
-                let remaining = Double(input.budget.maxWallClockSeconds) - elapsed
-                turn = try await Self.runTurn(backend, request, remainingSeconds: remaining)
+                // Measured NOW rather than reusing the loop's `elapsed`: that
+                // value was taken before the steering drain and the request
+                // assembly, so a budget of a few seconds could hand the step
+                // more time than the run has left.
+                let remaining = Double(input.budget.maxWallClockSeconds) - (CFAbsoluteTimeGetCurrent() - start)
+                turn = try await Self.runTurn(backend, request, remainingSeconds: max(0, remaining))
             } catch AgentLoopError.wallClockExceeded {
                 usage.merge(usageLedger.drain())
                 status = .failed

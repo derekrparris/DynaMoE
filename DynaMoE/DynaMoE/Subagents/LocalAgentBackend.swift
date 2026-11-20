@@ -146,7 +146,7 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
         )
     }
 
-    func runTurn(_ request: AgentBackendRequest) async throws -> AgentBackendTurn {
+    @concurrent func runTurn(_ request: AgentBackendRequest) async throws -> AgentBackendTurn {
         let prepared = try await Self.prepare(request, thinkingEnabled: thinkingEnabled)
         // A run cancelled while it prepared (rendering, tokenizing, waiting for
         // the slot) must not burn a full turn nobody will process: a DeepSeek

@@ -444,6 +444,17 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         do {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
+            // A non-finite Double (NaN/inf cost or elapsed time) is not valid
+            // JSON and the default strategy THROWS on it, which would make this
+            // run's record permanently unwritable: every later save of the same
+            // run fails the same way, and the run vanishes from the inspector.
+            // Encoding it as a string keeps the record readable and the loss
+            // visible rather than silent.
+            encoder.nonConformingFloatEncodingStrategy = .convertToString(
+                positiveInfinity: "Infinity",
+                negativeInfinity: "-Infinity",
+                nan: "NaN"
+            )
             data = try encoder.encode(record)
         } catch {
             DiagLog.warning("subagent.store", "failed to encode run \(record.id): \(error.localizedDescription)")
@@ -823,6 +834,25 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     func load(runId: UUID, sessionId: UUID?) -> AgentRunRecord? {
         onQueue { [self] in
             decodeRecord(at: fileURL(runId: runId, sessionId: sessionId))
+        }
+    }
+
+    /// Several runs by id, in ONE hop onto the IO queue.
+    ///
+    /// The per-id form is an `ioQueue.sync` each, so a caller that reads a set
+    /// of owed relay ids pays a queue round trip per id — on the send path,
+    /// where the main actor is waiting. Ids that no longer resolve are simply
+    /// absent from the result.
+    func load(runIds: [UUID], sessionId: UUID?) -> [UUID: AgentRunRecord] {
+        guard !runIds.isEmpty else { return [:] }
+        return onQueue { [self] in
+            var found: [UUID: AgentRunRecord] = [:]
+            for id in runIds {
+                if let record = decodeRecord(at: fileURL(runId: id, sessionId: sessionId)) {
+                    found[id] = record
+                }
+            }
+            return found
         }
     }
 

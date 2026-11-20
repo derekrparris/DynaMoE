@@ -2487,20 +2487,22 @@ struct ContentView: View {
     /// the hidden message on the next send while its reports were already
     /// flagged as seen.
     @discardableResult
-    private func insertStartOfTurnSubagentRelay(sessionIdx: Int, sessionId: UUID) -> [String] {
+    private func insertStartOfTurnSubagentRelay(
+        sessionIdx: Int,
+        sessionId: UUID,
+        pending: [String]
+    ) -> (reports: [String], messageId: UUID?) {
         // A directive belongs to exactly one turn; a later send must not find
         // the previous one still in history and re-read reports it already saw.
         sessions[sessionIdx].messages.removeAll { $0.isPromptOnly == true }
-        let pending = gatherCompletedSubagentRelayResponsesSynchronously(forSession: sessionId)
-        guard !pending.isEmpty else { return [] }
-        sessions[sessionIdx].messages.append(
-            ChatMessage(
-                role: .user,
-                content: LocalSubagentRelay.directive(reports: pending),
-                isPromptOnly: true
-            )
+        guard !pending.isEmpty else { return ([], nil) }
+        let message = ChatMessage(
+            role: .user,
+            content: LocalSubagentRelay.directive(reports: pending),
+            isPromptOnly: true
         )
-        return pending
+        sessions[sessionIdx].messages.append(message)
+        return (pending, message.id)
     }
 
     /// Collects final reports from this session's completed subagents that have not yet been
@@ -2513,12 +2515,11 @@ struct ContentView: View {
     /// `summaryRelayed` is still false is exactly the report this relay exists
     /// to deliver. Live instances come first and their ids suppress the stored
     /// copy, so one run is never injected twice.
-    /// The send path's form. `handleSendMessage` is synchronous (a view
-    /// builder calls it), so it cannot await the off-actor read the async
-    /// version does: this keeps the blocking store read, on the main actor,
-    /// exactly as before. Every other caller is async and takes the read off
-    /// the main actor; this one is the send's own first frame, where the read
-    /// is bounded by what the conversation still owes.
+    /// The send path's form: `handleSendMessage` is synchronous by contract,
+    /// so this cannot await. It reads the owed records in ONE hop onto the IO
+    /// queue (`load(runIds:sessionId:)`) rather than one `sync` per id, which
+    /// is the only cost this path can remove without going async. Every other
+    /// caller uses the async twin below and takes the read off the main actor.
     private func gatherCompletedSubagentRelayResponsesSynchronously(forSession sessionId: UUID?) -> [String] {
         guard let sessionId else { return [] }
         var seen = Set<UUID>()
@@ -2561,8 +2562,12 @@ struct ContentView: View {
         }
 
         let owed = Set(AgentRunStore.shared.unrelayedRunIds(sessionId: sessionId)).subtracting(seen)
+        let restored = AgentRunStore.shared.load(
+            runIds: owed.sorted { $0.uuidString < $1.uuidString },
+            sessionId: sessionId
+        )
         for id in owed.sorted(by: { $0.uuidString < $1.uuidString }) {
-            guard let record = AgentRunStore.shared.load(runId: id, sessionId: sessionId) else { continue }
+            guard let record = restored[id] else { continue }
             let summary: String
             if record.status == .cancelled {
                 let partial = record.report?.summary
@@ -4046,14 +4051,35 @@ struct ContentView: View {
         // reports as a trailing directive (`startCloudGeneration`), which keeps
         // the provider's cached prefix intact; every other backend renders the
         // transcript locally, so an extra hidden turn costs nothing.
-        let pendingSubagentRelay: [String]
+        //
+        // This path is synchronous by contract (`onSendMessage` is
+        // `(String, [PreparedImage]) -> Bool`), so it cannot await the
+        // off-actor read the async twin does. What it CAN avoid is paying a
+        // queue round trip per owed id: the store read below is one hop for
+        // the whole set, and every other caller is async and takes the read
+        // off the main actor entirely.
+        let relayCandidates: [String]
         if !sendSessionUsesCloud {
-            pendingSubagentRelay = insertStartOfTurnSubagentRelay(
-                sessionIdx: sessionIdx,
-                sessionId: currentSessionId
-            )
+            relayCandidates = gatherCompletedSubagentRelayResponsesSynchronously(forSession: currentSessionId)
         } else {
-            pendingSubagentRelay = []
+            relayCandidates = []
+        }
+        let relay = insertStartOfTurnSubagentRelay(
+            sessionIdx: sessionIdx,
+            sessionId: currentSessionId,
+            pending: relayCandidates
+        )
+        let pendingSubagentRelay = relay.reports
+        // The directive is part of the turn's prompt, so it has to go in
+        // before the launch -- but a REFUSED send must not leave it behind:
+        // the request log and the prompt builder would see a hidden user
+        // message for a turn that never ran. Every return below that can
+        // refuse goes through this.
+        func unwindRelayIfRefused(_ accepted: Bool) -> Bool {
+            if !accepted, let messageId = relay.messageId {
+                sessions[sessionIdx].messages.removeAll { $0.id == messageId }
+            }
+            return accepted
         }
 
         let userMsg = ChatMessage(
@@ -4192,6 +4218,13 @@ struct ContentView: View {
                    reports: pendingSubagentRelay
                ) {
                 markSubagentSummariesRelayed(pendingSubagentRelay, sessionId: currentSessionId)
+            } else if !afmStarted {
+                // No turn started (the failure went into the placeholder), so
+                // the directive was never delivered: drop it rather than leave
+                // a hidden user message in the session. The send still reports
+                // true — the placeholder carries the error — so this cannot go
+                // through `unwindRelayIfRefused`.
+                unwindRelayIfRefused(false)
             }
             return true
         }
@@ -4243,7 +4276,7 @@ struct ContentView: View {
                 AgentHarness.shared.beginAgentSearchGuard()
                 cloudSystemPrompt += "\n\n" + AgentHarness.shared.buildCloudToolGuidance(mode: sessionMode)
             }
-            return startCloudGeneration(
+            return unwindRelayIfRefused(startCloudGeneration(
                 sessionId: currentSessionId,
                 messageId: assistantMsgId,
                 provider: cloud.provider,
@@ -4253,7 +4286,7 @@ struct ContentView: View {
                 systemPrompt: cloudSystemPrompt,
                 mode: sessionMode,
                 isAgentTurn: cloudAgentMode
-            )
+            ))
         }
 
         // Runs BEFORE the system prompt is built: beginAgentSearchGuard (re)loads
@@ -4732,7 +4765,7 @@ struct ContentView: View {
             messageId: assistantMsgId,
             relayedReports: pendingSubagentRelay
         )
-        return launched
+        return unwindRelayIfRefused(launched)
     }
 
     // MARK: - Tokenizer Execution

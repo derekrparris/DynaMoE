@@ -309,6 +309,26 @@ nonisolated struct AgentReport: Codable, Equatable, Sendable {
     var openQuestions: [String]
     var usage: AgentUsage
     var backend: AgentBackendDescriptor
+
+}
+
+nonisolated extension AgentReport {
+    /// Defaults-tolerant like `AgentUsage`: a report is persisted inside a run
+    /// record, so one field it predates must not make the whole run unreadable.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        status = try container.decodeIfPresent(AgentRunStatus.self, forKey: .status) ?? .completed
+        summary = try container.decodeIfPresent(String.self, forKey: .summary) ?? ""
+        findings = try container.decodeIfPresent([AgentFinding].self, forKey: .findings) ?? []
+        changedFiles = try container.decodeIfPresent([String].self, forKey: .changedFiles) ?? []
+        diff = try container.decodeIfPresent(String.self, forKey: .diff)
+        tests = try container.decodeIfPresent([AgentTestOutcome].self, forKey: .tests) ?? []
+        risks = try container.decodeIfPresent([String].self, forKey: .risks) ?? []
+        openQuestions = try container.decodeIfPresent([String].self, forKey: .openQuestions) ?? []
+        usage = try container.decodeIfPresent(AgentUsage.self, forKey: .usage) ?? AgentUsage()
+        backend = try container.decodeIfPresent(AgentBackendDescriptor.self, forKey: .backend)
+            ?? AgentBackendDescriptor(kind: .scripted, providerId: nil, modelId: nil, displayName: "Scripted")
+    }
 }
 
 nonisolated enum AgentTranscriptEntryKind: String, Codable, Equatable, Sendable {
@@ -346,6 +366,25 @@ nonisolated struct AgentTranscriptEntry: Identifiable, Codable, Equatable, Senda
         self.kind = kind
         self.text = text
         self.toolRecord = toolRecord
+    }
+
+}
+
+nonisolated extension AgentTranscriptEntry {
+    /// Defaults-tolerant like `AgentUsage`: a transcript entry is persisted
+    /// inside a run record, and one entry that predates a field must not make
+    /// the whole run unreadable. In an EXTENSION so the memberwise init the
+    /// loop and the tests use survives: a custom `init(from:)` in the body
+    /// would displace it.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        index = try container.decodeIfPresent(Int.self, forKey: .index) ?? 0
+        stepIndex = try container.decodeIfPresent(Int.self, forKey: .stepIndex) ?? 0
+        timestamp = try container.decodeIfPresent(Date.self, forKey: .timestamp) ?? Date()
+        kind = try container.decodeIfPresent(AgentTranscriptEntryKind.self, forKey: .kind) ?? .status
+        text = try container.decodeIfPresent(String.self, forKey: .text)
+        toolRecord = try container.decodeIfPresent(ToolCallRecord.self, forKey: .toolRecord)
     }
 }
 
@@ -413,6 +452,7 @@ nonisolated struct AgentRunRecord: Identifiable, Codable, Equatable, Sendable {
     var schemaVersion: Int
 
     static let currentSchemaVersion = 1
+
 
     init(
         id: UUID = UUID(),
@@ -484,6 +524,56 @@ nonisolated struct AgentRunRecord: Identifiable, Codable, Equatable, Sendable {
     nonisolated var holdsWorktreeWork: Bool {
         isolation.isIsolated
             && (appliedAt == nil || !(keptIgnoredFiles?.isEmpty ?? true))
+    }
+}
+
+nonisolated extension AgentRunRecord {
+    private enum CodingKeys: String, CodingKey {
+        case id, parentSessionId, parentTurnId, role, preset, task, contextSummary
+        case backend, workingDirectory, isolation, allowedTools, budget, status
+        case createdAt, startedAt, completedAt, transcript, report, usage
+        case messages, error, depth, summaryRelayed, appliedAt, appliedToBranch
+        case keptIgnoredFiles, repositoryRoot, baseCommit, schemaVersion
+    }
+
+    /// Every field is `decodeIfPresent` with the value its initializer
+    /// defaults to, for the same reason `AgentUsage` is: the store's
+    /// decode-failure path is "the record is lost", so a record written
+    /// before a field existed must still decode. Adding a field here is
+    /// therefore safe for old records; removing or renaming one is not
+    /// (`.custom` preset is the enum case a rename would orphan).
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        parentSessionId = try container.decodeIfPresent(UUID.self, forKey: .parentSessionId)
+        parentTurnId = try container.decodeIfPresent(UUID.self, forKey: .parentTurnId)
+        role = try container.decodeIfPresent(String.self, forKey: .role) ?? ""
+        preset = try container.decodeIfPresent(AgentRolePreset.self, forKey: .preset) ?? .general
+        task = try container.decodeIfPresent(String.self, forKey: .task) ?? ""
+        contextSummary = try container.decodeIfPresent(String.self, forKey: .contextSummary)
+        backend = try container.decodeIfPresent(AgentBackendDescriptor.self, forKey: .backend)
+            ?? AgentBackendDescriptor(kind: .scripted, providerId: nil, modelId: nil, displayName: "Scripted")
+        workingDirectory = try container.decodeIfPresent(String.self, forKey: .workingDirectory) ?? ""
+        isolation = try container.decodeIfPresent(AgentIsolation.self, forKey: .isolation) ?? .none
+        allowedTools = try container.decodeIfPresent([String].self, forKey: .allowedTools) ?? []
+        budget = try container.decodeIfPresent(AgentBudget.self, forKey: .budget) ?? .standard
+        status = try container.decodeIfPresent(AgentRunStatus.self, forKey: .status) ?? .pending
+        createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        startedAt = try container.decodeIfPresent(Date.self, forKey: .startedAt)
+        completedAt = try container.decodeIfPresent(Date.self, forKey: .completedAt)
+        transcript = try container.decodeIfPresent([AgentTranscriptEntry].self, forKey: .transcript) ?? []
+        report = try container.decodeIfPresent(AgentReport.self, forKey: .report)
+        usage = try container.decodeIfPresent(AgentUsage.self, forKey: .usage) ?? AgentUsage()
+        messages = try container.decodeIfPresent([AgentMessageRecord].self, forKey: .messages) ?? []
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+        depth = try container.decodeIfPresent(Int.self, forKey: .depth) ?? 0
+        summaryRelayed = try container.decodeIfPresent(Bool.self, forKey: .summaryRelayed) ?? false
+        appliedAt = try container.decodeIfPresent(Date.self, forKey: .appliedAt)
+        appliedToBranch = try container.decodeIfPresent(String.self, forKey: .appliedToBranch)
+        keptIgnoredFiles = try container.decodeIfPresent([String].self, forKey: .keptIgnoredFiles)
+        repositoryRoot = try container.decodeIfPresent(String.self, forKey: .repositoryRoot)
+        baseCommit = try container.decodeIfPresent(String.self, forKey: .baseCommit)
+        schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 0
     }
 }
 

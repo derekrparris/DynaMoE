@@ -116,6 +116,18 @@ nonisolated final class TurnSlotLedger: @unchecked Sendable {
     /// distinction for a claim cancelled that long ago.
     private var cancelledTickets: [UInt64] = []
     private static let cancelledTicketLimit = 64
+    /// The highest ticket ever dropped by a preemption.
+    ///
+    /// The ring above is exact but bounded, so a holder that looks LATE (after
+    /// 64 more cancellations) would be told its ticket was never cancelled and
+    /// report a preemption as a failure. Ticket numbers only grow, so "at or
+    /// below the watermark" answers for the ones the ring has aged out. The
+    /// ring is still consulted first: within the limit the answer stays exact,
+    /// and the watermark only speaks for tickets older than everything the
+    /// ring holds. It can over-report for a ticket that was RELEASED normally
+    /// before a later one was cancelled, which is why the only caller asks
+    /// about a claim it did not release itself.
+    private var cancelledWatermark: UInt64 = 0
     /// True once the holder has reached the point where its turn becomes the
     /// live generation. Past it a preemption is refused rather than dropped:
     /// the turn owns the KV cache by then, and dropping the claim would let a
@@ -228,12 +240,22 @@ nonisolated final class TurnSlotLedger: @unchecked Sendable {
     func wasCancelled(_ ticket: UInt64) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        return cancelledTickets.contains(ticket)
+        if let oldest = cancelledTickets.first, ticket >= oldest {
+            // Inside the ring's coverage: answer exactly, so a ticket that was
+            // merely released is never reported as cancelled.
+            return cancelledTickets.contains(ticket)
+        }
+        // Aged out (or the ring is empty): the watermark is all that is left,
+        // and it is right for a ticket that was cancelled. A released ticket
+        // below it would read as cancelled — accepted, because the one caller
+        // asks only about a claim it did not release itself.
+        return ticket != 0 && ticket <= cancelledWatermark
     }
 
     /// Records a dropped ticket. Caller holds the lock.
     private func noteCancelledLocked(_ ticket: UInt64) {
         cancelledTickets.append(ticket)
+        cancelledWatermark = max(cancelledWatermark, ticket)
         if cancelledTickets.count > Self.cancelledTicketLimit {
             cancelledTickets.removeFirst(cancelledTickets.count - Self.cancelledTicketLimit)
         }

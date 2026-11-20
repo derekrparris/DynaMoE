@@ -1586,6 +1586,14 @@ nonisolated enum WorkspaceIsolation {
         var removed: [String] = []
         var uncontained: [String] = []
         for name in names {
+            // One entry's discard claim, if it took one. Released at the end of
+            // the entry (or on any `continue`), never before the removal.
+            var discardClaim: UUID?
+            defer {
+                if let discardClaim {
+                    Task { @MainActor in SubagentApplyService.endDiscard(discardClaim) }
+                }
+            }
             let path = root.appendingPathComponent(name, isDirectory: true)
             var isDirectory: ObjCBool = false
             guard fileManager.fileExists(atPath: path.path, isDirectory: &isDirectory),
@@ -1620,15 +1628,22 @@ nonisolated enum WorkspaceIsolation {
                 // Taken as a CLAIM, not just read: the git calls below await,
                 // so a discard or an apply starting in that window could delete
                 // or read the same tree concurrently. Holding the discard slot
-                // for the deletion makes the check and the removal one step;
-                // the apply claim is still only read (the sweep must never
-                // block an apply), so it is re-checked after each await below.
+                // for the deletion makes the check and the removal one step,
+                // and it is what makes a re-check unnecessary: both sides take
+                // their claim synchronously on the MainActor, so an apply is
+                // either already in flight (seen above, and this entry skipped)
+                // or it sees the discard claim and refuses to start.
                 let owned = await MainActor.run { () -> Bool in
                     if SubagentApplyService.isRunInFlight(runId) { return true }
                     return !SubagentApplyService.beginDiscard(runId)
                 }
                 if owned { continue }
-                defer { Task { @MainActor in SubagentApplyService.endDiscard(runId) } }
+                // Released on EVERY exit below and only AFTER the deletion it
+                // guards. A `defer` here fires at the end of this `if let`
+                // block, i.e. BEFORE the awaits that remove the tree, and an
+                // apply starting in that window would have its worktree
+                // deleted underneath it.
+                discardClaim = runId
             }
 
             // Nothing below may touch git in this tree until its `.git` is
@@ -1691,6 +1706,13 @@ nonisolated enum WorkspaceIsolation {
             // was destroyed when it is still on disk.
             if removedTree {
                 removed.append(name)
+            }
+            // The removal is done, so the claim can go. `defer` at the top of
+            // the entry does this on the `continue` paths too; releasing here
+            // keeps the successful path explicit about the ordering.
+            if let claim = discardClaim {
+                discardClaim = nil
+                await MainActor.run { SubagentApplyService.endDiscard(claim) }
             }
         }
         if !uncontained.isEmpty {
