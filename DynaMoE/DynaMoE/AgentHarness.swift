@@ -2872,7 +2872,11 @@ public final class SpawnSubagentTool: AgentTool {
     }
 
     private static func isolation(from raw: Any?) -> AgentIsolation {
-        guard let value = (raw as? String)?.lowercased(), value == "worktree" else {
+        // Trimmed: the value is model-authored, and " worktree" is the same
+        // intent as "worktree" — reading it as `.none` silently dropped the
+        // isolation the call asked for.
+        let value = (raw as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard let value, value == "worktree" else {
             return .none
         }
         // The empty path and branch are the request's intent. The resolver
@@ -3433,9 +3437,10 @@ public final class ApplySubagentChangesTool: AgentTool {
         }
         // `nil` is not a match: an unscoped caller has no conversation
         // identity to compare, and `nil == nil` would reach a rescued record
-        // whose parent is also unknown.
+        // whose parent is also unknown. Compared through the optional on
+        // purpose — `let ownerSessionId` would skip the check entirely when
+        // the owner is nil, which is the wildcard this guard exists to close.
         if runExists,
-           let ownerSessionId,
            ownerSessionId != AgentHarness.executingSessionId {
             let err = "No subagent run with id \(runId.uuidString) was found."
             return (AgentHarness.toolErrorJSON(tool: "apply_subagent_changes", error: err), nil, err, false)
@@ -4309,7 +4314,11 @@ public final class AgentHarness {
         // `git_diff` reads the repository it is pointed at, and its `path`
         // argument is confined by the same rule — a diff of a file outside the
         // workspace shows that file's contents.
-        "git_diff"
+        "git_diff",
+        // `git_status` takes the same `path` and resolves it the same way, and
+        // it discloses a repository's branch, tracking and file names — which
+        // for a directory outside the workspace is a cardless read of it.
+        "git_status"
     ]
     /// Tools whose purpose is to send bytes off this Mac. `subq_decide` uploads
     /// its `state` (and any image bytes) to the decisions API.
@@ -4929,11 +4938,17 @@ public final class AgentHarness {
     /// Whether this call carries at least one image, from either the decoded
     /// arguments or the wire form (the approval center only keeps the
     /// stringified copy, where an array is a description).
+    ///
+    /// Both questions go to `SubQDecideTool`'s own predicates, the same pair
+    /// `subqDecideRequiresApproval` asks: a local run's card carries
+    /// `[String: String]`, where `arguments["images"]` is a described STRING and
+    /// the wire form is XML rather than JSON, so a narrower check here waved
+    /// exactly those uploads through Turbo.
     static func subqDecideCarriesImages(
         arguments: [String: Any],
         rawArguments: String? = nil
     ) -> Bool {
-        if let images = arguments["images"] as? [Any], !images.isEmpty { return true }
+        if SubQDecideTool.uploadsImages(arguments: arguments) { return true }
         return SubQDecideTool.uploadsImages(rawArguments: rawArguments)
     }
 

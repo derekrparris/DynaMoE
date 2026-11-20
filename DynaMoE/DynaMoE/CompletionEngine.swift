@@ -273,6 +273,18 @@ public final class CompletionEngine: @unchecked Sendable {
     private let stateLock = NSLock()
     private var currentGenerationTask: Task<Void, Never>?
     private var currentGenerationId: UInt64 = 0
+    /// The generation id whose task has already ENDED, set as the id is minted
+    /// and cleared when the next one is.
+    ///
+    /// `launchTurn` starts the turn's task and only then registers it under
+    /// `stateLock`, and the task may run to completion in between (an early
+    /// throw is the easy case). `turnDidEnd` would clear `currentGenerationTask`,
+    /// and the registration that followed would put the finished task back —
+    /// leaving `isActive` true for the process's life, i.e. every later turn
+    /// refused. Registration therefore consults this, and so does
+    /// `isCurrentGenerationUnchecked`: a turn whose task is running but not yet
+    /// registered is still the current generation.
+    private var endedGenerationId: UInt64 = 0
     /// Cooperative Stop for the work that runs on `runOnLargeStack`'s dedicated
     /// thread. That thread is a plain `Thread`, not an executor-managed one, so
     /// `Task.isCancelled` always reads false there and the layer loops would lose
@@ -877,6 +889,7 @@ public final class CompletionEngine: @unchecked Sendable {
                 // after it, and an id one past the ticket named nothing.
                 let myGenerationId = held.ticket
                 currentGenerationId = myGenerationId
+                endedGenerationId = 0
                 activeTurnCancelled = false
                 activeTurnPriority = request.turnPriority
                 stateLock.unlock()
@@ -1235,9 +1248,12 @@ public final class CompletionEngine: @unchecked Sendable {
                     }
                 }
                 // The engine is single-flight: register the turn so a second launch
-                // is refused and `cancelActiveTurn` reaches this task.
+                // is refused and `cancelActiveTurn` reaches this task. The task may
+                // already have finished (it is started above), so a turn that ended
+                // is never registered — `endedGenerationId` is what makes that
+                // visible, because `turnDidEnd` has already cleared the field.
                 stateLock.lock()
-                if currentGenerationId == myGenerationId {
+                if currentGenerationId == myGenerationId && endedGenerationId != myGenerationId {
                     currentGenerationTask = handleTask
                 }
                 stateLock.unlock()
@@ -2611,6 +2627,7 @@ public final class CompletionEngine: @unchecked Sendable {
         // the following turn's claim.
         let myGenerationId = held.ticket
         currentGenerationId = myGenerationId
+        endedGenerationId = 0
         activeTurnCancelled = false
         activeTurnPriority = request.turnPriority
         stateLock.unlock()
@@ -11701,7 +11718,7 @@ if layer.attnGateProjTensor != nil,
             )))
         }
         stateLock.lock()
-        if currentGenerationId == myGenerationId {
+        if currentGenerationId == myGenerationId && endedGenerationId != myGenerationId {
             currentGenerationTask = handleTask
         }
         stateLock.unlock()
@@ -11932,15 +11949,21 @@ if layer.attnGateProjTensor != nil,
         defer { stateLock.unlock() }
         if currentGenerationId == id {
             currentGenerationTask = nil
+            endedGenerationId = id
             activeTurnPriority = .interactive
         }
     }
 
     /// True while the given turn still owns the engine slot.
+    ///
+    /// The task is not the test: a turn is registered only AFTER its task starts,
+    /// so a running-but-unregistered turn would read as inactive, and its identity
+    /// is the generation id alone (`endedGenerationId` says whether that turn is
+    /// over yet).
     fileprivate func isCurrentGenerationUnchecked(_ id: UInt64) -> Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return id == currentGenerationId && currentGenerationTask != nil
+        return id == currentGenerationId && endedGenerationId != id
     }
 
     /// True when turn `id` must stop at its next layer boundary.

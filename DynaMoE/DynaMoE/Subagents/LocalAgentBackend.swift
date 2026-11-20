@@ -547,12 +547,19 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
         // completed. The gesture's own skip notice is already in the text, so
         // reporting the turn as a normal stop keeps the answer.
         let gestureOnly = calls.isEmpty && !result.parsedToolCalls.isEmpty
+        // An unclosed tool-call block is removed to EOF by the strip above, so
+        // prose followed by a truncated call would otherwise read as a finished
+        // answer. It is a fragment: report it as a truncation, which the loop
+        // already treats as unusable, instead of letting `eos` vouch for it.
+        let hasBrokenFragment = !result.brokenFragments.isEmpty
         return AgentBackendTurn(
             text: visibleText,
             thinking: result.thinkingText,
             calls: calls,
             rawText: result.rawDecodedText,
-            finishReason: gestureOnly ? TurnFinishReason.eos.rawValue : result.finishReason.rawValue,
+            finishReason: hasBrokenFragment
+                ? TurnFinishReason.lengthCapped.rawValue
+                : (gestureOnly ? TurnFinishReason.eos.rawValue : result.finishReason.rawValue),
             usage: usage
         )
     }

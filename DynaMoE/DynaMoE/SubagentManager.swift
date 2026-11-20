@@ -263,8 +263,6 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     private var isFinished: Bool = false
     /// Latched by the first `startExecution`, so a second call in the same
     /// actor turn cannot launch a second task over the first.
-    /// Latched by the first `startExecution`, so a second call in the same
-    /// actor turn cannot launch a second task over the first.
     private var hasStarted: Bool = false
     /// The scheduler admission this run holds until it goes terminal. Taken by
     /// `claimFinish`, released by `finishRun` (or re-queued by `cancel`).
@@ -945,6 +943,13 @@ public final class SubagentInstance: Identifiable, ObservableObject {
                     duration: CFAbsoluteTimeGetCurrent() - startTime,
                     liveStatus: "Cancelled"
                 )
+            } else if let ticket = takeSchedulerTicket() {
+                // A Stop landed between `acquire` and the store above: `cancel`
+                // found no ticket to hand on, so this path owns it and must give
+                // it back. `.local` has capacity 1, so leaking it wedges every
+                // later local run until the app restarts.
+                await AgentScheduler.shared.release(ticket)
+                await AgentScheduler.shared.finish(runId: id)
             }
             return
         }
@@ -2317,8 +2322,15 @@ public final class SubagentManager: ObservableObject {
         for instance in liveSnapshot {
             guard instance.backendDescriptor?.kind == .cloud else { continue }
             let actual = instance.usage.costUSD.isFinite ? max(0, instance.usage.costUSD) : 0
+            let unpriced = instance.usage.costIsUnpriced
             if instance.status.isTerminal {
-                byRunId[instance.id] = actual
+                // An unpriced terminal run reports 0 for tokens it did bill, so
+                // writing `actual` alone would erase the charge the persisted
+                // record loop above just committed and let the session cap be
+                // re-spent by spawning again. Keep the larger of the two.
+                let committed = instance.modelPlan?.budget.maxCostUSD ?? 0
+                let reserved = committed.isFinite ? max(0, committed) : 0
+                byRunId[instance.id] = unpriced ? max(actual, reserved, byRunId[instance.id] ?? 0) : actual
             } else {
                 let committed = instance.modelPlan?.budget.maxCostUSD ?? 0
                 let reserved = committed.isFinite ? max(0, committed) : 0
@@ -2619,8 +2631,14 @@ public final class SubagentManager: ObservableObject {
         // former leaves the object listed (and reachable by id through
         // `getSubagent`'s fallback) for a conversation the operator deleted.
         lock.lock()
+        // `status.isTerminal` is not enough to drop one: `cancel` above sets it
+        // immediately while `executionUnwound` is still false, and the apply
+        // path reads `isExecutionUnwound` through `getSubagent(byId:)` — a
+        // dropped instance answers `nil` there, which every caller reads as
+        // "unwound", so Apply could land a worktree while a child process is
+        // still being killed. Keep it until the unwind completes.
         let terminal = subagentsOrder.filter {
-            $0.parentSessionId == sessionId && $0.status.isTerminal
+            $0.parentSessionId == sessionId && $0.status.isTerminal && $0.isExecutionUnwound
         }.map(\.id)
         if !terminal.isEmpty {
             let dropped = Set(terminal)

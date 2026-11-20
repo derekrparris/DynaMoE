@@ -190,6 +190,15 @@ nonisolated enum WorkspaceIsolation {
     /// prefers it. This derivation is the fallback for a record that predates
     /// that field and for the launch sweep, which only has the path.
     static func owningRepository(for worktree: URL) async -> URL? {
+        // Same reason as `worktreeLinkageState`: a `.git` the run can replace
+        // (a FIFO blocks git for the whole process timeout, a symlink is
+        // followed) must be inspected before any git command runs in here.
+        switch await worktreeGitEntryState(worktree) {
+        case .regularFile:
+            break
+        case .missing, .unreadable, .hostile:
+            return nil
+        }
         guard let (code, stdout, _) = try? await git(
             ["rev-parse", "--path-format=absolute", "--git-common-dir"],
             in: worktree
@@ -236,6 +245,20 @@ nonisolated enum WorkspaceIsolation {
         // The worktree itself is a working tree of the same repository; it is
         // not the place a patch may land.
         guard candidate.standardizedFileURL != worktree.standardizedFileURL else { return false }
+        // `rev-parse` below runs in the candidate only when the candidate IS the
+        // worktree's own tree (the hostile-entry case). The main repository is
+        // the operator's, not the run's, so its `.git` is not something a run
+        // could have replaced — and it is a DIRECTORY there, which the entry
+        // state reads as hostile: guarding every candidate made a legitimate
+        // apply refuse its own repository.
+        if candidate.standardizedFileURL == worktree.standardizedFileURL {
+            switch await worktreeGitEntryState(candidate) {
+            case .regularFile:
+                break
+            case .missing, .unreadable, .hostile:
+                return false
+            }
+        }
         guard let (topCode, topOut, _) = try? await git(
             ["rev-parse", "--show-toplevel"],
             in: candidate
@@ -1417,7 +1440,13 @@ nonisolated enum WorkspaceIsolation {
         }
         let (code, out, err): (Int32, String, String)
         do {
-            (code, out, err) = try await git(["apply", "--numstat", url.path], in: directory)
+            // `-z` for the same reason the snapshot uses it: without it git
+            // C-quotes any path it considers unusual (`"caf\303\251.txt"`,
+            // escaped quotes and backslashes), and the cross-check below would
+            // reject a valid patch because the two sides spell the name
+            // differently. It also drops the rename arrow: a rename is emitted
+            // as two records, one per path, so nothing has to parse " => ".
+            (code, out, err) = try await git(["apply", "--numstat", "-z", url.path], in: directory)
         } catch {
             throw WorkspaceIsolationError.applyFailed(
                 "the patch's file list could not be read: \(error.localizedDescription)"
@@ -1428,20 +1457,14 @@ nonisolated enum WorkspaceIsolation {
                 "the patch's file list could not be read: \(err.trimmingCharacters(in: .whitespacesAndNewlines))"
             )
         }
-        // One line per file: "added\tdeleted\tpath", with a rename spelled
-        // "added\tdeleted\told => new" (or a brace form) and a binary file's
-        // counts as dashes.
+        // One NUL-terminated record per path: "added\tdeleted\tpath\0", with a
+        // binary file's counts as dashes.
         var files = Set<String>()
-        for line in out.split(separator: "\n", omittingEmptySubsequences: true) {
-            let fields = line.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
+        for record in out.split(separator: "\0", omittingEmptySubsequences: true) {
+            let fields = record.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
             guard fields.count == 3 else { continue }
             let path = String(fields[2])
-            if let arrow = path.range(of: " => ") {
-                files.insert(String(path[..<arrow.lowerBound]))
-                files.insert(String(path[arrow.upperBound...]))
-            } else {
-                files.insert(path)
-            }
+            if !path.isEmpty { files.insert(path) }
         }
         return files
     }

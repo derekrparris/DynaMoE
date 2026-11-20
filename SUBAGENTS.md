@@ -136,7 +136,7 @@ SubagentManager                      coordinator-facing API + registry + relays
 | `Subagents/WorkspaceIsolation.swift` | Git worktree lifecycle, base-commit snapshots, `git apply`, cleanup and stale sweep |
 | `Subagents/SubagentApply.swift` | The approved path that lands a run's worktree diff, used by both `apply_subagent_changes` and the inspector's Apply Changes (`SubagentApplyControl`, single-flight per run) |
 | `Subagents/SubagentApprovalCenter.swift` | The operator's approval queue: card lifetime, the Turbo rules and the bound (32) |
-| `Subagents/SubagentRelay.swift` / `Subagents/SubagentRelayWait.swift` | `[SUBAGENT_RESULT]` line format, relay marking, the bounded wait for in-flight runs |
+| `Subagents/SubagentRelay.swift` / `Subagents/SubagentRelayWait.swift` | Relay marking (relayed/delivered) and the bounded wait for in-flight runs. The `[SUBAGENT_RESULT]` line FORMAT and its assembly into a prompt live in `ContentView.swift` |
 | `Subagents/SubagentNotifier.swift` | Finish notifications (banner, frontmost and permission rules) |
 | `Subagents/LocalSubagentCost.swift` | The local cost estimate and the pre-spawn refusal |
 | `SubagentManager.swift` | Coordinator API (`spawn`, status, message, cancel, relays, apply, discard) plus the live→record projection. Lives at the app target's top level, not in `Subagents/` |
@@ -703,7 +703,8 @@ it.
   not consume its unread state: the partial report lands during the loop's
   unwind and is relayed on the next turn.
 - **Settings**: default backend, cloud model for subagents, the cloud spend cap
-  (see §8), local cost limit,
+  (see §8) and the SESSION spend cap (the per-conversation aggregate; 0 derives
+  it as 4x the per-run cap, capped at $500), local cost limit,
   max concurrency (per provider and global), retention (runs and days),
   notifications. The subagent approval timeout is a default
   (`SubagentApprovalCenter.resolvedApprovalTimeout`) readable from

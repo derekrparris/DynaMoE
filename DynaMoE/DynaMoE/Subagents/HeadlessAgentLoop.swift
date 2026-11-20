@@ -357,8 +357,16 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             let localCompletionReasons: Set<String> = [
                 "eos", "endtag", "stoppedbysequence", "toolfreeze"
             ]
+            // A truncation, a degenerate cycle and a bare `stopped` are the
+            // decode loop's own endings and each has a more specific message
+            // below, so `cloudHalted` must not claim them: it means "a reason
+            // this app cannot vouch for", and `lengthCapped` is vouched for.
             let cloudHalted = disposition == .halted
-                || (disposition == .unrecognized && !localCompletionReasons.contains(loweredReason))
+                || (disposition == .unrecognized
+                    && !localCompletionReasons.contains(loweredReason)
+                    && !Self.finishReasonIsTruncated(turn.finishReason)
+                    && loweredReason != "degeneratecycle"
+                    && loweredReason != "stopped")
             let alwaysUnusable = Self.finishReasonIsTruncated(turn.finishReason)
                 || loweredReason == "degeneratecycle"
                 || loweredReason == "stopped"

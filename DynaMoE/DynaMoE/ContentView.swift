@@ -4149,7 +4149,10 @@ struct ContentView: View {
                 sessions[sessionIdx].messages.removeLast(2)
                 let err = "⚠️ This message is too long for the on-device model's context window. Shorten it and try again."
                 showStatus(err, kind: .warning)
-                return false
+                // The relay directive was appended before this launch, and a
+                // refused send must not leave it in the transcript: the pair
+                // above is rolled back, so is it.
+                return unwindRelayIfRefused(false)
             }
             // History travels in the session instructions as context; only the
             // newest user message is the prompt. Feeding the speaker-labeled
@@ -4919,6 +4922,16 @@ struct ContentView: View {
         // Captured before the flags are cleared: the subagent cancellation below
         // is scoped to it.
         let stoppedSessionId = generatingSessionId
+        // A continuation waiting for the engine slot has cleared
+        // `generationTask` (the queued relaunch installs its own) while
+        // `isGeneratingText` and the turn identity stay set. Gating delegated
+        // work on the task alone therefore let Stop skip the subagents a step 0
+        // had already spawned — including a local run holding the slot this
+        // continuation was waiting for. The TURN is the scope, and a fresh
+        // queued send mints a new turn id with no children, so it stays skipped.
+        let stoppedLiveTurn = hadActiveGenerationTask
+            || (isGeneratingText && activeAgentTurnId != nil
+                && activeAgentTurnSessionId == stoppedSessionId)
         isGeneratingText = false
         // Cancel the ENGINE turn this window launched, by the id the launch
         // returned. The old priority-blind `cancelActiveTurn()` stopped
@@ -4947,7 +4960,7 @@ struct ContentView: View {
         // including a background run this Stop is written to spare. The
         // coordinator's own cards belong to this session; a child run's card
         // belongs to the run, and is declined just before its task is stopped.
-        if hadActiveGenerationTask, let stoppedSessionId {
+        if stoppedLiveTurn, let stoppedSessionId {
             ActionApprovalManager.shared.cancel(scope: .session(stoppedSessionId))
         }
         // Delegation is part of the turn: a Stop must not leave a child working
@@ -4955,7 +4968,7 @@ struct ContentView: View {
         // running (e.g. a queued fresh send aborted before launching), so Stop
         // does not cancel an earlier turn's subagents or fall back to
         // session-wide cancellation.
-        if hadActiveGenerationTask, let stoppedSessionId {
+        if stoppedLiveTurn, let stoppedSessionId {
             // Cancellation is scoped to the TURN. The session-wide form reaches
             // runs spawned by EARLIER turns of the same conversation, and a
             // cancelled run's worktree is the only full copy of its work — a
@@ -7227,6 +7240,12 @@ struct ContentView: View {
             let relaunchKey = UUID()
             if let sessionId { deferredRelaunchSessions[relaunchKey] = sessionId }
             deferredRelaunchTasks[relaunchKey] = Task { @MainActor in
+                // Whether the launch below actually started. Only an abandoned
+                // relaunch has a stranded placeholder to clear: a launch that
+                // succeeded set `isThinking` itself and its turn owns the
+                // bubble, so clearing it here (content is still empty at this
+                // point) would kill the spinner of a turn that is running.
+                var launched = false
                 defer {
                     self.deferredRelaunchTasks[relaunchKey] = nil
                     self.deferredRelaunchSessions[relaunchKey] = nil
@@ -7234,7 +7253,9 @@ struct ContentView: View {
                     // See the preemption branch: an early exit here strands an
                     // empty spinning bubble, because no turn ever runs to clear
                     // its `isThinking`.
-                    self.clearThinkingPlaceholder(sessionId: sessionId, messageId: messageId)
+                    if !launched {
+                        self.clearThinkingPlaceholder(sessionId: sessionId, messageId: messageId)
+                    }
                 }
                 var held: TurnSlotClaim?
                 let deadline = Date().addingTimeInterval(Self.queuedSlotWaitSeconds)
@@ -7264,7 +7285,7 @@ struct ContentView: View {
                     return
                 }
                 if let held {
-                    _ = self.startAutoregressiveGeneration(
+                    launched = self.startAutoregressiveGeneration(
                         customPrompt: customPrompt,
                         promptTokens: promptTokens,
                         images: images,
@@ -7326,7 +7347,7 @@ struct ContentView: View {
                     let reclaimed = CompletionEngine.shared.reserveTurnSlot()
                     // Same rule as the immediate preemption above: a nil
                     // claim re-enters the wait instead of launching unauthorised.
-                    _ = self.startAutoregressiveGeneration(
+                    launched = self.startAutoregressiveGeneration(
                         customPrompt: customPrompt,
                         promptTokens: promptTokens,
                         images: images,
@@ -7948,6 +7969,10 @@ struct ContentView: View {
             let fullyEmptyTurn = finalThink.isEmpty && finalResp.isEmpty && tokensGenerated <= 24
             if !isInThinkingContinuation && !willContinueAgent && !shouldForceSynthesis && (emptyReplyAfterThinking || fullyEmptyTurn) && !Task.isCancelled {
                 await MainActor.run {
+                    // The emptiness checks above are another suspension away
+                    // from this launch: a Stop landing in between would
+                    // otherwise regenerate a stopped turn.
+                    guard !Task.isCancelled, self.ownsGeneration(myGenerationId) else { return }
                     if let sId = sessionId,
                        let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
                        let mId = messageId,
@@ -8353,6 +8378,7 @@ struct ContentView: View {
                             encode: { try tokenizer.encode(text: $0) }
                         )
                         await MainActor.run {
+                            guard !Task.isCancelled, self.ownsGeneration(myGenerationId) else { return }
                             let nextAssistantMsgId = UUID()
                             if let sId = sessionId, let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
                                 if let mId = messageId, let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
@@ -8424,6 +8450,7 @@ struct ContentView: View {
                                 encode: { try tokenizer.encode(text: $0) }
                             )
                             await MainActor.run {
+                                guard !Task.isCancelled, self.ownsGeneration(myGenerationId) else { return }
                                 let synthesisMsgId = UUID()
                                 if let sId = sessionId, let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
                                     if let mId = messageId, let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
@@ -8588,6 +8615,7 @@ struct ContentView: View {
                         encode: { try tokenizer.encode(text: $0) }
                     )
                     await MainActor.run {
+                        guard !Task.isCancelled, self.ownsGeneration(myGenerationId) else { return }
                         let nextAssistantMsgId = UUID()
                         if let sId = sessionId, let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
                             if let mId = messageId, let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
@@ -8650,6 +8678,7 @@ struct ContentView: View {
                         encode: { try tokenizer.encode(text: $0) }
                     )
                     await MainActor.run {
+                        guard !Task.isCancelled, self.ownsGeneration(myGenerationId) else { return }
                         let nextAssistantMsgId = UUID()
                         if let sId = sessionId, let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
                             if let mId = messageId, let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {

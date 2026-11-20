@@ -907,7 +907,22 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
                     records.append(contentsOf: loadSessionDirectory(named: name))
                 }
             }
-            return records.sorted { Self.sortDate($0) > Self.sortDate($1) }
+            // A conversation delete rescues a run into the unscoped bucket
+            // before removing the scoped copy, so a crash in between leaves the
+            // SAME run id in two directories. Returning both made the launch
+            // sweep rewrite (and re-freshen) the stale copy, retention count it
+            // twice, and the inspector show whichever it read last. One record
+            // per run id, keeping the newest — the rescued copy carries the
+            // later write, and a genuinely newer scoped one wins on its own.
+            var newestByRun: [UUID: AgentRunRecord] = [:]
+            for record in records {
+                if let existing = newestByRun[record.id],
+                   Self.sortDate(existing) >= Self.sortDate(record) {
+                    continue
+                }
+                newestByRun[record.id] = record
+            }
+            return newestByRun.values.sorted { Self.sortDate($0) > Self.sortDate($1) }
         }
     }
 

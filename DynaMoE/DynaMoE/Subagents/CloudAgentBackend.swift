@@ -269,9 +269,9 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
         // silently disables the completion cap, the one budget that bounds a
         // run by what it spends rather than by steps or the clock.
         //
-        // Cache WRITES are prompt tokens the provider billed as input, so they
-        // belong in the prompt total (a cache read is already inside it on the
-        // providers that report both).
+        // Cache WRITES are already inside `CloudUsage.promptTokens` (it folds
+        // them in for the Anthropic-shaped block, whose `input_tokens` excludes
+        // both cache columns), so nothing is added for them here.
         var prompt = usage.promptTokens
         var completion = usage.completionTokens
         if let total = usage.totalTokens {
@@ -280,9 +280,11 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
             if prompt == nil, let completion { prompt = max(0, total - completion) }
             if completion == nil, let prompt { completion = max(0, total - prompt) }
         }
-        if let writes = usage.cacheWriteTokens, writes > 0 {
-            prompt = (prompt ?? 0) + writes
-        }
+        // Do NOT add `cacheWriteTokens` here: `CloudUsage` already folds the
+        // cache write into `promptTokens` for the Anthropic-shaped block that
+        // reports it separately (its `input_tokens` excludes both cache
+        // columns), and adding it again inflated the prompt count, the
+        // latest-prompt figure and every context reading derived from them.
         result.promptTokens = prompt ?? 0
         result.completionTokens = completion ?? 0
         result.cachedTokens = usage.cachedTokens ?? 0
@@ -377,11 +379,16 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
                 wire.append(CloudChatMessage(role: "user", content: text))
             case .assistant(let text, _, let calls):
                 let wireCalls = calls.map { call in
-                    CloudChatToolCall(
-                        id: call.id,
-                        name: call.name,
-                        arguments: call.rawArguments.isEmpty ? argumentsJSON(call.arguments) : call.rawArguments
-                    )
+                    // A rejected malformed call is kept in the history (its
+                    // error result is what the model must see), but its wire
+                    // arguments were never valid JSON: re-sending them verbatim
+                    // makes an OpenAI-compatible server reject the NEXT step
+                    // with a 400 and strands the run. The call is dead either
+                    // way, so it goes out as an empty object.
+                    let arguments = call.argumentsMalformed
+                        ? "{}"
+                        : (call.rawArguments.isEmpty ? argumentsJSON(call.arguments) : call.rawArguments)
+                    return CloudChatToolCall(id: call.id, name: call.name, arguments: arguments)
                 }
                 wire.append(CloudChatMessage(
                     role: "assistant",
@@ -446,10 +453,18 @@ nonisolated enum SubagentBackendSettings {
     static let maximumSessionCloudCostUSD: Double = 500
 
     /// `nil` means "no per-conversation aggregate ceiling".
+    ///
+    /// A stored 0 is the Settings field's "derive it" value, which is what the
+    /// field has always documented and what `@AppStorage` writes when the
+    /// operator types 0 — so it must derive, not disable the cap. Only an
+    /// absent key (the operator cleared it) means no ceiling.
     static func sessionCloudCostCeiling(defaults: UserDefaults = .standard) -> Double? {
         if let stored = defaults.object(forKey: sessionCloudCostCeilingKey) as? NSNumber {
             let ceiling = stored.doubleValue
-            guard ceiling.isFinite, ceiling > 0 else { return nil }
+            guard ceiling.isFinite, ceiling > 0 else {
+                guard let perRun = cloudCostCeiling(defaults: defaults) else { return nil }
+                return min(perRun * defaultSessionCloudCostMultiplier, maximumSessionCloudCostUSD)
+            }
             return min(ceiling, maximumSessionCloudCostUSD)
         }
         guard let perRun = cloudCostCeiling(defaults: defaults) else { return nil }

@@ -33,7 +33,10 @@ extension AgentUsage {
         if contextTokens > 0 { parts.append("\(contextTokens) tok") }
         if toolCalls > 0 { parts.append("\(toolCalls) tool\(toolCalls == 1 ? "" : "s")") }
         if costUSD > 0 {
-            parts.append(String(format: "$%.4f", costUSD))
+            // A priced figure that is also flagged unpriced is a PARTIAL one
+            // (some of the turn could not be priced), so it reads as a floor —
+            // without the marker it looks like the exact spend.
+            parts.append(String(format: costIsUnpriced ? "$%.4f+" : "$%.4f", costUSD))
         } else if costIsUnpriced {
             parts.append("cost unpriced")
         }

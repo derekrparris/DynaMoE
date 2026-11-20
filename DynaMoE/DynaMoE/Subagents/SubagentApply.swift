@@ -389,9 +389,12 @@ enum SubagentApplyService {
             if let expectation, expectation.destinationBranchResolved {
                 let current = await WorkspaceIsolation.currentBranch(of: worktree.repositoryRoot)
                 if current != destinationBranch {
+                    // Both are OPTIONAL and the description renders nil as
+                    // "detached HEAD": passing the words as a branch name made
+                    // it read "branch 'detached HEAD'".
                     throw SubagentApplyError.destinationBranchChanged(
-                        expected: destinationBranch ?? "detached HEAD",
-                        actual: current ?? "detached HEAD"
+                        expected: destinationBranch,
+                        actual: current
                     )
                 }
             }
