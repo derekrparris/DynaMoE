@@ -1036,6 +1036,80 @@ final class WorkspaceIsolationTests: XCTestCase {
         XCTAssertFalse(status.resultJSON.contains("apply_directive"), status.resultJSON)
     }
 
+    func testCleanWorktreeWithApprovedEscapedWriteSurfacesWarningAndOmitsApplyDirective() async throws {
+        let runId = UUID()
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: runId,
+            root: worktreeRoot
+        )
+        let escapedTarget = repository.appendingPathComponent("escaped_direct.txt")
+        let backend = ScriptedBackend(turns: [
+            ScriptedBackend.ScriptedTurn(
+                text: "",
+                calls: [
+                    AgentToolCall(
+                        name: "file_write",
+                        arguments: ["path": escapedTarget.path, "content": "direct write\n"]
+                    )
+                ]
+            ),
+            ScriptedBackend.ScriptedTurn(text: "Done.")
+        ])
+        let plan = AgentSpawnPlan(
+            role: "Implementer",
+            taskDescription: "Write file.",
+            contextSummary: nil,
+            preset: .implementer,
+            backendDescriptor: .scripted,
+            schedulingClass: .cloud(providerId: "scripted"),
+            backend: backend,
+            toolNames: ["file_write"],
+            budget: AgentBudget(maxSteps: 4, maxCompletionTokens: 4_000, maxWallClockSeconds: 60, maxCostUSD: nil),
+            approvalPolicy: .spawnOnly,
+            isolation: worktree.isolation,
+            thinking: false,
+            sampling: .default,
+            priority: .userRequested,
+            parentSessionId: nil,
+            parentTurnId: nil,
+            workingDirectory: worktree.path,
+            repositoryRoot: repository,
+            baseCommit: worktree.baseCommit
+        )
+        // Approve the containment escape card automatically for this test run.
+        let waiterTask = Task {
+            for _ in 0..<200 {
+                if let entry = SubagentApprovalCenter.shared.pending.first(where: { $0.request.runId == runId }) {
+                    SubagentApprovalCenter.shared.approve(entry.id)
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+        }
+        let subagent = SubagentManager.shared.spawnModelBacked(plan, id: runId)
+        defer {
+            waiterTask.cancel()
+        }
+
+        _ = await subagent.waitForCompletion()
+        XCTAssertEqual(subagent.status, .completed)
+        XCTAssertEqual(subagent.report?.changedFiles, [])
+        let warningJoined = subagent.report?.openQuestions.joined(separator: "\n") ?? ""
+        XCTAssertTrue(warningJoined.contains("outside the worktree"), warningJoined)
+
+        let status = try await GetSubagentStatusTool().execute(
+            arguments: ["subagent_id": runId.uuidString],
+            workingDirectory: repository,
+            maxOutputLength: 4_000
+        )
+        XCTAssertFalse(status.resultJSON.contains("apply_directive"), status.resultJSON)
+        XCTAssertTrue(status.resultJSON.contains("escaped_writes"), status.resultJSON)
+
+        _ = await SubagentManager.shared.discard(runId: runId, sessionId: nil)
+        try? FileManager.default.removeItem(at: escapedTarget)
+    }
+
     /// An operator who decides a writer's work should not be landed must be
     /// able to discard it. `clearCompleted` deliberately refuses to make that
     /// decision in bulk (the record is what protects the worktree), so the

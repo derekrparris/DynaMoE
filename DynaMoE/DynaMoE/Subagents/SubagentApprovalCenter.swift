@@ -202,7 +202,8 @@ final class SubagentApprovalCenter: ObservableObject {
                 workingDirectory: request.workingDirectory
             ),
             diffPreview: evidence.isEmpty ? nil : evidence,
-            commandPreview: request.arguments["command"]
+            commandPreview: request.arguments["command"],
+            isContainmentEscape: request.containmentEscape
         )
     }
 }

@@ -2790,19 +2790,44 @@ public final class SpawnSubagentTool: AgentTool {
         // call is waiting; the result must not tell the coordinator to apply
         // work that is already in the main tree.
         let alreadyApplied = subagent.appliedAt != nil
+        let escapedWrites: [String] = {
+            guard let worktree, !alreadyApplied,
+                  subagent.report?.changedFiles.isEmpty == true,
+                  subagent.report?.diff == nil else { return [] }
+            return AgentHarness.escapedWritePaths(
+                in: subagent.runTranscript,
+                worktreePath: URL(fileURLWithPath: worktree.path, isDirectory: true)
+            )
+        }()
         let cleanSummary = AgentHarness.truncateText(AgentHarness.sanitizeText(summary), limit: maxOutputLength)
+        let directive: String
+        if let worktree {
+            if alreadyApplied {
+                directive = "Present this report to the user now, then answer their original question with it. Its isolated changes have already been applied to the working tree; do not call apply_subagent_changes."
+            } else if !escapedWrites.isEmpty {
+                directive = "Present this report to the user now, and note that the isolated worktree on branch \(worktree.branch) has NO changes: approved writes landed directly outside the worktree (\(escapedWrites.joined(separator: ", "))). Do not expect apply_subagent_changes to carry those out-of-worktree writes."
+            } else {
+                directive = "Present this report to the user now, then answer their original question with it. Its changes are isolated on branch \(worktree.branch); call apply_subagent_changes with subagent_id \(subagent.id.uuidString) to land them on the working tree (the operator approves the apply), unless the user asked to keep them isolated."
+            }
+        } else {
+            directive = "Present this report to the user now, then answer their original question with it."
+        }
         var data: [String: Any] = [
             "subagent_id": subagent.id.uuidString,
             "role": subagent.role,
             "status": subagent.status.rawValue,
             "duration_seconds": subagent.executionDurationSeconds,
             "summary": cleanSummary,
-            "directive": worktree == nil
-                ? "Present this report to the user now, then answer their original question with it."
-                : alreadyApplied
-                    ? "Present this report to the user now, then answer their original question with it. Its isolated changes have already been applied to the working tree; do not call apply_subagent_changes."
-                    : "Present this report to the user now, then answer their original question with it. Its changes are isolated on branch \(worktree!.branch); call apply_subagent_changes with subagent_id \(subagent.id.uuidString) to land them on the working tree (the operator approves the apply), unless the user asked to keep them isolated."
+            "directive": directive
         ]
+        if let report = subagent.report {
+            if worktree != nil {
+                data["changed_files"] = report.changedFiles
+            }
+            if !report.openQuestions.isEmpty {
+                data["open_questions"] = report.openQuestions.map { AgentHarness.sanitizeText($0) }
+            }
+        }
         if let worktree, !alreadyApplied {
             data["isolation"] = "worktree"
             data["worktree"] = worktree.path
@@ -3066,8 +3091,22 @@ public final class GetSubagentStatusTool: AgentTool {
                     data["isolation"] = "worktree"
                     data["worktree"] = worktree.path
                     data["branch"] = worktree.branch
-                    data["apply_directive"] = "This run's changes are isolated on branch \(worktree.branch). Call apply_subagent_changes with subagent_id \(subagent.id.uuidString) to land them on the main tree (the operator approves the apply), unless the user asked to keep them isolated."
-                    readable += "\nChanges: isolated worktree on \(worktree.branch). Call apply_subagent_changes with subagent_id \(subagent.id.uuidString) to apply them.\n"
+                    let escapedWrites: [String] = {
+                        guard subagent.report?.changedFiles.isEmpty == true,
+                              subagent.report?.diff == nil else { return [] }
+                        return AgentHarness.escapedWritePaths(
+                            in: subagent.runTranscript,
+                            worktreePath: URL(fileURLWithPath: worktree.path, isDirectory: true)
+                        )
+                    }()
+                    if !escapedWrites.isEmpty {
+                        let list = escapedWrites.joined(separator: ", ")
+                        data["escaped_writes"] = escapedWrites
+                        readable += "\nChanges: the isolated worktree on \(worktree.branch) has NO changes; approved writes landed directly outside the worktree (\(list)) and are not carried by apply_subagent_changes.\n"
+                    } else {
+                        data["apply_directive"] = "This run's changes are isolated on branch \(worktree.branch). Call apply_subagent_changes with subagent_id \(subagent.id.uuidString) to land them on the main tree (the operator approves the apply), unless the user asked to keep them isolated."
+                        readable += "\nChanges: isolated worktree on \(worktree.branch). Call apply_subagent_changes with subagent_id \(subagent.id.uuidString) to apply them.\n"
+                    }
                 }
             }
             data["directive"] = "Present this report to the user in your reply, then answer their original question with it. Do not end your turn without delivering these results."
@@ -5517,6 +5556,39 @@ public final class AgentHarness {
         """
     }
 
+    /// Tells a run-scoped worker where its workspace lives on disk and, for an
+    /// isolated git worktree, warns it not to target the coordinator's main
+    /// repository path. Without this, a worker that sees the repository path in
+    /// `context_summary` (or is told to use absolute paths) writes straight into
+    /// the coordinator's working tree instead of its worktree.
+    private func workerWorkspaceSection() -> String {
+        guard isRunScoped, let workspace = defaultWorkingDirectory else { return "" }
+        if isWorkspaceIsolated {
+            var lines: [String] = [
+                "# Workspace",
+                "",
+                "Working directory (isolated git worktree): \(workspace.path)"
+            ]
+            if let branch = workspaceBranch, !branch.isEmpty {
+                lines.append("Worktree branch: \(branch)")
+            }
+            lines.append("All relative paths in tool calls resolve against this worktree.")
+            lines.append("- Keep every file read, write, edit, and git call inside \(workspace.path) (use relative paths from the repository root, or absolute paths under \(workspace.path)).")
+            if let repoRoot = workspaceRepositoryRoot {
+                lines.append("- Do NOT read or write paths under the coordinator's main repository (\(repoRoot.path)): targeting that path escapes your isolated worktree, triggers a containment-escape approval prompt, and leaves the worktree empty.")
+            }
+            return lines.joined(separator: "\n") + "\n\n"
+        }
+        return """
+        # Workspace
+
+        Working directory: \(workspace.path)
+        Relative paths in tool calls resolve against this directory.
+
+
+        """
+    }
+
     /// The system prompt for a model-backed subagent run.
     ///
     /// Deliberately separate from `buildSystemPrompt`: a worker is not the
@@ -5546,6 +5618,7 @@ public final class AgentHarness {
         The coordinator owns the conversation with the user; you do not. Work only on the task you were given, with the tools listed below, and return a report the coordinator can use. Do not ask the user questions and do not wait for approval you cannot receive.
 
         """
+        prompt += workerWorkspaceSection()
         if mode == .plan {
             prompt += PlanModePolicy.directive(toolNames: availableToolDefinitions(mode: mode).map { $0.function.name }) + "\n\n"
         }
@@ -5667,8 +5740,19 @@ public final class AgentHarness {
         The coordinator owns the conversation with the user; you do not. Work only on the task you were given and return a report the coordinator can use. Do not ask the user questions.
 
         """
+        prompt += workerWorkspaceSection()
         if mode == .plan {
             prompt += PlanModePolicy.directive(toolNames: availableToolDefinitions(mode: mode).map { $0.function.name }) + "\n\n"
+        }
+        let pathRule: String
+        if isRunScoped, let workspace = defaultWorkingDirectory {
+            if isWorkspaceIsolated {
+                pathRule = "- Prefer relative paths (which resolve inside your worktree \(workspace.path)) or absolute paths under \(workspace.path). Never pass paths under the coordinator's main repository."
+            } else {
+                pathRule = "- Use relative paths (resolved against \(workspace.path)) or absolute paths inside \(workspace.path)."
+            }
+        } else {
+            pathRule = "- Use absolute paths."
         }
         prompt += """
 
@@ -5678,7 +5762,7 @@ public final class AgentHarness {
 
         - Issue the call rather than narrating it.
         - Read every result before deciding the next step, and never repeat an identical call hoping for a different answer.
-        - Use absolute paths.
+        \(pathRule)
         - A refused tool is final for this run: continue with what you have and report the limitation.
 
         # Subagent Rules
@@ -6815,6 +6899,70 @@ public final class AgentHarness {
         return contains(resolved, in: workspace) ? nil : resolved.path
     }
 
+    /// True when `rawPath` (resolved against `workspace`) stays inside
+    /// `workspace` after symlink resolution and does not touch `.git`.
+    static func isPathInsideWorkspace(_ rawPath: String, workspace: URL) -> Bool {
+        let resolved = resolvePath(rawPath, workingDirectory: workspace)
+        return !pathTouchesGitMetadata(resolved) && contains(resolved, in: workspace)
+    }
+
+    /// Successful `file_write` / `file_edit` destination paths in `transcript`
+    /// that landed outside `worktreePath`.
+    static func escapedWritePaths(in transcript: [AgentTranscriptEntry], worktreePath: URL) -> [String] {
+        var seen: Set<String> = []
+        var escaped: [String] = []
+        for entry in transcript {
+            guard let record = entry.toolRecord,
+                  record.status == .success,
+                  record.name == "file_write" || record.name == "file_edit",
+                  let rawPath = record.arguments["path"], !rawPath.isEmpty else {
+                continue
+            }
+            if !isPathInsideWorkspace(rawPath, workspace: worktreePath) {
+                let resolved = resolvedForContainment(resolvePath(rawPath, workingDirectory: worktreePath)).path
+                if seen.insert(resolved).inserted {
+                    escaped.append(resolved)
+                }
+            }
+        }
+        return escaped
+    }
+
+    /// Builds a two-paragraph containment-escape reason so the card summary stays
+    /// concise while `Escape Details:` names the isolated worktree, target path,
+    /// and (when applicable) the main repository being modified directly.
+    private func containmentEscapeReason(
+        summary: String,
+        rawPath: String?,
+        resolvedDisplayPath: String?,
+        workspace: URL?,
+        workingDirectory: URL?,
+        isWrite: Bool
+    ) -> String {
+        guard let workspace else { return summary }
+        var details: [String] = [
+            "\(isWorkspaceIsolated ? "Isolated worktree" : "Workspace"): \(workspace.path)"
+        ]
+        let resolvedURL: URL? = rawPath.flatMap { raw in
+            guard !raw.isEmpty else { return nil }
+            return Self.resolvePath(raw, workingDirectory: workingDirectory ?? workspace)
+        }
+        if let target = resolvedDisplayPath ?? resolvedURL.map({ Self.resolvedForContainment($0).path }) {
+            details.append("Requested target: \(target)")
+        }
+        if isWorkspaceIsolated,
+           let repoRoot = workspaceRepositoryRoot,
+           let resolvedURL,
+           Self.contains(resolvedURL, in: repoRoot) {
+            if isWrite {
+                details.append("WARNING: This targets the coordinator's main repository (\(repoRoot.path)) instead of the isolated worktree. Approving it writes directly to the main working tree and bypasses apply_subagent_changes.")
+            } else {
+                details.append("WARNING: This reads from the coordinator's main repository (\(repoRoot.path)) instead of the isolated worktree.")
+            }
+        }
+        return summary + "\n\n" + details.joined(separator: "\n")
+    }
+
     /// `mode` is the TURN's effective mode, not the process's: a run's own mode
     /// is what its card is judged under, and `activeMode` is whichever turn
     /// happened to be current.
@@ -6876,10 +7024,15 @@ public final class AgentHarness {
             // Both halves of containment are `containmentEscape`, so Turbo Mode
             // cannot wave either through: a blank card is the same leak as no
             // card, and the setting exists to skip ROUTINE writes.
-            return ask(
-                "it reads outside the run's work files (\(escape))",
-                containmentEscape: true
+            let reason = containmentEscapeReason(
+                summary: "it reads outside the run's work files (\(escape))",
+                rawPath: call.arguments["path"] as? String,
+                resolvedDisplayPath: escape,
+                workspace: workingDirectory ?? defaultWorkingDirectory,
+                workingDirectory: workingDirectory,
+                isWrite: false
             )
+            return ask(reason, containmentEscape: true)
         }
         // A secret committed inside the workspace is readable cardlessly, so
         // containment alone does not stop the leak: once anything outside the
@@ -6925,7 +7078,15 @@ public final class AgentHarness {
                 // confined may skip the card.
                 guard let workspace = workingDirectory ?? defaultWorkingDirectory,
                       Self.writesStayInsideWorkspace(call, workspace: workspace, workingDirectory: workingDirectory) else {
-                    return ask("it can change state outside the run's isolated workspace", containmentEscape: true)
+                    let reason = containmentEscapeReason(
+                        summary: "it can change state outside the run's isolated workspace",
+                        rawPath: call.arguments["path"] as? String,
+                        resolvedDisplayPath: nil,
+                        workspace: workingDirectory ?? defaultWorkingDirectory,
+                        workingDirectory: workingDirectory,
+                        isWrite: true
+                    )
+                    return ask(reason, containmentEscape: true)
                 }
             }
             return .allow
@@ -6961,10 +7122,15 @@ public final class AgentHarness {
                             workspace: workspace,
                             workingDirectory: workingDirectory
                           ) else {
-                        return ask(
-                            "it can change state outside the run's workspace",
-                            containmentEscape: true
+                        let reason = containmentEscapeReason(
+                            summary: "it can change state outside the run's workspace",
+                            rawPath: call.arguments["path"] as? String,
+                            resolvedDisplayPath: nil,
+                            workspace: workingDirectory ?? defaultWorkingDirectory,
+                            workingDirectory: workingDirectory,
+                            isWrite: true
                         )
+                        return ask(reason, containmentEscape: true)
                     }
                 }
                 return ask("it changes files, the repository or the system")

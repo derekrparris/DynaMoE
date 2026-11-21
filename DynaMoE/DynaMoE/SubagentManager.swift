@@ -1266,6 +1266,18 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             let changes = try await WorkspaceIsolation.snapshot(worktree)
             report.changedFiles = changes.changedFiles
             report.diff = changes.diff.isEmpty ? nil : changes.diff
+            if changes.isEmpty {
+                let escapedWrites = AgentHarness.escapedWritePaths(
+                    in: outcome.transcript,
+                    worktreePath: worktree.path
+                )
+                if !escapedWrites.isEmpty {
+                    let list = escapedWrites.joined(separator: ", ")
+                    report.openQuestions.append(
+                        "This isolated run's worktree has no changes, because its approved writes targeted paths outside the worktree (\(list)). Those writes already landed directly at those paths and are not carried by apply_subagent_changes."
+                    )
+                }
+            }
             if changes.diffWasTruncated {
                 report.openQuestions.append(
                     "The worktree diff was too large to store in full. apply_subagent_changes still applies the complete patch."

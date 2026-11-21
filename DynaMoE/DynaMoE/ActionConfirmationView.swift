@@ -255,6 +255,9 @@ public struct PendingActionConfirmation: Identifiable, Equatable {
     public let destinationSummary: String?
     public let diffPreview: String?
     public let commandPreview: String?
+    /// True when a subagent call targets a path or command outside its sandbox
+    /// (e.g. writing to the main repository from an isolated worktree).
+    public let isContainmentEscape: Bool
 
     public init(
         id: UUID = UUID(),
@@ -263,7 +266,8 @@ public struct PendingActionConfirmation: Identifiable, Equatable {
         targetSummary: String,
         destinationSummary: String? = nil,
         diffPreview: String? = nil,
-        commandPreview: String? = nil
+        commandPreview: String? = nil,
+        isContainmentEscape: Bool = false
     ) {
         self.id = id
         self.toolName = toolName
@@ -272,6 +276,7 @@ public struct PendingActionConfirmation: Identifiable, Equatable {
         self.destinationSummary = destinationSummary
         self.diffPreview = diffPreview
         self.commandPreview = commandPreview
+        self.isContainmentEscape = isContainmentEscape
     }
 }
 
@@ -290,13 +295,13 @@ public struct ActionConfirmationView: View {
         VStack(alignment: .leading, spacing: 10) {
             // Header: Warning & Tool Badge
             HStack(spacing: 8) {
-                Image(systemName: "exclamationmark.shield.fill")
+                Image(systemName: confirmation.isContainmentEscape ? "exclamationmark.triangle.fill" : "exclamationmark.shield.fill")
                     .font(.system(size: 14, weight: .bold))
-                    .foregroundColor(.orange)
+                    .foregroundColor(confirmation.isContainmentEscape ? .red : .orange)
 
-                Text("Action Requires Confirmation")
+                Text(confirmation.isContainmentEscape ? "Containment Escape — Outside Sandbox" : "Action Requires Confirmation")
                     .font(.system(size: 12.5, weight: .bold))
-                    .foregroundColor(.primary)
+                    .foregroundColor(confirmation.isContainmentEscape ? .red : .primary)
 
                 Spacer()
 
@@ -352,9 +357,10 @@ public struct ActionConfirmationView: View {
 
                 Text(confirmation.targetSummary)
                     .font(.system(size: 11.5, weight: .medium, design: .monospaced))
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
+                    .foregroundColor(confirmation.isContainmentEscape ? .primary : .secondary)
+                    .lineLimit(confirmation.isContainmentEscape ? nil : 1)
                     .truncationMode(.middle)
+                    .fixedSize(horizontal: false, vertical: confirmation.isContainmentEscape)
             }
 
             // Destination (a third-party upload, a custom endpoint)
@@ -362,7 +368,7 @@ public struct ActionConfirmationView: View {
                 HStack(alignment: .top, spacing: 6) {
                     Image(systemName: "arrow.up.forward.square")
                         .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(.orange)
+                        .foregroundColor(confirmation.isContainmentEscape ? .red : .orange)
                     Text(destination)
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundColor(.primary)
@@ -370,7 +376,7 @@ public struct ActionConfirmationView: View {
                 }
                 .padding(7)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.orange.opacity(0.08))
+                .background((confirmation.isContainmentEscape ? Color.red : Color.orange).opacity(0.08))
                 .cornerRadius(5)
             }
 
@@ -391,9 +397,9 @@ public struct ActionConfirmationView: View {
                 }
             } else if let diff = confirmation.diffPreview {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Proposed Changes:")
+                    Text(confirmation.isContainmentEscape ? "Escape Details:" : "Proposed Changes:")
                         .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(.secondary)
+                        .foregroundColor(confirmation.isContainmentEscape ? .red : .secondary)
                     ScrollView(.vertical, showsIndicators: true) {
                         Text(diff)
                             .font(.system(size: 10.5, design: .monospaced))
@@ -449,7 +455,7 @@ public struct ActionConfirmationView: View {
         .cornerRadius(8)
         .overlay(
             RoundedRectangle(cornerRadius: 8)
-                .stroke(Color.orange.opacity(0.35), lineWidth: 1.5)
+                .stroke((confirmation.isContainmentEscape ? Color.red : Color.orange).opacity(confirmation.isContainmentEscape ? 0.6 : 0.35), lineWidth: 1.5)
         )
     }
 }

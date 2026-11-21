@@ -2528,6 +2528,95 @@ final class SubagentLoopTests: XCTestCase {
         XCTAssertNotNil(try? JSONSerialization.jsonObject(with: Data(fallback.utf8)))
     }
 
+    func testIsolatedWorkerPromptsNameWorktreeAndWarnAgainstMainRepository() throws {
+        let worktree = URL(fileURLWithPath: "/tmp/dynamoe-worktree-test", isDirectory: true)
+        let repoRoot = URL(fileURLWithPath: "/tmp/dynamoe-main-repo", isDirectory: true)
+        let harness = AgentHarness.makeRunScoped()
+        try harness.configureRunScope(
+            runId: UUID(),
+            toolNames: ["file_write", "file_read", "complete"],
+            workingDirectory: worktree,
+            mode: .code,
+            approvalPolicy: .spawnOnly,
+            workspaceIsolated: true,
+            workspaceRepositoryRoot: repoRoot,
+            workspaceBranch: "dynamoe/agent/test-branch",
+            approvalHandler: nil
+        )
+
+        let localPrompt = harness.buildWorkerSystemPrompt(baseSystem: "", role: "Implementer", mode: .code)
+        XCTAssertTrue(localPrompt.contains("# Workspace"), localPrompt)
+        XCTAssertTrue(localPrompt.contains(worktree.path), localPrompt)
+        XCTAssertTrue(localPrompt.contains("dynamoe/agent/test-branch"), localPrompt)
+        XCTAssertTrue(localPrompt.contains(repoRoot.path), localPrompt)
+
+        let cloudPrompt = harness.buildCloudWorkerSystemPrompt(baseSystem: "", role: "Implementer", mode: .code)
+        XCTAssertTrue(cloudPrompt.contains("# Workspace"), cloudPrompt)
+        XCTAssertTrue(cloudPrompt.contains(worktree.path), cloudPrompt)
+        XCTAssertTrue(cloudPrompt.contains("dynamoe/agent/test-branch"), cloudPrompt)
+        XCTAssertTrue(cloudPrompt.contains(repoRoot.path), cloudPrompt)
+        XCTAssertFalse(
+            cloudPrompt.contains("- Use absolute paths.\n"),
+            "an isolated cloud worker must not be told to use bare absolute paths without naming its worktree"
+        )
+    }
+
+    func testIsolatedEscapeCardNamesWorktreeAndMainRepositoryWarning() async throws {
+        let worktree = try makeWorkspace()
+        let repoRoot = try makeWorkspace()
+        defer {
+            try? FileManager.default.removeItem(at: worktree)
+            try? FileManager.default.removeItem(at: repoRoot)
+        }
+        let mainRepoTarget = repoRoot.appendingPathComponent("ESCAPED.md")
+        var capturedRequest: AgentApprovalRequest?
+
+        let harness = AgentHarness.makeRunScoped()
+        try harness.configureRunScope(
+            runId: UUID(),
+            toolNames: ["file_write", "complete"],
+            workingDirectory: worktree,
+            mode: .code,
+            approvalPolicy: .spawnOnly,
+            workspaceIsolated: true,
+            workspaceRepositoryRoot: repoRoot,
+            workspaceBranch: "dynamoe/agent/escape-test",
+            approvalHandler: { request in
+                capturedRequest = request
+                return false
+            }
+        )
+        let context = AgentRunContext(
+            runId: UUID(),
+            sessionId: UUID(),
+            allowedTools: ["file_write", "complete"],
+            mode: .code,
+            workingDirectory: worktree,
+            approvalPolicy: .spawnOnly,
+            harness: harness
+        )
+        let backend = ScriptedBackend(turns: [
+            .init(text: "writing", calls: [
+                AgentToolCall(name: "file_write", arguments: ["path": mainRepoTarget.path, "content": "nope"])
+            ]),
+            .init(text: "done", calls: [completeCall("Declined.")])
+        ])
+
+        _ = await HeadlessAgentLoop().run(
+            input: input(),
+            backend: backend,
+            context: context,
+            emit: { _ in }
+        )
+
+        let request = try XCTUnwrap(capturedRequest)
+        XCTAssertTrue(request.containmentEscape)
+        XCTAssertTrue(request.reason.contains(worktree.path), request.reason)
+        XCTAssertTrue(request.reason.contains(repoRoot.path), request.reason)
+        XCTAssertTrue(request.reason.contains("apply_subagent_changes"), request.reason)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: mainRepoTarget.path))
+    }
+
     private func makeRunScopedHarness(
         tools: [String],
         workspace: URL,

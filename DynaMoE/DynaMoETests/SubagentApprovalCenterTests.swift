@@ -261,4 +261,23 @@ final class SubagentApprovalCenterTests: XCTestCase {
         for waiter in waiters { _ = await waiter.value }
         XCTAssertTrue(center.pending.isEmpty, "the queue drains once every card is answered")
     }
+
+    func testContainmentEscapeConfirmationPreservesFlagAndSplitsDetails() {
+        let req = AgentApprovalRequest(
+            runId: UUID(),
+            toolName: "file_write",
+            arguments: ["path": "/tmp/main/ESCAPED.md"],
+            workingDirectory: "/tmp/worktrees/123",
+            reason: "it can change state outside the run's isolated workspace\n\nIsolated worktree: /tmp/worktrees/123\nRequested target: /tmp/main/ESCAPED.md",
+            containmentEscape: true
+        )
+        let confirmation = SubagentApprovalCenter.confirmation(for: req)
+        XCTAssertTrue(confirmation.isContainmentEscape)
+        XCTAssertEqual(confirmation.targetSummary, "it can change state outside the run's isolated workspace")
+        XCTAssertEqual(
+            confirmation.diffPreview,
+            "Isolated worktree: /tmp/worktrees/123\nRequested target: /tmp/main/ESCAPED.md"
+        )
+        XCTAssertEqual(confirmation.destinationSummary, "/tmp/main/ESCAPED.md")
+    }
 }
