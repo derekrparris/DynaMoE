@@ -1,0 +1,1383 @@
+//
+//  Inkling2LogicTests.swift
+//  DynaMoETests
+//
+//  Model-independent coverage for the Inkling 2 port: config decoding (the
+//  nested wrapper, strict unknown-key refusal, the loop schedule), the visit
+//  plan, the exhaustive tensor catalog, query unpacking, expert layouts,
+//  memory and preflight arithmetic, the prompt dialect, and every host
+//  primitive (element formats, both activation quantizers, the layer rules).
+//
+//  No Metal device, no weights, no MainActor, so this runs anywhere.
+//
+//  The numeric goldens are produced by an INDEPENDENT Python mirror of the
+//  reference algorithms (the format definitions, vLLM's quantizer rules and
+//  numpy versions of the layer rules), never from this Swift code: a test that
+//  compares an implementation with itself proves only that it is deterministic.
+//
+//  The config fixtures are SYNTHETIC -- they exercise branches at small widths
+//  and are not the model. Facts about the real checkpoint belong in
+//  `Inkling2PublishedConfigTests` (the config) and `Inkling2PublishedTensorTests`
+//  (the catalog over the real shard headers, skipped when the snapshot is
+//  absent).
+//
+
+import XCTest
+@testable import DynaMoE
+
+// MARK: - Config
+
+final class Inkling2ConfigTests: XCTestCase {
+
+    /// A small but structurally complete text tower: 12 layers, a 6-layer core
+    /// looped three times, one full layer per six, two experts. The widths are
+    /// not the model's; the RELATIONS are.
+    static let smallJSON = """
+    {
+      "architectures": ["Inkling2LoopForConditionalGeneration"],
+      "model_type": "inkling2_loop",
+      "dtype": "bfloat16",
+      "eos_token_id": 17,
+      "image_token_id": 15,
+      "quantization_config": {"quant_method": "modelopt"},
+      "text_config": {
+        "model_type": "inkling2_loop_text",
+        "hidden_size": 64,
+        "num_hidden_layers": 12,
+        "vocab_size": 32,
+        "unpadded_vocab_size": 30,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 16,
+        "swa_head_dim": 16,
+        "swa_num_attention_heads": 4,
+        "swa_num_key_value_heads": 2,
+        "sliding_window_size": 8,
+        "d_rel": 4,
+        "rel_extent": 8,
+        "log_scaling_n_floor": 8192,
+        "log_scaling_alpha": 0.1,
+        "rms_norm_eps": 1e-06,
+        "qk_l2_clip_threshold": 22.627416997969522,
+        "rel_l2_clip_threshold": 8.0,
+        "sconv_kernel_size": 4,
+        "final_logit_softcapping": 30.0,
+        "n_layers_per_attn_res_block": 6,
+        "n_routed_experts": 2,
+        "num_experts_per_tok": 1,
+        "n_shared_experts": 0,
+        "intermediate_size": 16,
+        "mlp_gate_softcap": 4.0,
+        "mlp_up_softcap": 25.0,
+        "route_scale": 8.0,
+        "use_gate_bias": true,
+        "loop_config": {
+          "core_start": 6,
+          "core_end": 12,
+          "num_passes": 3,
+          "gate_rank": 8,
+          "is_varloop": false
+        }
+      }
+    }
+    """
+
+    func config(_ json: String = smallJSON) throws -> Inkling2Config {
+        try Inkling2Config.decode(jsonData: Data(json.utf8))
+    }
+
+    func testTheNestedWrapperDecodes() throws {
+        let config = try config()
+        XCTAssertEqual(config.modelType, "inkling2_loop")
+        XCTAssertEqual(config.textModelType, "inkling2_loop_text")
+        XCTAssertEqual(config.hiddenSize, 64)
+        XCTAssertEqual(config.numHiddenLayers, 12)
+        XCTAssertEqual(config.numAttentionHeads, 4)
+        XCTAssertEqual(config.numKeyValueHeads, 2)
+        XCTAssertEqual(config.numRoutedExperts, 2)
+        XCTAssertEqual(config.numPasses, 3)
+        XCTAssertEqual(config.loopCoreStart, 6)
+        XCTAssertEqual(config.loopCoreEnd, 12)
+        XCTAssertEqual(config.eosTokenID, 17)
+        XCTAssertEqual(config.imageTokenID, 15)
+        XCTAssertEqual(config.quantizationMethod, "modelopt")
+        XCTAssertEqual(config.executedVisitCount, 12 + 2 * 6)
+        XCTAssertNil(config.vision, "no vision_config means no tower")
+        XCTAssertNil(config.mtp, "no mtp_config means no sidecar")
+    }
+
+    /// The loop schedule: only the core range repeats, every visit owns its own
+    /// state slot, and only the full-attention visits get a growing cache.
+    func testTheVisitPlanRepeatsOnlyTheCore() throws {
+        let config = try config()
+        let plan = try config.makeVisitPlan()
+        // 6 pre + 6 core x 3 passes + 0 post.
+        XCTAssertEqual(plan.count, 24)
+        XCTAssertEqual(plan.count, config.executedVisitCount)
+        XCTAssertEqual(
+            plan.map(\.physicalLayer),
+            [0, 1, 2, 3, 4, 5,
+             6, 7, 8, 9, 10, 11, 6, 7, 8, 9, 10, 11, 6, 7, 8, 9, 10, 11]
+        )
+        // Every visit owns its own state slot, and the slots are unique: KV and
+        // the convolution states are per VISIT while the weights are per layer.
+        XCTAssertEqual(plan.map(\.cacheSlot), Array(0..<plan.count))
+        // One full layer per six: 5 once, 11 in each pass.
+        XCTAssertEqual(plan.filter(\.isFullAttention).map(\.physicalLayer), [5, 11, 11, 11])
+        XCTAssertEqual(plan.filter(\.hasMessageControllers).count, 18, "every core visit carries controllers")
+        XCTAssertNil(plan[0].attentionInputLayer, "layer 0 has no attention-input read")
+        XCTAssertEqual(plan[1].attentionInputLayer, 1)
+        // Passes are numbered from one for core visits and zero outside.
+        let corePasses: [Int] = plan.map(\.pass).filter { $0 > 0 }
+        XCTAssertEqual(corePasses, [Int](repeating: 1, count: 6) + [Int](repeating: 2, count: 6) + [Int](repeating: 3, count: 6))
+        XCTAssertEqual(Array(plan.map(\.pass).prefix(6)), [Int](repeating: 0, count: 6))
+    }
+
+    func testAVariableLoopCheckpointIsRefusedByName() throws {
+        let json = Self.smallJSON.replacingOccurrences(of: "\"is_varloop\": false", with: "\"is_varloop\": true")
+        XCTAssertThrowsError(try config(json)) { error in
+            guard case Inkling2ConfigError.invalidField(let field, let detail) = error else {
+                return XCTFail("expected a named field refusal, got \(error)")
+            }
+            XCTAssertEqual(field, "loop_config.is_varloop")
+            XCTAssertTrue(detail.contains("variable-loop"), detail)
+        }
+    }
+
+    func testAnUnknownKeyIsRefusedRatherThanIgnored() throws {
+        let json = Self.smallJSON.replacingOccurrences(
+            of: "\"sconv_kernel_size\": 4,",
+            with: "\"sconv_kernel_size\": 4, \"brand_new_knob\": 3,"
+        )
+        XCTAssertThrowsError(try config(json)) { error in
+            guard case Inkling2ConfigError.unknownField(let field, let where_) = error else {
+                return XCTFail("expected an unknown-field refusal, got \(error)")
+            }
+            XCTAssertEqual(field, "brand_new_knob")
+            XCTAssertEqual(where_, "text_config")
+        }
+    }
+
+    func testAMissingRequiredFieldIsNamed() throws {
+        let json = Self.smallJSON.replacingOccurrences(of: "\"hidden_size\": 64,\n", with: "")
+        XCTAssertThrowsError(try config(json)) { error in
+            guard case Inkling2ConfigError.missingField(let field) = error else {
+                return XCTFail("expected a missing-field refusal, got \(error)")
+            }
+            XCTAssertEqual(field, "text_config.hidden_size")
+        }
+    }
+
+    func testSharedExpertsAreRefusedBecauseTheGraphHasNoPath() throws {
+        let json = Self.smallJSON.replacingOccurrences(of: "\"n_shared_experts\": 0", with: "\"n_shared_experts\": 2")
+        XCTAssertThrowsError(try config(json)) { error in
+            guard case Inkling2ConfigError.invalidField(let field, _) = error else {
+                return XCTFail("expected an invalid-field refusal, got \(error)")
+            }
+            XCTAssertEqual(field, "n_shared_experts")
+        }
+    }
+
+    /// `layer_types` and `local_layer_ids` are two spellings of one fact. A
+    /// checkpoint publishing only one of them must answer the same, and the
+    /// derived default is the checkpoint's own (one full layer per six).
+    func testLayerKindComesFromEitherSpelling() throws {
+        let derived = try config()
+        XCTAssertEqual(derived.derivedLayerTypes.filter { $0 == "hybrid" }.count, 2)
+        XCTAssertTrue(derived.isLocalLayer(0))
+        XCTAssertFalse(derived.isLocalLayer(5))
+        XCTAssertTrue(derived.isLocalLayer(6))
+        XCTAssertFalse(derived.isLocalLayer(11))
+        XCTAssertEqual(derived.fullAttentionLayers, [5, 11])
+
+        let published = Self.smallJSON.replacingOccurrences(
+            of: "\"n_layers_per_attn_res_block\": 6,",
+            with: "\"n_layers_per_attn_res_block\": 6, \"local_layer_ids\": [0, 1, 2, 3, 4, 6, 7, 8, 9, 10],"
+        )
+        let explicit = try config(published)
+        XCTAssertEqual(explicit.fullAttentionLayers, [5, 11])
+        for layer in 0..<12 {
+            XCTAssertEqual(derived.isLocalLayer(layer), explicit.isLocalLayer(layer), "layer \(layer)")
+        }
+    }
+
+    func testAPaddedUnembeddingMustFitInsideTheVocabulary() throws {
+        let json = Self.smallJSON.replacingOccurrences(of: "\"unpadded_vocab_size\": 30", with: "\"unpadded_vocab_size\": 40")
+        XCTAssertThrowsError(try config(json)) { error in
+            guard case Inkling2ConfigError.invalidField(let field, _) = error else {
+                return XCTFail("expected an invalid-field refusal, got \(error)")
+            }
+            XCTAssertEqual(field, "unpadded_vocab_size")
+        }
+    }
+
+    func testAForeignConfigIsNotMistakenForInkling() throws {
+        let json = #"{"model_type": "llama", "hidden_size": 64}"#
+        XCTAssertThrowsError(try Inkling2Config.decode(jsonData: Data(json.utf8))) { error in
+            XCTAssertEqual(error as? Inkling2ConfigError, .notInkling2)
+        }
+    }
+}
+
+// MARK: - Primitives: element formats
+
+final class Inkling2ElementFormatTests: XCTestCase {
+
+    func testE2M1DecodesEveryNibble() {
+        let expected: [Float] = [0, 0.5, 1, 1.5, 2, 3, 4, 6,
+                                 -0, -0.5, -1, -1.5, -2, -3, -4, -6]
+        for code in 0..<16 {
+            XCTAssertEqual(
+                Inkling2Element.decodeE2M1(UInt8(code)), expected[code],
+                "nibble \(code)"
+            )
+        }
+    }
+
+    func testE2M1RoundsToNearestEvenAndSaturates() {
+        // Exact values round-trip.
+        for code in 0..<8 {
+            let value = Inkling2Element.decodeE2M1(UInt8(code))
+            XCTAssertEqual(Inkling2Element.encodeE2M1(value), UInt8(code))
+        }
+        // Midpoints, IEEE nearest-even: 0.25 is between 0 (LSB 0) and .5 (LSB 1) -> 0.
+        XCTAssertEqual(Inkling2Element.encodeE2M1(0.25), 0)
+        // 0.75 is between .5 (m=1, LSB 1) and 1 (m=0, LSB 0) -> 1.0.
+        XCTAssertEqual(Inkling2Element.encodeE2M1(0.75), 2)
+        // 1.25 between 1 (LSB 0) and 1.5 (LSB 1) -> 1.0.
+        XCTAssertEqual(Inkling2Element.encodeE2M1(1.25), 2)
+        // 2.5 between 2 (LSB 0) and 3 (LSB 1) -> 2.
+        XCTAssertEqual(Inkling2Element.encodeE2M1(2.5), 4)
+        // 5.0 between 4 and 6 -> nearer 4.
+        XCTAssertEqual(Inkling2Element.encodeE2M1(5.0), 6)
+        // Saturates rather than producing inf.
+        XCTAssertEqual(Inkling2Element.encodeE2M1(1000), 0x7)
+        XCTAssertEqual(Inkling2Element.encodeE2M1(-1000), 0xF)
+        // Signed zero is preserved.
+        XCTAssertEqual(Inkling2Element.encodeE2M1(-0.0), 0x8)
+    }
+
+    func testE4M3DecodesTheReferenceCodes() {
+        XCTAssertEqual(Inkling2Element.decodeE4M3(0x00), 0)
+        XCTAssertEqual(Inkling2Element.decodeE4M3(0x38), 1)
+        XCTAssertEqual(Inkling2Element.decodeE4M3(0x3C), 1.5)
+        XCTAssertEqual(Inkling2Element.decodeE4M3(0x40), 2)
+        XCTAssertEqual(Inkling2Element.decodeE4M3(0x7E), 448)
+        XCTAssertTrue(Inkling2Element.decodeE4M3(0x7F).isNaN)
+        XCTAssertTrue(Inkling2Element.decodeE4M3(0xFF).isNaN)
+        XCTAssertEqual(Inkling2Element.decodeE4M3(0x01), 1.0 / 512.0, "smallest subnormal")
+        XCTAssertEqual(Inkling2Element.decodeE4M3(0x80), -0)
+    }
+
+    func testE4M3RoundsToNearestEvenAndSaturates() {
+        for code in UInt8(0)...UInt8(0x7E) {
+            let value = Inkling2Element.decodeE4M3(code)
+            XCTAssertEqual(Inkling2Element.encodeE4M3(value), code, "code \(code)")
+        }
+        XCTAssertEqual(Inkling2Element.encodeE4M3(500), 0x7E, "saturates at 448")
+        XCTAssertEqual(Inkling2Element.encodeE4M3(-500), 0xFE)
+        XCTAssertEqual(Inkling2Element.encodeE4M3(.infinity), 0x7E)
+        XCTAssertEqual(Inkling2Element.encodeE4M3(.nan), 0x7F)
+        XCTAssertEqual(Inkling2Element.encodeE4M3(-0.0), 0x80)
+        // A midpoint between 1.0 (0x38) and 1.125 (0x39) is 1.0625 -> even (0x38).
+        XCTAssertEqual(Inkling2Element.encodeE4M3(1.0625), 0x38)
+    }
+
+    func testE8M0SelectsPowersOfTwoWithTiesUp() {
+        XCTAssertEqual(Inkling2Element.encodeE8M0(1), 127)
+        XCTAssertEqual(Inkling2Element.decodeE8M0(127), 1)
+        XCTAssertEqual(Inkling2Element.encodeE8M0(0.5), 126)
+        XCTAssertEqual(Inkling2Element.encodeE8M0(2), 128)
+        // 448 is between 256 and 512, and nearer 512 in the log domain.
+        XCTAssertEqual(Inkling2Element.encodeE8M0(448), 136)
+        XCTAssertEqual(Inkling2Element.decodeE8M0(136), 512)
+        // sqrt(2) is the midpoint; a tie goes UP.
+        let midpoint = Float(2).squareRoot()
+        XCTAssertEqual(Inkling2Element.encodeE8M0(midpoint), 128)
+        XCTAssertEqual(Inkling2Element.encodeE8M0(0), 0)
+        XCTAssertEqual(Inkling2Element.encodeE8M0(-1), 0)
+    }
+
+    func testPackedPairsPutTheLowerColumnInTheLowNibble() {
+        let byte = Inkling2Element.packE2M1Pair(low: 1.5, high: -2)
+        XCTAssertEqual(byte & 0xF, 0x3, "1.5 is code 3")
+        XCTAssertEqual(byte >> 4, 0xC, "-2 is code 12")
+        let (low, high) = Inkling2Element.unpackE2M1Pair(byte)
+        XCTAssertEqual(low, 1.5)
+        XCTAssertEqual(high, -2)
+    }
+}
+
+// MARK: - Primitives: activation quantizers
+
+final class Inkling2ActivationQuantizerTests: XCTestCase {
+
+    /// The vector the Python mirror quantized, with its exact output.
+    static let nvfp4Probe: [Float] =
+        [Float](repeating: 0, count: 16)
+        + [1.0, -2.0, 3.0, -0.25] + [Float](repeating: 0.5, count: 12)
+        + [7.0, -6.5, 0.125, 0.0] + [Float](repeating: 2.0, count: 12)
+
+    func testNVFP4MatchesTheIndependentMirror() throws {
+        let result = try Inkling2ActivationQuantizer.nvfp4(Self.nvfp4Probe)
+        XCTAssertEqual(result.blockSize, 16)
+        // outer = rowAmax / 1536, rowAmax = 7
+        XCTAssertEqual(result.outerScale, Float(7.0 / 1536.0), accuracy: 1e-9)
+        XCTAssertEqual(result.blockScales, [56, 110, 120])
+        XCTAssertEqual(result.codes, [
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            4, 14, 7, 9, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+            7, 15, 0, 0, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3
+        ])
+    }
+
+    /// The two candidate rules are not interchangeable: this block is one where
+    /// the 4.0 candidate wins, and the mirror's scale says so.
+    func testTheBlockScaleSearchPicksTheLowerErrorCandidate() {
+        let block: [Float] = [Float](repeating: 0.9, count: 16)
+        let scale = Inkling2ActivationQuantizer.chooseNVFP4BlockScale(block: block, blockAmax: 0.9)
+        XCTAssertEqual(scale, 0.9 / 4.0, accuracy: 1e-7)
+        // A tie keeps the 6.0 candidate: all-zero blocks have zero error under
+        // both, and the first candidate is the one retained.
+        XCTAssertEqual(
+            Inkling2ActivationQuantizer.chooseNVFP4BlockScale(
+                block: [Float](repeating: 0, count: 16), blockAmax: 0
+            ),
+            1.0
+        )
+    }
+
+    func testNVFP4DequantizesToItsOwnCodes() throws {
+        let result = try Inkling2ActivationQuantizer.nvfp4(Self.nvfp4Probe)
+        let values = result.dequantized(format: .e2m1)
+        XCTAssertEqual(values.count, Self.nvfp4Probe.count)
+        // The 7.0 entry is the row maximum, so it lands on the top code of the
+        // third block scaled to nearly itself: the reconstruction is within one
+        // E2M1 step of the original.
+        let maxIndex = 32
+        XCTAssertEqual(values[maxIndex], 7.0, accuracy: 7.0 * 0.25)
+        // A zero stays zero.
+        XCTAssertEqual(values[0], 0)
+    }
+
+    static let mxfp8Probe: [Float] =
+        (0..<32).map { 0.1 * Float($0 + 1) } + [Float](repeating: 0, count: 32)
+        + [1000.0] + [Float](repeating: 1.0, count: 31)
+
+    func testMXFP8MatchesTheIndependentMirror() throws {
+        let result = try Inkling2ActivationQuantizer.mxfp8(Self.mxfp8Probe)
+        XCTAssertEqual(result.blockSize, 32)
+        XCTAssertEqual(result.blockScales, [120, 127, 129])
+        XCTAssertEqual(Array(result.codes.prefix(8)), [85, 93, 98, 101, 104, 106, 107, 109])
+        XCTAssertEqual(Array(result.codes[32..<40]), [0, 0, 0, 0, 0, 0, 0, 0])
+        // The block's scale is 4 (round-up of 1000/448), so 1000 becomes 250,
+        // which rounds to the E4M3 code for 256.
+        XCTAssertEqual(Inkling2Element.decodeE8M0(result.blockScales[2]), 4)
+        XCTAssertEqual(Array(result.codes[64..<68]), [120, 40, 40, 40])
+        XCTAssertEqual(Inkling2Element.decodeE4M3(result.codes[64]), 256)
+    }
+
+    func testRoundUpPowerOfTwoKeepsAnExactPower() {
+        XCTAssertEqual(Inkling2ActivationQuantizer.roundUpPowerOfTwo(4), 4)
+        XCTAssertEqual(Inkling2ActivationQuantizer.roundUpPowerOfTwo(4.5), 8)
+        XCTAssertEqual(Inkling2ActivationQuantizer.roundUpPowerOfTwo(0), 1)
+        XCTAssertEqual(Inkling2ActivationQuantizer.roundUpPowerOfTwo(1), 1)
+    }
+
+    func testTheTwoProfilesAreDistinctContracts() {
+        XCTAssertFalse(Inkling2ActivationProfile.hfReference.quantizesActivation)
+        XCTAssertTrue(Inkling2ActivationProfile.trained.quantizesActivation)
+        XCTAssertNotEqual(Inkling2ActivationProfile.hfReference, .trained)
+    }
+}
+
+// MARK: - Primitives: layer rules
+
+final class Inkling2LayerRuleTests: XCTestCase {
+
+    /// Values from the numpy mirror, to 5 decimal places.
+    func testRMSNormMatchesTheMirror() {
+        let result = Inkling2Math.rmsNorm([1, 2, 3], eps: 1e-6)
+        XCTAssertEqual(result[0], 0.4629100003, accuracy: 1e-6)
+        XCTAssertEqual(result[1], 0.9258200006, accuracy: 1e-6)
+        XCTAssertEqual(result[2], 1.3887300009, accuracy: 1e-6)
+    }
+
+    func testTheWeightedNormMultipliesTheGainAfterNormalizing() {
+        let result = Inkling2Math.rmsNorm([1, 2, 3], gain: [2, 0, -1], eps: 1e-6)
+        XCTAssertEqual(result[0], 0.9258200006, accuracy: 1e-6)
+        XCTAssertEqual(result[1], 0)
+        XCTAssertEqual(result[2], -1.3887300009, accuracy: 1e-6)
+    }
+
+    func testL2ClipScalesDownAndNeverUp() {
+        let clipped = Inkling2Math.l2Clip([3, 4], threshold: 2)
+        XCTAssertEqual(clipped[0], 1.19999976, accuracy: 1e-6)
+        XCTAssertEqual(clipped[1], 1.59999968, accuracy: 1e-6)
+        // Norm 0.5 is under the threshold: unchanged, not scaled UP to it.
+        XCTAssertEqual(Inkling2Math.l2Clip([0.3, 0.4], threshold: 2), [0.3, 0.4])
+    }
+
+    func testLogScaleRampsOnlyPastTheFloor() {
+        XCTAssertEqual(Inkling2Math.logScale(position: 0, alpha: 0.1, floor: 8192), 1.0)
+        XCTAssertEqual(Inkling2Math.logScale(position: 8191, alpha: 0.1, floor: 8192), 1.0)
+        XCTAssertEqual(Inkling2Math.logScale(position: 8192, alpha: 0.1, floor: 8192), 1.0000122063, accuracy: 1e-6)
+        XCTAssertEqual(Inkling2Math.logScale(position: 100000, alpha: 0.1, floor: 8192), 1.2502022118, accuracy: 1e-6)
+    }
+
+    func testStaticShortConvolutionMatchesTheMirror() {
+        let weights: [Float] = [0.1, -0.2, 0.3, -0.4]
+        let history: [Float] = [0.5, -1.0, 2.0]   // newest last
+        XCTAssertEqual(
+            Inkling2Math.staticShortConvolution(current: 1.5, history: history, weights: weights),
+            0.3354101966, accuracy: 1e-6
+        )
+        // With no history the older taps read zero.
+        XCTAssertEqual(
+            Inkling2Math.staticShortConvolution(current: 1.5, history: [], weights: weights),
+            0.7379024326, accuracy: 1e-6
+        )
+    }
+
+    func testDynamicShortConvolutionMatchesTheMirror() {
+        let staticWeights: [Float] = [0.05, 0.1, -0.15, 0.2]
+        let dynamicWeights: [Float] = [0.01, -0.02, 0.03, -0.04]
+        XCTAssertEqual(
+            Inkling2Math.dynamicShortConvolution(
+                current: -0.75, history: [1.5, 0.25],
+                staticWeights: staticWeights, dynamicWeights: dynamicWeights
+            ),
+            -0.3183333333, accuracy: 1e-6
+        )
+    }
+
+    func testBlockResidualReadMatchesTheMirror() {
+        let rows = Inkling2Math.blockResidualRead(
+            blockStates: [[0.5, -0.25, 1.0], [1.0, 0.0, -0.5]],
+            partial: [0.25, 0.75, -1.0],
+            queries: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.5]]
+        )
+        let expected: [[Float]] = [
+            [1.0311480138, 0.1257373850, -0.2319897923],
+            [0.7951546372, 0.2360961171, -0.1202336762]
+        ]
+        for (row, want) in zip(rows, expected) {
+            for (got, value) in zip(row, want) {
+                XCTAssertEqual(got, value, accuracy: 1e-6)
+            }
+        }
+    }
+
+    func testMessageGateMatchesTheMirror() {
+        let result = Inkling2Math.messageGate(
+            current: [1.0, -2.0, 0.5], message: [0.25, 3.0, -1.0],
+            forget: [0.3, -0.7, 1.2], gain: [-0.2, 0.9, 0.4]
+        )
+        let expected: [Float] = [0.6593435575, -1.0598419436, -0.2967762658]
+        for (got, want) in zip(result, expected) {
+            XCTAssertEqual(got, want, accuracy: 1e-6)
+        }
+    }
+
+    /// The bias steers SELECTION only: expert 2 has the same score as expert 1
+    /// but a negative bias, so it drops out, and the weights are the SCORES
+    /// renormalized (not score + bias).
+    func testRouterSelectsByBiasedScoreAndWeightsByScore() {
+        let route = Inkling2Math.route(
+            scores: [0.4, 0.9, 0.9, 0.1, 0.7], bias: [0.0, 0.0, -0.5, 0.6, 0.1],
+            topK: 3, routeScale: 8
+        )
+        XCTAssertEqual(route.indices, [1, 4, 3])
+        XCTAssertEqual(route.weights[0], 4.2352941176, accuracy: 1e-5)
+        XCTAssertEqual(route.weights[1], 3.2941176471, accuracy: 1e-5)
+        XCTAssertEqual(route.weights[2], 0.4705882353, accuracy: 1e-5)
+    }
+
+    func testRouterBreaksATieToTheLowerExpertID() {
+        let route = Inkling2Math.route(scores: [0.5, 0.5], bias: [0, 0], topK: 1, routeScale: 1)
+        XCTAssertEqual(route.indices, [0])
+        XCTAssertEqual(route.weights[0], 1.0, accuracy: 1e-6)
+    }
+
+    func testSoftcappedSwiGLUMatchesTheMirror() {
+        XCTAssertEqual(
+            Inkling2Math.softcappedSwiGLU(gate: 2.5, up: -7.0),
+            -13.9871712574, accuracy: 1e-5
+        )
+    }
+
+    /// The sigmoid factor sees the RAW gate: softcapping it too would make
+    /// `tanh(g/4)*4*sigmoid(tanh(g/4)*4)` instead, which differs everywhere.
+    func testTheSigmoidSeesTheRawGate() {
+        let gate: Float = 6.0
+        let raw = Inkling2Math.softcap(gate, 4.0) * Inkling2Math.sigmoid(gate) * Inkling2Math.softcap(1.0, 25.0)
+        let capped = Inkling2Math.softcap(gate, 4.0)
+        let wrong = capped * Inkling2Math.sigmoid(capped) * Inkling2Math.softcap(1.0, 25.0)
+        XCTAssertEqual(Inkling2Math.softcappedSwiGLU(gate: gate, up: 1.0), raw, accuracy: 1e-7)
+        XCTAssertNotEqual(raw, wrong, accuracy: 1e-4)
+    }
+
+    func testTheFinalSoftcapBoundsTheLogits() {
+        XCTAssertEqual(Inkling2Math.finalLogitSoftcap([100, -3])[0], 29.9237390242, accuracy: 1e-5)
+        XCTAssertEqual(Inkling2Math.finalLogitSoftcap([100, -3])[1], -2.9900398387, accuracy: 1e-5)
+    }
+}
+
+// MARK: - Query unpacking
+
+final class Inkling2QueryUnpackingTests: XCTestCase {
+
+    func testAttentionInputQueriesStartAtLayerOne() {
+        XCTAssertEqual(Inkling2QueryUnpacking.attentionInputLayer(forQueryIndex: 0), 1)
+        XCTAssertEqual(Inkling2QueryUnpacking.attentionInputLayer(forQueryIndex: 22), 23)
+        XCTAssertEqual(Inkling2QueryUnpacking.mlpInputLayer(forQueryIndex: 0), 0)
+        XCTAssertEqual(Inkling2QueryUnpacking.mlpInputLayer(forQueryIndex: 23), 23)
+        XCTAssertEqual(Inkling2QueryUnpacking.attentionInputQueryCount(isFullAttention: true), 3)
+        XCTAssertEqual(Inkling2QueryUnpacking.attentionInputQueryCount(isFullAttention: false), 1)
+    }
+
+    /// The plan's required golden: four logical messages per core layer, read
+    /// from two 24-row tensors.
+    func testCrossPassQueriesUnpackTwoRowsPerCoreLayer() {
+        let layer = Inkling2QueryUnpacking.CrossPassQueryRows(coreLayer: 5)
+        XCTAssertEqual(layer.rows, [10, 10, 11, 11], "Q and K from row 2i, V and MLP from 2i+1")
+        XCTAssertEqual(layer.fromMainTensor, [true, false, false, true])
+        // Every row of the 24-row tensor is claimed exactly once across the 12
+        // core layers.
+        var rows: [Int] = []
+        for core in 0..<12 { rows.append(contentsOf: Inkling2QueryUnpacking.CrossPassQueryRows(coreLayer: core).rows) }
+        XCTAssertEqual(Set(rows), Set(0..<24))
+        XCTAssertEqual(rows.count, 48, "four logical messages per core layer")
+    }
+}
+
+// MARK: - Expert layout
+
+final class Inkling2ExpertLayoutTests: XCTestCase {
+
+    func testNVFP4StridesFollowTheStoredShapes() {
+        let layout = Inkling2ExpertQuantLayout.nvfp4
+        XCTAssertEqual(layout.blockSize, 16)
+        XCTAssertEqual(layout.valuesPerByte, 2)
+        XCTAssertEqual(layout.packedInputWidth(2304), 1152)
+        XCTAssertEqual(layout.scaleInputWidth(2304), 144)
+        XCTAssertEqual(layout.packedInputWidth(1152), 576)
+        XCTAssertEqual(layout.scaleInputWidth(1152), 72)
+        XCTAssertEqual(layout.scaleFormat, .e4m3)
+        XCTAssertEqual(layout.valueFormat, .e2m1)
+        XCTAssertTrue(layout.requiresAmaxDenominator)
+    }
+
+    func testMXFP8StridesFollowTheStoredShapes() {
+        let layout = Inkling2ExpertQuantLayout.mxfp8
+        XCTAssertEqual(layout.blockSize, 32)
+        XCTAssertEqual(layout.valuesPerByte, 1)
+        XCTAssertEqual(layout.packedInputWidth(2304), 2304)
+        XCTAssertEqual(layout.scaleInputWidth(2304), 72)
+        XCTAssertEqual(layout.packedInputWidth(1152), 1152)
+        XCTAssertEqual(layout.scaleInputWidth(1152), 36)
+        XCTAssertEqual(layout.scaleFormat, .e8m0)
+        XCTAssertEqual(layout.valueFormat, .e4m3)
+        XCTAssertFalse(layout.requiresAmaxDenominator)
+    }
+}
+
+// MARK: - Memory and preflight
+
+final class Inkling2MemoryPlanTests: XCTestCase {
+
+    private func config() throws -> Inkling2Config {
+        try Inkling2Config.decode(jsonData: Data(Inkling2ConfigTests.smallJSON.utf8))
+    }
+
+    /// The convolution state is the one term that is a closed formula, and the
+    /// plan's published figure (3,833,856 bytes for 48 visits) is checkable
+    /// from the geometry: 48 * (2304 + 1024 + 1024 + 2304) * 3 * 4.
+    func testConvolutionStateIsFourFP32StatesPerVisit() throws {
+        let config = try config()
+        let plan = Inkling2MemoryPlan.make(config: config, catalog: nil, contextLength: 128)
+        let visits = config.executedVisitCount
+        let channels = 2 * (config.numKeyValueHeads * config.headDim) + 2 * config.hiddenSize
+        XCTAssertEqual(plan.convolutionStateBytes, visits * channels * 3 * 4)
+        XCTAssertEqual(plan.convolutionStateBytes, 24 * 192 * 3 * 4)
+    }
+
+    /// Full caches grow with context, rings do not, and only the FULL visits get
+    /// a full cache: at twice the context the total grows by exactly the full
+    /// visits' share.
+    func testOnlyFullVisitsGrowWithContext() throws {
+        let config = try config()
+        let short = Inkling2MemoryPlan.make(config: config, catalog: nil, contextLength: 16)
+        let long = Inkling2MemoryPlan.make(config: config, catalog: nil, contextLength: 4096)
+        let record = 2 * config.numKeyValueHeads * config.headDim * 2
+        let plan = try config.makeVisitPlan()
+        let fullVisits = plan.filter(\.isFullAttention).count
+        XCTAssertEqual(
+            long.fullAttentionCacheBytes - short.fullAttentionCacheBytes,
+            fullVisits * (4096 - 16) * record
+        )
+        // The ring is capped at the window, so past it the ring term is constant.
+        let windowed = Inkling2MemoryPlan.make(config: config, catalog: nil, contextLength: 8)
+        XCTAssertEqual(long.localRingBytes, windowed.localRingBytes)
+    }
+
+    /// The plan's published hybrid total: eight full visits, FP16, 1.242 GB at
+    /// 32,768 tokens, to within the ring and convolution terms the plan's table
+    /// excludes.
+    func testThePublishedHybridKvFiguresFollowFromTheGeometry() {
+        let fullVisits = 8
+        let record = 8 * 128 * 2 * 2   // kvHeads * headDim * K+V * FP16
+        XCTAssertEqual(fullVisits * 32_768 * record, 1_073_741_824)
+        XCTAssertEqual(fullVisits * 1_048_576 * record, 34_359_738_368)
+        // And the naive 48 full caches, which the table exists to rule out.
+        XCTAssertEqual(48 * 1_048_576 * record, 206_158_430_208)
+    }
+
+    func testPreflightLeavesRoomForTheReply() throws {
+        let result = try Inkling2Preflight.check(promptTokens: 100, contextLength: 1000, requestedReplyTokens: 200)
+        XCTAssertEqual(result.availablePromptTokens, 1000)
+        XCTAssertEqual(result.replyBudget, 200)
+        // A reply budget longer than what is left is clamped, not refused.
+        let clamped = try Inkling2Preflight.check(promptTokens: 100, contextLength: 1000, requestedReplyTokens: 5000)
+        XCTAssertEqual(clamped.replyBudget, 900)
+    }
+
+    func testAPromptThatCannotFitIsRefusedByName() {
+        XCTAssertThrowsError(
+            try Inkling2Preflight.check(promptTokens: 1001, contextLength: 1000, requestedReplyTokens: 10)
+        ) { error in
+            guard case Inkling2PreflightError.promptTooLong(let prompt, let available) = error else {
+                return XCTFail("expected a prompt-too-long refusal, got \(error)")
+            }
+            XCTAssertEqual(prompt, 1001)
+            XCTAssertEqual(available, 1000)
+        }
+    }
+}
+
+// MARK: - Prompt
+
+final class Inkling2PromptTests: XCTestCase {
+
+    private let prompt = Inkling2Prompt()
+
+    /// Every golden below is what jinja2 produced from the checkpoint's OWN
+    /// `chat_template.jinja` (with `{% generation %}` registered as a
+    /// passthrough, which is all it is at render time).
+
+    func testAUserTurnMatchesTheTemplate() throws {
+        XCTAssertEqual(
+            try prompt.render(turns: [.user([.text("Hi")])]),
+            "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>"
+                + "<|message_user|><|content_text|>Hi<|end_message|>"
+        )
+    }
+
+    func testASystemTurnComesBeforeTheEffortLine() throws {
+        XCTAssertEqual(
+            try prompt.render(turns: [.system("You are helpful."), .user([.text("Hi")])]),
+            "<|message_system|><|content_text|>You are helpful.<|end_message|>"
+                + "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>"
+                + "<|message_user|><|content_text|>Hi<|end_message|>"
+        )
+    }
+
+    func testACompletedAssistantTurnClosesWithTheEndOfSamplingToken() throws {
+        XCTAssertEqual(
+            try prompt.render(turns: [
+                .user([.text("Hi")]),
+                .assistant(reasoning: nil, content: "Hello!"),
+                .user([.text("Again")])
+            ]),
+            "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>"
+                + "<|message_user|><|content_text|>Hi<|end_message|>"
+                + "<|message_model|><|content_text|>Hello!<|end_message|><|content_model_end_sampling|>"
+                + "<|message_user|><|content_text|>Again<|end_message|>"
+        )
+    }
+
+    func testReasoningIsItsOwnTypedBlock() throws {
+        XCTAssertEqual(
+            try prompt.render(turns: [
+                .user([.text("Hi")]),
+                .assistant(reasoning: "thinking...", content: "Hello!"),
+                .user([.text("Again")])
+            ]),
+            "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>"
+                + "<|message_user|><|content_text|>Hi<|end_message|>"
+                + "<|message_model|><|content_thinking|>thinking...<|end_message|>"
+                + "<|message_model|><|content_text|>Hello!<|end_message|><|content_model_end_sampling|>"
+                + "<|message_user|><|content_text|>Again<|end_message|>"
+        )
+    }
+
+    func testNamedEffortsAndNumericEffortsRenderTheTemplatesNumbers() throws {
+        let expected: [(String, String)] = [
+            ("low", "0.2"), ("medium", "0.7"), ("high", "0.9"),
+            ("xhigh", "0.99"), ("max", "0.99"), ("minimal", "0.1")
+        ]
+        for (name, rendered) in expected {
+            let value = try XCTUnwrap(Inkling2Effort.value(for: name), name)
+            XCTAssertEqual(
+                try prompt.render(turns: [.user([.text("Hi")])], effort: value),
+                "<|message_system|><|content_text|>Thinking effort level: \(rendered)<|end_message|>"
+                    + "<|message_user|><|content_text|>Hi<|end_message|>",
+                name
+            )
+        }
+        // Zero renders as `0`, not `0.0`: the template interpolates Python's str.
+        XCTAssertEqual(
+            try prompt.render(turns: [.user([.text("Hi")])], effort: 0),
+            "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|>"
+                + "<|message_user|><|content_text|>Hi<|end_message|>"
+        )
+        XCTAssertEqual(Inkling2Effort.value(for: "none"), 0)
+        XCTAssertNil(Inkling2Effort.value(for: "extreme"))
+    }
+
+    func testAnEffortOutsideTheRangeIsRefused() {
+        XCTAssertThrowsError(try prompt.render(turns: [.user([.text("Hi")])], effort: 1.0)) { error in
+            XCTAssertEqual(error as? Inkling2PromptError, .effortOutOfRange(1.0))
+        }
+        XCTAssertThrowsError(try prompt.render(turns: [.user([.text("Hi")])], effort: -0.1))
+    }
+
+    func testAToolResultNamesItsTool() throws {
+        XCTAssertEqual(
+            try prompt.render(turns: [.tool(name: "foo", content: [.text("done")])]),
+            "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>"
+                + "<|message_tool|>foo<|content_text|>done<|end_message|>"
+        )
+        XCTAssertThrowsError(try prompt.render(turns: [.tool(name: "", content: [.text("done")])])) { error in
+            XCTAssertEqual(error as? Inkling2PromptError, .emptyToolName)
+        }
+    }
+
+    func testAnImageRendersAsThePlaceholderPairAndOnlyOnUserOrToolTurns() throws {
+        XCTAssertEqual(
+            try prompt.render(turns: [.user([.image, .text("What is this?")])]),
+            "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>"
+                + "<|message_user|><|content_image|><|unused_200054|><|end_message|>"
+                + "<|content_text|>What is this?<|end_message|>"
+        )
+        XCTAssertThrowsError(try prompt.render(parts: [.image], role: "assistant")) { error in
+            XCTAssertEqual(error as? Inkling2PromptError, .imageNotSupportedHere("assistant"))
+        }
+        // No assistant prefix: generation starts right after the last turn.
+        XCTAssertEqual(prompt.assistantPrefix, "")
+    }
+
+    /// The markers are the tokenizer's own added-token spellings, asserted as
+    /// codepoints so a renderer that stripped a tag cannot make a lookalike pass.
+    /// Each is ASCII `<`, `|`, the exact name, `|`, `>`.
+    func testMarkersAreTheCheckpointsAddedTokenSpellings() {
+        let markers = Inkling2PromptMarkers.familyDefault
+        func expect(_ marker: String, _ name: String) {
+            XCTAssertEqual(marker.unicodeScalars.map(\.value),
+                           [0x3C, 0x7C] + name.unicodeScalars.map(\.value) + [0x7C, 0x3E],
+                           name)
+            XCTAssertEqual(marker, "<" + "|" + name + "|" + ">")
+        }
+        expect(markers.system, "message_system")
+        expect(markers.user, "message_user")
+        expect(markers.model, "message_model")
+        expect(markers.tool, "message_tool")
+        expect(markers.contentText, "content_text")
+        expect(markers.contentThinking, "content_thinking")
+        expect(markers.contentModelEndSampling, "content_model_end_sampling")
+        expect(markers.endMessage, "end_message")
+        expect(markers.imagePlaceholder, "unused_200054")
+    }
+}
+
+// MARK: - Published config
+
+/// Facts about the REAL checkpoint's `config.json`, embedded verbatim so the
+/// decode is checked against the file rather than against a fixture that
+/// drifted from it. The JSON below is the published file (snapshot
+/// `ed40e7da...`) with no fields removed.
+final class Inkling2PublishedConfigTests: XCTestCase {
+
+    static let publishedJSON = """
+    {
+      "dtype": "bfloat16",
+      "architectures": [
+        "Inkling2LoopForConditionalGeneration"
+      ],
+      "model_type": "inkling2_loop",
+      "eos_token_id": 200006,
+      "text_config": {
+        "model_type": "inkling2_loop_text",
+        "model_max_length": 1048576,
+        "torch_dtype": "bfloat16",
+        "hidden_size": 2304,
+        "num_hidden_layers": 24,
+        "vocab_size": 201024,
+        "num_attention_heads": 24,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "d_rel": 16,
+        "rel_extent": 1024,
+        "q_bias": false,
+        "o_bias": false,
+        "log_scaling_n_floor": 8192,
+        "log_scaling_alpha": 0.1,
+        "rms_norm_eps": 1e-06,
+        "use_value_norm_no_gamma": true,
+        "qk_l2_clip_threshold": 22.627416997969522,
+        "rel_l2_clip_threshold": 8.0,
+        "local_layer_ids": [
+          0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22
+        ],
+        "sconv_kernel_size": 4,
+        "unpadded_vocab_size": 200058,
+        "final_logit_softcapping": 30.0,
+        "swa_head_dim": 128,
+        "swa_num_attention_heads": 24,
+        "swa_num_key_value_heads": 8,
+        "sliding_window_size": 1024,
+        "n_layers_per_attn_res_block": 6,
+        "attn_res_normalize_values": true,
+        "n_routed_experts": 128,
+        "num_experts_per_tok": 8,
+        "n_shared_experts": 0,
+        "intermediate_size": 1152,
+        "mlp_gate_softcap": 4.0,
+        "mlp_up_softcap": 25.0,
+        "route_scale": 8.0,
+        "use_gate_bias": true,
+        "loop_config": {
+          "core_start": 6,
+          "core_end": 18,
+          "num_passes": 3,
+          "gate_rank": 64,
+          "is_varloop": false
+        }
+      },
+      "vision_config": {
+        "model_type": "inkling2_vision",
+        "text_hidden_size": 2304,
+        "temporal_patch_size": 2,
+        "native_patch_size": 20,
+        "adapter_merge_size": 2,
+        "projection_hidden_dim": 4096,
+        "projector_bias": false,
+        "hidden_size": 1024,
+        "num_hidden_layers": 23,
+        "num_attention_heads": 16,
+        "mlp_ratio": 4.0,
+        "posemb_grid_size": 32,
+        "layer_norm_eps": 1e-05
+      },
+      "mtp_config": {
+        "hidden_size": 2304,
+        "num_hidden_layers": 3,
+        "num_attention_heads": 24,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "intermediate_size": 9216,
+        "max_position_embeddings": 1048576,
+        "torch_dtype": "bfloat16",
+        "q_bias": false,
+        "o_bias": false,
+        "rms_norm_eps": 1e-06,
+        "rope_theta": 1000000.0,
+        "local_layer_ids": [
+          0,
+          2
+        ],
+        "sliding_window_size": 1024,
+        "block_size": 8,
+        "markov_rank": 256,
+        "markov_head_type": "rnn_hidden",
+        "target_layer_ids": [
+          5,
+          23,
+          41,
+          48
+        ]
+      },
+      "quantization_config": {
+        "quant_method": "modelopt",
+        "quant_algo": "NVFP4"
+      }
+    }
+    """
+
+    func published() throws -> Inkling2Config {
+        try Inkling2Config.decode(jsonData: Data(Self.publishedJSON.utf8))
+    }
+
+    func testThePublishedConfigDecodesToItsGeometry() throws {
+        let config = try published()
+        XCTAssertEqual(config.hiddenSize, 2304)
+        XCTAssertEqual(config.numHiddenLayers, 24)
+        XCTAssertEqual(config.numAttentionHeads, 24)
+        XCTAssertEqual(config.numKeyValueHeads, 8)
+        XCTAssertEqual(config.headDim, 128)
+        XCTAssertEqual(config.vocabSize, 201024)
+        XCTAssertEqual(config.unpaddedVocabSize, 200058)
+        XCTAssertEqual(config.maxPositionEmbeddings, 1_048_576)
+        XCTAssertEqual(config.slidingWindowSize, 1024)
+        XCTAssertEqual(config.numRoutedExperts, 128)
+        XCTAssertEqual(config.numExpertsPerToken, 8)
+        XCTAssertEqual(config.moeIntermediateSize, 1152)
+        XCTAssertEqual(config.eosTokenID, 200006)
+        XCTAssertEqual(config.imageTokenID, 200054)
+    }
+
+    /// The plan's headline schedule: 48 visits, eight of them full attention, at
+    /// slots 5, 11, 17, 23, 29, 35, 41 and 47.
+    func testThePublishedScheduleIsFortyEightVisitsWithEightFull() throws {
+        let config = try published()
+        let plan = try config.makeVisitPlan()
+        XCTAssertEqual(plan.count, 48)
+        XCTAssertEqual(config.executedVisitCount, 48)
+        XCTAssertEqual(plan.filter(\.isFullAttention).map(\.visit), [5, 11, 17, 23, 29, 35, 41, 47])
+        // Full physical layers 5, 11, 17 and 23, and the core repeats 11 and 17 in passes two and three.
+        XCTAssertEqual(plan.filter(\.isFullAttention).map(\.physicalLayer), [5, 11, 17, 11, 17, 11, 17, 23])
+        // Layers 0...5 once, 6...17 three times, 18...23 once.
+        XCTAssertEqual(plan.map(\.physicalLayer).prefix(6), [0, 1, 2, 3, 4, 5])
+        XCTAssertEqual(plan.map(\.physicalLayer).prefix(24).suffix(18).filter { $0 < 6 }, [])
+        XCTAssertEqual(plan.map(\.physicalLayer).suffix(6), [18, 19, 20, 21, 22, 23])
+        // Visit 23 is layer 11 of pass two (6 pre + 6 of pass one + 6 of pass two),
+        // 29 is layer 17 of pass two, 35 layer 11 of pass three; 5 and 47 sit outside the loop.
+        XCTAssertEqual(plan[23].physicalLayer, 11)
+        XCTAssertEqual(plan[23].pass, 2)
+        XCTAssertEqual(plan[29].physicalLayer, 17)
+        XCTAssertEqual(plan[29].pass, 2)
+        XCTAssertEqual(plan[35].physicalLayer, 11)
+        XCTAssertEqual(plan[35].pass, 3)
+        XCTAssertEqual(plan[5].pass, 0)
+        XCTAssertEqual(plan[41].physicalLayer, 17)
+        XCTAssertEqual(plan[41].pass, 3)
+        XCTAssertEqual(plan[47].physicalLayer, 23)
+        XCTAssertEqual(plan[47].pass, 0)
+    }
+
+    func testTheTowersGeometryIsValidatedNotExecuted() throws {
+        let config = try published()
+        let vision = try XCTUnwrap(config.vision)
+        XCTAssertEqual(vision.hiddenSize, 1024)
+        XCTAssertEqual(vision.numHiddenLayers, 23)
+        XCTAssertEqual(vision.projectionHiddenDim, 4096)
+        // The span arithmetic from the plan's examples.
+        XCTAssertEqual(vision.languagePositions(width: 40, height: 40), 1)
+        XCTAssertEqual(vision.towerTokens(width: 40, height: 40), 4)
+        XCTAssertEqual(vision.languagePositions(width: 512, height: 512), 169)
+        XCTAssertEqual(vision.towerTokens(width: 512, height: 512), 676)
+        XCTAssertEqual(vision.languagePositions(width: 1024, height: 1024), 676)
+        XCTAssertEqual(vision.towerTokens(width: 1024, height: 1024), 2704)
+        XCTAssertEqual(vision.languagePositions(width: 2048, height: 2048), 2704)
+        XCTAssertEqual(vision.languagePositions(width: 4096, height: 4096), 10609)
+        XCTAssertEqual(vision.towerTokens(width: 4096, height: 4096), 42436)
+        // A non-multiple pads up to the next cell.
+        XCTAssertEqual(vision.languagePositions(width: 41, height: 80), 4)
+    }
+
+    func testTheSidecarSpecIsValidated() throws {
+        let mtp = try XCTUnwrap(try published().mtp)
+        XCTAssertEqual(mtp.numHiddenLayers, 3)
+        XCTAssertEqual(mtp.blockSize, 8)
+        XCTAssertEqual(mtp.markovRank, 256)
+        XCTAssertEqual(mtp.targetLayerIDs, [5, 23, 41, 48])
+        XCTAssertEqual(mtp.localLayerIDs, [0, 2])
+    }
+
+    /// The three published figures the memory plan is checked against: 3.66 MiB
+    /// of convolution state for 48 visits, and the hybrid FP16 KV total.
+    func testThePublishedMemoryFiguresFollowFromTheGeometry() throws {
+        let config = try published()
+        let plan = Inkling2MemoryPlan.make(config: config, catalog: nil, contextLength: 32_768)
+        XCTAssertEqual(plan.convolutionStateBytes, 3_833_856)
+        // 8 full visits x 32,768 x 4,096 bytes + rings + convolution.
+        let record = 2 * config.numKeyValueHeads * config.headDim * 2
+        XCTAssertEqual(plan.fullAttentionCacheBytes, 8 * 32_768 * record)
+        XCTAssertEqual(plan.fullAttentionCacheBytes, 1_073_741_824)
+        // The rings: 40 visits x 1,024 x 4,096.
+        XCTAssertEqual(plan.localRingBytes, 40 * 1024 * record)
+        // The loop messages: 12 core layers x 4 messages x 2304 x 4 bytes.
+        XCTAssertEqual(plan.loopMessageBytesPerPosition, 12 * 4 * 2304 * 4)
+        // The plan's table quotes decimal GB and excludes convolution state:
+        // 1.0737 GB of full caches + 0.1678 GB of rings = 1.242 GB at 32K.
+        let tableGB = Double(plan.fullAttentionCacheBytes + plan.localRingBytes) / 1e9
+        XCTAssertEqual(tableGB, 1.242, accuracy: 0.001)
+        // And at the 1M declaration, exactly the table's last row.
+        let million = Inkling2MemoryPlan.make(config: config, catalog: nil, contextLength: 1_048_576)
+        XCTAssertEqual(
+            Double(million.fullAttentionCacheBytes + million.localRingBytes) / 1e9,
+            34.528, accuracy: 0.001
+        )
+        // The naive 48-full-cache figure the table rules out.
+        let naive = 48 * 1_048_576 * record
+        XCTAssertEqual(Double(naive) / 1e9, 206.158, accuracy: 0.001)
+    }
+}
+
+// MARK: - Published checkpoint (opt-in)
+
+/// The catalog and memory plan over the REAL checkpoint's shard headers.
+///
+/// Skipped when the snapshot is absent, like the DeepSeek published cases: it
+/// reads the safetensors headers through the Rust engine (19.5 GB of tensors are
+/// indexed, not read) and nothing else.
+///
+/// The Rust summary reports a fused expert bank ONE ENTRY PER EXPERT (the
+/// generic engine binds experts one at a time), so `Inkling2WeightCatalog`
+/// coalesces those entries back to the checkpoint's own name before
+/// classifying. The counts asserted here are of the summary's entries; the
+/// catalog's are of the tensors, which is why the two differ by exactly the
+/// experts' fan-out. It is the test that keeps the 1,244-name
+/// classification honest against the file, which a synthetic fixture cannot do:
+/// a role I invented would pass a fixture I also wrote.
+final class Inkling2PublishedTensorTests: XCTestCase {
+
+    static let snapshotRelativePath =
+        ".cache/huggingface/hub/models--thinkingmachines--Inkling-2-Mini/snapshots/"
+        + "ed40e7da625f594fc9c4990f5f66be24873c22d7"
+
+    private func snapshot() throws -> URL {
+        let path = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(Self.snapshotRelativePath)
+        guard FileManager.default.fileExists(atPath: path.path) else {
+            throw XCTSkip("Inkling 2 snapshot is not downloaded at \(path.path)")
+        }
+        return path
+    }
+
+    /// The main file's tensors, as the engine indexes them.
+    private func mainTensors() throws -> (directory: URL, refs: [Inkling2TensorRef], config: Inkling2Config) {
+        let directory = try snapshot()
+        let engine = try DynaMoeEngine(filePath: directory.path)
+        let summary = try engine.getSummary()
+        let config = try Inkling2Config.decode(
+            contentsOf: directory.appendingPathComponent("config.json")
+        )
+        return (directory, summary.tensors.map { Inkling2TensorRef(metadata: $0) }, config)
+    }
+
+    /// The sidecar's header, read directly: `mtp.safetensors` is not in the main
+    /// index, so the engine never sees it and the DSpark path will have to open
+    /// it by name.
+    static func sidecarTensors(_ directory: URL) throws -> [Inkling2TensorRef] {
+        let url = directory.appendingPathComponent("mtp.safetensors")
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        guard let lengthData = try handle.read(upToCount: 8), lengthData.count == 8 else {
+            throw Inkling2WeightError.unsupportedDtypes(["mtp.safetensors: no header length"])
+        }
+        var headerLength: UInt64 = 0
+        for (index, byte) in lengthData.enumerated() {
+            headerLength |= UInt64(byte) << (8 * UInt64(index))
+        }
+        guard let headerData = try handle.read(upToCount: Int(headerLength)),
+              let object = try JSONSerialization.jsonObject(with: headerData) as? [String: Any] else {
+            throw Inkling2WeightError.unsupportedDtypes(["mtp.safetensors: unreadable header"])
+        }
+        return object.compactMap { name, value in
+            guard name != "__metadata__",
+                  let entry = value as? [String: Any],
+                  let dtype = entry["dtype"] as? String,
+                  let shape = entry["shape"] as? [Int] else { return nil }
+            return Inkling2TensorRef(name: name, dtype: dtype, shape: shape)
+        }.sorted { $0.name < $1.name }
+    }
+
+    func testEveryPublishedTensorHasARoleAndEveryRequiredRoleIsPresent() throws {
+        let (directory, refs, config) = try mainTensors()
+        let sidecar = try Self.sidecarTensors(directory)
+        let catalog = Inkling2WeightCatalog(
+            mainFile: refs, sidecar: sidecar, layerCount: config.numHiddenLayers
+        )
+        XCTAssertTrue(catalog.unconsumed.isEmpty, "unplaced: \(catalog.unconsumed.prefix(10))")
+        XCTAssertTrue(catalog.duplicateRoles.isEmpty, "duplicates: \(catalog.duplicateRoles.prefix(5))")
+        let problems = catalog.validate(config: config)
+        XCTAssertTrue(problems.isEmpty, "catalog problems: \(problems.prefix(10))")
+        // The plan's evidence lock: 1,244 main tensors and 54 sidecar ones.
+        // The summary reports one entry per expert of a fused bank, so its count
+        // is the tensors' fan-out and not 1,244; the catalog coalesces them back.
+        XCTAssertGreaterThan(refs.count, 1244)
+        XCTAssertEqual(sidecar.count, 54)
+        // One slot per checkpoint tensor once the split banks are coalesced.
+        XCTAssertEqual(catalog.slots.count, 1244 + 54)
+        // The vision tower's block count comes from the tensors themselves.
+        XCTAssertEqual(catalog.layers(of: .visionBlockLn1Weight, scope: .vision).count, config.vision?.numHiddenLayers)
+        XCTAssertEqual(catalog.layers(of: .draftQProj, scope: .sidecar), [0, 1, 2])
+    }
+
+    /// The published expert layouts: NVFP4 on layers 0...19, MXFP8 on 20...23,
+    /// with the strides the stored shapes give.
+    func testThePublishedExpertLayoutsAreWhatTheStridesSay() throws {
+        let (_, refs, config) = try mainTensors()
+        let catalog = Inkling2WeightCatalog(mainFile: refs, layerCount: config.numHiddenLayers)
+        for layer in 0..<config.numHiddenLayers {
+            let w13 = try XCTUnwrap(catalog.tensor(.expertW13, layer: layer))
+            let w13Scale = try XCTUnwrap(catalog.tensor(.expertW13Scale, layer: layer))
+            let w2 = try XCTUnwrap(catalog.tensor(.expertW2, layer: layer))
+            let w2Scale = try XCTUnwrap(catalog.tensor(.expertW2Scale, layer: layer))
+            let layout = try Inkling2ExpertQuantLayout.infer(
+                w13: w13, w13Scale: w13Scale, w2: w2, w2Scale: w2Scale, config: config
+            ).get()
+            XCTAssertEqual(layout, layer < 20 ? .nvfp4 : .mxfp8, "layer \(layer)")
+            XCTAssertEqual(w13.shape[0], 128)
+            XCTAssertEqual(w13.shape[1], 2 * 1152)
+            XCTAssertEqual(w13.shape[2], layout.packedInputWidth(2304))
+            XCTAssertEqual(w13Scale.shape[2], layout.scaleInputWidth(2304))
+            XCTAssertEqual(w2.shape[2], layout.packedInputWidth(1152))
+            XCTAssertEqual(w2Scale.shape[2], layout.scaleInputWidth(1152))
+        }
+        // The published outer-scale denominator is 2688, which the plan's
+        // amax rule (`blockScale * (expertAmax / 2688)`) is written around.
+        let denominator = try XCTUnwrap(catalog.tensor(.expertW13OuterScaleDenominator, layer: 0))
+        XCTAssertEqual(denominator.shape, [1])
+    }
+
+    /// The packed query tensors: 23 attention-input reads (layer 0 has none),
+    /// three rows on the layer that follows a full-attention layer 5/11/17/23
+    /// and one elsewhere, plus 24 MLP reads and two 24-row cross-pass tensors.
+    func testThePublishedPackedQueriesUnpack() throws {
+        let (_, refs, config) = try mainTensors()
+        let catalog = Inkling2WeightCatalog(mainFile: refs, layerCount: config.numHiddenLayers)
+        XCTAssertEqual(catalog.layers(of: .attnResAttnQuery), Array(0..<23))
+        XCTAssertEqual(catalog.layers(of: .attnResMlpQuery), Array(0..<24))
+        var threeWide: [Int] = []
+        for index in 0..<23 {
+            let ref = try XCTUnwrap(catalog.tensor(.attnResAttnQuery, layer: index))
+            let layer = Inkling2QueryUnpacking.attentionInputLayer(forQueryIndex: index)
+            if ref.shape.count == 2 {
+                XCTAssertEqual(ref.shape, [3, 2304], "layer \(layer) reads three block queries")
+                threeWide.append(layer)
+            } else {
+                XCTAssertEqual(ref.shape, [2304], "layer \(layer) reads one")
+            }
+        }
+        // The query is indexed by the layer whose ATTENTION input it reads, and
+        // a full layer publishes three; the published three-wide set is what
+        // says the mapping is layer-1 and not layer.
+        XCTAssertEqual(threeWide.sorted(), [5, 11, 17, 23])
+        XCTAssertEqual(try XCTUnwrap(catalog.tensor(.crossPassQuery)).shape, [24, 2304])
+        XCTAssertEqual(try XCTUnwrap(catalog.tensor(.crossPassKVQuery)).shape, [24, 2304])
+    }
+
+    /// The text tower's dense weights against the plan's ~3.86 GB and the two
+    /// expert layouts against its ~15.67 GB, from the real headers. The plan
+    /// quotes decimal GB over the whole main file, which also holds the vision
+    /// tower, so the dense figure is a floor here rather than an equality.
+    func testThePublishedByteSplitMatchesThePlan() throws {
+        let (_, refs, config) = try mainTensors()
+        let catalog = Inkling2WeightCatalog(mainFile: refs, layerCount: config.numHiddenLayers)
+        let expertGB = Double(catalog.expertBankBytes) / 1e9
+        XCTAssertEqual(expertGB, 15.67, accuracy: 0.1)
+        let visionGB = Double(catalog.slots.filter { $0.scope == .vision }
+            .reduce(0) { $0 + Inkling2WeightCatalog.byteCount($1.ref) }) / 1e9
+        XCTAssertEqual(visionGB, 0.637, accuracy: 0.01, "the 23-layer tower plus its 4,096-wide projector")
+        // Everything but the experts: the plan's ~3.86 GB, which INCLUDES the tower.
+        let denseGB = Double(catalog.nonExpertBytes) / 1e9
+        XCTAssertEqual(denseGB, 3.86, accuracy: 0.02)
+        // Every byte of the main file is one of the two classes.
+        let total = Double(catalog.nonExpertBytes + catalog.expertBankBytes) / 1e9
+        XCTAssertEqual(total, 19.526, accuracy: 0.01)
+    }
+}
+
+// MARK: - Family identity
+
+/// The interception: `ModelConfig` has to resolve this family to its own
+/// architecture BEFORE the MoE topology rules, and discovery has to name it.
+/// Both are pure and run with no model.
+final class Inkling2IdentityTests: XCTestCase {
+
+    /// `ModelConfig` decodes from a FILE, so a test writes one.
+    private static func decode(_ json: String) -> ModelConfig? {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("inkling2-identity-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        guard (try? Data(json.utf8).write(to: url)) != nil else { return nil }
+        return ModelConfig.load(fromFilePath: url.path)
+    }
+
+    /// The published config, as `ModelConfig` decodes it. 128 experts over 24
+    /// layers would otherwise fall through to Standard MoE (or Qwen 3.8 Flash
+    /// Next at >= 512), which is the wrong forward pass.
+    func testThePublishedConfigResolvesToItsOwnArchitecture() throws {
+        let config = try XCTUnwrap(Self.decode(Inkling2PublishedConfigTests.publishedJSON))
+        XCTAssertTrue(config.isInkling2Model)
+        XCTAssertEqual(config.resolveArchitectureType(summary: nil), .inkling2Mini)
+        XCTAssertTrue(config.resolveArchitectureType(summary: nil).isInkling2)
+        XCTAssertFalse(config.resolveArchitectureType(summary: nil).isDeepSeekV41)
+    }
+
+    /// A nested text tower is enough: the reference nests `model_type` there.
+    func testTheNestedTextTowerIdentifiesTheFamily() throws {
+        let json = """
+        {"architectures": ["SomethingElse"], "model_type": "wrapper",
+         "text_config": {"model_type": "inkling2_loop_text", "hidden_size": 8,
+                         "num_hidden_layers": 1, "num_attention_heads": 1,
+                         "num_key_value_heads": 1, "vocab_size": 8}}
+        """
+        let config = try XCTUnwrap(Self.decode(json))
+        XCTAssertTrue(config.isInkling2Model)
+        XCTAssertEqual(config.resolveArchitectureType(summary: nil), .inkling2Mini)
+    }
+
+    /// The architecture class alone identifies it, with no `model_type`.
+    func testTheArchitectureClassIdentifiesTheFamily() {
+        XCTAssertTrue(ModelConfig.isInkling2Identity(
+            modelType: nil, textModelType: nil,
+            architectures: ["Inkling2LoopForConditionalGeneration"]
+        ))
+        XCTAssertFalse(ModelConfig.isInkling2Identity(
+            modelType: "llama", textModelType: nil, architectures: ["LlamaForCausalLM"]
+        ))
+        XCTAssertFalse(ModelConfig.isInkling2Identity(
+            modelType: "inkling_other", textModelType: nil, architectures: nil
+        ), "a family name has to be the Inkling 2 prefix, not merely Inkling")
+    }
+
+    /// The runtime is honestly unavailable until Phase 2 lands a turn, and the
+    /// discovery label says so.
+    func testAvailabilityIsHonestUntilATurnRuns() {
+        XCTAssertFalse(Inkling2Availability.isRuntimeAvailable)
+        XCTAssertFalse(Inkling2Conformance.unverifiedSummary.isEmpty)
+        // The gates that ARE pinned by this phase, against the reference.
+        XCTAssertTrue(Inkling2Conformance.promptText.isVerified)
+        XCTAssertTrue(Inkling2Conformance.router.isVerified)
+        XCTAssertTrue(Inkling2Conformance.expertLayout.isVerified)
+        XCTAssertTrue(Inkling2Conformance.softcappedSwiGLU.isVerified)
+        XCTAssertTrue(Inkling2Conformance.loopSchedule.isVerified)
+    }
+
+    /// Discovery names the family from the checkpoint's own config and reads its
+    /// two expert layouts out of `hf_quant_config.json`, so the model row is not
+    /// labelled a plain "Mixture of Experts" in "MODELOPT".
+    func testDiscoveryNamesTheFamilyAndItsQuantization() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("inkling2-discovery-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        try Data(Inkling2PublishedConfigTests.publishedJSON.utf8)
+            .write(to: dir.appendingPathComponent("config.json"))
+        try Data("{}".utf8).write(to: dir.appendingPathComponent("tokenizer.json"))
+        try Data().write(to: dir.appendingPathComponent("model.safetensors"))
+        let quant = """
+        {"model": {"parameter_groups": [
+          {"compute_dtype": "bfloat16", "output_dtype": "bfloat16", "tensors": ["a"]},
+          {"compute_dtype": "nvfp4", "output_dtype": "uint8", "tensors": ["b"]},
+          {"compute_dtype": "mxfp8", "output_dtype": "float8_e4m3fn", "tensors": ["c"]}
+        ]}}
+        """
+        try Data(quant.utf8).write(to: dir.appendingPathComponent("hf_quant_config.json"))
+
+        let model = try XCTUnwrap(
+            LocalModelManager.shared.inspectModelDirectory(
+                dirUrl: dir, customRepoId: "thinkingmachines/Inkling-2-Mini"
+            ),
+            "a directory with config + weights must be discovered"
+        )
+        XCTAssertEqual(model.architectureName, "Inkling 2 Mini (Loop / RelPos MoE, runtime not available)")
+        XCTAssertEqual(model.quantization, "BF16 + MXFP8 / NVFP4 experts")
+        XCTAssertTrue(model.isMoE)
+        XCTAssertEqual(model.expertCount, 128)
+        XCTAssertEqual(model.rawModelType, "inkling2_loop")
+        XCTAssertTrue(model.supportsThinking)
+    }
+}
+
+// MARK: - Packed expert arithmetic
+
+final class Inkling2PackedExpertTests: XCTestCase {
+
+    /// A two-row NVFP4 matrix, hand-built: row 0 is `[1.0, -2.0, 3.0, 0.0]` at
+    /// one E4M3 scale of 1.0, row 1 is all zeros at a scale of 0.5.
+    func nvfp4Matrix() -> Inkling2PackedExpertMatrix {
+        let row0 = [Inkling2Element.packE2M1Pair(low: 1.0, high: -2.0),
+                    Inkling2Element.packE2M1Pair(low: 3.0, high: 0.0)]
+        let row1 = [UInt8](repeating: 0, count: 2)
+        return Inkling2PackedExpertMatrix(
+            layout: .nvfp4,
+            weight: row0 + row1,
+            weightRowStride: 2,
+            scales: [Inkling2Element.encodeE4M3(1.0), Inkling2Element.encodeE4M3(0.5)],
+            scaleRowStride: 1,
+            rows: 2,
+            logicalColumns: 4,
+            expertAmax: 2688,
+            outerScaleDenominator: 2688
+        )
+    }
+
+    func testNVFP4ValuesDecodeWithScaleAndAmax() {
+        let matrix = nvfp4Matrix()
+        XCTAssertEqual(matrix.value(row: 0, column: 0), 1.0)
+        XCTAssertEqual(matrix.value(row: 0, column: 1), -2.0)
+        XCTAssertEqual(matrix.value(row: 0, column: 2), 3.0)
+        XCTAssertEqual(matrix.value(row: 0, column: 3), 0.0)
+        XCTAssertEqual(matrix.value(row: 1, column: 0), 0.0)
+        // Out of range reads are zero rather than a trap or a wrapped index.
+        XCTAssertEqual(matrix.value(row: 2, column: 0), 0)
+        XCTAssertEqual(matrix.value(row: 0, column: 4), 0)
+    }
+
+    /// The amax/denominator pair multiplies in: with amax half the denominator,
+    /// every value halves.
+    func testTheAmaxDenominatorPairScalesTheBank() {
+        var matrix = nvfp4Matrix()
+        matrix = Inkling2PackedExpertMatrix(
+            layout: matrix.layout, weight: matrix.weight, weightRowStride: matrix.weightRowStride,
+            scales: matrix.scales, scaleRowStride: matrix.scaleRowStride,
+            rows: matrix.rows, logicalColumns: matrix.logicalColumns,
+            expertAmax: 1344, outerScaleDenominator: 2688
+        )
+        XCTAssertEqual(matrix.value(row: 0, column: 0), 0.5)
+        XCTAssertEqual(matrix.value(row: 0, column: 1), -1.0)
+    }
+
+    func testMXFP8ValuesDecodeWithTheirE8M0Scale() {
+        let matrix = Inkling2PackedExpertMatrix(
+            layout: .mxfp8,
+            weight: [Inkling2Element.encodeE4M3(1.5), Inkling2Element.encodeE4M3(-0.25)],
+            weightRowStride: 2,
+            scales: [Inkling2Element.encodeE8M0(4)],
+            scaleRowStride: 1,
+            rows: 1,
+            logicalColumns: 2
+        )
+        XCTAssertEqual(matrix.value(row: 0, column: 0), 6.0)
+        XCTAssertEqual(matrix.value(row: 0, column: 1), -1.0)
+    }
+
+    /// The HF-reference profile rounds each dequantized weight to BF16 before
+    /// projecting, which is what Transformers' dense fallback does.
+    func testTheReferenceProfileProjectsInBf16() {
+        let matrix = nvfp4Matrix()
+        let row = matrix.bf16Row(0)
+        XCTAssertEqual(row, [1.0, -2.0, 3.0, 0.0])
+        XCTAssertEqual(matrix.project(row: 0, input: [1, 1, 1, 1]), 2.0)
+        XCTAssertEqual(matrix.project(row: 0, input: [0.5, 0, 0, 0]), 0.5)
+        // A short input is read as far as it goes, never past its end.
+        XCTAssertEqual(matrix.project(row: 0, input: [1]), 1.0)
+    }
+
+    func testBF16RoundingUsesSevenExplicitMantissaBits() {
+        // BF16 is one sign, eight exponent and seven mantissa bits, so the ulp
+        // at 1.0 is 2^-7.
+        XCTAssertEqual(Inkling2Element.roundToBF16(1 + 1.0 / 128.0), 1 + 1.0 / 128.0)
+        // 1 + 2^-8 is exactly halfway -> ties to even -> 1.0.
+        XCTAssertEqual(Inkling2Element.roundToBF16(1 + 1.0 / 256.0), 1.0)
+        // 1 + 3 * 2^-8 is halfway between one and two ulps -> ties to even -> two.
+        XCTAssertEqual(Inkling2Element.roundToBF16(1 + 3.0 / 256.0), 1 + 2.0 / 128.0)
+        // Past the midpoint it rounds up.
+        XCTAssertEqual(Inkling2Element.roundToBF16(1 + 1.6 / 256.0), 1 + 1.0 / 128.0)
+        XCTAssertEqual(Inkling2Element.roundToBF16(-2.0), -2.0)
+    }
+
+    /// The fused bank's gate and up are interleaved by PARITY, never two halves.
+    func testGateAndUpAreEvenAndOddRows() {
+        let matrix = nvfp4Matrix()
+        XCTAssertEqual(matrix.gateUpRow(0).gate, 0)
+        XCTAssertEqual(matrix.gateUpRow(0).up, 1)
+        XCTAssertEqual(matrix.gateUpRow(5).gate, 10)
+        XCTAssertEqual(matrix.gateUpRow(5).up, 11)
+    }
+}

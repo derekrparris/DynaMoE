@@ -303,6 +303,14 @@ Keep integration adapters thin. Reuse `CompletionTurnRequest`, `TurnImage`, `Tur
 - A missing companion, truncated shard, unknown tensor, unsupported quant declaration, or half tower is refused by name.
 - No generic `runTokenForward`, generic prefill, or JetSpec path can execute this family.
 
+**Recorded 2026-11-21: DONE (partly deferred to the phases that own it).**
+
+Landed under `DynaMoE/DynaMoE/Inkling2/`: `Inkling2Config` (strict nested decode, unknown-key refusal, visit plan, vision/MTP specs), `Inkling2Weights` (exhaustive exact-match catalog over all 1,244 main + 54 sidecar tensors, coalescing the Rust summary's per-expert split of fused banks, expert-layout inference from stored strides, query unpacking), `Inkling2MemoryPlan` (+ `Inkling2Preflight`), `Inkling2Prompt` (text path), `Inkling2Primitives` (element formats, both activation quantizers, layer rules) and `Inkling2Conformance` (gate ledger). Identity is in `ModelConfig` (`isInkling2Model` checked before DeepSeek) and `LocalModelManager`; `CompletionEngine.launchTurn` refuses the family by name before generic setup, so no generic decode/prefill/JetSpec path can run it.
+
+Evidence: `Inkling2LogicTests` (72 cases) green, including 4 opt-in cases over the real snapshot: every tensor classified, no duplicates, the full validate() clean, NVFP4 on layers 0...19 / MXFP8 on 20...23 by stored stride, the packed queries (23 one-or-three-row attention reads, 24 MLP reads, two 24-row cross-pass tensors), dense 3.86 GB / experts 15.67 GB / tower 0.637 GB from the real headers. The identity/discovery and packed-expert suites are the rest. `cargo test` 22 green. Numeric goldens come from an independent numpy/jinja2 mirror, not from the Swift.
+
+Deviations: `mtp.safetensors` is not in the main index, so the summary never sees it; the sidecar is read by its own header in the test and will be opened by name in Phase 8. `temporal_patch_size` is 2 in the published config for still images, so it is not refused (only < 1 is). The published 40 GB-class vision numbers are validated as geometry, not executed, until Phase 5. Reasoning effort accepts the template's named map and numeric 0.0...0.99; the app's two-level UI mapping is Phase 4.
+
 ### Phase 2: Correct native text vertical slice
 
 **Work**

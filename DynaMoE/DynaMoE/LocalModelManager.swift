@@ -355,7 +355,16 @@ public class LocalModelManager: ObservableObject {
                 hiddenSize: json["hidden_size"] as? Int,
                 layerCount: json["num_hidden_layers"] as? Int
             )
-            if textType.localizedCaseInsensitiveContains("deepseek_v41") || archLower.contains("deepseekv41") || (rawModelType?.localizedCaseInsensitiveContains("deepseek_v41") ?? false) {
+            let isInkling2 = ModelConfig.isInkling2Identity(
+                modelType: rawModelType,
+                textModelType: textType,
+                architectures: archs
+            )
+            if isInkling2 {
+                architectureName = Inkling2Availability.isRuntimeAvailable
+                    ? "Inkling 2 Mini (Loop / RelPos MoE)"
+                    : "Inkling 2 Mini (Loop / RelPos MoE, runtime not available)"
+            } else if textType.localizedCaseInsensitiveContains("deepseek_v41") || archLower.contains("deepseekv41") || (rawModelType?.localizedCaseInsensitiveContains("deepseek_v41") ?? false) {
                 architectureName = DeepSeekV41Availability.isRuntimeAvailable
                     ? "DeepSeek V4.1 Flash (CED / CSA2 MoE)"
                     : "DeepSeek V4.1 Flash (CED / CSA2 MoE, runtime not available)"
@@ -402,6 +411,38 @@ public class LocalModelManager: ObservableObject {
                 || (rawModelType?.localizedCaseInsensitiveContains("deepseek_v41") ?? false)),
                let quant = quantization, quant.contains("FP8") {
                 quantization = "FP8 + MXFP4 experts"
+            }
+            // Inkling 2 names its own recipe in `hf_quant_config.json` rather
+            // than `quantization_config`, and the two expert layouts (NVFP4 on
+            // layers 0...19, MXFP8 on 20...23) are both real. Read the file's
+            // parameter groups so the label says what is stored instead of
+            // echoing "MODELOPT".
+            if isInkling2 {
+                var layouts: [String] = []
+                var dense: String?
+                let quantUrl = dirUrl.appendingPathComponent("hf_quant_config.json")
+                if let data = try? Data(contentsOf: quantUrl),
+                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let model = object["model"] as? [String: Any],
+                   let groups = model["parameter_groups"] as? [[String: Any]] {
+                    for group in groups {
+                        let compute = (group["compute_dtype"] as? String) ?? ""
+                        let output = (group["output_dtype"] as? String) ?? ""
+                        switch compute.lowercased() {
+                        case "nvfp4": layouts.append("NVFP4")
+                        case "mxfp8": layouts.append("MXFP8")
+                        case "bfloat16" where output.lowercased() == "bfloat16":
+                            dense = dense ?? "BF16"
+                        default: break
+                        }
+                    }
+                }
+                if !layouts.isEmpty {
+                    let unique = Array(Set(layouts)).sorted()
+                    quantization = (dense ?? "BF16") + " + " + unique.joined(separator: " / ") + " experts"
+                } else if quantization == nil, let dtype = json["dtype"] as? String ?? json["torch_dtype"] as? String {
+                    quantization = Self.dtypeLabel(dtype)
+                }
             }
         }
 

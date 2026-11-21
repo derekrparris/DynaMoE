@@ -584,6 +584,22 @@ public final class CompletionEngine: @unchecked Sendable {
                     + "\(request.images.count == 1 ? "it" : "them")."
             )
         }
+        // Inkling 2 is detected natively but its 48-visit loop, relative-position
+        // attention, block attention residuals and cross-pass message gates are
+        // served by a dedicated runtime (see `Inkling2/`). Refuse here rather
+        // than letting the generic decode loop run over tensors it cannot bind:
+        // that path would emit plausible text from the wrong graph. Phase 1
+        // lands the identity, catalog, memory plan and prompt; the turn engine
+        // arrives in Phase 2, so this is the one entry point that must never
+        // fall through in the meantime.
+        if let config = modelConfig, config.isInkling2Model {
+            stateLock.unlock()
+            throw CompletionLaunchError.engineNotReady(
+                "⚠️ Inkling 2 Mini is recognized, but its turn engine is not wired yet: this build has "
+                    + "its config, tensor catalog, memory plan and prompt renderer only. The generic "
+                    + "decode path cannot run this architecture."
+            )
+        }
         // DeepSeek V4.1 is detected natively but its forward pass is served by a
         // dedicated runtime (latent CSA2 attention, mHC residual streams, Engram
         // memory, MXFP4 experts). Refuse here rather than letting the generic

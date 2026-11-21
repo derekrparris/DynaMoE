@@ -18,6 +18,11 @@ public enum ModelArchitectureType: String, CaseIterable, Identifiable, Codable {
     /// n-gram Engram memory on two layers and a DSpark draft head. Its forward
     /// pass has its own runtime; see `DeepSeekV41/`.
     case deepSeekV41Flash = "CED + CSA2 MoE (DeepSeek V4.1 Flash)"
+    /// Inkling 2 Mini: a 24-layer decoder executed as a fixed 48-visit loop,
+    /// with relative-position attention (no RoPE), four short-convolution
+    /// states per visit, block attention residuals and cross-pass message
+    /// gates. Its forward pass has its own runtime; see `Inkling2/`.
+    case inkling2Mini = "Loop + RelPos MoE (Inkling 2 Mini)"
 
     public var id: String { rawValue }
 
@@ -29,6 +34,7 @@ public enum ModelArchitectureType: String, CaseIterable, Identifiable, Codable {
         case .standardMoe: return "Standard MoE"
         case .denseTransformer: return "Dense Transformer"
         case .deepSeekV41Flash: return "DeepSeek V4.1 Flash"
+        case .inkling2Mini: return "Inkling 2 Mini"
         }
     }
 
@@ -40,6 +46,7 @@ public enum ModelArchitectureType: String, CaseIterable, Identifiable, Codable {
         case .standardMoe: return "square.grid.3x3.fill"
         case .denseTransformer: return "cube.fill"
         case .deepSeekV41Flash: return "brain.head.profile"
+        case .inkling2Mini: return "arrow.trianglehead.2.clockwise.rotate.90"
         }
     }
 
@@ -55,6 +62,12 @@ public enum ModelArchitectureType: String, CaseIterable, Identifiable, Codable {
     /// dedicated engine in `DeepSeekV41/` rather than the generic decode loop.
     public var isDeepSeekV41: Bool {
         return self == .deepSeekV41Flash
+    }
+
+    /// True for the Inkling 2 family, whose forward pass is served by the
+    /// dedicated engine in `Inkling2/` rather than the generic decode loop.
+    public var isInkling2: Bool {
+        return self == .inkling2Mini
     }
 }
 
@@ -644,6 +657,34 @@ public struct ModelConfig: Codable {
             || archs.contains(where: { $0.contains("deepseekv41") })
     }
 
+    /// Inkling 2 Mini (`inkling2_loop`). Detected from the config's own
+    /// `model_type` or its architecture class, at the root or under
+    /// `text_config` -- the reference nests the text tower there.
+    public var isInkling2Model: Bool {
+        Self.isInkling2Identity(
+            modelType: modelType,
+            textModelType: textConfig?.modelType,
+            architectures: architectures
+        )
+    }
+
+    /// The name-based half of Inkling identity, shared by the decoded config,
+    /// the file-only probe and discovery so all three agree.
+    nonisolated public static func isInkling2Identity(
+        modelType: String?,
+        textModelType: String?,
+        architectures: [String]?
+    ) -> Bool {
+        let types = [modelType, textModelType].compactMap { $0?.lowercased() }
+        if types.contains(where: { $0.hasPrefix("inkling2") || $0.hasPrefix("inkling_2") }) {
+            return true
+        }
+        return (architectures ?? []).contains {
+            let lower = $0.lowercased()
+            return lower.contains("inkling2") || lower.contains("inkling_2")
+        }
+    }
+
     /// Nanbeige 4.3 (33B dense). The checkpoint declares
     /// `architectures: ["LlamaForCausalLM"]` and `model_type: "llama"`, so the
     /// name says nothing about the family and identity has to come from the
@@ -866,10 +907,15 @@ public struct ModelConfig: Codable {
         let rawType = (modelType ?? (textConfig != nil ? "qwen3_5_moe" : "")).lowercased()
         let archs = architectures?.map { $0.lowercased() } ?? []
 
-        // DeepSeek V4.1 is checked first: it must not fall through to the
-        // MoE topology rules below, which would classify 384 experts as
-        // Qwen 3.8 Flash Next (>= 512) or Standard MoE and run the wrong
-        // forward pass.
+        // The dedicated-runtime families are checked first: neither may fall
+        // through to the MoE topology rules below, which would classify their
+        // experts as Qwen 3.8 Flash Next or Standard MoE and run the wrong
+        // forward pass. Inkling is checked before DeepSeek because its
+        // `model_type` is unique while DeepSeek's rule also matches a nested
+        // text tower by substring.
+        if isInkling2Model {
+            return .inkling2Mini
+        }
         if isDeepSeekV41Model {
             return .deepSeekV41Flash
         }
@@ -1113,8 +1159,12 @@ public struct ModelConfig: Codable {
         let typeStr = (config?.modelType ?? "").lowercased()
         let archStr = config?.architectures?.joined(separator: " ").lowercased() ?? ""
 
-        // Structural first: this family is `llama`-typed, so a renamed copy has
-        // no name to match and only the checkpoint's own shape to go on.
+        // Structural first: these families are recognised from their own
+        // config rather than a name, so a renamed copy still answers.
+        if config?.isInkling2Model == true { return true }
+        if config == nil, Self.isInkling2Directory(URL(fileURLWithPath: modelPath ?? "")) { return true }
+        // Nanbeige's shape is `llama`-typed, so a renamed copy has no name to
+        // match and only the checkpoint's own geometry to go on.
         if config?.isNanbeige43Model == true { return true }
         if config == nil, Self.isNanbeige43Snapshot(modelPath) { return true }
 
@@ -1189,6 +1239,9 @@ public struct ModelConfig: Codable {
         let directory = URL(fileURLWithPath: path)
         let supported = (DeepSeekV41Availability.isRuntimeAvailable
                 && isDeepSeekV41Directory(directory))
+            || (Inkling2Availability.isRuntimeAvailable
+                && isInkling2Directory(directory)
+                && chatTemplateText(in: directory)?.contains("reasoning_effort") == true)
             || (isSparkDirectory(directory)
                 && chatTemplateText(in: directory)?.contains("reasoning_effort") == true)
         thinkingLevelsCache.setObject(NSNumber(value: supported), forKey: key)
@@ -1340,6 +1393,19 @@ public struct ModelConfig: Codable {
         let modelType = json["model_type"] as? String
         let architectures = json["architectures"] as? [String]
         return isSparkModel(modelType: modelType, architectures: architectures)
+    }
+
+    /// Whether the model directory holds an Inkling 2 checkpoint. Uses the same
+    /// identity probe as the full decode so discovery and load agree: the
+    /// checkpoint's `model_type` is `inkling2_loop`, at the root and on the
+    /// nested text tower.
+    nonisolated static func isInkling2Directory(_ directory: URL) -> Bool {
+        let configUrl = directory.appendingPathComponent("config.json")
+        guard let data = try? Data(contentsOf: configUrl),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return false
+        }
+        return Inkling2Config.identifies(json)
     }
 
     /// Whether the model directory holds a DeepSeek V4.1 checkpoint. Uses the
