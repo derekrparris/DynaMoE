@@ -1953,15 +1953,28 @@ final class Inkling2SyntheticForwardTests: XCTestCase {
         forward.onVisitComplete = { (_: Int, layer: Int, _: Int, output: [Float]) in
             callLog.append((layer, output))
         }
-        forward.onPostAttention = { (visit: Int, value: [Float]) in
-            // Keep the LAST position's visit 0, not the first position's: the
-            // comparison is against the golden's final-position capture.
-            if visit == 0 { if postAttention.isEmpty { postAttention.append(value) } else { postAttention[0] = value } }
+        // Every stage of every visit, written for the OFFLINE diff: one run each
+        // side, then comparisons are free instead of minutes.
+        var stageDump: [String: [Float]] = [:]
+        func record(_ visit: Int, _ stage: String, _ value: [Float]) {
+            stageDump["\(visit).\(stage)"] = value
         }
+        forward.onVisitSubStages = { (visit: Int, attention: [Float], mixture: [Float]) in
+            record(visit, "attnRaw", attention)
+            record(visit, "mlp", mixture)
+        }
+        var lastPositionInternals: [String: [Float]] = [:]
         var internals: [String: [Float]] = [:]
+        forward.onPostAttention = { (visit: Int, value: [Float]) in
+            record(visit, "postAttnConv", value)
+            // The final position's capture is the last write, which is what the
+            // reference dump holds.
+            if visit == 0 { postAttention = [value] }
+        }
         forward.onInternal = { (visit: Int, name: String, value: [Float]) in
-            // Both the first and the second visit: the divergence now starts at
-            // visit 7, which is the seventh visit's own index.
+            // ONE closure: a second assignment would overwrite the first, which
+            // is how a whole dump once came back empty.
+            lastPositionInternals["\(visit).\(name)"] = value
             if visit == 0 || visit == 7 || name.hasPrefix("message") || name.hasPrefix("previousHidden") {
                 internals["\(visit):\(name)"] = value
                 if visit == 0 { internals[name] = value }
@@ -1992,6 +2005,11 @@ final class Inkling2SyntheticForwardTests: XCTestCase {
         }
         let goldenVisits = try XCTUnwrap(golden["visits"] as? [[NSNumber]])
         let finalPositionCalls = Array(callLog.suffix(forward.plan.count))
+        for (index, call) in finalPositionCalls.enumerated() { record(index, "out", call.output) }
+        for (key, value) in lastPositionInternals { stageDump[key] = value }
+        if let data = try? JSONSerialization.data(withJSONObject: stageDump.mapValues { $0.map { Double($0) } }) {
+            try? data.write(to: URL(fileURLWithPath: "/tmp/inkling2_all_mine.json"))
+        }
         var visits: [[Float]] = []
         for layer in 0..<config.numHiddenLayers {
             visits.append(contentsOf: finalPositionCalls.filter { $0.layer == layer }.map(\.output))
@@ -2007,11 +2025,17 @@ final class Inkling2SyntheticForwardTests: XCTestCase {
             print("FIXTURE MINE \(name)", internals[name].map(short) ?? [])
         }
         print("FIXTURE REF message0", [0.70003, -0.03322, -0.08491, -0.54429])
-        for name in ["q_linear", "k_linear", "k_sconv", "k_norm", "v_norm", "rel_linear", "sink", "gate", "scores_head0", "weights_head0", "attn_raw"] {
+        for name in ["route_indices", "route_weights", "q_linear", "k_norm", "v_norm", "gate", "attn_raw", "postAttention", "mlp_input", "mixtureOut", "postMlpConv", "residual"] {
             if let value = internals[name] { print("FIXTURE MINE L0 \(name)", short(value)) }
             if let value = internals["7:\(name)"] { print("FIXTURE MINE L7 \(name)", short(value)) }
         }
         print("FIXTURE MINE postAttn", short(postAttention[0]))
+        let l7w13 = try source.expertMatrix(.expertW13, layer: 7, expert: 0)
+        print("FIXTURE L7 expert0 w13 row0[:4]", l7w13.bf16Row(0).prefix(4),
+              "scaleRow0[0]", l7w13.scales.prefix(2), "amax", l7w13.expertAmax, "den", l7w13.outerScaleDenominator)
+        let l0w13 = try source.expertMatrix(.expertW13, layer: 0, expert: 0)
+        print("FIXTURE L0 expert0 w13 row0[:4]", l0w13.bf16Row(0).prefix(4),
+              "scaleRow0[0]", l0w13.scales.prefix(2), "amax", l0w13.expertAmax, "den", l0w13.outerScaleDenominator)
         // Internal consistency: the captured operands of the final add must sum
         // to the captured visit output. If they do not, a capture is misaligned
         // and every comparison drawn from it is meaningless.
@@ -2025,6 +2049,22 @@ final class Inkling2SyntheticForwardTests: XCTestCase {
         // because a failing assert returns early.
         print("FIXTURE visits[0]     mine", short(visits[0]), " ref", shortJSON(goldenVisits[0]))
         print("FIXTURE postAttn[0]   mine", short(postAttention[0]), " ref", shortJSON(goldenAttention[0]))
+        // Where in the vector does visit 0 diverge? The output is one block per
+        // head, so a per-head error profile names the head instead of a number.
+        for target in [0, 1] where target < visits.count && target < goldenVisits.count {
+            let reference = goldenVisits[target].map { $0.floatValue }
+            let mine = visits[target]
+            let headDim = config.swaHeadDim
+            let heads = config.swaNumAttentionHeads
+            var profile: [(head: Int, error: Float)] = []
+            for head in 0..<heads {
+                let range = (head * headDim)..<min((head + 1) * headDim, min(mine.count, reference.count))
+                var worst: Float = 0
+                for index in range { worst = max(worst, abs(mine[index] - reference[index])) }
+                profile.append((head, worst))
+            }
+            print("FIXTURE visit\(target) per-head abs error", profile.map { "\($0.head):\(($0.error * 1e3).rounded() / 1e3)" }.joined(separator: " "))
+        }
         for index in 0..<min(visits.count, goldenVisits.count) {
             let error = rel(visits[index], goldenVisits[index])
             if error > 2e-2 {

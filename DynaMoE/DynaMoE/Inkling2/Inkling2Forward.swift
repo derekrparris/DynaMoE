@@ -186,7 +186,9 @@ nonisolated public final class Inkling2CPUForward {
                 layer: layer, pass: 0, hidden: hidden, blockStates: &blockStates,
                 messages: nil, position: position
             )
-            if layer % block == 0 { blockStates.append(hidden) }
+            // The loop appends the layer's OUTPUT at a boundary, after assigning it:
+            // the layer's own append was its INPUT, local to the MLP read.
+            if layer % block == 0 { blockStates.append(output) }
             hidden = output
         }
         let preLoopHidden = hidden
@@ -198,7 +200,7 @@ nonisolated public final class Inkling2CPUForward {
                 layer: layer, pass: 0, hidden: hidden, blockStates: &blockStates,
                 messages: nil, position: position
             )
-            if layer % block == 0 { blockStates.append(hidden) }
+            if layer % block == 0 { blockStates.append(output) }
             hidden = output
         }
 
@@ -221,7 +223,7 @@ nonisolated public final class Inkling2CPUForward {
                     layer: layer, pass: pass, hidden: hidden, blockStates: &blockStates,
                     messages: messages, position: position
                 )
-                if layer % block == 0 { blockStates.append(hidden) }
+                if layer % block == 0 { blockStates.append(output) }
                 hidden = output
             }
         }
@@ -231,7 +233,7 @@ nonisolated public final class Inkling2CPUForward {
                 layer: layer, pass: 0, hidden: hidden, blockStates: &blockStates,
                 messages: nil, position: position
             )
-            if layer % block == 0 { blockStates.append(hidden) }
+            if layer % block == 0 { blockStates.append(output) }
             hidden = output
         }
 
@@ -353,10 +355,17 @@ nonisolated public final class Inkling2CPUForward {
         onInternal?(visitIndex, "mlp_input", mlpHidden)
         let mixtureInput = Inkling2Math.rmsNorm(mlpHidden, gain: try weights.matrix(.mlpNorm, layer: layer), eps: config.rmsNormEps)
         var mixture = try mixture(hidden: mixtureInput, layer: layer)
+        onInternal?(visitIndex, "mixtureOut", mixture)
+
         onVisitSubStages?(visitIndex, attentionOutput, mixture)
         mixture = try shortConvolution(layer: layer, state: state, index: 3, values: mixture)
         onInternal?(visitIndex, "postMlpConv", mixture)
         onInternal?(visitIndex, "residual", residual)
+        if visitIndex == 7, positionForDebug == 3 {
+            print("L7@3 stack norms", mlpStack.map { $0.reduce(0) { $0 + $1 * $1 }.squareRoot() },
+                  "partial norm", residual.reduce(0) { $0 + $1 * $1 }.squareRoot(),
+                  "mlpInput norm", mlpHidden.reduce(0) { $0 + $1 * $1 }.squareRoot())
+        }
         let output = zip(residual, mixture).map(+)
         if visitIndex == 0 {
             onInternal?(visitIndex, "add_residual", Array(residual.prefix(4)))
@@ -785,6 +794,11 @@ nonisolated public final class Inkling2CPUForward {
                     gate: gate[index], up: up[index],
                     gateSoftcap: config.mlpGateSoftcap, upSoftcap: config.mlpUpSoftcap
                 )
+            }
+            if visitIndexForDebug == 7 && slot == 0 {
+                print("L7 mixtureInput norm", hidden.reduce(0) { $0 + $1 * $1 }.squareRoot(),
+                      "gate[:3]", gate.prefix(3), "up[:3]", up.prefix(3),
+                      "act[:3]", activated.prefix(3))
             }
             if slot == 0 {
                 onInternal?(visitIndexForDebug, "expert0_gate", Array(gate.prefix(4)))
