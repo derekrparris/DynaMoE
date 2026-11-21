@@ -52,16 +52,73 @@ final class PR104ReviewFindingsTests: XCTestCase {
     // MARK: - #5: the deadline and the work settling together
 
     /// Work that finishes on its own must be reported as finished even when
-    /// the timer is dequeued first — the tie the old code resolved as
-    /// `.timedOut`, failing work that had already completed.
-    func testWorkSettlingAtTheDeadlineIsReportedAsCompleted() async {
-        let raced = await HeadlessAgentLoop.firstResult(deadlineNanoseconds: 0) { 42 }
-        switch raced {
-        case .completed(let value):
-            XCTAssertEqual(value, 42)
-        case .timedOut:
-            XCTFail("work that returned must not be reported as timed out")
+    /// the deadline EXPIRED first and had already cancelled it -- the tie the
+    /// old code resolved as `.timedOut`, failing work that had already
+    /// completed.
+    ///
+    /// The race itself cannot be forced from outside: once the deadline arm
+    /// wins, `cancelAll()` makes the work observe the cancellation, so any
+    /// real race ends in `.timedOut` and a case built on one is a coin flip
+    /// (the original zero-deadline version reproduced its failure once in
+    /// 20,000). What decides the tie is the CLASSIFICATION, so that is what is
+    /// pinned here, and the end-to-end orderings are covered by the two cases
+    /// below.
+    func testWorkSettlingAtTheDeadlineIsReportedAsCompleted() {
+        // `RacedResult` is not Equatable (its payload is generic), so each
+        // expectation is spelled as a pattern.
+        func isCompleted(_ raced: HeadlessAgentLoop.RacedResult<Int>, _ expected: Int) -> Bool {
+            if case .completed(let value) = raced { return value == expected }
+            return false
         }
+        func isTimedOut(_ raced: HeadlessAgentLoop.RacedResult<Int>, _ expected: Int?) -> Bool {
+            if case .timedOut(let value) = raced { return value == expected }
+            return false
+        }
+        XCTAssertTrue(
+            isCompleted(
+                HeadlessAgentLoop.racedResult(expired: true, workSawCancellation: false, workValue: 42),
+                42
+            ),
+            "an answer that never observed the cancellation is a finished result"
+        )
+        XCTAssertTrue(
+            isTimedOut(
+                HeadlessAgentLoop.racedResult(expired: true, workSawCancellation: true, workValue: 42),
+                42
+            ),
+            "an answer the deadline interrupted is the deadline's casualty, and keeps its partial"
+        )
+        XCTAssertTrue(isCompleted(
+            HeadlessAgentLoop.racedResult(expired: false, workSawCancellation: false, workValue: 7),
+            7
+        ))
+        // A nil answer is an answer: `T` may be an Optional, and the race must
+        // not read "the value is nil" as "no value arrived".
+        let nilAnswer = HeadlessAgentLoop.racedResult(
+            expired: false,
+            workSawCancellation: false,
+            workValue: Optional<Int>.none
+        )
+        guard case .completed(let answered) = nilAnswer else {
+            return XCTFail("a nil answer must still be .completed")
+        }
+        XCTAssertNil(answered)
+        // `T` is `Int?` here, so the payload is a nil answer rather than an
+        // absent one: the race reports the timeout but still carries it.
+        let interruptedNil: HeadlessAgentLoop.RacedResult<Int?> = HeadlessAgentLoop.racedResult(
+            expired: true,
+            workSawCancellation: true,
+            workValue: Optional<Int>.none
+        )
+        guard case .timedOut(let carried) = interruptedNil else {
+            return XCTFail("the deadline interrupted it, so it is a timeout")
+        }
+        // `carried` is `Int??`: the point is that the inner answer ARRIVED and
+        // is nil, so the outer level must be `.some`, not `.none`.
+        guard let answer = carried else {
+            return XCTFail("the nil answer it produced must be kept, not dropped as an absent one")
+        }
+        XCTAssertNil(answer)
     }
 
     /// The other half, which the tie-break must not swallow: a deadline that
@@ -69,7 +126,10 @@ final class PR104ReviewFindingsTests: XCTestCase {
     /// the cancelled work returned.
     func testAnExpiredDeadlineIsStillATimeoutAndKeepsThePartial() async {
         let raced = await HeadlessAgentLoop.firstResult(deadlineNanoseconds: 20_000_000) {
-            try? await Task.sleep(nanoseconds: 30_000_000_000)
+            // Its own, shorter than the deadline's sleep: the work is the one
+            // producing "partial" AFTER the deadline expired, and it must not
+            // hold the suite for the deadline's full span.
+            try? await Task.sleep(nanoseconds: 60_000_000)
             return "partial"
         }
         switch raced {

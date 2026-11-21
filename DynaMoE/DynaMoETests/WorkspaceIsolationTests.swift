@@ -68,6 +68,40 @@ final class WorkspaceIsolationTests: XCTestCase {
 
     /// A tree that survives both removals must NOT lose its branch.
     ///
+    /// A run can write the shared repository config from its own worktree, so
+    /// a `filter.<n>.clean` command there is executed by the plain read-only
+    /// git calls this app makes -- code execution outside the sandbox with no
+    /// shell escape. The driver NAMES are the run's, so the neutralization has
+    /// to be read out of the config, not a fixed list.
+    func testEveryConfiguredFilterDriverIsNeutralized() {
+        let config = """
+        [filter "evil"]
+        \tclean = touch /tmp/PWNED; cat
+        [filter "lfs"]
+        \tprocess = git-lfs filter-process
+        \trequired = true
+        [core]
+        \tbare = false
+        """
+        XCTAssertEqual(
+            WorkspaceIsolation.neutralizedFilterOverrides(configText: config),
+            [
+                "-c", "filter.evil.clean=",
+                "-c", "filter.evil.smudge=",
+                "-c", "filter.evil.process=",
+                "-c", "filter.lfs.clean=",
+                "-c", "filter.lfs.smudge=",
+                "-c", "filter.lfs.process="
+            ],
+            "every configured driver is overridden, sorted, and no non-filter key is"
+        )
+        XCTAssertEqual(
+            WorkspaceIsolation.neutralizedFilterOverrides(configText: "[core]\n\tbare = false\n"),
+            [],
+            "a repository with no filter drivers needs no overrides"
+        )
+    }
+
     /// The branch is what `open` re-derives a worktree from; deleting it left a
     /// surviving tree that no apply could read, with its commits reachable only
     /// through the reflog. Cleanup also has to SAY the tree survived, because

@@ -1411,10 +1411,23 @@ nonisolated enum WorkspaceIsolation {
                 ["worktree", "remove", "--force", worktree.path.path],
                 in: worktree.repositoryRoot
             )
-            _ = try? await git(["worktree", "prune"], in: worktree.repositoryRoot)
         }
         if fileManager.fileExists(atPath: worktree.path.path), contained {
             try? fileManager.removeItem(at: worktree.path)
+        }
+        // The admin entry goes with a SECOND, now-scoped `worktree remove`, and
+        // only once the tree is gone: `worktree prune` used to run here and it
+        // is repository-wide, so it also dropped a sibling run's entry whose
+        // `.git` was broken while its files still held the only copy of that
+        // run's work (which `worktree repair` can restore, and cannot after a
+        // prune). `remove` refuses while the tree is still there, so this
+        // cannot touch anything but the entry for the path just deleted.
+        if contained && gitSafe && repositoryOwnsWorktree,
+           !fileManager.fileExists(atPath: worktree.path.path) {
+            _ = try? await git(
+                ["worktree", "remove", "--force", worktree.path.path],
+                in: worktree.repositoryRoot
+            )
         }
         // The branch is deleted only once the TREE is actually gone. A tree
         // that survived both removals (an immutable file, a corrupt admin
@@ -1787,11 +1800,18 @@ nonisolated enum WorkspaceIsolation {
                     removedTree = await cleanup(worktree, root: root)
                 } else if contained {
                     _ = try? await git(["worktree", "remove", "--force", path.path], in: repositoryRoot)
-                    _ = try? await git(["worktree", "prune"], in: repositoryRoot)
                     // A detached HEAD is still a real checkout with the run's
                     // work in it, so the containment check above is what makes
                     // this removal safe to attempt at all.
                     try? fileManager.removeItem(at: path)
+                    // No `worktree prune` here: it is repository-wide, so it
+                    // would also drop a sibling run's admin entry whose `.git`
+                    // is broken while its files still hold that run's only copy
+                    // of the work (repairable before a prune, not after). The
+                    // second `remove` is scoped to this path and clears the
+                    // entry once the tree is gone, which is all the prune did
+                    // for it.
+                    _ = try? await git(["worktree", "remove", "--force", path.path], in: repositoryRoot)
                     removedTree = !fileManager.fileExists(atPath: path.path)
                 } else {
                     // Outside the root: leave it, and say so once per sweep —
@@ -1878,6 +1898,85 @@ nonisolated enum WorkspaceIsolation {
         return out.split(separator: "\0", omittingEmptySubsequences: true).count
     }
 
+    /// `-c filter.<name>.<kind>=` for every filter driver `configText` (the
+    /// repository's config files, one per line as git writes them) defines, so an attribute from a
+    /// source that cannot be overridden (`$GIT_DIR/info/attributes`) still
+    /// assigns no COMMAND. Pure, so it is testable without a repository.
+    ///
+    /// The names come from the config rather than a fixed list because whoever
+    /// wrote the config chose them -- in this threat model, a run.
+    /// Every config file git would read for `directory`, as one text blob.
+    ///
+    /// Read synchronously as plain text on purpose: this runs inside an async
+    /// function on the very path being hardened, so spawning a `git config`
+    /// child to ask would be another await (and another execution) there. In a
+    /// linked worktree `.git` is a FILE pointing at the per-worktree admin
+    /// dir, whose `commondir` names the main repository's shared config --
+    /// where a run's `filter.<n>` write actually lands. A missing or
+    /// unreadable file contributes nothing.
+    static func repositoryConfigText(in directory: URL) -> String {
+        func read(_ url: URL) -> String {
+            (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        }
+        let dotGit = directory.appendingPathComponent(".git")
+        var text = read(dotGit.appendingPathComponent("config")) + "\n"
+        let pointer = read(dotGit)
+        guard pointer.hasPrefix("gitdir:") else { return text }
+        let adminPath = pointer
+            .dropFirst("gitdir:".count)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let admin = adminPath.hasPrefix("/")
+            ? URL(fileURLWithPath: adminPath)
+            : dotGit.deletingLastPathComponent().appendingPathComponent(adminPath)
+        text += read(admin.appendingPathComponent("config")) + "\n"
+        let commonPath = read(admin.appendingPathComponent("commondir"))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !commonPath.isEmpty {
+            let common = commonPath.hasPrefix("/")
+                ? URL(fileURLWithPath: commonPath)
+                : admin.appendingPathComponent(commonPath)
+            text += read(common.appendingPathComponent("config")) + "\n"
+        }
+        return text
+    }
+
+    static func neutralizedFilterOverrides(configText: String) -> [String] {
+        // The text is INI as git writes it, `[filter "evil"]` then indented
+        // `clean = …` lines, so the section header carries the driver's name
+        // (which may itself contain dots) and the keys below it are its kinds.
+        var drivers: Set<String> = []
+        var inFilterSection = false
+        for rawLine in configText.split(separator: "\n") {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty, !line.hasPrefix("#"), !line.hasPrefix(";") else { continue }
+            if line.hasPrefix("[") {
+                let header = line.dropFirst().prefix { $0 != "]" }
+                let parts = header.split(separator: " ", maxSplits: 1)
+                inFilterSection = parts.first?.lowercased() == "filter" && parts.count == 2
+                if inFilterSection {
+                    let driver = parts[1]
+                        .trimmingCharacters(in: .whitespaces)
+                        .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+                    if !driver.isEmpty { drivers.insert(driver) }
+                }
+                continue
+            }
+            // A key/value under no filter section (a flat `filter.x.y = …`
+            // form, which git also accepts) still names a driver.
+            let key = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)[0]
+                .trimmingCharacters(in: .whitespaces)
+            guard key.lowercased().hasPrefix("filter.") else { continue }
+            let parts = key.dropFirst("filter.".count).split(separator: ".")
+            guard let driver = parts.first, parts.count >= 2, !driver.isEmpty else { continue }
+            drivers.insert(String(driver))
+        }
+        return drivers.sorted().flatMap { driver in
+            ["clean", "smudge", "process"].flatMap { kind in
+                ["-c", "filter.\(driver).\(kind)="]
+            }
+        }
+    }
+
     private static func git(
         _ arguments: [String],
         in directory: URL
@@ -1894,28 +1993,45 @@ nonisolated enum WorkspaceIsolation {
         // hooks are then EXECUTED as commands by the plain read-only git calls
         // this file makes in the operator's tree (status, diff, add), which is
         // code execution outside the sandbox that needs no shell escape at all.
-        // `filter.<n>.clean` is the same class and cannot be enumerated away,
-        // so the destructive calls also avoid `git add` where they can.
+        //
+        // `filter.<n>.clean` / `.smudge` / `.process` are the same class, and
+        // they are not closable by enumerating the config: a filter is only a
+        // command once an ATTRIBUTE assigns it, so the attributes are what get
+        // neutralized. `--attr-source` points at the empty tree (the in-tree
+        // `.gitattributes` files are then not read) and `core.attributesFile`
+        // at /dev/null (the operator's global file). `$GIT_DIR/info/attributes`
+        // is read regardless, so every CONFIGURED driver is also overridden to
+        // an empty value below: git then sees a filter with no command and
+        // runs cat, which is what a diff of the worktree's own bytes wants.
         var environment = ControlledProcessRunner.toolEnvironment(
             scoped: AgentHarness.executingInRunScope
         )
         for key in environment.keys where key.hasPrefix("GIT_") {
             environment.removeValue(forKey: key)
         }
+        let configText = repositoryConfigText(in: directory)
+        var hardened: [String] = [
+            "-c", "diff.noprefix=false",
+            // The default prefix is what `diffDestination` parses, and a
+            // user's `diff.mnemonicPrefix=true` replaces it with letters
+            // keyed to the invocation (`c/`, `w/`, …). Pinning it keeps a
+            // personal gitconfig from making an apply look like a
+            // different patch.
+            "-c", "diff.mnemonicPrefix=false",
+            "-c", "core.fsmonitor=false",
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "core.untrackedCache=false",
+            "-c", "core.attributesFile=/dev/null"
+        ]
+        // Deliberately NOT `--attr-source=<empty tree>`, which would also
+        // stop the in-tree `.gitattributes` files from naming a filter: this
+        // git SEGFAULTS on `git apply --attr-source=…` (exit 139, checked
+        // against a plain one-line patch), and apply is half of what this
+        // helper runs. The driver override below covers the same vector
+        // without changing what git reads.
         var arguments = arguments
         arguments.insert(
-            contentsOf: [
-                "-c", "diff.noprefix=false",
-                // The default prefix is what `diffDestination` parses, and a
-                // user's `diff.mnemonicPrefix=true` replaces it with letters
-                // keyed to the invocation (`c/`, `w/`, …). Pinning it keeps a
-                // personal gitconfig from making an apply look like a
-                // different patch.
-                "-c", "diff.mnemonicPrefix=false",
-                "-c", "core.fsmonitor=false",
-                "-c", "core.hooksPath=/dev/null",
-                "-c", "core.untrackedCache=false",
-            ],
+            contentsOf: hardened + Self.neutralizedFilterOverrides(configText: configText),
             at: 0
         )
         return try await AgentHarness.runProcess(

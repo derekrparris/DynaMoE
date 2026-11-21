@@ -177,6 +177,57 @@ nonisolated final class InstanceCancellationBox: @unchecked Sendable {
     }
 }
 
+/// Coalesces streamed assistant deltas between the run's producer and the
+/// single main-actor pump that applies them.
+///
+/// The pump hops to the main actor per event, so one queued event per token let
+/// an unbounded stream buffer a whole run while the UI was busy. The backlog is
+/// the buffer instead: text is merged here under a lock, and ONE queued delta
+/// carries whatever accumulated by the time the pump drains it. `append` returns
+/// whether the caller should queue a wake-up event (true only when none is
+/// outstanding), so the queue holds at most one delta per channel at a time.
+nonisolated final class AssistantDeltaBacklog: @unchecked Sendable {
+    struct Delta {
+        var entryId: UUID
+        var text: String
+        var isThinking: Bool
+    }
+
+    private let lock = NSLock()
+    private var pending: [Delta] = []
+    private var isQueued = false
+
+    /// Merges a delta. Returns true when the caller must queue one event to
+    /// wake the pump; false when an event is already queued and will carry
+    /// this text too.
+    func append(entryId: UUID, text: String, isThinking: Bool) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        // Adjacent text of the same channel merges into one string; a channel
+        // switch starts a new entry so the pump applies them in order.
+        if let last = pending.last,
+           last.entryId == entryId,
+           last.isThinking == isThinking {
+            pending[pending.count - 1].text += text
+        } else {
+            pending.append(Delta(entryId: entryId, text: text, isThinking: isThinking))
+        }
+        guard !isQueued else { return false }
+        isQueued = true
+        return true
+    }
+
+    /// Everything merged so far, oldest first, and clears the queued flag.
+    func drain() -> [Delta] {
+        lock.lock()
+        defer { lock.unlock() }
+        let drained = pending
+        pending = []
+        isQueued = false
+        return drained
+    }
+}
+
 public final class SubagentInstance: Identifiable, ObservableObject {
     public let id: UUID
     public let role: String
@@ -828,6 +879,11 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         return executionUnwound
     }
 
+    /// `isExecutionUnwound` for a caller that already holds `lock`: it is a
+    /// plain `NSLock`, so re-entering it from `SubagentManager`'s own critical
+    /// sections would deadlock rather than answer.
+    var executionUnwoundUnderLock: Bool { executionUnwound }
+
     private func markExecutionUnwound() {
         lock.lock()
         executionUnwound = true
@@ -1114,9 +1170,28 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         // could read a completed run as still running. Finishing the stream and
         // awaiting the pump before the terminal bookkeeping keeps the order the
         // loop emitted them in.
+        //
+        // Assistant deltas are COALESCED before they are queued: the pump hops
+        // to the main actor per event and a fast backend emits one delta per
+        // token, so an unbounded stream buffered a whole run while the UI was
+        // busy. Non-delta events (status, tool, usage, report) are what the
+        // drawer's state is made of and are always queued in order; delta text
+        // is merged in a lock box and the one queued delta carries whatever
+        // accumulated, which shows the same live text as one event per token.
+        let deltaBacklog = AssistantDeltaBacklog()
         let (events, eventSink) = AsyncStream<AgentRunEvent>.makeStream()
         let eventPump = Task { @MainActor [weak self] in
             for await event in events {
+                if case .assistantDelta = event {
+                    for delta in deltaBacklog.drain() {
+                        self?.apply(.assistantDelta(
+                            entryId: delta.entryId,
+                            text: delta.text,
+                            isThinking: delta.isThinking
+                        ))
+                    }
+                    continue
+                }
                 self?.apply(event)
             }
         }
@@ -1124,7 +1199,15 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             input: input,
             backend: plan.backend,
             context: context,
-            emit: { eventSink.yield($0) }
+            emit: { event in
+                if case .assistantDelta(let entryId, let text, let isThinking) = event {
+                    if deltaBacklog.append(entryId: entryId, text: text, isThinking: isThinking) {
+                        eventSink.yield(event)
+                    }
+                    return
+                }
+                eventSink.yield(event)
+            }
         )
         eventSink.finish()
         await eventPump.value
@@ -2080,6 +2163,40 @@ final class SubagentToolExecutor {
             .flatMap { String(data: $0, encoding: .utf8) } ?? ""
         let call = ParsedToolCall(name: name, arguments: arguments, rawArguments: rawArgs, rawText: name)
 
+        // The same READ containment a run-scoped harness applies, applied here
+        // because this path runs on the SHARED harness, where `runScopeDecision`
+        // short-circuits on `!isRunScoped`. Nobody reviews these calls and no
+        // card can be raised for them, so an escape is refused rather than
+        // carded: the working directory is the whole workspace a canned
+        // pipeline was given, and a path outside it (or into `.git`, where
+        // credentials live) is not work. The task text that names it is
+        // model-written, so it is prompt-injectable.
+        // `shell_run`'s `cwd` is the same escape by another name: the command
+        // itself is arbitrary, so only its working directory can be checked
+        // here, and a `cwd` outside the workspace is refused outright.
+        let escapedRead: String? = {
+            if AgentHarness.pathReadToolNames.contains(name) {
+                return AgentHarness.readEscapeDestination(call, workspace: workingDirectory)
+            }
+            if name == "shell_run", let cwd = arguments["cwd"] as? String, !cwd.isEmpty {
+                if !AgentHarness.isPathInsideWorkspace(cwd, workspace: workingDirectory) {
+                    return AgentHarness.resolvePath(cwd, workingDirectory: workingDirectory).path
+                }
+            }
+            return nil
+        }()
+        if let escape = escapedRead {
+            let err = "Containment: '\(name)' would work outside this subagent's working directory (\(escape)) and was not executed. Only paths inside \(workingDirectory.path) are available to a subagent."
+            await owner.recordStep(
+                actionName: name,
+                arguments: strArgs,
+                output: err,
+                duration: 0,
+                isError: true
+            )
+            return (AgentHarness.toolErrorJSON(tool: name, error: err), err)
+        }
+
         let exec = await AgentHarness.shared.executeTool(
             call: call,
             workingDirectory: workingDirectory,
@@ -2855,6 +2972,12 @@ public final class SubagentManager: ObservableObject {
     public func clearCompleted(sessionId: UUID? = nil) {
         let terminal: [SubagentInstance]
         lock.lock()
+        // A terminal run can still be unwinding (its child process is
+        // exiting, its record not yet rewritten). Every other removal path
+        // skips or defers it, because an apply/discard that can no longer
+        // find the instance reads that as "unwound" and can land or delete a
+        // worktree out from under it. Read under this same hold rather than
+        // through `isExecutionUnwound`, which takes the lock this frame owns.
         terminal = subagentsOrder.filter {
             $0.status.isTerminal
                 // The same selection `deleteClearableRecords` makes below, so
@@ -2866,6 +2989,7 @@ public final class SubagentManager: ObservableObject {
                 // next reload put them back.
                 && ($0.parentSessionId == sessionId || $0.parentSessionId == nil)
                 && !$0.holdsUnappliedWorktreeWork
+                && $0.executionUnwoundUnderLock
         }
         let clearedIds = Set(terminal.map(\.id))
         let liveIds = Set(subagentsOrder.map(\.id))

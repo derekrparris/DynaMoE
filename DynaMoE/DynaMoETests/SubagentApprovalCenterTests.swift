@@ -184,7 +184,13 @@ final class SubagentApprovalCenterTests: XCTestCase {
         // preference this test must not depend on: every routine write is
         // bypassed when it is on, and this suite must not flip it.
         let card = request(tool: "file_write", containmentEscape: true)
+        // `request` opens the inspector drawer, and this suite shares the app
+        // process with the operator's real UI: put it back rather than leave a
+        // window where the next case (or the next suite) does not expect one.
+        let drawerWasOpen = SubagentManager.shared.isDrawerOpen
+        addTeardownBlock { @MainActor in SubagentManager.shared.isDrawerOpen = drawerWasOpen }
         let approved = await SubagentApprovalCenter.shared.request(card, timeout: 0.05)
+        XCTAssertTrue(SubagentManager.shared.isDrawerOpen, "a card must bring the drawer in front of the operator")
         XCTAssertFalse(approved, "an unanswered card is a refusal")
         XCTAssertFalse(
             SubagentApprovalCenter.shared.pending.contains { $0.request.runId == card.runId },
@@ -227,7 +233,14 @@ final class SubagentApprovalCenterTests: XCTestCase {
     /// A card past the cap must resolve REJECTED without ever being shown.
     func testRequestRefusesACardPastTheCap() async {
         let center = SubagentApprovalCenter.shared
-        XCTAssertTrue(center.pending.isEmpty, "the suite must start from an empty queue")
+        // Restored, like the timeout one above: every card here opens the drawer.
+        let drawerWasOpen = SubagentManager.shared.isDrawerOpen
+        addTeardownBlock { @MainActor in SubagentManager.shared.isDrawerOpen = drawerWasOpen }
+        // Not `XCTAssertTrue(center.pending.isEmpty)`: this suite shares the
+        // process with others that can leave a card or a poller behind, so a
+        // leftover would fail a case about the CAP for a reason about order.
+        // Fill from whatever is there and assert on the delta instead.
+        let baseline = center.pending.count
         let parked = (0..<SubagentApprovalCenter.maximumPendingCards).map { _ in
             request(tool: "file_write", containmentEscape: true)
         }
@@ -239,9 +252,10 @@ final class SubagentApprovalCenterTests: XCTestCase {
             for entry in center.pending { center.reject(entry.id) }
             for waiter in waiters { waiter.cancel() }
         }
+        // The queue is at the cap when ours are in it, whatever else was there.
         var filled = false
         for _ in 0..<1_000 {
-            if center.pending.count == SubagentApprovalCenter.maximumPendingCards {
+            if center.pending.count >= SubagentApprovalCenter.maximumPendingCards {
                 filled = true
                 break
             }
@@ -257,9 +271,18 @@ final class SubagentApprovalCenterTests: XCTestCase {
             "the refused card never reaches the operator's list"
         )
 
-        for entry in center.pending { center.reject(entry.id) }
+        // Only OUR cards are answered, and only OUR drain is asserted: another
+        // suite's leftover card is not this case's to resolve.
+        let parkedIds = Set(parked.map(\.runId))
+        for entry in center.pending where parkedIds.contains(entry.request.runId) {
+            center.reject(entry.id)
+        }
         for waiter in waiters { _ = await waiter.value }
-        XCTAssertTrue(center.pending.isEmpty, "the queue drains once every card is answered")
+        XCTAssertEqual(
+            center.pending.count,
+            baseline,
+            "the queue drains once every card is answered"
+        )
     }
 
     func testContainmentEscapeConfirmationPreservesFlagAndSplitsDetails() {

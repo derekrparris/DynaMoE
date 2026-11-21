@@ -37,18 +37,33 @@ final class SubagentRelayWaitTests: XCTestCase {
     /// that ignored cancellation kept that task alive for up to two minutes and
     /// then relayed a report into the stopped conversation.
     func testAStoppedWaitReturnsImmediately() async {
+        // The predicate always says "still active" and COUNTS its asks: with a
+        // timing-only assertion, a wait that returned early for any other
+        // reason (or never consulted the predicate at all) would pass.
+        let calls = Calls()
         let started = Date()
         let task = Task {
-            await SubagentRelayWait.wait(sessionId: UUID(), timeout: 60) { _ in true }
+            await SubagentRelayWait.wait(sessionId: UUID(), timeout: 60) { sessionId in
+                calls.note(sessionId)
+                return true
+            }
         }
+        // Long enough for at least one ask, short enough to stay well under
+        // the two-second bound asserted below.
         try? await Task.sleep(nanoseconds: 150_000_000)
         task.cancel()
         await task.value
+        let callsAtCancel = calls.value
 
         XCTAssertLessThan(
             Date().timeIntervalSince(started), 2,
             "cancellation must end the wait, not run it to the deadline"
         )
+        XCTAssertGreaterThanOrEqual(callsAtCancel, 1, "the wait must have been consulting the predicate")
+        // One more poll interval would have been due by now if the wait had
+        // ignored the cancellation and kept its 250 ms loop going.
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        XCTAssertEqual(calls.value, callsAtCancel, "no ask may happen after the wait was stopped")
     }
 
     /// The predicate is what decides the wait, so a timing-only assertion

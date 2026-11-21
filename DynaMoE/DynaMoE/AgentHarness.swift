@@ -2489,6 +2489,21 @@ public final class SpawnSubagentTool: AgentTool {
             return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: err), nil, err, false)
         }
         let contextSummary = arguments["context_summary"] as? String
+        // A budget key that was SENT but cannot be read is refused here rather
+        // than dropped: a run that silently loses its cost ceiling is unbounded
+        // while the coordinator and the operator both believe it is capped.
+        if let budgetObject = arguments["budget"] as? [String: Any] {
+            let unreadable = budgetObject
+                .filter { key, value in
+                    Self.budgetKeys.contains(key) && Self.budgetNumber(value) == nil
+                }
+                .keys
+                .sorted()
+            if !unreadable.isEmpty {
+                let err = "Error: budget field(s) \(unreadable.joined(separator: ", ")) could not be read as a number. Send them as numbers (or numeric strings) so the ceiling can be enforced."
+                return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: err), nil, err, false)
+            }
+        }
         let runInBackground = (arguments["run_in_background"] as? Bool) ?? false
         // The turn's mode, not the process-global one: another turn can move
         // `activeMode`, and a plan turn's child must inherit plan mode.
@@ -2541,12 +2556,16 @@ public final class SpawnSubagentTool: AgentTool {
             let runId = UUID()
             // Priced ONCE, from the same pin and measured rate the backend
             // will consult, so the refusal's number is the number the card
-            // shows and the number admission compares against.
+            // shows and the number admission compares against. The text is
+            // bounded first: `resolve` truncates to the same limits, so
+            // pricing the raw task made a 200 KB paste show its full size on
+            // the card while only 24 KB reached the model.
+            let priced = AgentSpawnResolver.boundedSpawnInputs(task: taskDesc, contextSummary: contextSummary)
             let localCostEstimate = LocalAgentBackend.costEstimate(
                 runSessionId: runId,
                 promptTokenEstimate: LocalAgentBackend.spawnPromptTokenEstimate(
-                    task: taskDesc,
-                    contextSummary: contextSummary
+                    task: priced.task,
+                    contextSummary: priced.contextSummary
                 )
             )
             let request = AgentSpawnRequest(
@@ -2885,18 +2904,36 @@ public final class SpawnSubagentTool: AgentTool {
         }
     }
 
+    /// The budget keys `spawn_subagent` reads.
+    static let budgetKeys: Set<String> = [
+        "max_steps", "max_completion_tokens", "max_wall_clock_seconds", "max_cost_usd"
+    ]
+
+    /// One budget value as a number, or nil when it cannot be read as one.
+    ///
+    /// A model writes JSON, and JSON has no integer type: `"max_cost_usd":
+    /// "5"` used to be dropped by an `as? Double` cast, so the spawn silently
+    /// ran with no ceiling of its own while the caller believed it had set
+    /// one. Numeric strings are read as numbers; anything else is nil, and the
+    /// spawn tool refuses a present-but-unreadable key by name.
+    static func budgetNumber(_ raw: Any?) -> NSNumber? {
+        if let value = raw as? NSNumber { return value }
+        if let text = raw as? String {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let value = Int(trimmed) { return NSNumber(value: value) }
+            if let value = Double(trimmed) { return NSNumber(value: value) }
+        }
+        return nil
+    }
+
     private static func budgetOverrides(from raw: Any?) -> AgentBudgetOverrides? {
         guard let object = raw as? [String: Any] else { return nil }
-        func int(_ key: String) -> Int? {
-            if let value = object[key] as? Int { return value }
-            if let value = object[key] as? NSNumber { return value.intValue }
-            return nil
-        }
-        func double(_ key: String) -> Double? {
-            if let value = object[key] as? Double { return value }
-            if let value = object[key] as? NSNumber { return value.doubleValue }
-            return nil
-        }
+        // Values go through `budgetNumber`: a model writes JSON, and JSON has
+        // no integer type, so `"max_steps": "40"` must read as 40 rather than
+        // vanish. A key that is present and still unreadable is refused by
+        // `spawn_subagent` before it gets here.
+        func int(_ key: String) -> Int? { Self.budgetNumber(object[key])?.intValue }
+        func double(_ key: String) -> Double? { Self.budgetNumber(object[key])?.doubleValue }
         let overrides = AgentBudgetOverrides(
             maxSteps: int("max_steps"),
             maxCompletionTokens: int("max_completion_tokens"),

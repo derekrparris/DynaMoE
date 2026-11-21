@@ -762,6 +762,16 @@ final class SubagentLoopTests: XCTestCase {
 
         XCTAssertEqual(firstNames, ["file_read"])
         XCTAssertEqual(secondNames, ["find_files", "grep_search"])
+        // A run that leaked its own registration into the shared registry
+        // would have ADDED these names, so the check is a set difference and
+        // not just "nothing changed": another suite in this shared process may
+        // already have loaded a tool, and that must not be this case's result.
+        let leaked = Set(firstNames + secondNames).subtracting(sharedBefore)
+            .filter { AgentHarness.shared.loadedTools[$0] != nil }
+        XCTAssertTrue(
+            leaked.isEmpty,
+            "a run's tools are its own; the shared registry gained \(leaked.sorted())"
+        )
         XCTAssertEqual(AgentHarness.shared.loadedTools.keys.sorted(), sharedBefore)
     }
 

@@ -245,8 +245,18 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 turn = try await Self.runTurn(backend, request, remainingSeconds: max(0, remaining))
             } catch let deadlineError as AgentLoopError {
                 usage.merge(usageLedger.drain())
-                status = .failed
-                failure = "The run exceeded its \(input.budget.maxWallClockSeconds)-second wall-clock budget."
+                // The deadline arm fires on CANCELLATION too: a Stop that lands
+                // as the budget expires unwinds the backend through the same
+                // error, and reporting it as a budget failure blames a number
+                // for a decision the operator made. Cancellation is the honest
+                // outcome (the tool path already says so).
+                if Task.isCancelled {
+                    status = .cancelled
+                    failure = "The run was cancelled."
+                } else {
+                    status = .failed
+                    failure = "The run exceeded its \(input.budget.maxWallClockSeconds)-second wall-clock budget."
+                }
                 // The deadline can win while the backend is mid-answer. Keep
                 // what it streamed: the transcript is authoritative once the
                 // run unwinds, so dropping it here erased text the operator
@@ -499,13 +509,14 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                     finishedRun = true
                     break
                 }
-                // What this step can actually call, from the same definitions
-                // the prompt advertised: a `tools_load` inside the loop arms a
-                // tool mid-run, and checking a snapshot taken at spawn refused
-                // it while the model had just been shown its schema. The static
-                // grant stays in the union so a tool plan mode deliberately
-                // withheld still reaches plan mode's own refusal, which says
-                // what to do instead of "not allowed".
+                // What this step can call, from the same definitions the
+                // prompt advertised, unioned with the static grant. The
+                // definitions cannot GROW inside a run (`tools_load` is
+                // forbidden in a run scope and mutates the shared harness
+                // anyway), so the union's live purpose is the other direction:
+                // a tool plan mode deliberately withheld from the advertised
+                // set is still in the grant, and reaches plan mode's own
+                // refusal, which says what to do instead of "not allowed".
                 let callableNames = Set(toolDefinitions.map(\.function.name))
                     .union(context.allowedTools)
                 if !callableNames.contains(call.name) {
@@ -1290,14 +1301,32 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             // One level of unwrap, which is right even when `T` is itself an
             // optional: a nil answer is `.some(nil)` here, not an absent one.
             guard let settledValue = workValue else { return .timedOut(nil) }
-            // A work result the deadline RACED but did not interrupt is a
-            // finished result: when the timer and the work settle in the same
-            // instant the timer can be dequeued first, and reporting that as
-            // timedOut failed work that had already completed. Only a result
-            // that observed the cancellation is the deadline's casualty.
-            if !expired || !workSawCancellation { return .completed(settledValue) }
-            return .timedOut(settledValue)
+            return Self.racedResult(
+                expired: expired,
+                workSawCancellation: workSawCancellation,
+                workValue: settledValue
+            )
         }
+    }
+
+    /// How one race settles, given what each arm observed.
+    ///
+    /// A work result the deadline RACED but did not interrupt is a finished
+    /// result: when the timer and the work settle in the same instant the
+    /// timer can be dequeued first, and reporting that as timedOut failed work
+    /// that had already completed. Only a result that observed the
+    /// cancellation is the deadline's casualty.
+    ///
+    /// Pure, and separate from the race, because the tie (expired, but the
+    /// work never saw the cancellation) cannot be forced from outside: a test
+    /// that races a real deadline and hopes for it is a coin flip.
+    static func racedResult<T: Sendable>(
+        expired: Bool,
+        workSawCancellation: Bool,
+        workValue: T
+    ) -> RacedResult<T> {
+        if !expired || !workSawCancellation { return .completed(workValue) }
+        return .timedOut(workValue)
     }
 
     /// One child's answer in the `firstResult` race. The deadline arm has to

@@ -1859,7 +1859,7 @@ struct ContentView: View {
                         return "about " + String(rounded) + " s"
                     },
                     isAgentToolsEnabled: isAgentToolsEnabledForActiveSession,
-                    isModelLoaded: (tokenizer != nil && summary != nil) || isAppleFoundationModelActive || isCloudModelActive,
+                    isModelLoaded: isModelLoadedForComposer,
                     isAppleFoundationModelActive: isAppleFoundationModelActive,
                     isCloudModelActive: isCloudModelActive,
                     onSendMessage: { prompt, images in

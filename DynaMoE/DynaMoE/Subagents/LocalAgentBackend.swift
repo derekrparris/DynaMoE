@@ -393,6 +393,18 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
                 Self.strippingToolCallBlocks(emittedThinking)
             )
         }
+        // Usage an attempt spent without returning a turn travels through the
+        // ledger: the run's usage is otherwise the operator's only spend figure,
+        // and a cancelled or failed step counted a step with zero tokens.
+        func billCompletion(_ generated: Int) {
+            guard generated > 0 else { return }
+            var delta = AgentUsage()
+            delta.completionTokens = generated
+            delta.latestCompletionTokens = generated
+            delta.costIsUnpriced = true
+            delta.costUnpricedReason = .noPriceRecorded
+            request.usageLedger?.add(delta)
+        }
         func cancellationError() -> AgentBackendError {
             let partial = partialText()
             if partial.text.isEmpty && partial.thinking.isEmpty {
@@ -422,6 +434,7 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
                 emittedThinking = frame.thinkingText
                 emittedText = frame.responseText
             case .failedTurn(let failure):
+                billCompletion(failure.tokensGenerated)
                 if failure.cancelled || Task.isCancelled {
                     await launch.handle.task.value
                     throw cancellationError()

@@ -384,7 +384,13 @@ actor AgentScheduler {
             // registered. Remember it instead of dropping it; `register`
             // applies it and `finish` forgets it if the run never comes back.
             pendingCancellations[runId] = reason
-            pendingCancellationOrder.append(runId)
+            // One order entry per remembered run: a second Stop for the same
+            // unregistered run used to append a duplicate, so eviction could
+            // drop the id's only pending entry while a duplicate remained,
+            // and the run then started after the operator stopped it.
+            if !pendingCancellationOrder.contains(runId) {
+                pendingCancellationOrder.append(runId)
+            }
             while pendingCancellationOrder.count > maximumPendingCancellations {
                 let oldest = pendingCancellationOrder.removeFirst()
                 pendingCancellations.removeValue(forKey: oldest)

@@ -206,6 +206,21 @@ enum AgentSpawnResolver {
         return String(text.prefix(keep)) + marker
     }
 
+    /// The task and context summary as the run will actually see them.
+    ///
+    /// Every consumer that prices or measures a spawn must go through this:
+    /// `resolve` truncates to these limits, so a card priced from the RAW
+    /// arguments showed a 200 KB paste's full size while the model got 24 KB.
+    nonisolated static func boundedSpawnInputs(
+        task: String,
+        contextSummary: String?
+    ) -> (task: String, contextSummary: String?) {
+        (
+            boundedSpawnText(task, limit: maxTaskDescriptionCharacters),
+            contextSummary.map { boundedSpawnText($0, limit: maxContextSummaryCharacters) }
+        )
+    }
+
     static func resolve(
         _ request: AgentSpawnRequest,
         runId: UUID,
@@ -214,10 +229,9 @@ enum AgentSpawnResolver {
     ) async throws -> AgentSpawnPlan {
         let rawTask = request.taskDescription.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !rawTask.isEmpty else { throw AgentSpawnError.emptyTask }
-        let task = Self.boundedSpawnText(rawTask, limit: Self.maxTaskDescriptionCharacters)
-        let contextSummary = request.contextSummary.map {
-            Self.boundedSpawnText($0, limit: Self.maxContextSummaryCharacters)
-        }
+        let bounded = Self.boundedSpawnInputs(task: rawTask, contextSummary: request.contextSummary)
+        let task = bounded.task
+        let contextSummary = bounded.contextSummary
 
         let preset = AgentRolePresetCatalog.preset(named: request.presetName, role: request.role)
         let definition = AgentRolePresetCatalog.definition(for: preset)

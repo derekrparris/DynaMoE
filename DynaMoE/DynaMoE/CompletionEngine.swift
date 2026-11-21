@@ -11898,7 +11898,14 @@ if layer.attnGateProjTensor != nil,
     }
 #endif
 
-    /// Suspends until no turn is active (model switch/load safety).
+    /// Waits (bounded) for no turn to be active, for model switch/load safety.
+    ///
+    /// The wait is capped at `unboundedIdleWaitSeconds` and returns even when
+    /// the engine is still busy, logging a warning: a leaked claim must not
+    /// wedge every later caller. A caller that has to KNOW the engine is free
+    /// before it touches shard buffers or the runtime must call
+    /// `awaitIdle(boundedBy:)` and check its result instead of relying on this
+    /// one.
     ///
     /// "Active" is `isActive`, not just the registered task. A turn is UNREGISTERED
     /// for the whole of its preparation — `launchTurn` builds the DeepSeek runtime,

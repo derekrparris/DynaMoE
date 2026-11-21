@@ -1189,8 +1189,13 @@ private struct SubagentRunDetailView: View {
                     .font(.system(size: 10.5))
                     .foregroundColor(.secondary)
             } else {
-                ForEach(entries) { entry in
-                    SubagentTimelineRow(entry: entry)
+                // Lazy, like the run list: a long run's transcript is thousands
+                // of entries, and an eager stack built every row the moment the
+                // run was selected.
+                LazyVStack(alignment: .leading, spacing: 6) {
+                    ForEach(entries) { entry in
+                        SubagentTimelineRow(entry: entry)
+                    }
                 }
             }
         }
