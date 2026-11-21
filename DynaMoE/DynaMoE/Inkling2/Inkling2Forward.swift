@@ -321,6 +321,11 @@ nonisolated public final class Inkling2CPUForward {
         // MLP input, and the persistent stack entry is the loop's own append
         // after the layer returns. Appending to the caller's stack here would
         // count every boundary layer twice.
+        // The residual the mixture is added back to is `block_residual +
+        // postAttention` on an ordinary layer, and the post-attention value
+        // ALONE at a block boundary (the boundary's block input is what gets
+        // stacked instead). The layer's own append is local to this MLP read:
+        // the persistent stack entry is the loop's, after the layer returns.
         var residual = postAttention
         var mlpStack = blockStates
         if layer % block == 0 {
@@ -339,6 +344,8 @@ nonisolated public final class Inkling2CPUForward {
         var mixture = try mixture(hidden: mixtureInput, layer: layer)
         onVisitSubStages?(visitIndex, attentionOutput, mixture)
         mixture = try shortConvolution(layer: layer, state: state, index: 3, values: mixture)
+        onInternal?(visitIndex, "postMlpConv", mixture)
+        onInternal?(visitIndex, "residual", residual)
         let output = zip(residual, mixture).map(+)
         onVisitComplete?(visitIndex, layer, pass, output)
         return (output, attentionQueries)
@@ -750,8 +757,15 @@ nonisolated public final class Inkling2CPUForward {
                 onInternal?(visitIndexForDebug, "expert0_act", Array(activated.prefix(4)))
                 onInternal?(visitIndexForDebug, "expert0_down", (0..<4).map { down.project(row: $0, input: activated) })
             }
+            var contribution = [Float](repeating: 0, count: config.hiddenSize)
             for row in 0..<config.hiddenSize {
-                accumulator[row] += down.project(row: row, input: activated) * weight
+                contribution[row] = down.project(row: row, input: activated) * weight
+            }
+            onInternal?(visitIndexForDebug, "slot\(slot)_expert", [Float(expert), weight])
+            onInternal?(visitIndexForDebug, "slot\(slot)_norm", [Float(contribution.reduce(0) { $0 + $1 * $1 }.squareRoot())])
+            onInternal?(visitIndexForDebug, "slot\(slot)_row0", Array(contribution.prefix(4)))
+            for row in 0..<config.hiddenSize {
+                accumulator[row] += contribution[row]
             }
         }
         return accumulator

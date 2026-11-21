@@ -330,6 +330,14 @@ Deviations: `mtp.safetensors` is not in the main index, so the summary never see
 - Cancellation stops at a position boundary, leaves internally consistent counts, and cannot wedge the turn slot.
 - Other model families’ pure-logic suites remain green.
 
+**Recorded 2026-11-21: IN PROGRESS. The host graph runs the real checkpoint and every stage it can be checked at matches the reference; the whole-model logit bound is not met yet, so the runtime is NOT wired into the turn engine and the family is still refused by name.**
+
+Landed (`Inkling2Forward`, `Inkling2KVCache`, `Inkling2SnapshotWeights`, `Inkling2Turn`, commit `3db63c8`): the 48-visit schedule as one host graph, per-visit KV and four convolution states with chronological rings, relative-bias/sink attention with no RoPE, block attention residuals, cross-pass message gates, the packed-expert HF-reference profile, a closure-driven turn loop with a `Inkling2PositionForward` protocol, and an opt-in golden harness (`Tools/inkling2_goldens.py` equivalent: a pinned-Transformers run with forward hooks dumping per-visit and per-stage last-position values).
+
+Cross-checked against the pinned reference on the published checkpoint (`thinkingmachines/Inkling-2-Mini`, revision `ed40e7da`), each to BF16 rounding (0.2-0.5%): every Q/K/V/R/O projection, the Q/K/V norms, the sink logits, the relative-position bias, the output gate, the attention output (correlation 0.99996), the router scores (0.12%), per-slot mixture contributions, and one expert's gate/up/down. That comparison settled two questions the plan could not: raw `w13` rows ARE interleaved (even = gate; the reference de-interleaves at conversion, so its `chunk(2)` applies to the converted tensor -- verified numerically against its loaded bank), and the reference LOADS THIS CHECKPOINT'S EXPERTS AS PLAIN BF16 (its log says "Unknown quantization type... we will skip the quantization"), i.e. it runs the W4A16/W8A16 dense-activation profile while DynaMoE's native path dequantizes NVFP4/MXFP8.
+
+Open: the per-visit outputs diverge from the reference from visit 0 onward (norm ratio ~10x at visit 0, then 2-4x), even though every layer-0 piece checked individually agrees -- so the remaining discrepancy is in how the pieces compose (residual-stack bookkeeping or a per-visit state detail), not in a projection or the expert arithmetic. The plan's `5e-4 + 5e-4*|ref|` bound cannot be asserted until that is resolved, and it will need a measured revision anyway because the reference's BF16 experts and the native packed path are different arithmetic by construction. Fast suites: 83 case green (config, catalog, memory, prompt, quant primitives, packed experts, identity/discovery, turn loop, and the real-checkpoint catalog); `cargo test` 22 green.
+
 ### Phase 3: Stateful prefill, prefix reuse, and text server integration
 
 **Work**
