@@ -1274,11 +1274,41 @@ nonisolated public struct Inkling2PackedExpertMatrix: Sendable, Equatable {
     }
 
     /// `y = W @ x` for one output row, in the HF-reference profile.
+    ///
+    /// The block scale is decoded once per `blockSize` columns rather than per
+    /// column: 32 consecutive values share one scale byte, and decoding it per
+    /// column was the inner loop of every expert projection.
     public func project(row: Int, input: [Float]) -> Float {
-        var total: Float = 0
+        guard row >= 0, row < rows else { return 0 }
         let count = min(input.count, logicalColumns)
-        for column in 0..<count {
-            total += Inkling2Element.roundToBF16(value(row: row, column: column)) * input[column]
+        var total: Float = 0
+        let outerScale = layout.requiresAmaxDenominator && outerScaleDenominator > 0
+            ? expertAmax / outerScaleDenominator
+            : 1
+        let weightBase = row * weightRowStride
+        let scaleBase = row * scaleRowStride
+        var column = 0
+        while column < count {
+            let block = column / layout.blockSize
+            let scale = block < scaleRowStride
+                ? Inkling2Element.decode(scales[scaleBase + block], as: layout.scaleFormat) * outerScale
+                : 0
+            let end = min(count, (block + 1) * layout.blockSize)
+            switch layout {
+            case .nvfp4:
+                while column < end {
+                    let byte = weight[weightBase + column / 2]
+                    let nibble = column % 2 == 0 ? byte & 0xF : byte >> 4
+                    total += Inkling2Element.roundToBF16(Inkling2Element.decodeE2M1(nibble) * scale) * input[column]
+                    column += 1
+                }
+            case .mxfp8:
+                while column < end {
+                    let value = Inkling2Element.decodeE4M3(weight[weightBase + column])
+                    total += Inkling2Element.roundToBF16(value * scale) * input[column]
+                    column += 1
+                }
+            }
         }
         return total
     }

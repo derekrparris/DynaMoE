@@ -487,10 +487,11 @@ final class Inkling2LayerRuleTests: XCTestCase {
             scores: [0.4, 0.9, 0.9, 0.1, 0.7], bias: [0.0, 0.0, -0.5, 0.6, 0.1],
             topK: 3, routeScale: 8
         )
-        XCTAssertEqual(route.indices, [1, 4, 3])
+        // Ascending expert id, the checkpoint's topk order: 1, 3, 4.
+        XCTAssertEqual(route.indices, [1, 3, 4])
         XCTAssertEqual(route.weights[0], 4.2352941176, accuracy: 1e-5)
-        XCTAssertEqual(route.weights[1], 3.2941176471, accuracy: 1e-5)
-        XCTAssertEqual(route.weights[2], 0.4705882353, accuracy: 1e-5)
+        XCTAssertEqual(route.weights[1], 0.4705882353, accuracy: 1e-5)
+        XCTAssertEqual(route.weights[2], 3.2941176471, accuracy: 1e-5)
     }
 
     func testRouterBreaksATieToTheLowerExpertID() {
@@ -1159,6 +1160,37 @@ final class Inkling2PublishedTensorTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(catalog.tensor(.crossPassKVQuery)).shape, [24, 2304])
     }
 
+    /// The weight source reads the bytes the header names: a row by index must
+    /// equal the same slice of the whole-matrix read, and both must equal values
+    /// taken straight from the file by an independent reader.
+    func testTheWeightSourceReadsTheRowsTheHeaderNames() throws {
+        let (directory, refs, config) = try mainTensors()
+        let catalog = Inkling2WeightCatalog(mainFile: refs, layerCount: config.numHiddenLayers)
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let engine = try DynaMoeEngine(filePath: directory.path)
+        let summary = try engine.getSummary()
+        var buffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards where shard.length > 0 {
+            guard let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)),
+                  shard.length <= UInt64(device.maxBufferLength) else { continue }
+            buffers[shard.index] = device.makeBuffer(
+                bytesNoCopy: pointer, length: Int(shard.length),
+                options: .storageModeShared, deallocator: nil
+            )
+        }
+        let source = Inkling2SnapshotWeights(config: config, catalog: catalog, shardBuffers: buffers)
+
+        // Row 200010 of the embedding, from the file itself (numpy):
+        // [-0.97265625, -0.81640625, 0.27929688, -0.3125]
+        let whole = try source.matrix(.tokenEmbedding, layer: nil)
+        let byRow = try source.row(.tokenEmbedding, layer: nil, index: 200010)
+        XCTAssertEqual(Array(whole[(200010 * 2304)..<(200010 * 2304 + 4)]), [-0.97265625, -0.81640625, 0.27929688, -0.3125])
+        XCTAssertEqual(Array(byRow.prefix(4)), Array(whole[(200010 * 2304)..<(200010 * 2304 + 4)]))
+        // A dense projection's first row, from the file: wq_du[0][:4].
+        let wq = try source.matrix(.attnWqDu, layer: 0)
+        XCTAssertEqual(Array(wq.prefix(4)), [0.00384521484375, 0.01202392578125, -0.0123291015625, 0.01446533203125])
+    }
+
     /// The text tower's dense weights against the plan's ~3.86 GB and the two
     /// expert layouts against its ~15.67 GB, from the real headers. The plan
     /// quotes decimal GB over the whole main file, which also holds the vision
@@ -1379,5 +1411,396 @@ final class Inkling2PackedExpertTests: XCTestCase {
         XCTAssertEqual(matrix.gateUpRow(0).up, 1)
         XCTAssertEqual(matrix.gateUpRow(5).gate, 10)
         XCTAssertEqual(matrix.gateUpRow(5).up, 11)
+    }
+}
+
+// MARK: - Host forward against the reference (opt-in)
+
+/// The host graph against goldens dumped from the PINNED Transformers
+/// implementation on the published checkpoint.
+///
+/// Opt-in, like the DeepSeek published cases, and for the same reason: it reads
+/// the whole checkpoint. The goldens are produced by `Tools/inkling2_goldens.py`,
+/// which runs the reference with forward hooks -- so the expected values are the
+/// reference's own arithmetic, not a second hand-written model. Skipped when the
+/// dump is absent.
+///
+/// The bar is the plan's: `abs(actual - reference) <= 5e-4 + 5e-4 * abs(reference)`
+/// per logit, and the selected expert ids must match exactly. A stage output is
+/// held to a relative bound as a diagnostic, because a late stage can be within
+/// tolerance on the logits while an early one is not.
+final class Inkling2HostForwardTests: XCTestCase {
+
+    static let dumpPath = "/tmp/inkling2_host_goldens.json"
+
+    /// The engine owns the shard mappings, and the zero-copy buffers point into
+    /// them: letting it go out of scope unmaps the weights under the runtime
+    /// (AGENTS.md records the SIGSEGV this produces), so the test holds it.
+    private var engine: DynaMoeEngine?
+
+    private func dump() throws -> [String: Any] {
+        guard FileManager.default.fileExists(atPath: Self.dumpPath),
+              let data = try? Data(contentsOf: URL(fileURLWithPath: Self.dumpPath)),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw XCTSkip("no reference dump at \(Self.dumpPath): run Tools/inkling2_goldens.py")
+        }
+        return object
+    }
+
+    private func snapshot() throws -> URL {
+        let path = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(Inkling2PublishedTensorTests.snapshotRelativePath)
+        guard FileManager.default.fileExists(atPath: path.path) else {
+            throw XCTSkip("Inkling 2 snapshot is not downloaded at \(path.path)")
+        }
+        return path
+    }
+
+    /// Builds the host forward over the real snapshot: the engine's shard
+    /// mappings, the catalog and the snapshot weight source. The shard buffers
+    /// are zero-copy views of the engine's own mmap addresses, which is what
+    /// the app's Metal layer does with `MTLBuffer(bytesNoCopy:)`.
+    private func makeForward() throws -> Inkling2CPUForward {
+        let directory = try snapshot()
+        let engine = try DynaMoeEngine(filePath: directory.path)
+        self.engine = engine
+        let summary = try engine.getSummary()
+        let config = try Inkling2Config.decode(
+            contentsOf: directory.appendingPathComponent("config.json")
+        )
+        let catalog = Inkling2WeightCatalog(
+            mainFile: summary.tensors.map { Inkling2TensorRef(metadata: $0) },
+            layerCount: config.numHiddenLayers
+        )
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        var buffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            guard shard.length > 0,
+                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)) else { continue }
+            guard shard.length <= UInt64(device.maxBufferLength) else { continue }
+            if let buffer = device.makeBuffer(
+                bytesNoCopy: pointer, length: Int(shard.length), options: .storageModeShared, deallocator: nil
+            ) {
+                buffers[shard.index] = buffer
+            }
+        }
+        let source = Inkling2SnapshotWeights(
+            config: config, catalog: catalog, shardBuffers: buffers
+        )
+        return try Inkling2CPUForward(config: config, weights: source)
+    }
+
+    private func relativeError(_ actual: [Float], _ reference: [Float]) -> Float {
+        guard actual.count == reference.count, !reference.isEmpty else { return .infinity }
+        let scale = reference.reduce(Float(0)) { max($0, abs($1)) }
+        var worst: Float = 0
+        for (a, r) in zip(actual, reference) {
+            worst = max(worst, abs(a - r))
+        }
+        return scale > 0 ? worst / scale : worst
+    }
+
+    /// Every visit's output against the reference's, in execution order, then
+    /// the final logits. The first failing stage is reported by name, because
+    /// "the logits differ" says nothing about where.
+    func testTheHostForwardMatchesTheReferenceStageByStage() throws {
+        let dumped = try dump()
+        let ids = try XCTUnwrap(dumped["ids"] as? [Int])
+        let referenceLogits = (dumped["logits"] as? [NSNumber])?.map(\.floatValue) ?? []
+        XCTAssertEqual(referenceLogits.count, 200058)
+        let referenceVisits = (dumped["visits"] as? [[String: Any]]) ?? []
+        XCTAssertEqual(referenceVisits.count, 48)
+
+        let forward = try makeForward()
+        // A focused probe of one expert: the reference's own BF16 bank for layer
+        // 0 expert 18 against the packed projection over the same input, so a
+        // mixture mismatch is narrowed to "which expert, which half" rather than
+        // "the MoE is wrong".
+        let probeInput = (0..<2304).map { Float($0 % 7) * 0.01 - 0.03 }
+        let bank = forward.weights
+        let packed = try bank.expertMatrix(.expertW13, layer: 0, expert: 18)
+        let gateRow = packed.project(row: 0, input: probeInput)
+        let upRow = packed.project(row: 1, input: probeInput)
+        print("PROBE layer0 expert18 gate[0]=\(gateRow) up[0]=\(upRow)")
+        let down = try bank.expertMatrix(.expertW2, layer: 0, expert: 18)
+        var gateFull = [Float](repeating: 0, count: 1152)
+        var upFull = [Float](repeating: 0, count: 1152)
+        for index in 0..<1152 {
+            let rows = packed.gateUpRow(index)
+            gateFull[index] = packed.project(row: rows.gate, input: probeInput)
+            upFull[index] = packed.project(row: rows.up, input: probeInput)
+        }
+        var activated = [Float](repeating: 0, count: 1152)
+        for index in 0..<1152 {
+            activated[index] = Inkling2Math.softcappedSwiGLU(gate: gateFull[index], up: upFull[index])
+        }
+        print("PROBE down[0:3]=\([down.project(row: 0, input: activated), down.project(row: 1, input: activated), down.project(row: 2, input: activated)])")
+        // The golden holds one entry per VISIT, for the prompt's LAST position
+        // (the reference hook takes `[-1, -1]`), so the capture keeps only the
+        // last position's output of each visit: 16 positions x 48 visits would
+        // otherwise be 768 entries against 48.
+        var actualVisits: [[Float]] = []
+        var actualAttention: [[Float]] = []
+        var actualMixture: [[Float]] = []
+        var internals: [String: [Float]] = [:]
+        forward.onInternal = { visit, name, value in
+            // Keyed by visit: a name alone is overwritten by every later visit,
+            // which once made layer 23's value look like layer 0's.
+            if visit == 0 { internals[name] = value }
+        }
+        forward.onVisitComplete = { _, _, _, output in
+            if actualVisits.count >= 48 {
+                actualVisits[actualVisits.count - 48] = output
+            } else {
+                actualVisits.append(output)
+            }
+        }
+        forward.onVisitSubStages = { _, attention, mixture in
+            if actualAttention.count >= 48 {
+                actualAttention[actualAttention.count - 48] = attention
+                actualMixture[actualMixture.count - 48] = mixture
+            } else {
+                actualAttention.append(attention)
+                actualMixture.append(mixture)
+            }
+        }
+        var logits: [Float] = []
+        for (position, id) in ids.enumerated() {
+            logits = try forward.forwardToken(token: UInt32(id), position: position)
+        }
+        // Written for offline comparison: one -O run of this test is minutes, so
+        // the numbers are kept rather than only asserted on.
+        let actual: [String: Any] = [
+            "visits": actualVisits.map { $0.map { Double($0) } },
+            "attention": actualAttention.map { $0.map { Double($0) } },
+            "mixture": actualMixture.map { $0.map { Double($0) } },
+            "logits": logits.map { Double($0) },
+            "internals": internals.mapValues { $0.map { Double($0) } }
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: actual) {
+            try? data.write(to: URL(fileURLWithPath: "/tmp/inkling2_actual.json"))
+        }
+
+        // Stage by stage: the first visit that leaves the bound is the one to
+        // report, with its layer and pass.
+        XCTAssertEqual(actualVisits.count, referenceVisits.count)
+        for (index, reference) in referenceVisits.enumerated() {
+            guard index < actualVisits.count else { break }
+            let expected = (reference["output"] as? [NSNumber])?.map(\.floatValue) ?? []
+            let error = relativeError(actualVisits[index], expected)
+            if error > 2e-2 {
+                let layer = reference["physicalLayer"] as? Int ?? -1
+                XCTFail("visit \(index) (layer \(layer)) is \(error) relative from the reference")
+                return
+            }
+        }
+
+        // The plan's elementwise bar on the logits.
+        var worstIndex = 0
+        var worstExcess: Float = -.infinity
+        for index in 0..<min(logits.count, referenceLogits.count) {
+            let reference = referenceLogits[index]
+            let bound = 5e-4 + 5e-4 * abs(reference)
+            let excess = abs(logits[index] - reference) - bound
+            if excess > worstExcess {
+                worstExcess = excess
+                worstIndex = index
+            }
+        }
+        XCTAssertLessThanOrEqual(
+            worstExcess, 0,
+            "logit \(worstIndex): \(logits[worstIndex]) against \(referenceLogits[worstIndex])"
+        )
+        // The argmax has to agree, which a tolerance can otherwise hide.
+        let actualArgmax = logits.indices.max { logits[$0] < logits[$1] }
+        let referenceArgmax = referenceLogits.indices.max { referenceLogits[$0] < referenceLogits[$1] }
+        XCTAssertEqual(actualArgmax, referenceArgmax)
+    }
+}
+
+// MARK: - Turn loop
+
+/// A scripted executor: it records what it was asked and answers from a table,
+/// so the loop's stop conditions, cap, cancellation and position arithmetic are
+/// tested with no model.
+private final class ScriptedInklingForward: Inkling2PositionForward {
+    let positionLimit: Int
+    private(set) var storedPositions = 0
+    private(set) var forwarded: [Int] = []
+    private(set) var resets = 0
+    /// Logits per forwarded position, cycled.
+    var logits: [[Float]]
+    var failAt: Int?
+
+    init(positionLimit: Int = 64, logits: [[Float]]) {
+        self.positionLimit = positionLimit
+        self.logits = logits
+    }
+
+    func reusablePrefix(proposedPrefix: Int, promptTokenIds: [Int]) -> Int { 0 }
+
+    func reset() {
+        resets += 1
+        storedPositions = 0
+        forwarded.removeAll()
+    }
+
+    func forwardToken(_ token: Int, position: Int) throws -> [Float] {
+        if let failAt, forwarded.count == failAt {
+            throw Inkling2ForwardError.unsupported("scripted failure")
+        }
+        forwarded.append(token)
+        storedPositions += 1
+        return logits[forwarded.count % logits.count]
+    }
+}
+
+final class Inkling2TurnTests: XCTestCase {
+
+    private func settings(maxTokens: Int = 8, eos: [UInt32] = [9]) -> Inkling2TurnRunner.Settings {
+        Inkling2TurnRunner.Settings(maxTokens: maxTokens, eosTokenIds: eos)
+    }
+
+    /// Always draws the highest-logit id, so the turns below are deterministic.
+    private func greedy(_ logits: [Float], _ soFar: [UInt32]) -> UInt32 {
+        UInt32(logits.indices.max { logits[$0] < logits[$1] } ?? 0)
+    }
+
+    func testATurnStopsAtEos() throws {
+        // Logits favour id 9 (EOS) at every position.
+        var logits = [Float](repeating: 0, count: 16)
+        logits[9] = 10
+        let forward = ScriptedInklingForward(logits: [logits])
+        let output = try Inkling2TurnRunner.run(
+            forward: forward, promptTokenIds: [1, 2, 3], settings: settings(),
+            sample: greedy, decode: { $0.map(String.init).joined() }
+        )
+        XCTAssertEqual(output.finishReason, .eos)
+        XCTAssertEqual(output.generatedTokenIds, [9])
+        XCTAssertEqual(output.promptTokens, 3)
+        // The EOS token is sampled but never forwarded, so the cache holds only
+        // the prompt: a sampled token is not a committed position until it is fed
+        // back, and the turn stops before that.
+        XCTAssertEqual(output.storedPromptTokens, 3)
+        XCTAssertFalse(output.cancelled)
+        XCTAssertEqual(forward.forwarded, [1, 2, 3])
+    }
+
+    func testATurnStopsAtTheTokenCap() throws {
+        var logits = [Float](repeating: 0, count: 16)
+        logits[5] = 10
+        let forward = ScriptedInklingForward(logits: [logits])
+        let output = try Inkling2TurnRunner.run(
+            forward: forward, promptTokenIds: [1], settings: settings(maxTokens: 3),
+            sample: greedy, decode: { $0.map(String.init).joined() }
+        )
+        XCTAssertEqual(output.generatedTokenIds, [5, 5, 5])
+        XCTAssertEqual(output.finishReason, .lengthCapped)
+    }
+
+    func testATurnStopsAtThePositionLimit() throws {
+        var logits = [Float](repeating: 0, count: 16)
+        logits[5] = 10
+        let forward = ScriptedInklingForward(positionLimit: 4, logits: [logits])
+        let output = try Inkling2TurnRunner.run(
+            forward: forward, promptTokenIds: [1, 2], settings: settings(maxTokens: 100),
+            sample: greedy, decode: { $0.map(String.init).joined() }
+        )
+        // Two prompt positions plus two generated fill the four-position limit.
+        XCTAssertEqual(output.generatedTokenIds.count, 2)
+        XCTAssertEqual(output.finishReason, .lengthCapped)
+    }
+
+    func testCancellationStopsAtAPositionBoundary() throws {
+        var logits = [Float](repeating: 0, count: 16)
+        logits[5] = 10
+        let forward = ScriptedInklingForward(logits: [logits])
+        var count = 0
+        let output = try Inkling2TurnRunner.run(
+            forward: forward, promptTokenIds: [1], settings: settings(maxTokens: 100),
+            sample: greedy, decode: { $0.map(String.init).joined() },
+            isCancelled: { count += 1; return count > 3 }
+        )
+        XCTAssertTrue(output.cancelled)
+        XCTAssertEqual(output.finishReason, .stopped)
+        XCTAssertLessThan(output.tokensGenerated, 100)
+    }
+
+    func testAStopSequenceEndsTheTurn() throws {
+        var logits = [Float](repeating: 0, count: 16)
+        logits[5] = 10
+        var turn = settings(maxTokens: 10, eos: [])
+        turn.stopSequences = ["55"]
+        let forward = ScriptedInklingForward(logits: [logits])
+        let output = try Inkling2TurnRunner.run(
+            forward: forward, promptTokenIds: [1], settings: turn,
+            sample: greedy, decode: { $0.map(String.init).joined() }
+        )
+        XCTAssertEqual(output.matchedStopSequence, "55")
+        XCTAssertEqual(output.finishReason, .stoppedBySequence)
+        XCTAssertEqual(output.generatedTokenIds, [5, 5])
+    }
+
+    func testTheToolFreezeEndsTheTurnOnTheCall() throws {
+        var logits = [Float](repeating: 0, count: 16)
+        logits[5] = 10
+        let forward = ScriptedInklingForward(logits: [logits])
+        let output = try Inkling2TurnRunner.run(
+            forward: forward, promptTokenIds: [1], settings: settings(maxTokens: 10, eos: []),
+            sample: greedy, shouldFreeze: { $0 == "55" }, decode: { $0.map(String.init).joined() }
+        )
+        XCTAssertEqual(output.finishReason, .toolFreeze)
+        XCTAssertEqual(output.generatedTokenIds, [5, 5])
+    }
+
+    /// The constraint sees the logits BEFORE the draw and its rewrite is what the
+    /// sampler reads, which is the contract a grammar mask depends on.
+    func testTheConstraintRewritesTheLogitsBeforeTheDraw() throws {
+        var logits = [Float](repeating: 0, count: 16)
+        logits[5] = 10
+        let forward = ScriptedInklingForward(logits: [logits])
+        let output = try Inkling2TurnRunner.run(
+            forward: forward, promptTokenIds: [1], settings: settings(maxTokens: 1, eos: []),
+            sample: greedy, constrain: { values, _ in values[7] = 100 },
+            decode: { $0.map(String.init).joined() }
+        )
+        XCTAssertEqual(output.generatedTokenIds, [7])
+    }
+
+    func testAnEmptyPromptIsRefused() {
+        let forward = ScriptedInklingForward(logits: [[0]])
+        XCTAssertThrowsError(
+            try Inkling2TurnRunner.run(forward: forward, promptTokenIds: [], settings: settings(), sample: greedy, decode: { _ in "" })
+        ) { error in
+            XCTAssertEqual(error as? Inkling2TurnError, .emptyPrompt)
+        }
+    }
+
+    func testAPromptPastTheLimitIsRefusedByName() {
+        let forward = ScriptedInklingForward(positionLimit: 2, logits: [[0]])
+        XCTAssertThrowsError(
+            try Inkling2TurnRunner.run(forward: forward, promptTokenIds: [1, 2, 3], settings: settings(), sample: greedy, decode: { _ in "" })
+        ) { error in
+            guard case Inkling2TurnError.promptTooLong(let prompt, let limit) = error else {
+                return XCTFail("expected promptTooLong, got \\(error)")
+            }
+            XCTAssertEqual(prompt, 3)
+            XCTAssertEqual(limit, 2)
+        }
+    }
+
+    func testAFailedPrefillNamesItsPosition() {
+        var logits = [Float](repeating: 0, count: 16)
+        logits[5] = 10
+        let forward = ScriptedInklingForward(logits: [logits])
+        forward.failAt = 2
+        XCTAssertThrowsError(
+            try Inkling2TurnRunner.run(forward: forward, promptTokenIds: [1, 2, 3], settings: settings(), sample: greedy, decode: { _ in "" })
+        ) { error in
+            guard case Inkling2TurnError.prefillFailed(let position, _) = error else {
+                return XCTFail("expected prefillFailed, got \\(error)")
+            }
+            XCTAssertEqual(position, 2)
+        }
     }
 }

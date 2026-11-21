@@ -439,8 +439,19 @@ nonisolated public enum Inkling2Math {
         return 1 + alpha * log(max(ratio, 1))
     }
 
-    /// One static short-convolution tap set at a position: `(sum_k w[k] * x[t-k] + x[t]) / sqrt(kernel + 1)`.
+    /// One static short-convolution tap set at a position:
+    /// `(sum_k w[k] * x[t-k] + x[t]) / sqrt(kernel + 1)`.
+    ///
     /// `history` is newest-last and holds at most `kernel - 1` earlier values.
+    /// `weights` is indexed by BACKWARD DISTANCE (`weights[0]` weights the current
+    /// token), which is NOT the order the checkpoint stores a `conv1d` weight in:
+    /// `F.conv1d` is a cross-correlation, so with left padding the stored `w[k]`
+    /// weights the token `kernel - 1 - k` steps back. The reference's own
+    /// `Inkling2LoopShortConvolution` therefore reads its weight REVERSED
+    /// relative to this function's contract, and a caller must reverse it. The
+    /// dynamic convolution is the opposite: the reference builds it with
+    /// `unfold(...).flip(-1)`, so its `static_weight[0]` is the current token,
+    /// which is this function's order already.
     public static func staticShortConvolution(
         current: Float,
         history: [Float],
@@ -536,8 +547,14 @@ nonisolated public enum Inkling2Math {
 
     /// The mixture weight rule: FP32 sigmoid scores, the bias steers SELECTION
     /// only, the selected scores are renormalized and scaled by `routeScale`.
-    /// Returns indices in descending score order (ties to the lower id) so a
-    /// caller never has to decide how to break one.
+    ///
+    /// The order is the reference's `torch.topk(..., sorted=False)`: the top-k
+    /// come back in ascending EXPERT ID, not by score. The pair of index and
+    /// weight is what a caller consumes, so a score order would still be
+    /// self-consistent -- but it pairs each expert with its own weight only if
+    /// the caller preserves it, and the checkpoint's own MoE loop does not
+    /// assume any order. Ascending id is the one order that is also the
+    /// checkpoint's, which is what a golden comparison can see.
     public static func route(
         scores: [Float],
         bias: [Float],
@@ -559,7 +576,7 @@ nonisolated public enum Inkling2Math {
             if left.rank == right.rank { return left.index < right.index }
             return left.rank > right.rank
         }
-        let selected = candidates.prefix(count)
+        let selected = candidates.prefix(count).sorted { $0.index < $1.index }
         let indices: [Int] = selected.map { $0.index }
         let chosen: [Float] = indices.map { scores[$0] }
         let total = chosen.reduce(Float(0), +)
