@@ -5206,6 +5206,267 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         )
     }
 
+    /// One real LOCAL subagent turn, through `LocalAgentBackend`.
+    ///
+    /// This is the only case that runs the backend's own path against the real
+    /// engine: prompt rendering through the family formatter, the tool mask
+    /// install/restore, `launchTurn`, the stream's frame deltas and the result
+    /// mapping. Everything above it is pure logic, so a mistake in the wiring
+    /// (a prompt the V4.1 template re-wraps, a session id the prefix pin
+    /// rejects, a finish reason that never arrives) can only be seen here.
+    ///
+    /// Opt-in through the class's own gate (`/tmp/dynamoe_dsv41_real_turn`).
+    func testALocalSubagentTurnRunsOnThePublishedCheckpoint() async throws {
+        let snapshot = try snapshotDirectory()
+        let engine = try loadPublishedCheckpointIntoTheSharedEngine(snapshot)
+        defer {
+            unloadSharedEngine()
+            withExtendedLifetime(engine) {}
+        }
+
+        let runSession = UUID()
+        // The run is admitted explicitly: the cost estimate prices the
+        // coordinator's displaced prefix, which this harness cannot know.
+        let backend = try await MainActor.run {
+            try LocalAgentBackend.make(
+                runId: UUID(),
+                sessionId: runSession,
+                thinking: false,
+                promptTokenEstimate: 64,
+                operatorOverride: true
+            )
+        }
+        XCTAssertEqual(backend.descriptor.kind, .local)
+
+        let deltas = DeltaCollector()
+        let request = AgentBackendRequest(
+            systemPrompt: "You are a subagent working for a coordinator. Answer in one short sentence.",
+            messages: [.user("What is the capital of France?")],
+            tools: [],
+            sampling: AgentSampling(temperature: 0, topP: 1, maxTokens: 48),
+            maxTokens: 48,
+            stopSequences: [],
+            thinking: false,
+            sessionId: runSession,
+            onDelta: { text, thinking in deltas.add(text, thinking) }
+        )
+        let turn = try await backend.runTurn(request)
+
+        XCTAssertFalse(turn.text.isEmpty, "a real local turn must produce text")
+        XCTAssertGreaterThan(turn.usage.promptTokens, 0)
+        XCTAssertGreaterThan(turn.usage.completionTokens, 0)
+        XCTAssertEqual(turn.calls.count, 0, "a tool-less run must not report calls")
+        XCTAssertGreaterThan(deltas.count, 0, "the stream must reach the run's delta sink")
+        print(
+            "🔎 [dsv41 real] local subagent turn: \(turn.usage.promptTokens) prompt / "
+                + "\(turn.usage.completionTokens) generated, finish \(turn.finishReason), "
+                + "\(deltas.count) delta(s)/\(deltas.characters) character(s), "
+                + "text: \(turn.text.prefix(160))"
+        )
+    }
+
+    /// One real LOCAL subagent RUN, through `SubagentManager` and the loop.
+    ///
+    /// `testALocalSubagentTurnRunsOnThePublishedCheckpoint` pins the backend;
+    /// this pins the wiring above it: the spawn resolver's local admission, the
+    /// run-scoped harness and its worker prompt, the scheduler's local class,
+    /// the loop's report, and the drawer-facing instance that receives it. A
+    /// mistake there (an empty tool set the resolver refuses, a scheduler
+    /// ticket never released, a report the manager drops) cannot be seen by any
+    /// pure-logic case.
+    ///
+    /// Opt-in through the class's own gate (`/tmp/dynamoe_dsv41_real_turn`).
+    @MainActor
+    func testARealLocalSubagentRunAnswersThroughTheManager() async throws {
+        let snapshot = try snapshotDirectory()
+        let engine = try loadPublishedCheckpointIntoTheSharedEngine(snapshot)
+        let workingDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SubagentRealRun_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: workingDirectory, withIntermediateDirectories: true)
+        defer {
+            SubagentManager.shared.cancelAll()
+            unloadSharedEngine()
+            try? FileManager.default.removeItem(at: workingDirectory)
+            withExtendedLifetime(engine) {}
+        }
+
+        let runId = UUID()
+        let request = AgentSpawnRequest(
+            role: "Codebase Researcher",
+            taskDescription: "In one short sentence, what is the capital of France?",
+            presetName: "explore",
+            backendPreference: .local,
+            explicitToolNames: ["file_read"],
+            workingDirectory: workingDirectory,
+            parentMode: .code,
+            thinking: false,
+            operatorOverride: true,
+            sampling: AgentSampling(temperature: 0, topP: 1, maxTokens: 48)
+        )
+        let plan = try await AgentSpawnResolver.resolve(request, runId: runId, sessionId: runId)
+        XCTAssertEqual(plan.backendDescriptor.kind, .local)
+        XCTAssertEqual(plan.schedulingClass, .local)
+        XCTAssertEqual(plan.approvalPolicy, .auto, "the explore preset is read-only")
+
+        let subagent = SubagentManager.shared.spawnModelBacked(plan, id: runId)
+        let summary = await subagent.waitForCompletion()
+
+        XCTAssertEqual(subagent.status, .completed, "summary: \(summary)")
+        XCTAssertTrue(
+            summary.lowercased().contains("paris"),
+            "a real local run must answer the task it was given: \(summary)"
+        )
+        XCTAssertTrue(summary.contains("Backend: \(plan.backendDescriptor.displayName)"))
+        XCTAssertEqual(subagent.report?.backend, plan.backendDescriptor)
+        XCTAssertGreaterThan(subagent.usage.completionTokens, 0)
+        XCTAssertGreaterThanOrEqual(subagent.usage.backendRequests, 1)
+        print(
+            "🔎 [dsv41 real] local subagent run: \(subagent.usage.steps) step(s), "
+                + "\(subagent.usage.promptTokens) prompt / \(subagent.usage.completionTokens) generated, "
+                + "summary: \(summary.prefix(200))"
+        )
+    }
+
+    /// One real LOCAL WRITER RUN, landed through the operator's own apply.
+    ///
+    /// `testARealLocalSubagentRunAnswersThroughTheManager` pins the read-only
+    /// manager path. This pins the writers path with a model rather than the
+    /// scripted backend `WorkspaceIsolationTests` uses: the resolver validates
+    /// isolation and creates the worktree, the model writes inside it, the
+    /// coordinator's tree stays untouched, and `SubagentApplyControl` raises
+    /// the approval seam and lands the work. A model that never calls
+    /// `file_write`, a worktree cut from the wrong base, or an apply that reads
+    /// a stale record can only be seen here.
+    ///
+    /// Opt-in through the class's own gate (`/tmp/dynamoe_dsv41_real_turn`).
+    @MainActor
+    func testARealLocalWriterLandsItsWorkFromTheWorktree() async throws {
+        let snapshot = try snapshotDirectory()
+        let engine = try loadPublishedCheckpointIntoTheSharedEngine(snapshot)
+        let repository = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SubagentRealWriter_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
+        try "seed\n".write(
+            to: repository.appendingPathComponent("README.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try await git(["init", "-b", "main"], in: repository)
+        try await git(["add", "-A"], in: repository)
+        try await git(["commit", "-m", "init"], in: repository)
+        defer {
+            SubagentManager.shared.cancelAll()
+            unloadSharedEngine()
+            try? FileManager.default.removeItem(at: repository)
+            withExtendedLifetime(engine) {}
+        }
+
+        let runId = UUID()
+        let fileName = "hello_from_subagent.txt"
+        let body = "hello from the subagent"
+        let request = AgentSpawnRequest(
+            role: "Implementer",
+            taskDescription: "Create a file named \(fileName) in your working directory containing exactly the line: \(body). Use the file_write tool. Do not change anything else.",
+            presetName: "implementer",
+            backendPreference: .local,
+            isolation: .worktree(path: "", branch: ""),
+            workingDirectory: repository,
+            parentMode: .code,
+            thinking: false,
+            operatorOverride: true,
+            sampling: AgentSampling(temperature: 0, topP: 1, maxTokens: 512)
+        )
+        let plan = try await AgentSpawnResolver.resolve(request, runId: runId, sessionId: runId)
+        XCTAssertEqual(plan.backendDescriptor.kind, .local)
+        guard case .worktree(let worktreePath, let branch) = plan.isolation else {
+            return XCTFail("an implementer in a git repository must be isolated")
+        }
+        XCTAssertNotEqual(worktreePath, repository.path)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: worktreePath))
+
+        let subagent = SubagentManager.shared.spawnModelBacked(plan, id: runId)
+        let summary = await subagent.waitForCompletion()
+
+        XCTAssertEqual(subagent.status, .completed, "summary: \(summary)")
+        let written = URL(fileURLWithPath: worktreePath).appendingPathComponent(fileName)
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: written.path),
+            "the model did not write \(fileName) in its worktree: \(summary.prefix(400))"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: repository.appendingPathComponent(fileName).path),
+            "an isolated writer must not touch the main tree"
+        )
+        XCTAssertEqual(subagent.report?.changedFiles, [fileName])
+
+        let outcome = try await SubagentApplyControl.apply(runId: runId) { request in
+            XCTAssertEqual(request.runId, runId)
+            XCTAssertEqual(request.toolName, "apply_subagent_changes")
+            return true
+        }
+        XCTAssertFalse(outcome.alreadyApplied)
+        XCTAssertEqual(outcome.changedFiles, [fileName])
+        let landed = repository.appendingPathComponent(fileName)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: landed.path))
+        let landedBody = try String(contentsOf: landed, encoding: .utf8)
+        XCTAssertTrue(
+            landedBody.contains(body),
+            "the applied content must be what the run wrote: \(landedBody.prefix(200))"
+        )
+        XCTAssertNotNil(subagent.appliedAt)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: worktreePath),
+            "applying removes the worktree"
+        )
+        print(
+            "🔎 [dsv41 real] local writer: \(subagent.usage.steps) step(s), "
+                + "\(subagent.usage.promptTokens) prompt / \(subagent.usage.completionTokens) generated, "
+                + "branch \(branch), applied \(outcome.changedFiles)"
+        )
+    }
+
+    /// A throwaway repository for the writers case; a commit made without the
+    /// developer's identity must carry its own.
+    private func git(_ arguments: [String], in directory: URL) async throws -> (Int32, String, String) {
+        var args = arguments
+        if args.first == "commit" {
+            args = ["-c", "user.name=DynaMoE Tests", "-c", "user.email=tests@dynamoe.invalid"] + args
+        }
+        return try await AgentHarness.runProcess(
+            executableURL: URL(fileURLWithPath: "/usr/bin/git"),
+            arguments: args,
+            currentDirectory: directory,
+            timeoutSeconds: 60
+        )
+    }
+
+    /// Deltas arrive on the run's own task, so the collector is locked rather
+    /// than main-actor state.
+    private final class DeltaCollector: @unchecked Sendable {
+        private let lock = NSLock()
+        private var deltaCount = 0
+        private var deltaCharacters = 0
+
+        func add(_ text: String, _ thinking: Bool) {
+            lock.lock()
+            deltaCount += 1
+            deltaCharacters += text.count
+            lock.unlock()
+        }
+
+        var count: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return deltaCount
+        }
+
+        var characters: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return deltaCharacters
+        }
+    }
+
     /// The chat UI's history, at the checkpoint's own tokenizer.
     ///
     /// `DeepSeekV41ChatPromptFormatterTests` pins the rendered SHAPE. This pins the

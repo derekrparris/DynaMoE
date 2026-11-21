@@ -17,7 +17,7 @@ final class EngineTurnSlotTests: XCTestCase {
     /// The smallest request the engine will look at. Every field is read only
     /// after the slot is taken, so the values never matter: a launch in this file
     /// is refused for its claim or for the missing model.
-    private func makeRequest() -> CompletionTurnRequest {
+    private func makeRequest(priority: TurnPriority = .interactive) -> CompletionTurnRequest {
         CompletionTurnRequest(
             promptTokenIds: [1, 2, 3],
             formattedPrompt: "hi",
@@ -42,7 +42,8 @@ final class EngineTurnSlotTests: XCTestCase {
             isSplicedContinuation: false,
             stopSequences: [],
             asOfDate: nil,
-            images: []
+            images: [],
+            turnPriority: priority
         )
     }
 
@@ -90,6 +91,40 @@ final class EngineTurnSlotTests: XCTestCase {
         XCTAssertTrue(ledger.isClaimed)
 
         live.release()
+        XCTAssertFalse(ledger.isClaimed)
+    }
+
+    /// The three callers that compete for the one slot — chat, the API
+    /// server's queue and a subagent run's step — reserving from their own
+    /// concurrent tasks. The sequential cases above could not see a ledger that
+    /// let two of them in at once.
+    func testConcurrentReservationsFromEveryCallerGrantExactlyOneHolder() async {
+        let ledger = TurnSlotLedger()
+        let counter = HeldClaimCounter()
+        let priorities: [TurnPriority] = [.interactive, .interactive, .background]
+        await withTaskGroup(of: Void.self) { group in
+            for priority in priorities {
+                for _ in 0..<32 {
+                    group.addTask {
+                        for _ in 0..<20 {
+                            guard let claim = ledger.tryClaim(priority: priority) else {
+                                await Task.yield()
+                                continue
+                            }
+                            counter.enter()
+                            // Hold ACROSS a suspension point: that is exactly
+                            // the window in which a second caller must be
+                            // refused.
+                            await Task.yield()
+                            counter.leave()
+                            claim.release()
+                        }
+                    }
+                }
+            }
+        }
+        XCTAssertGreaterThan(counter.granted, 0, "the race must actually grant claims, or it proves nothing")
+        XCTAssertEqual(counter.peak, 1, "two callers must never believe they hold the single slot")
         XCTAssertFalse(ledger.isClaimed)
     }
 
@@ -162,7 +197,15 @@ final class EngineTurnSlotTests: XCTestCase {
     func testARefusedLaunchWithoutAClaimGivesTheSlotBack() {
         let engine = CompletionEngine.shared
         XCTAssertFalse(engine.isActive, "the slot must be free at the start of the case")
-        XCTAssertThrowsError(try engine.launchTurn(makeRequest()))
+        XCTAssertThrowsError(try engine.launchTurn(makeRequest())) { error in
+            // Not just "an error": a refusal for the slot would also throw,
+            // and would make this case pass while proving the opposite.
+            let text = message(error)
+            XCTAssertTrue(
+                text.contains("Metal or Tokenizer"),
+                "the refusal must come from the missing model, not from a lost slot: \(text)"
+            )
+        }
         XCTAssertFalse(engine.isActive, "a launch that took the slot and refused must not keep it")
     }
 
@@ -233,5 +276,146 @@ final class EngineTurnSlotTests: XCTestCase {
         }
         XCTAssertFalse(claim.isHeld, "the launch released the claim when it refused")
         XCTAssertFalse(engine.isActive, "and nothing is left occupying the slot")
+    }
+
+    // MARK: - Ownership-scoped cancellation
+
+    /// `cancelTurn(id:)` names a TURN; `cancelBackgroundTurn()` names a
+    /// PRIORITY. A subagent's cancel arrives while its run unwinds, by which
+    /// time the slot may already belong to a successor, so a stale id has to be
+    /// a no-op. No live turn is needed to prove the reachable half of that: a
+    /// claim being PREPARED is exactly the state a stale cancel must not touch.
+    @MainActor
+    func testAStaleCancelIsANoOpOnAPreparingTurn() throws {
+        let engine = CompletionEngine.shared
+        XCTAssertFalse(engine.isActive, "the slot must be free at the start of the case")
+
+        XCTAssertFalse(engine.cancelTurn(id: UInt64.max), "an id the engine never issued cancels nothing")
+        XCTAssertFalse(engine.cancelBackgroundTurn(), "and no priority-scoped cancel fires without a turn")
+        XCTAssertFalse(engine.hasActiveBackgroundTurn)
+
+        let preparing = try XCTUnwrap(engine.reserveTurnSlot())
+        defer { preparing.release() }
+        XCTAssertFalse(
+            engine.cancelTurn(id: UInt64.max),
+            "a stale id must not reach the claim another caller is preparing under"
+        )
+        XCTAssertTrue(preparing.isHeld, "the preparing turn's claim survives a stale cancel")
+        XCTAssertTrue(engine.isActive, "and the engine still reads busy to every prober")
+    }
+
+    /// The successor case the old version could not observe: a REGISTERED
+    /// turn exists (so `cancelTurn`'s second branch is reachable), and a stale
+    /// id must leave it running while its own id stops it. The test bundle has
+    /// no model, so the turn is installed through the DEBUG seam.
+    @MainActor
+    func testAStaleCancelIsANoOpOnARegisteredSuccessorTurn() async throws {
+        let engine = CompletionEngine.shared
+        XCTAssertFalse(engine.isActive, "the slot must be free at the start of the case")
+
+        let successorId: UInt64 = 4_242
+        let successor = Task<Void, Never> {
+            try? await Task.sleep(nanoseconds: 60_000_000_000)
+        }
+        engine.installTurnForTesting(id: successorId, task: successor)
+        defer {
+            engine.clearTurnForTesting()
+            successor.cancel()
+        }
+
+        XCTAssertTrue(engine.isActive, "the installed turn owns the slot")
+        XCTAssertFalse(
+            engine.cancelTurn(id: successorId &+ 1),
+            "a stale id must be a no-op even while a successor turn is registered"
+        )
+        XCTAssertFalse(successor.isCancelled, "the stale id must not stop the successor")
+        XCTAssertTrue(engine.isActive, "and the successor still owns the slot")
+
+        XCTAssertTrue(engine.cancelTurn(id: successorId), "the owning id does stop it")
+        XCTAssertTrue(successor.isCancelled)
+    }
+
+    /// `hasActiveBackgroundTurn` counts a turn being PREPARED (a claim, no
+    /// task), so a cancel that only looked at `currentGenerationTask` was
+    /// inert in exactly the window the prober had just called cancellable.
+    @MainActor
+    func testAPreparationClaimIsStoppableOnlyWhenItIsBackground() throws {
+        let engine = CompletionEngine.shared
+        XCTAssertFalse(engine.isActive, "the slot must be free at the start of the case")
+
+        let background = try XCTUnwrap(engine.reserveTurnSlot(priority: .background))
+        XCTAssertTrue(engine.hasActiveBackgroundTurn, "a background preparation is a background turn")
+        XCTAssertTrue(engine.cancelBackgroundTurn(), "and it can be stopped without a task to cancel")
+        XCTAssertFalse(background.isHeld, "its launch is refused because the claim was given back")
+        XCTAssertFalse(engine.isActive)
+        XCTAssertThrowsError(try engine.launchTurn(makeRequest(priority: .background), claim: background)) { error in
+            XCTAssertTrue(
+                message(error).contains("reservation"),
+                "a turn stopped during preparation must refuse for its claim: \(message(error))"
+            )
+        }
+
+        let interactive = try XCTUnwrap(engine.reserveTurnSlot(priority: .interactive))
+        defer { interactive.release() }
+        XCTAssertFalse(engine.hasActiveBackgroundTurn)
+        XCTAssertFalse(
+            engine.cancelBackgroundTurn(),
+            "a chat/server/model-load preparation is never cancelled to make room"
+        )
+        XCTAssertTrue(interactive.isHeld)
+    }
+
+    /// The claim's priority is what every other prober reads to decide whether
+    /// the slot may be preempted; a claim taken for one priority and launched
+    /// as the other would lie about that for the turn's whole length.
+    @MainActor
+    func testAClaimTakenForOnePriorityCannotLaunchTheOther() throws {
+        let engine = CompletionEngine.shared
+        XCTAssertFalse(engine.isActive, "the slot must be free at the start of the case")
+
+        let claim = try XCTUnwrap(engine.reserveTurnSlot(priority: .interactive))
+        XCTAssertThrowsError(try engine.launchTurn(makeRequest(priority: .background), claim: claim)) { error in
+            XCTAssertTrue(
+                message(error).contains("priority"),
+                "the refusal must name the priority mismatch: \(message(error))"
+            )
+        }
+        XCTAssertFalse(claim.isHeld, "the launch released the claim it refused")
+        XCTAssertFalse(engine.isActive, "and nothing is left occupying the slot")
+    }
+}
+
+/// Counts how many claims are held at once, so the concurrency case can prove
+/// the ledger never looked free to two callers.
+private final class HeldClaimCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current = 0
+    private var peakValue = 0
+    private var grantedValue = 0
+
+    func enter() {
+        lock.lock()
+        current += 1
+        peakValue = max(peakValue, current)
+        grantedValue += 1
+        lock.unlock()
+    }
+
+    func leave() {
+        lock.lock()
+        current -= 1
+        lock.unlock()
+    }
+
+    var peak: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return peakValue
+    }
+
+    var granted: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return grantedValue
     }
 }

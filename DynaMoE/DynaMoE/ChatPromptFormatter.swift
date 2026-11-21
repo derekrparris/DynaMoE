@@ -125,8 +125,11 @@ public enum ChatPromptFormatter {
 
     /// Spark 2.5 (DeepSeek-style) end-of-sentence marker. Built from unicode
     /// escapes so a renderer can never mangle the fullwidth bars / block
-    /// underscores (AGENTS.md: "Reading files safely").
-    public static let sparkEndOfSentence = "<\u{FF5C}end\u{2581}of\u{2581}sentence\u{FF5C}>"
+    /// underscores (AGENTS.md: "Reading files safely"). `nonisolated` for the
+    /// same reason as the framing below: `PromptMarkers` reads it from a
+    /// nonisolated context, and default main-actor isolation would make that a
+    /// concurrency diagnostic.
+    public nonisolated static let sparkEndOfSentence = "<\u{FF5C}end\u{2581}of\u{2581}sentence\u{FF5C}>"
 
     /// Spark 2.5's remaining turn framing. `nonisolated` because
     /// `PromptMarkers` sanitizes them from a nonisolated context, and named

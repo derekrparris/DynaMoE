@@ -137,7 +137,8 @@ public extension AgentTool {
         case "find_symbol_definition", "find_references": return "analysis"
         case "web_search", "web_fetch": return "web"
         case "git_status", "git_diff", "git_commit": return "git"
-        case "spawn_subagent", "get_subagent_status", "send_subagent_message", "list_subagents": return "subagents"
+        case "spawn_subagent", "get_subagent_status", "send_subagent_message", "list_subagents",
+             "apply_subagent_changes": return "subagents"
         case "lint_diagnostics": return "quality"
         case "subq_decide": return "decisions"
         default: return "core"
@@ -205,11 +206,24 @@ public final class ShellRunTool: AgentTool {
             targetDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         }
 
-        let (stdout, stderr, exitCode) = try await ControlledProcessRunner.shared.runCommand(
-            command: command,
-            workingDirectory: targetDir,
-            timeoutSeconds: 120.0
-        )
+        let exitCode: Int32
+        let stdout: String
+        let stderr: String
+        do {
+            (exitCode, stdout, stderr) = try await AgentHarness.runProcess(
+                executableURL: URL(fileURLWithPath: "/bin/zsh"),
+                arguments: ["-c", command],
+                currentDirectory: targetDir,
+                timeoutSeconds: 120.0
+            )
+        } catch is CancellationError {
+            // `runProcess` refuses to spawn for an already-cancelled task, and a
+            // bare CancellationError carries no message, so the tool loop would
+            // record an empty error string. Report the stop the way a killed
+            // child reports it (130 is SIGINT's shell status).
+            let err = "Command was cancelled by user."
+            return (AgentHarness.toolErrorJSON(tool: "shell_run", error: err), nil, err, false)
+        }
 
         var rawStdout = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         if AgentHarness.looksLikeHTML(rawStdout), rawStdout.utf8.count > 2048 {
@@ -656,17 +670,32 @@ public final class FindFilesTool: AgentTool {
         }
 
         let maxDepth = (arguments["max_depth"] as? Int) ?? 5
-        let escapedPattern = pattern.replacingOccurrences(of: "'", with: "\\'")
-        let cmd = "find . -maxdepth \(maxDepth) -iname '\(escapedPattern)' -not -path '*/.*' | head -n 50"
-
+        // argv, never a shell. The pattern is model text, and the old
+        // `zsh -c "find … -iname '\(pattern)'"` escaped a quote as `\'`, which
+        // does not escape inside a zsh single-quoted word: a pattern of
+        // `a' ; rm -rf ~/Documents ; #` closed the quote and ran the rest as
+        // commands, cardlessly, because find_files is a read-only tool that no
+        // policy treats as state-changing. `-maxdepth` is clamped because find
+        // treats a negative value as an error and a huge one as a walk of the
+        // whole disk.
+        let depthLimit = min(max(1, maxDepth), 64)
         let (_, stdout, _) = try await AgentHarness.runProcess(
-            executableURL: URL(fileURLWithPath: "/bin/zsh"),
-            arguments: ["-c", cmd],
+            executableURL: URL(fileURLWithPath: "/usr/bin/find"),
+            arguments: [
+                ".", "-maxdepth", "\(depthLimit)",
+                "-iname", pattern,
+                "-not", "-path", "*/.*"
+            ],
             currentDirectory: baseDir,
             timeoutSeconds: 30
         )
 
-        let matches = stdout.components(separatedBy: "\n").filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        // Truncated here rather than by `head -n 50` in a pipeline, so the
+        // child writes nothing it does not need to and no SIGPIPE is possible.
+        let matches = stdout.components(separatedBy: "\n")
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .prefix(50)
+            .map { $0 }
         let res = AgentHarness.toolSuccessJSON(tool: "find_files", data: [
             "search_path": baseDir.path,
             "pattern": pattern,
@@ -1002,12 +1031,27 @@ public final class HeadlessChromeSearchEngine: @unchecked Sendable {
         process.standardError = FileHandle.nullDevice
 
         return try await withCheckedThrowingContinuation { continuation in
-            var isResumed = false
+            // The timer handler, the termination handler and the run-failure
+            // path all race to resume exactly once. A plain captured `var`
+            // would be a data race here (an error in Swift 6 mode), so the
+            // once-claim is lock-guarded and the type is nonisolated so its
+            // members stay mutable from every handler.
+            nonisolated final class ResumeOnce: @unchecked Sendable {
+                private let lock = NSLock()
+                private var claimed = false
+                func claim() -> Bool {
+                    lock.lock()
+                    defer { lock.unlock() }
+                    if claimed { return false }
+                    claimed = true
+                    return true
+                }
+            }
+            let resume = ResumeOnce()
             let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
             timer.schedule(deadline: .now() + timeoutSeconds)
             timer.setEventHandler {
-                if !isResumed {
-                    isResumed = true
+                if resume.claim() {
                     process.terminate()
                     try? fileHandle.close()
                     try? FileManager.default.removeItem(at: tmpFile)
@@ -1020,8 +1064,7 @@ public final class HeadlessChromeSearchEngine: @unchecked Sendable {
 
             process.terminationHandler = { proc in
                 timer.cancel()
-                if !isResumed {
-                    isResumed = true
+                if resume.claim() {
                     try? fileHandle.close()
                     do {
                         let html = try String(contentsOf: tmpFile, encoding: .utf8)
@@ -1038,8 +1081,7 @@ public final class HeadlessChromeSearchEngine: @unchecked Sendable {
                 try process.run()
             } catch {
                 timer.cancel()
-                if !isResumed {
-                    isResumed = true
+                if resume.claim() {
                     try? fileHandle.close()
                     try? FileManager.default.removeItem(at: tmpFile)
                     continuation.resume(throwing: error)
@@ -2347,7 +2389,7 @@ public final class CodebaseSearchTool: AgentTool {
 public final class SpawnSubagentTool: AgentTool {
     public let definition = ToolDefinition(
         name: "spawn_subagent",
-        description: "Spawns an isolated background subagent with a dedicated role (e.g. Codebase Researcher, Test Runner, Shader Optimizer) to handle focused multi-step tasks without filling your primary context window.",
+        description: "Spawns an isolated subagent with a dedicated role (e.g. Codebase Researcher, Test Runner, Shader Optimizer) to handle focused multi-step tasks without filling your primary context window. Set backend to 'local' or 'cloud' for a run where another model actually works the task; leave it unset for the built-in role pipelines.",
         parameters: [
             "type": AnyCodable("object"),
             "properties": AnyCodable([
@@ -2362,7 +2404,7 @@ public final class SpawnSubagentTool: AgentTool {
                 "allowed_tools": [
                     "type": "array",
                     "items": ["type": "string"],
-                    "description": "List of tools the subagent is permitted to call (optional). Defaults to safe read & research tools."
+                    "description": "List of tools the subagent is permitted to call (optional). Omit it to use the preset's tool set; an explicit empty list is refused, because a run with no tools cannot finish."
                 ],
                 "context_summary": [
                     "type": "string",
@@ -2371,6 +2413,47 @@ public final class SpawnSubagentTool: AgentTool {
                 "run_in_background": [
                     "type": "boolean",
                     "description": "Set true to execute asynchronously in the background task manager; set false (default) to wait for the subagent to complete and return its synthesized report."
+                ],
+                "backend": [
+                    "type": "string",
+                    "enum": ["auto", "local", "cloud", "legacy"],
+                    "description": "Which model works the run: 'local' (the loaded checkpoint), 'cloud' (the configured subagent model), 'auto' (the backend chosen in Settings), or 'legacy' (the built-in role pipelines). Omit for the Settings default."
+                ],
+                "preset": [
+                    "type": "string",
+                    "enum": ["explore", "implementer", "verifier", "reviewer", "general", "custom"],
+                    "description": "Capability preset for a model-backed run: which tools it may use and its default budget. Inferred from the role when omitted."
+                ],
+                "budget": [
+                    "type": "object",
+                    "description": "Optional budget overrides for a model-backed run.",
+                    "properties": [
+                        "max_steps": [
+                            "type": "integer",
+                            "description": "Maximum model turns before the run stops."
+                        ],
+                        "max_completion_tokens": [
+                            "type": "integer",
+                            "description": "Completion tokens across the whole run."
+                        ],
+                        "max_wall_clock_seconds": [
+                            "type": "integer",
+                            "description": "Wall-clock seconds across the whole run."
+                        ],
+                        "max_cost_usd": [
+                            "type": "number",
+                            "description": "Cloud spend ceiling, in US dollars. The model must have input and output prices recorded in Settings, or the spawn is refused: an unpriced run reports $0 for every token and the ceiling could never bind."
+                        ]
+                    ]
+                ],
+                "isolation": [
+                    "type": "string",
+                    "enum": ["none", "worktree"],
+                    "description": "Workspace isolation. Use 'worktree' for any writer in a git repository: it gets its own worktree and branch and its file writes stay there without a per-call card. A shell command can reach outside the worktree, so it still asks each call. Changes are left for apply_subagent_changes. 'none' runs in the coordinator's directory with per-call approval; a read-only run or a non-git workspace cannot use a worktree."
+                ],
+                "thinking": [
+                    "type": "boolean",
+                    "description": "Ask a local model to reason before answering. Ignored by cloud providers that decide this themselves."
                 ]
             ]),
             "required": AnyCodable(["role", "task_description"])
@@ -2392,49 +2475,487 @@ public final class SpawnSubagentTool: AgentTool {
         }
 
         var allowedTools: [String] = []
+        // Nil means the argument was OMITTED (use the preset); an explicit
+        // empty array means "no tools", which a model-backed run cannot start
+        // with and is refused by name in `resolveTools`. Collapsing the two
+        // here is what made `allowed_tools: []` silently grant the preset.
+        var explicitAllowedTools: [String]? = nil
         if let toolsArray = arguments["allowed_tools"] as? [String] {
             allowedTools = toolsArray
+            explicitAllowedTools = toolsArray
+        }
+        if let explicitAllowedTools, explicitAllowedTools.isEmpty {
+            let err = "Error: 'allowed_tools' was an explicit empty list. Omit it to use the preset's tools; a run with no tools cannot finish or change anything."
+            return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: err), nil, err, false)
         }
         let contextSummary = arguments["context_summary"] as? String
+        // A budget key that was SENT but cannot be read is refused here rather
+        // than dropped: a run that silently loses its cost ceiling is unbounded
+        // while the coordinator and the operator both believe it is capped.
+        if let budgetObject = arguments["budget"] as? [String: Any] {
+            let unreadable = budgetObject
+                .filter { key, value in
+                    Self.budgetKeys.contains(key) && Self.budgetNumber(value) == nil
+                }
+                .keys
+                .sorted()
+            if !unreadable.isEmpty {
+                let err = "Error: budget field(s) \(unreadable.joined(separator: ", ")) could not be read as a number. Send them as numbers (or numeric strings) so the ceiling can be enforced."
+                return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: err), nil, err, false)
+            }
+        }
         let runInBackground = (arguments["run_in_background"] as? Bool) ?? false
+        // The turn's mode, not the process-global one: another turn can move
+        // `activeMode`, and a plan turn's child must inherit plan mode.
+        let parentMode = AgentHarness.executingTurnMode ?? AgentHarness.shared.activeMode
+        let sessionsWorkingDirectory = URL(
+            fileURLWithPath: FileManager.default.currentDirectoryPath
+        )
+        let spawnDirectory = workingDirectory ?? sessionsWorkingDirectory
 
+        let backendSelection = Self.backendSelection(from: arguments)
+        // The turn's identity, not the process-global one: a send that happens
+        // while this tool is awaiting would overwrite `currentTurnId`, and the
+        // run would be stamped with a turn that never asked for it (so Stop
+        // cancelled the wrong runs). A run-scoped harness has no global turn to
+        // fall back to; its identity was passed in, and nil there means nil.
+        //
+        // The SESSION has no fallback of its own: `executeTool` binds the one
+        // effective session (including the `currentSessionId` fallback) for the
+        // whole call, and `get_subagent_status`, `send_subagent_message`,
+        // `list_subagents` and `apply_subagent_changes` compare against that
+        // exact binding. Resolving a different value here spawned runs the
+        // sibling tools could not see.
+        let inRunScope = AgentHarness.executingInRunScope
+        let parentSessionId = AgentHarness.executingSessionId
+        let parentTurnId = AgentHarness.executingTurnId
+            ?? (inRunScope ? nil : AgentHarness.shared.currentTurnId)
+
+        // Reserve a per-session spawn slot BEFORE `AgentSpawnResolver.resolve`
+        // (and before any git worktree or legacy pipeline starts) so a batch of
+        // `spawn_subagent` calls cannot create unbounded worktrees or unprunable
+        // records.
+        guard let spawnSlot = SubagentManager.shared.tryReserveSpawnSlot(forSession: parentSessionId) else {
+            let err = "This conversation already has \(SubagentManager.defaultMaxActiveSubagentsPerSession) active subagent runs (the per-conversation limit). Wait for an active run to finish or stop one before spawning another."
+            return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: err), nil, err, false)
+        }
+        // Released as soon as the instance is REGISTERED, not when this call
+        // returns: a synchronous spawn then waits for the run's completion, and
+        // holding the reservation across that wait counted the same run twice
+        // (once as active, once as pending) for its whole lifetime — six slots
+        // behaved like three. `defer` is the error path; `released` makes it
+        // once-only.
+        var released = false
+        func releaseSlot() {
+            guard !released else { return }
+            released = true
+            SubagentManager.shared.releaseSpawnSlot(spawnSlot, forSession: parentSessionId)
+        }
+        defer { releaseSlot() }
+        if backendSelection.error == nil, backendSelection.modelBacked {
+            let runId = UUID()
+            // Priced ONCE, from the same pin and measured rate the backend
+            // will consult, so the refusal's number is the number the card
+            // shows and the number admission compares against. The text is
+            // bounded first: `resolve` truncates to the same limits, so
+            // pricing the raw task made a 200 KB paste show its full size on
+            // the card while only 24 KB reached the model.
+            let priced = AgentSpawnResolver.boundedSpawnInputs(task: taskDesc, contextSummary: contextSummary)
+            let localCostEstimate = LocalAgentBackend.costEstimate(
+                runSessionId: runId,
+                promptTokenEstimate: LocalAgentBackend.spawnPromptTokenEstimate(
+                    task: priced.task,
+                    contextSummary: priced.contextSummary
+                )
+            )
+            let request = AgentSpawnRequest(
+                role: role,
+                taskDescription: taskDesc,
+                contextSummary: contextSummary,
+                presetName: arguments["preset"] as? String,
+                backendPreference: backendSelection.preference,
+                explicitToolNames: explicitAllowedTools,
+                budgetOverrides: Self.budgetOverrides(from: arguments["budget"]),
+                isolation: Self.isolation(from: arguments["isolation"]),
+                workingDirectory: spawnDirectory,
+                parentSessionId: parentSessionId,
+                parentTurnId: parentTurnId,
+                parentMode: parentMode,
+                thinking: (arguments["thinking"] as? Bool) ?? false,
+                operatorOverride: false,
+                localCostEstimate: localCostEstimate,
+                priority: .userRequested
+            )
+            do {
+                let plan = try await AgentSpawnResolver.resolve(
+                    request,
+                    runId: runId,
+                    sessionId: runId
+                )
+                // Stop can land DURING the resolve (worktree creation, backend
+                // resolution). `cancelTurnRuns` has already walked the runs it
+                // knew about, so a run started now would begin afterwards,
+                // stamped with the stopped turn and never cancelled. The plan's
+                // worktree was created for a run that will not start, so it is
+                // removed with it.
+                guard !Task.isCancelled else {
+                    // A tree that survived removal has no record yet (nothing
+                    // was spawned), so nothing else will ever name it: say so.
+                    let removed = await SubagentInstance.discardWorktree(plan: plan)
+                    return Self.stoppedBeforeStartResult(keptWorktree: removed ? nil : plan.worktreePath)
+                }
+                let subagent = SubagentManager.shared.spawnModelBacked(
+                    plan,
+                    id: runId,
+                    notifiesOnFinish: runInBackground
+                )
+                releaseSlot()
+                return await Self.respond(
+                    subagent: subagent,
+                    runInBackground: runInBackground,
+                    maxOutputLength: maxOutputLength
+                )
+            } catch let error as AgentBackendError {
+                // The local cost refusal is the spawn card's decision, not a dead
+                // end: show the estimate and, only if the operator approves it,
+                // re-resolve with the override (invariant 10). Turbo Mode must not
+                // make this choice, because the point of the setting is that the
+                // run can displace the coordinator's prefix for minutes.
+                guard case .refused(let message) = error else {
+                    let text = error.errorDescription ?? "The spawn was refused."
+                    return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: text), nil, text, false)
+                }
+                let approval = AgentApprovalRequest(
+                    runId: runId,
+                    toolName: "spawn_subagent",
+                    arguments: [
+                        "role": role,
+                        "task_description": taskDesc,
+                        "backend": backendSelection.preference.rawValue,
+                        "estimated_cost": message
+                    ],
+                    workingDirectory: spawnDirectory.path,
+                    reason: message
+                )
+                // The card is cancellation-aware: a Stop resolves it as
+                // "not approved", which is NOT the operator declining. Reporting
+                // a decline for a stopped turn blamed a decision nobody made.
+                let costApproved = await SubagentApprovalCenter.shared.request(approval, honorsTurbo: false)
+                guard costApproved else {
+                    if Task.isCancelled { return Self.stoppedBeforeStartResult() }
+                    let declined = "The operator declined this local run's estimated re-prefill cost. Send the task to a cloud backend, raise dynamoe_subagent_local_cost_limit in Settings, or give it a smaller task."
+                    return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: declined), nil, declined, false)
+                }
+                // The card can be up for minutes. A Stop during it is the same
+                // decision as a Stop before it, so nothing is started.
+                guard !Task.isCancelled else { return Self.stoppedBeforeStartResult() }
+                var overridden = request
+                overridden.operatorOverride = true
+                // The click approves the number the card showed. Admission
+                // refuses if the pin or the measured rate moved while the card
+                // was open, instead of silently admitting a larger estimate.
+                overridden.approvedLocalCost = localCostEstimate
+                do {
+                    let plan = try await AgentSpawnResolver.resolve(
+                        overridden,
+                        runId: runId,
+                        sessionId: runId
+                    )
+                    guard !Task.isCancelled else {
+                        let removed = await SubagentInstance.discardWorktree(plan: plan)
+                        return Self.stoppedBeforeStartResult(keptWorktree: removed ? nil : plan.worktreePath)
+                    }
+                    let subagent = SubagentManager.shared.spawnModelBacked(
+                        plan,
+                        id: runId,
+                        notifiesOnFinish: runInBackground
+                    )
+                    releaseSlot()
+                    return await Self.respond(
+                        subagent: subagent,
+                        runInBackground: runInBackground,
+                        maxOutputLength: maxOutputLength
+                    )
+                } catch {
+                    let text = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: text), nil, text, false)
+                }
+            } catch {
+                let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: message), nil, message, false)
+            }
+        }
+        if let error = backendSelection.error {
+            return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: error), nil, error, false)
+        }
+
+        // The legacy pipelines ignore `isolation`, `budget`, and `preset` —
+        // they run fixed archetype pipelines in the coordinator's directory.
+        // Accepting those arguments and silently discarding them leaves the
+        // caller believing work is isolated or budgeted when it is not.
+        var unsupportedLegacyArgs: [String] = []
+        if Self.isolation(from: arguments["isolation"]).isIsolated {
+            unsupportedLegacyArgs.append("isolation")
+        }
+        if arguments["budget"] != nil {
+            unsupportedLegacyArgs.append("budget")
+        }
+        if let preset = arguments["preset"] as? String,
+           !preset.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            unsupportedLegacyArgs.append("preset")
+        }
+        if !unsupportedLegacyArgs.isEmpty {
+            let list = unsupportedLegacyArgs.joined(separator: ", ")
+            let err = "The legacy subagent backend does not support \(list). Select backend 'local' or 'cloud' to use these options, or omit them for the legacy role pipelines."
+            return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: err), nil, err, false)
+        }
+        guard !Task.isCancelled else { return Self.stoppedBeforeStartResult() }
+        let boundedTask = AgentSpawnResolver.boundedSpawnText(
+            taskDesc,
+            limit: AgentSpawnResolver.maxTaskDescriptionCharacters
+        )
+        let boundedContext = contextSummary.map {
+            AgentSpawnResolver.boundedSpawnText($0, limit: AgentSpawnResolver.maxContextSummaryCharacters)
+        }
         let subagent = SubagentManager.shared.spawn(
             role: role,
-            taskDescription: taskDesc,
+            taskDescription: boundedTask,
             allowedTools: allowedTools,
-            // The turn's mode, not the process-global one: another turn can move
-            // `activeMode`, and a plan turn's child must inherit plan mode.
-            parentMode: AgentHarness.executingTurnMode ?? AgentHarness.shared.activeMode,
-            contextSummary: contextSummary,
-            parentSessionId: AgentHarness.shared.currentSessionId,
-            workingDirectory: workingDirectory
+            parentMode: parentMode,
+            contextSummary: boundedContext,
+            parentSessionId: parentSessionId,
+            parentTurnId: parentTurnId,
+            workingDirectory: workingDirectory,
+            // A synchronous caller is already watching the tool card; only a
+            // background run should ask for attention when it ends. The legacy
+            // pipelines were the one spawn path that never said so.
+            notifiesOnFinish: runInBackground
         )
+        releaseSlot()
+        return await Self.respond(
+            subagent: subagent,
+            runInBackground: runInBackground,
+            maxOutputLength: maxOutputLength
+        )
+    }
 
+    private static func stoppedBeforeStartResult() -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        stoppedBeforeStartResult(keptWorktree: nil)
+    }
+
+    private static func stoppedBeforeStartResult(
+        keptWorktree: String?
+    ) -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        let base = "The coordinator turn was stopped before the subagent run could start."
+        guard let keptWorktree else {
+            return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: base), nil, base, false)
+        }
+        let text = base + " Its unused worktree at \(keptWorktree) could not be removed, so it is still on disk with its branch; no run exists to apply or discard it, so remove that directory (and the branch, if you want it gone) by hand."
+        return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: text), nil, text, false)
+    }
+
+    private static func respond(
+        subagent: SubagentInstance,
+        runInBackground: Bool,
+        maxOutputLength: Int,
+        warning: String? = nil
+    ) async -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        // The notification decision is made at spawn time (before execution
+        // starts); a synchronous caller is watching the tool card, and only a
+        // background run should ask for attention when it ends.
+        let worktree = AgentHarness.worktreeDescription(of: subagent)
         if runInBackground {
-            let msg = "Subagent [\(role)] spawned in background (ID: \(subagent.id.uuidString)). You are responsible for its outcome: when you need its results, call get_subagent_status with wait=true, then present the report to the user in your reply. The user never contacts the subagent directly."
-            let res = AgentHarness.toolSuccessJSON(tool: "spawn_subagent", data: [
+            var msg = "Subagent [\(subagent.role)] spawned in background (ID: \(subagent.id.uuidString)). You are responsible for its outcome: when you need its results, call get_subagent_status with wait=true, then present the report to the user in your reply. The user never contacts the subagent directly."
+            if let worktree {
+                msg += " It works in an isolated worktree on branch \(worktree.branch); when it finishes, call apply_subagent_changes with subagent_id \(subagent.id.uuidString) to land its changes on the main tree (the operator approves the apply), unless the user asked to keep the work isolated."
+            }
+            var data: [String: Any] = [
                 "subagent_id": subagent.id.uuidString,
                 "role": subagent.role,
                 "status": "running",
                 "run_in_background": true,
                 "message": msg
-            ])
+            ]
+            if let warning {
+                data["warning"] = warning
+                msg += " Warning: \(warning)"
+                data["message"] = msg
+            }
+            if let worktree {
+                data["isolation"] = "worktree"
+                data["worktree"] = worktree.path
+                data["branch"] = worktree.branch
+            }
+            if let backend = subagent.backendDescriptor {
+                data["backend"] = backend.displayName
+            }
+            let res = AgentHarness.toolSuccessJSON(tool: "spawn_subagent", data: data)
             return (res, msg, nil, false)
-        } else {
-            // Synchronous delegation: wait for subagent to finish
-            let summary = await subagent.waitForCompletion()
-            await MainActor.run { subagent.isSummaryRelayed = true }
-            let cleanSummary = AgentHarness.truncateText(AgentHarness.sanitizeText(summary), limit: maxOutputLength)
-            let res = AgentHarness.toolSuccessJSON(tool: "spawn_subagent", data: [
-                "subagent_id": subagent.id.uuidString,
-                "role": subagent.role,
-                "status": subagent.status.rawValue,
-                "duration_seconds": subagent.executionDurationSeconds,
-                "summary": cleanSummary,
-                "directive": "Present this report to the user now, then answer their original question with it."
-            ])
-            return (res, cleanSummary, nil, false)
         }
+        // Synchronous delegation: wait for subagent to finish
+        let summary = await subagent.waitForCompletion()
+        // A STOP resumes this wait with the stop reason, before the loop's own
+        // unwind has written the partial report (that write is what carries
+        // everything the run managed to do). Marking the report delivered here
+        // unconditionally consumed that richer report unseen: the relay skips a
+        // run marked relayed, so the partial was never delivered, this turn or
+        // any later one. A cancelled run stays unread; `SubagentManager` also
+        // re-opens a report that lands after its terminal write, and the
+        // relay's own rule never re-injects a bare stop reason.
+        if subagent.status != .cancelled {
+            await MainActor.run { subagent.isSummaryRelayed = true }
+        }
+        // The operator can land an isolated run from the inspector while this
+        // call is waiting; the result must not tell the coordinator to apply
+        // work that is already in the main tree.
+        let alreadyApplied = subagent.appliedAt != nil
+        let escapedWrites: [String] = {
+            guard let worktree, !alreadyApplied,
+                  subagent.report?.changedFiles.isEmpty == true,
+                  subagent.report?.diff == nil else { return [] }
+            return AgentHarness.escapedWritePaths(
+                in: subagent.runTranscript,
+                worktreePath: URL(fileURLWithPath: worktree.path, isDirectory: true)
+            )
+        }()
+        let cleanSummary = AgentHarness.truncateText(AgentHarness.sanitizeText(summary), limit: maxOutputLength)
+        let directive: String
+        if let worktree {
+            if alreadyApplied {
+                directive = "Present this report to the user now, then answer their original question with it. Its isolated changes have already been applied to the working tree; do not call apply_subagent_changes."
+            } else if !escapedWrites.isEmpty {
+                directive = "Present this report to the user now, and note that the isolated worktree on branch \(worktree.branch) has NO changes: approved writes landed directly outside the worktree (\(escapedWrites.joined(separator: ", "))). Do not expect apply_subagent_changes to carry those out-of-worktree writes."
+            } else {
+                directive = "Present this report to the user now, then answer their original question with it. Its changes are isolated on branch \(worktree.branch); call apply_subagent_changes with subagent_id \(subagent.id.uuidString) to land them on the working tree (the operator approves the apply), unless the user asked to keep them isolated."
+            }
+        } else {
+            directive = "Present this report to the user now, then answer their original question with it."
+        }
+        var data: [String: Any] = [
+            "subagent_id": subagent.id.uuidString,
+            "role": subagent.role,
+            "status": subagent.status.rawValue,
+            "duration_seconds": subagent.executionDurationSeconds,
+            "summary": cleanSummary,
+            "directive": directive
+        ]
+        if let report = subagent.report {
+            if worktree != nil {
+                data["changed_files"] = report.changedFiles
+            }
+            if !report.openQuestions.isEmpty {
+                data["open_questions"] = report.openQuestions.map { AgentHarness.sanitizeText($0) }
+            }
+        }
+        if let worktree, !alreadyApplied {
+            data["isolation"] = "worktree"
+            data["worktree"] = worktree.path
+            data["branch"] = worktree.branch
+        }
+        if alreadyApplied {
+            data["applied"] = true
+        }
+        if let warning {
+            data["warning"] = warning
+        }
+        if let backend = subagent.backendDescriptor {
+            data["backend"] = backend.displayName
+            data["usage"] = [
+                "steps": subagent.usage.steps,
+                "prompt_tokens": subagent.usage.promptTokens,
+                "completion_tokens": subagent.usage.completionTokens,
+                "tool_calls": subagent.usage.toolCalls
+            ]
+        }
+        let res = AgentHarness.toolSuccessJSON(tool: "spawn_subagent", data: data)
+        return (res, cleanSummary, nil, false)
+    }
+
+    // MARK: - Argument decoding
+
+    /// Which backend this spawn asked for, and whether that is a model-backed
+    /// run at all.
+    ///
+    /// `auto` reads the operator's Settings choice; with none stored it keeps
+    /// the legacy role pipelines. Sending work to a model (and, for cloud,
+    /// off-device) is a deliberate choice, not something an omitted argument
+    /// should make on the operator's behalf.
+    static func backendSelection(
+        from arguments: [String: Any],
+        defaults: UserDefaults = .standard
+    ) -> (preference: AgentBackendPreference, modelBacked: Bool, error: String?) {
+        let raw = (arguments["backend"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch raw {
+        case nil, "", "auto":
+            let stored = defaults
+                .string(forKey: SubagentBackendSettings.backendKey)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            switch stored {
+            case "local": return (.local, true, nil)
+            case "cloud": return (.cloud, true, nil)
+            default: return (.auto, false, nil)
+            }
+        case "local": return (.local, true, nil)
+        case "cloud": return (.cloud, true, nil)
+        case "legacy": return (.auto, false, nil)
+        default:
+            return (.auto, false, "The 'backend' argument must be one of auto, local, cloud or legacy.")
+        }
+    }
+
+    /// The budget keys `spawn_subagent` reads.
+    static let budgetKeys: Set<String> = [
+        "max_steps", "max_completion_tokens", "max_wall_clock_seconds", "max_cost_usd"
+    ]
+
+    /// One budget value as a number, or nil when it cannot be read as one.
+    ///
+    /// A model writes JSON, and JSON has no integer type: `"max_cost_usd":
+    /// "5"` used to be dropped by an `as? Double` cast, so the spawn silently
+    /// ran with no ceiling of its own while the caller believed it had set
+    /// one. Numeric strings are read as numbers; anything else is nil, and the
+    /// spawn tool refuses a present-but-unreadable key by name.
+    static func budgetNumber(_ raw: Any?) -> NSNumber? {
+        if let value = raw as? NSNumber { return value }
+        if let text = raw as? String {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let value = Int(trimmed) { return NSNumber(value: value) }
+            if let value = Double(trimmed) { return NSNumber(value: value) }
+        }
+        return nil
+    }
+
+    private static func budgetOverrides(from raw: Any?) -> AgentBudgetOverrides? {
+        guard let object = raw as? [String: Any] else { return nil }
+        // Values go through `budgetNumber`: a model writes JSON, and JSON has
+        // no integer type, so `"max_steps": "40"` must read as 40 rather than
+        // vanish. A key that is present and still unreadable is refused by
+        // `spawn_subagent` before it gets here.
+        func int(_ key: String) -> Int? { Self.budgetNumber(object[key])?.intValue }
+        func double(_ key: String) -> Double? { Self.budgetNumber(object[key])?.doubleValue }
+        let overrides = AgentBudgetOverrides(
+            maxSteps: int("max_steps"),
+            maxCompletionTokens: int("max_completion_tokens"),
+            maxWallClockSeconds: int("max_wall_clock_seconds"),
+            maxCostUSD: double("max_cost_usd")
+        )
+        if overrides == AgentBudgetOverrides() { return nil }
+        return overrides
+    }
+
+    private static func isolation(from raw: Any?) -> AgentIsolation {
+        // Trimmed: the value is model-authored, and " worktree" is the same
+        // intent as "worktree" — reading it as `.none` silently dropped the
+        // isolation the call asked for.
+        let value = (raw as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard let value, value == "worktree" else {
+            return .none
+        }
+        // The empty path and branch are the request's intent. The resolver
+        // replaces them with the worktree it creates, so the plan (and every
+        // record written from it) carries the real location.
+        return .worktree(path: "", branch: "")
     }
 }
 
@@ -2476,6 +2997,16 @@ public final class GetSubagentStatusTool: AgentTool {
             let err = "Subagent with ID '\(idStr)' not found."
             return (AgentHarness.toolErrorJSON(tool: "get_subagent_status", error: err), nil, err, false)
         }
+        // A run belongs to the conversation that spawned it. Answering another
+        // chat's id leaked its findings and worktree directives into this
+        // turn, and marking it relayed here suppressed the owning chat's own
+        // delivery. "Not found" is the honest answer: it is not found in THIS
+        // conversation, and naming it would confirm a run this caller must not
+        // know about.
+        guard subagent.parentSessionId == AgentHarness.executingSessionId else {
+            let err = "Subagent with ID '\(idStr)' not found."
+            return (AgentHarness.toolErrorJSON(tool: "get_subagent_status", error: err), nil, err, false)
+        }
 
         // Optional blocking wait for terminal state (used for background subagents).
         let shouldWait = (arguments["wait"] as? Bool) ?? false
@@ -2484,23 +3015,50 @@ public final class GetSubagentStatusTool: AgentTool {
             let timeout = min(max(requestedTimeout, 1.0), 300.0)
             let deadline = Date().addingTimeInterval(timeout)
             while !Task.isCancelled {
-                let s = subagent.status
-                if s == .completed || s == .failed || s == .cancelled { break }
+                // `isTerminal`, not three hand-listed cases: `blocked` is a
+                // terminal outcome (a loop guard stopped the run), and a
+                // waiter that omitted it polled a finished run to the full
+                // timeout before reporting it.
+                if subagent.status.isTerminal { break }
                 if Date() >= deadline { break }
                 try? await Task.sleep(nanoseconds: 500_000_000)
             }
         }
 
         let stepsSummary = subagent.transcript.map {
-            "Step \($0.stepIndex): \($0.actionName) (\(String(format: "%.2f", $0.durationSeconds))s)"
+            "Call \($0.stepIndex): \($0.actionName) (\(String(format: "%.2f", $0.durationSeconds))s)"
         }.joined(separator: "\n")
 
-        let isTerminal = subagent.status == .completed || subagent.status == .failed || subagent.status == .cancelled
+        let isTerminal = subagent.status.isTerminal
         var readable = "Subagent: \(subagent.role) [\(subagent.status.displayName)]\n"
         readable += "Status: \(subagent.liveStatusText)\n"
-        readable += "Steps Completed: \(subagent.transcript.count)\n"
+        // ONE definition of "steps" everywhere a run is described: the model
+        // turns its loop completed (`usage.steps`), which is what the usage
+        // block reports and the inspector's line shows. The transcript is a
+        // list of TOOL CALLS — a different quantity — and it used to be
+        // counted here as "steps", so the same run read 8 steps on one
+        // surface and 3 on another.
+        readable += "Steps Completed: \(subagent.usage.steps)\n"
+        if !subagent.transcript.isEmpty {
+            readable += "Tool Calls: \(subagent.transcript.count)\n"
+        }
         if !subagent.finalSummary.isEmpty {
             readable += "\nSummary:\n\(subagent.finalSummary)\n"
+        }
+        if let report = subagent.report, !report.findings.isEmpty {
+            // The report's findings are what the run learned, stated in its own
+            // words with the step they came from. A coordinator that only sees
+            // the summary repeats a paragraph; these are what it can relay.
+            readable += "\nFindings:\n"
+            for finding in report.findings.prefix(8) {
+                readable += "- \(finding.claim) [\(finding.evidence)]\n"
+            }
+        }
+        if let report = subagent.report, !report.openQuestions.isEmpty {
+            readable += "\nOpen questions:\n"
+            for question in report.openQuestions.prefix(5) {
+                readable += "- \(question)\n"
+            }
         }
         if isTerminal {
             if subagent.isSummaryRelayed {
@@ -2517,21 +3075,86 @@ public final class GetSubagentStatusTool: AgentTool {
             "role": subagent.role,
             "status": subagent.status.rawValue,
             "live_status": subagent.liveStatusText,
-            "steps_count": subagent.transcript.count,
+            // Model turns, matching the usage block the spawn response and the
+            // inspector both carry; `tool_calls_count` is the transcript's own
+            // quantity, reported under its own name.
+            "steps_count": subagent.usage.steps,
+            "tool_calls_count": subagent.transcript.count,
             "steps_summary": stepsSummary,
-            "summary": subagent.finalSummary,
+            "summary": AgentHarness.sanitizeText(subagent.finalSummary),
             "duration_seconds": subagent.executionDurationSeconds
         ]
+        if let report = subagent.report {
+            // The structured half is fed back verbatim by the local tool loop, so
+            // it needs the marker pass the readable half already gets: a report
+            // is model-authored and could otherwise smuggle a turn marker into
+            // the coordinator's context through a JSON field.
+            if !report.findings.isEmpty {
+                data["findings"] = report.findings.map {
+                    [
+                        "claim": AgentHarness.sanitizeText($0.claim),
+                        "evidence": AgentHarness.sanitizeText($0.evidence),
+                        "confidence": $0.confidence
+                    ]
+                }
+            }
+            if !report.openQuestions.isEmpty {
+                data["open_questions"] = report.openQuestions.map { AgentHarness.sanitizeText($0) }
+            }
+            if report.usage.costIsUnpriced {
+                data["cost_is_unpriced"] = true
+            }
+        }
         if isTerminal {
+            if let worktree = AgentHarness.worktreeDescription(of: subagent) {
+                if subagent.appliedAt != nil {
+                    // The record says the patch landed; the DISK says whether
+                    // cleanup could remove the tree. Reporting a removal that
+                    // did not happen sends the coordinator looking for a
+                    // worktree it was told was gone (or, worse, leaves the
+                    // operator believing the only copy of ignored work is
+                    // disposable).
+                    let treeGone = !FileManager.default.fileExists(atPath: worktree.path)
+                    data["isolation"] = "worktree"
+                    data["applied"] = true
+                    data["worktree_removed"] = treeGone
+                    if treeGone {
+                        readable += "\nChanges: this run's isolated changes have already been applied to the main tree; the worktree has been removed.\n"
+                    } else {
+                        data["worktree"] = worktree.path
+                        readable += "\nChanges: this run's isolated changes have already been applied to the main tree, but its worktree is STILL on disk at \(worktree.path) (removal failed). Clear it once the files are no longer needed.\n"
+                    }
+                } else {
+                    data["isolation"] = "worktree"
+                    data["worktree"] = worktree.path
+                    data["branch"] = worktree.branch
+                    let escapedWrites: [String] = {
+                        guard subagent.report?.changedFiles.isEmpty == true,
+                              subagent.report?.diff == nil else { return [] }
+                        return AgentHarness.escapedWritePaths(
+                            in: subagent.runTranscript,
+                            worktreePath: URL(fileURLWithPath: worktree.path, isDirectory: true)
+                        )
+                    }()
+                    if !escapedWrites.isEmpty {
+                        let list = escapedWrites.joined(separator: ", ")
+                        data["escaped_writes"] = escapedWrites
+                        readable += "\nChanges: the isolated worktree on \(worktree.branch) has NO changes; approved writes landed directly outside the worktree (\(list)) and are not carried by apply_subagent_changes.\n"
+                    } else {
+                        data["apply_directive"] = "This run's changes are isolated on branch \(worktree.branch). Call apply_subagent_changes with subagent_id \(subagent.id.uuidString) to land them on the main tree (the operator approves the apply), unless the user asked to keep them isolated."
+                        readable += "\nChanges: isolated worktree on \(worktree.branch). Call apply_subagent_changes with subagent_id \(subagent.id.uuidString) to apply them.\n"
+                    }
+                }
+            }
             data["directive"] = "Present this report to the user in your reply, then answer their original question with it. Do not end your turn without delivering these results."
         }
 
         let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeText(readable), limit: maxOutputLength)
         let res = AgentHarness.toolSuccessJSON(tool: "get_subagent_status", data: data)
 
-        if isTerminal && !subagent.finalSummary.isEmpty {
-            await MainActor.run { subagent.isSummaryRelayed = true }
-        }
+        // Do NOT mark `isSummaryRelayed = true` on a status read: a Stop, quota
+        // error, or app quit before the coordinator replies would consume the
+        // report forever. Every other path marks only on proven delivery.
         return (res, cleanOut, nil, false)
     }
 }
@@ -2539,7 +3162,7 @@ public final class GetSubagentStatusTool: AgentTool {
 public final class SendSubagentMessageTool: AgentTool {
     public let definition = ToolDefinition(
         name: "send_subagent_message",
-        description: "Sends a follow-up directive, instruction, or clarification to a running or completed subagent. The subagent consumes directives between execution steps: file paths in a directive are read, shell commands in a directive are run, and the results are folded into its final report.",
+        description: "Sends a follow-up directive, instruction, or clarification to a RUNNING subagent. The subagent consumes directives between execution steps: file paths in a directive are read, shell commands in a directive are run, and the results are folded into its final report. A finished run cannot consume directives; spawn a new one instead.",
         parameters: [
             "type": AnyCodable("object"),
             "properties": AnyCodable([
@@ -2572,6 +3195,30 @@ public final class SendSubagentMessageTool: AgentTool {
 
         guard let subagent = SubagentManager.shared.getSubagent(byId: uuid) else {
             let err = "Subagent with ID '\(idStr)' not found."
+            return (AgentHarness.toolErrorJSON(tool: "send_subagent_message", error: err), nil, err, false)
+        }
+        // Same scope as the read tools: steering another conversation's run is
+        // a cross-session write, not a lookup this turn is entitled to.
+        guard subagent.parentSessionId == AgentHarness.executingSessionId else {
+            let err = "Subagent with ID '\(idStr)' not found."
+            return (AgentHarness.toolErrorJSON(tool: "send_subagent_message", error: err), nil, err, false)
+        }
+
+        // A terminal run drains nothing: its channel is closed. Reporting a
+        // message "delivered" there was a promise the run could never keep —
+        // the note was queued into an object nobody reads again.
+        if subagent.status.isTerminal {
+            let err = "Subagent [\(subagent.role)] (ID: \(idStr)) has already finished; it cannot consume new directives. Spawn a new run instead."
+            return (AgentHarness.toolErrorJSON(tool: "send_subagent_message", error: err), nil, err, false)
+        }
+
+        // A Plan Mode turn must not steer a Code Mode subagent that can execute
+        // shell commands or write files (e.g. a legacy Test Runner or a running
+        // implementer). Switching to Plan Mode mid-run must not leave an
+        // unaudited shell/write channel open.
+        let callerMode = AgentHarness.executingTurnMode ?? AgentHarness.shared.activeMode
+        if callerMode == .plan && subagent.canRunShellCommands {
+            let err = "Plan Mode cannot send directives to a Code Mode subagent ([\(subagent.role)], ID: \(idStr)). Switch to Code Mode or spawn a read-only subagent."
             return (AgentHarness.toolErrorJSON(tool: "send_subagent_message", error: err), nil, err, false)
         }
 
@@ -2609,7 +3256,13 @@ public final class ListSubagentsTool: AgentTool {
         maxOutputLength: Int
     ) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
         let filter = (arguments["status_filter"] as? String)?.lowercased() ?? "all"
-        let allSubagents = SubagentManager.shared.allSubagents
+        // Conversation-scoped. The registry is process-wide, so an unfiltered
+        // list answered with runs from every chat in the window (and every
+        // API turn), including their ids — which the status tool would then
+        // have read.
+        let allSubagents = SubagentManager.shared.runs(
+            ownedBySession: AgentHarness.executingSessionId
+        )
 
         let filtered = allSubagents.filter { s in
             if filter == "all" { return true }
@@ -2628,9 +3281,10 @@ public final class ListSubagentsTool: AgentTool {
                 "role": s.role,
                 "status": s.status.rawValue,
                 "duration_seconds": s.executionDurationSeconds,
-                "steps_count": s.transcript.count
+                // Model turns, the same definition every other surface reports.
+                "steps_count": s.usage.steps
             ])
-            readableLines.append("- [\(s.role)] ID: \(s.id.uuidString) | Status: \(s.status.displayName) | Steps: \(s.transcript.count) | Duration: \(String(format: "%.2f", s.executionDurationSeconds))s")
+            readableLines.append("- [\(s.role)] ID: \(s.id.uuidString) | Status: \(s.status.displayName) | Steps: \(s.usage.steps) | Duration: \(String(format: "%.2f", s.executionDurationSeconds))s")
         }
 
         let readable = readableLines.isEmpty ? "No subagents matching filter '\(filter)'." : readableLines.joined(separator: "\n")
@@ -2815,6 +3469,247 @@ public final class GitCommitTool: AgentTool {
         } catch {
             let err = error.localizedDescription
             return (AgentHarness.toolErrorJSON(tool: "git_commit", error: err), nil, err, false)
+        }
+    }
+}
+
+/// Tool: apply_subagent_changes — lands an isolated run's worktree diff on the
+/// current working tree, behind the same approval card as any other write.
+public final class ApplySubagentChangesTool: AgentTool {
+    public let definition = ToolDefinition(
+        name: "apply_subagent_changes",
+        description: "Applies the changes an isolated writer subagent made in its git worktree onto the current working tree, then removes the worktree. The run must have been spawned with isolation 'worktree'. Changes are left unstaged so you can review and commit them yourself.",
+        parameters: [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "subagent_id": [
+                    "type": "string",
+                    "description": "The run id returned by spawn_subagent."
+                ],
+                "run_id": [
+                    "type": "string",
+                    "description": "Alias for subagent_id."
+                ]
+            ]),
+            "required": AnyCodable(["subagent_id"])
+        ]
+    )
+
+    /// The destination the approval card displayed, pinned by the caller that
+    /// raised it (the turn loop, next to the SubQ endpoint pin).
+    ///
+    /// `nil` for a headless caller: no card was shown, so there is no displayed
+    /// destination for the apply to be stale against, and `execute` resolves
+    /// the live branch itself.
+    @TaskLocal public static var pinnedDestination: SubagentApplyExpectation?
+
+    /// The destination an `apply_subagent_changes` card will name, for the
+    /// caller that raises it to pin before the operator can approve.
+    ///
+    /// Reads the same record and the same branch `execute` would, but WITHOUT
+    /// the patch digest: the card previews the run's recorded report rather
+    /// than a live snapshot, so a card-time digest would bind bytes that were
+    /// never displayed (see `execute`).
+    ///
+    /// Answers `nil` when the run is unknown or not isolated, where the tool
+    /// itself will refuse; a caller must not turn that into an error here.
+    public static func approvalExpectation(arguments: [String: Any]) async -> SubagentApplyExpectation? {
+        let raw = (arguments["subagent_id"] as? String) ?? (arguments["run_id"] as? String)
+        guard let raw,
+              let runId = UUID(uuidString: raw.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            return nil
+        }
+        let record = SubagentManager.shared.getSubagent(byId: runId)?.snapshotRecord()
+            ?? AgentRunStore.shared.loadAny(runId: runId)
+        guard let record, case .worktree(let path, let branch) = record.isolation else { return nil }
+        // The destination branch AND the exact patch are bound HERE, before the
+        // operator can click. Resolving the digest at execute time bound bytes
+        // nobody had a chance to review: a worktree that changed while the card
+        // sat open still matched its own fresh snapshot, so
+        // `patchChangedSinceApproval` could never fire.
+        let destination = record.repositoryRoot.map {
+            URL(fileURLWithPath: $0, isDirectory: true)
+        }
+        var destinationBranch: String?
+        var destinationBranchResolved = false
+        if let destination {
+            destinationBranch = await WorkspaceIsolation.currentBranch(of: destination)
+            // `resolved: true` even for a detached HEAD: the branch being nil is
+            // itself the answer, and a `git checkout main` while the card is open
+            // must be refused rather than read as "nothing to compare".
+            destinationBranchResolved = true
+        }
+        var digest: String?
+        if let worktree = try? await WorkspaceIsolation.open(
+            path: path,
+            branch: branch,
+            repositoryRoot: destination,
+            baseCommit: record.baseCommit,
+            runId: record.id
+        ), let changes = try? await WorkspaceIsolation.snapshot(worktree, diffLimit: nil) {
+            digest = SubagentApplyService.patchDigest(changes.diff)
+        }
+        return SubagentApplyExpectation(
+            destinationBranch: destinationBranch,
+            destinationBranchResolved: destinationBranchResolved,
+            patchDigest: digest
+        )
+    }
+
+    public func execute(
+        arguments: [String: Any],
+        workingDirectory: URL?,
+        maxOutputLength: Int
+    ) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        let raw = (arguments["subagent_id"] as? String) ?? (arguments["run_id"] as? String)
+        guard let raw,
+              let runId = UUID(uuidString: raw.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            let err = "Error: missing or invalid 'subagent_id' parameter in apply_subagent_changes"
+            return (AgentHarness.toolErrorJSON(tool: "apply_subagent_changes", error: err), nil, err, false)
+        }
+
+        // Same conversation scope as `get_subagent_status` and
+        // `send_subagent_message`: a coordinator must not land (and then
+        // destroy) another conversation's worktree.
+        let ownerSessionId: UUID?
+        let runExists: Bool
+        if let live = SubagentManager.shared.getSubagent(byId: runId) {
+            ownerSessionId = live.parentSessionId
+            runExists = true
+        } else if let stored = AgentRunStore.shared.loadAny(runId: runId) {
+            ownerSessionId = stored.parentSessionId
+            runExists = true
+        } else {
+            ownerSessionId = nil
+            runExists = false
+        }
+        // Same predicate as `get_subagent_status` / `send_subagent_message` /
+        // `runs(ownedBySession:)`: the owner must EQUAL the caller's session,
+        // and `nil` is a session of its own (an API/agent turn with no chat),
+        // not a wildcard — so a scoped caller can never reach a rescued record,
+        // whose owner is nil. Compared through the optional on purpose: a
+        // `let ownerSessionId` would skip the check whenever the id is unknown,
+        // which is the wildcard this guard exists to close.
+        if runExists,
+           ownerSessionId != AgentHarness.executingSessionId {
+            let err = "No subagent run with id \(runId.uuidString) was found."
+            return (AgentHarness.toolErrorJSON(tool: "apply_subagent_changes", error: err), nil, err, false)
+        }
+
+        // Bound to the destination branch AND the patch digest at card time,
+        // then re-checked before a byte is written: a `git checkout` or a
+        // worktree edit between the approval card and this call must not land
+        // something the operator never saw.
+        //
+        // The digest is part of that pin (`approvalExpectation` snapshots the
+        // live worktree before the card is raised). Resolving it here instead
+        // made the check a tautology — the fresh digest always matched the
+        // snapshot it had just taken — so a card left open over a changed
+        // worktree authorised bytes the card never showed.
+        //
+        // The branch is PINNED by the caller that raised the card
+        // (`approvalExpectation`, resolved next to the SubQ endpoint pin and
+        // handed through `executeTool`), so what is verified is the
+        // destination the CARD displayed rather than one read here — the card
+        // can sit open while the operator works in the repository. A headless
+        // caller raises no card, has nothing to be stale against, and pins
+        // nothing; it resolves the branch below exactly as before.
+        //
+        // Resolved HERE rather than through a card-raising helper: this tool's
+        // own invocation IS the operator's decision (it is state-changing, so
+        // it was approved before it ran), and asking a second time through
+        // `SubagentApplyControl` parked every headless caller on a card it
+        // never asked for. The inspector's button, which no tool call
+        // preceded, is the path that still needs one.
+        let recordedRoot = SubagentManager.shared.getSubagent(byId: runId)?.snapshotRecord().repositoryRoot
+            ?? AgentRunStore.shared.loadAny(runId: runId)?.repositoryRoot
+        // The branch is read from the root the RECORD names, which is the one
+        // the apply resolves too (the worktree's `.git` pointer is sandbox-
+        // writable and is deliberately not trusted for this).
+        var destinationBranch: String?
+        var destinationBranchResolved = false
+        if let pinned = Self.pinnedDestination, pinned.destinationBranchResolved {
+            destinationBranch = pinned.destinationBranch
+            destinationBranchResolved = true
+        } else if let recordedRoot {
+            destinationBranchResolved = true
+            destinationBranch = await WorkspaceIsolation.currentBranch(
+                of: URL(fileURLWithPath: recordedRoot, isDirectory: true)
+            )
+        }
+        let expectation: SubagentApplyExpectation?
+        if let pinned = Self.pinnedDestination {
+            // The card's own pin, digest included. Re-snapshotting here would
+            // authorize whatever the worktree holds NOW — the exact TOCTOU the
+            // pin exists to close — because the fresh digest always matches the
+            // snapshot that produced it.
+            expectation = SubagentApplyExpectation(
+                destinationBranch: destinationBranch,
+                destinationBranchResolved: destinationBranchResolved,
+                patchDigest: pinned.patchDigest
+            )
+        } else {
+            // A headless caller raised no card, so there is nothing to be stale
+            // against: it resolves the live patch immediately before the apply.
+            expectation = await SubagentApplyService.applyExpectation(
+                runId: runId,
+                destinationBranch: destinationBranch,
+                destinationBranchResolved: destinationBranchResolved
+            ).expectation
+        }
+        do {
+            let outcome = try await SubagentApplyService.apply(
+                runId: runId,
+                expectation: expectation
+            )
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let message: String
+            if outcome.alreadyApplied {
+                message = "These changes were already applied on \(formatter.string(from: outcome.appliedAt)). Nothing was applied twice."
+            } else if outcome.changedFiles.isEmpty {
+                message = outcome.worktreeRemoved
+                    ? "The run had no changes to apply. Its worktree has been removed."
+                    : "The run had no changes to apply, but its worktree could NOT be removed (a file in it may be locked). Clear the run from the inspector once it is gone."
+            } else {
+                let count = outcome.changedFiles.count
+                let destination = outcome.destinationBranch.map { " branch '\($0)'" } ?? " the working tree"
+                var composed = "Applied \(count) file\(count == 1 ? "" : "s") from \(outcome.branch) onto\(destination). The changes are unstaged; review them and commit when ready."
+                if outcome.keptIgnoredFiles.isEmpty {
+                    composed += outcome.worktreeRemoved
+                        ? " The worktree has been removed."
+                        : " The worktree could NOT be removed (a file in it may be locked); it is still on disk, and its branch was kept so the tree can be re-opened. Clear it manually when you are done."
+                } else {
+                    composed += " The worktree was KEPT: it also holds git-ignored files a patch cannot carry (\(outcome.keptIgnoredFiles.joined(separator: ", "))). Retrieve them manually before the run is cleared."
+                }
+                if outcome.keptBranch {
+                    composed += " Its branch '\(outcome.branch)' was KEPT because it holds commits outside the applied working tree; inspect or delete it manually when you are done."
+                }
+                message = composed
+            }
+            var jsonData: [String: Any] = [
+                "subagent_id": outcome.runId.uuidString,
+                "role": outcome.role,
+                "branch": outcome.branch,
+                "applied_files": outcome.changedFiles,
+                "already_applied": outcome.alreadyApplied,
+                "applied_at": formatter.string(from: outcome.appliedAt),
+                "kept_ignored_files": outcome.keptIgnoredFiles,
+                "kept_branch": outcome.keptBranch,
+                "worktree_removed": outcome.worktreeRemoved,
+                "message": message
+            ]
+            if let destination = outcome.destinationBranch {
+                jsonData["destination_branch"] = destination
+            }
+            let json = AgentHarness.toolSuccessJSON(tool: "apply_subagent_changes", data: jsonData)
+            return (json, message, nil, false)
+        } catch let error as SubagentApplyControlError where error == .approvalDenied {
+            let err = "The changes were not applied: the operator declined the apply."
+            return (AgentHarness.toolErrorJSON(tool: "apply_subagent_changes", error: err), nil, err, false)
+        } catch {
+            let err = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            return (AgentHarness.toolErrorJSON(tool: "apply_subagent_changes", error: err), nil, err, false)
         }
     }
 }
@@ -3061,8 +3956,12 @@ extension ToolExecutionStatus {
     /// run-ending decision reads this rather than testing the name itself, which
     /// is what keeps the two turn loops from disagreeing about it again.
     nonisolated func endsAgentRun(toolName: String, isCompleted: Bool) -> Bool {
-        guard self != .withheld else { return false }
-        return isCompleted || toolName == "complete"
+        switch self {
+        case .withheld, .rejected, .error:
+            return false
+        case .success, .running, .awaitingApproval:
+            return isCompleted || toolName == "complete"
+        }
     }
 }
 
@@ -3139,7 +4038,15 @@ public final class AgentHarness {
         // it (the start of an in-app send) is refused a moment later by the
         // single-flight slot anyway. Nothing can then run on stale grammar, and
         // the next assertion made while the engine is idle heals the registry.
-        guard !CompletionEngine.shared.isActive else { return }
+        //
+        // A refusal still has to be RECORDED. Returning here without arming the
+        // deferral left the mode flip with no pending rebuild at all, so the next
+        // idle assertion had nothing to flush and the stale registry survived
+        // until some unrelated registration happened to sync it.
+        guard !CompletionEngine.shared.isActive else {
+            grammarSyncDeferred = true
+            return
+        }
         syncGrammar()
     }
 
@@ -3148,6 +4055,12 @@ public final class AgentHarness {
     public var maxToolOutputLength: Int = 4000
     /// Session that owns the in-flight agent run; stamped onto spawned subagents.
     public var currentSessionId: UUID? = nil
+    /// The coordinator TURN that owns the in-flight generation (one operator
+    /// send and its continuations; a fresh send replaces it, a continuation
+    /// keeps it). Stamped onto spawned runs so a Stop scopes cancellation to
+    /// the turn that spawned the run instead of every run the conversation
+    /// ever spawned.
+    public var currentTurnId: UUID? = nil
 
     // MARK: - Web Search Loop Guard
     // Termination for tool loops is structural, not a matter of model capability: `web_search`
@@ -3213,7 +4126,13 @@ public final class AgentHarness {
     // streak lets the harness escalate to a forced synthesis turn instead of looping.
 
     /// Required argument keys per tool (from each tool's JSON schema).
+    ///
+    /// An entry lists every key that satisfies the tool, not only the schema's
+    /// `required`: `apply_subagent_changes` declares `subagent_id` required but
+    /// also accepts the `run_id` alias, and a call carrying only the alias is
+    /// not an empty scaffold.
     public static let requiredValueArgumentKeys: [String: [String]] = [
+        "apply_subagent_changes": ["subagent_id", "run_id"],
         "shell_run": ["command"],
         "file_read": ["path"],
         "file_write": ["path", "content"],
@@ -3237,9 +4156,13 @@ public final class AgentHarness {
     /// True only when EVERY required argument is missing or whitespace-empty —
     /// i.e. the call is an empty scaffold. Partially-filled calls pass through so
     /// each tool's own validation stays in charge.
-    public static func hasEmptyRequiredArguments(toolName: String, arguments: [String: Any]) -> Bool {
+    public static func hasEmptyRequiredArguments(
+        toolName: String,
+        arguments: [String: Any],
+        harness: AgentHarness = .shared
+    ) -> Bool {
         let required = requiredValueArgumentKeys[toolName]
-            ?? AgentHarness.shared.requiredArgumentsFromSchema(toolName: toolName)
+            ?? harness.requiredArgumentsFromSchema(toolName: toolName)
         guard !required.isEmpty else { return false }
         for key in required {
             if let v = arguments[key] as? String {
@@ -3484,6 +4407,24 @@ public final class AgentHarness {
         return count
     }
 
+    /// Counts an identical call that DID NOT RUN (`.withheld` or `.rejected`),
+    /// without clearing any fingerprints.
+    ///
+    /// `recordToolCallFingerprint` clears counts when a mutating tool or
+    /// `shell_run` executes, because a real write can invalidate an earlier
+    /// read. A withheld or rejected call changed nothing, so routing it through
+    /// `recordToolCallFingerprint` reset the repeat guard on every refusal (or
+    /// dropped read fingerprints for a refused `shell_run`). Counting directly
+    /// for all tool names lets the 3-repeat limit trip on refusal loops.
+    @discardableResult
+    public func recordWithheldToolCall(toolName: String, arguments: [String: Any]) -> Int {
+        let fingerprint = Self.toolCallFingerprint(toolName: toolName, arguments: arguments)
+        let count = (repeatedToolCallCounts[fingerprint] ?? 0) + 1
+        repeatedToolCallCounts[fingerprint] = count
+        maxRepeatedToolCallCount = max(maxRepeatedToolCallCount, count)
+        return count
+    }
+
     /// Tools seeded into the prompt on startup — the "fundamental" set.
     /// Kept minimal: every schema here costs prefill tokens on every turn, and each
     /// load/unload event invalidates the KV-cache prefix (full re-prefill). The model
@@ -3505,8 +4446,132 @@ public final class AgentHarness {
         "skill_load"
     ]
 
+    /// True for a harness created for one subagent run. A run-scoped harness
+    /// owns its loaded tools, guards, mode and approval policy, and must never
+    /// rebuild the process-global grammar registry.
+    private let isRunScoped: Bool
+
+    /// Tools a subagent run may never be given: they reach the coordinator's
+    /// own tool registry or would let a run delegate again. Delegation is one
+    /// level, so a child has no subagent surface at all. The status tools are
+    /// conversation-scoped now, but a child still has no business reading or
+    /// steering its siblings, and a read-only spawn must not reach them
+    /// without a card.
+    public static let runScopedForbiddenToolNames: Set<String> = [
+        "tools_discover", "tools_load", "tools_unload", "spawn_subagent", "apply_subagent_changes",
+        "get_subagent_status", "send_subagent_message", "list_subagents"
+    ]
+
+    public private(set) var runId: UUID?
+    public private(set) var runApprovalPolicy: AgentApprovalPolicy = .auto
+    public private(set) var isWorkspaceIsolated: Bool = false
+    /// The repository an isolated run's worktree was cut from, when the run
+    /// knows it. A cardless `git_commit` inside the worktree is provably
+    /// confined only while the worktree's `.git` file still points there, and
+    /// this is the root the re-verification compares against. Nil for a run
+    /// that is not worktree-isolated (or a restored record that predates the
+    /// field — those fall back to the snapshot/apply-time verification).
+    public private(set) var workspaceRepositoryRoot: URL?
+    /// The branch the worktree was created on. A carded `shell_run` can
+    /// checkout another branch inside the sandbox; a cardless `git_commit`
+    /// must not then move it, so this is the branch the commit guard checks
+    /// HEAD against.
+    public private(set) var workspaceBranch: String?
+    /// True once this run has read a path outside its workspace (or inside
+    /// `.git`). It never clears for the run's life.
+    ///
+    /// The write path was the only half enforced: a read-only run could read
+    /// any path it could name — `resolvePath` returns absolute and
+    /// `~`-expanded paths verbatim — and its own egress tools could send the
+    /// bytes out. Carding a `.git` read inside the workspace matters for the
+    /// same reason the write rule does: `.git/config` is where a remote URL's
+    /// embedded credential lives, and it is not work content.
+    ///
+    /// A read that leaves the workspace also TAINTS the run: a secret committed
+    /// INSIDE the workspace (a `.env`, a token in a source file) is readable
+    /// cardlessly, so egress is carded from then on as the other half of the
+    /// same leak. Read tools are listed by name so a new tool has to be added
+    /// deliberately rather than inheriting containment it does not have.
+    private var runReadOutsideWorkspace: Bool = false
+    /// Tools that read a path the caller names. `codebase_search` is absent on
+    /// purpose: it searches the workspace index and takes no path.
+    static let pathReadToolNames: Set<String> = [
+        "file_read", "find_files", "grep_search", "find_symbol_definition", "find_references",
+        // Same `path` argument and the same `resolvePath` call as `file_read`:
+        // it opens the file it names and returns its contents in diagnostics,
+        // so leaving it out of this set was a cardless read of any path.
+        "lint_diagnostics",
+        // `git_diff` reads the repository it is pointed at, and its `path`
+        // argument is confined by the same rule — a diff of a file outside the
+        // workspace shows that file's contents.
+        "git_diff",
+        // `git_status` takes the same `path` and resolves it the same way, and
+        // it discloses a repository's branch, tracking and file names — which
+        // for a directory outside the workspace is a cardless read of it.
+        "git_status"
+    ]
+    /// Tools whose purpose is to send bytes off this Mac. `subq_decide` uploads
+    /// its `state` (and any image bytes) to the decisions API.
+    static let egressToolNames: Set<String> = ["web_fetch", "web_search", "subq_decide"]
+    public var runHasReadOutsideWorkspace: Bool { runReadOutsideWorkspace }
+    public var runApprovalHandler: (@Sendable (AgentApprovalRequest) async -> Bool)?
+
     private init() {
+        self.isRunScoped = false
         registerDefaultTools()
+    }
+
+    private init(runScoped: Bool) {
+        self.isRunScoped = runScoped
+        registerDefaultTools()
+    }
+
+    /// An independent harness for one subagent run. It shares the installed
+    /// tool catalog but none of the coordinator's run state.
+    public static func makeRunScoped() -> AgentHarness {
+        AgentHarness(runScoped: true)
+    }
+
+    /// The tools a run-scoped harness actually installs.
+    ///
+    /// A spawn must validate against THIS, not `shared.tools`: the coordinator
+    /// also has dynamically loaded and MCP tools, and a run given one of those
+    /// is refused at `configureRunScope` after the operator already approved the
+    /// card. Failing at the spawn names the same fact earlier and changes
+    /// nothing about what a run can do.
+    public static func runScopedToolNames() -> Set<String> {
+        Set(makeRunScoped().tools.keys)
+    }
+
+    public func configureRunScope(
+        runId: UUID,
+        toolNames: [String],
+        workingDirectory: URL,
+        mode: AgentMode,
+        approvalPolicy: AgentApprovalPolicy,
+        workspaceIsolated: Bool,
+        workspaceRepositoryRoot: URL? = nil,
+        workspaceBranch: String? = nil,
+        approvalHandler: (@Sendable (AgentApprovalRequest) async -> Bool)?
+    ) throws {
+        guard isRunScoped else { throw AgentRunScopeError.notRunScoped }
+        var selected: [String: AgentTool] = [:]
+        for name in Set(toolNames).sorted() {
+            guard !Self.runScopedForbiddenToolNames.contains(name) else {
+                throw AgentRunScopeError.forbiddenTool(name)
+            }
+            guard let tool = tools[name] else { throw AgentRunScopeError.unknownTool(name) }
+            selected[name] = tool
+        }
+        self.runId = runId
+        self.loadedTools = selected
+        self.defaultWorkingDirectory = workingDirectory
+        self.activeMode = mode
+        self.runApprovalPolicy = approvalPolicy
+        self.isWorkspaceIsolated = workspaceIsolated
+        self.workspaceRepositoryRoot = workspaceRepositoryRoot
+        self.workspaceBranch = workspaceBranch
+        self.runApprovalHandler = approvalHandler
     }
 
     public func registerDefaultTools() {
@@ -3520,6 +4585,7 @@ public final class AgentHarness {
         registerTool(WebFetchTool())
         registerTool(CodebaseSearchTool())
         registerTool(SpawnSubagentTool())
+        registerTool(ApplySubagentChangesTool())
         registerTool(GetSubagentStatusTool())
         registerTool(SendSubagentMessageTool())
         registerTool(ListSubagentsTool())
@@ -3773,8 +4839,76 @@ public final class AgentHarness {
         syncGrammar()
     }
 
+    /// A registry rebuild that a live turn or a scoped mask refused.
+    private var grammarSyncDeferred = false
+
+    /// Rebuilds the shared grammar registry from this harness's loaded set.
+    ///
+    /// The registry has two other writers and both can be mid-turn:
+    ///
+    /// - A scoped mask (`GrammarConstrainedSampler.withTurnToolMask`) installs
+    ///   a client's or a run's tool vocabulary around ONE generation and
+    ///   restores the old registry afterwards. A rebuild landing inside that
+    ///   window replaced the scoped vocabulary with the app catalog for the
+    ///   rest of the step, and the model then called tools the mask did not
+    ///   describe (or could not call the ones it had). Reached from MCP
+    ///   connect, a Skills reload and `tools_load`, none of which are keyed on
+    ///   a turn.
+    /// - A generation that is merely READING the registry. Rebuilding it
+    ///   between two tokens changes the vocabulary under the live turn.
+    ///
+    /// Neither may be overwritten, so the rebuild is deferred and applied when
+    /// the next tool executes (the engine is idle then) or at the next
+    /// `setActiveMode`. A deferred rebuild is not lost: the loaded set is
+    /// current, and the next idle assertion re-derives the registry from it.
     private func syncGrammar() {
-        GrammarConstrainedSampler.shared.registerTools(availableToolDefinitions(mode: activeMode))
+        guard !isRunScoped else { return }
+        if CompletionEngine.shared.isActive {
+            grammarSyncDeferred = true
+            return
+        }
+        rebuildGrammarRegistry()
+    }
+
+    /// Applies a rebuild a live turn refused. Called where a tool is about to
+    /// run: the engine is idle between steps, which is exactly the moment the
+    /// registry may be rebuilt without disturbing a generation.
+    private func flushDeferredGrammarSync() {
+        guard grammarSyncDeferred, !isRunScoped else { return }
+        guard !CompletionEngine.shared.isActive else { return }
+        rebuildGrammarRegistry()
+    }
+
+    /// Applies a deferred rebuild at a turn's start, where the caller HOLDS the
+    /// engine slot. `flushDeferredGrammarSync` refuses whenever the engine
+    /// reads active, and `isActive` counts the caller's own claim — so the one
+    /// moment a turn could safely heal a `tools_load` the engine refused to
+    /// apply was also the moment that check turned it away, and the next step
+    /// ran on the step-0 tool set.
+    public func flushDeferredGrammarSyncForTurn() {
+        guard grammarSyncDeferred, !isRunScoped else { return }
+        rebuildGrammarRegistry()
+    }
+
+    private func rebuildGrammarRegistry() {
+        // The sampler refuses while a scoped mask owns the registry, and that
+        // refusal is atomic with the check. A refused rebuild stays deferred:
+        // the loaded set is already current, and the next idle assertion
+        // re-derives the registry from it.
+        let installed = GrammarConstrainedSampler.registerAppTools(
+            availableToolDefinitions(mode: activeMode)
+        )
+        grammarSyncDeferred = !installed
+    }
+
+    /// The run's worktree when it has one. A spawn's result and the status
+    /// tool both name it so the coordinator knows the work is not in the main
+    /// tree yet and which tool lands it.
+    static func worktreeDescription(of subagent: SubagentInstance) -> (path: String, branch: String)? {
+        guard let plan = subagent.modelPlan,
+              case .worktree(let path, let branch) = plan.isolation,
+              !path.isEmpty else { return nil }
+        return (path, branch)
     }
 
     /// MCP tools are treated as state-changing unconditionally. A remote server
@@ -3783,7 +4917,8 @@ public final class AgentHarness {
     /// call gates on HITL approval (Turbo Mode still bypasses it).
     public static func isStateChanging(toolName: String) -> Bool {
         if toolName.hasPrefix(MCPToolBridge.namePrefix) { return true }
-        return toolName == "file_write" || toolName == "file_edit" || toolName == "shell_run" || toolName == "git_commit"
+        return toolName == "file_write" || toolName == "file_edit" || toolName == "shell_run"
+            || toolName == "git_commit" || toolName == "apply_subagent_changes"
     }
 
     /// Whether a call must ask the user before it runs.
@@ -3804,18 +4939,169 @@ public final class AgentHarness {
         toolName: String,
         arguments: [String: Any],
         mode: AgentMode,
-        subQEndpoint: URL? = nil
+        subQEndpoint: URL? = nil,
+        rawArguments: String? = nil
     ) -> Bool {
         if isStateChanging(toolName: toolName) {
             return !PlanModePolicy.withholds(toolName, in: mode)
         }
+        if toolName == "spawn_subagent" {
+            return spawnSubagentRequiresApproval(arguments: arguments, mode: mode)
+        }
+        if toolName == "send_subagent_message" {
+            return sendSubagentMessageRequiresApproval(arguments: arguments, mode: mode)
+        }
         if toolName == "subq_decide" {
             return subqDecideRequiresApproval(
                 arguments: arguments,
-                endpoint: subQEndpoint ?? SubQDecisionSettings.endpoint()
+                endpoint: subQEndpoint ?? SubQDecisionSettings.endpoint(),
+                rawArguments: rawArguments
             )
         }
         return false
+    }
+
+    /// Delegation is the primary card: a spawn that can write is a decision the
+    /// operator makes once, with the role, backend and tool set in front of
+    /// them, rather than a stream of per-call cards they cannot attribute to a
+    /// background run. A read-only LOCAL spawn, and any local spawn in plan
+    /// mode, runs without a card, unless it asks for a wall-clock budget above
+    /// its preset's default, which is the one unattended number that can hold
+    /// the single local engine for hours.
+    ///
+    /// Plan mode is not a blanket exemption. Its write tools are withheld, but
+    /// the READ tools stay available, so a run that works off-device uploads
+    /// repository content on every `file_read` and `grep_search`, a decision
+    /// the operator has never been shown. The cloud branch therefore has to be
+    /// evaluated before the plan-mode shortcut, including when Settings (not
+    /// the argument) is what resolves to Cloud.
+    static func spawnSubagentRequiresApproval(
+        arguments: [String: Any],
+        mode: AgentMode,
+        defaults: UserDefaults = .standard
+    ) -> Bool {
+        if mode == .plan {
+            // Plan mode's local runs are read-only, but they still hold the
+            // single local engine for their whole budget, so an inflated
+            // wall clock is carded here too. Legacy pipelines do not run the
+            // model loop and never hold that engine, so their budget is not a
+            // reason for a card.
+            if spawnResolvesToCloud(arguments: arguments, defaults: defaults) { return true }
+            let selection = SpawnSubagentTool.backendSelection(from: arguments, defaults: defaults)
+            return selection.modelBacked && requestsWallClockAbovePresetDefault(arguments)
+        }
+        // Sending a run off-device is a decision the operator makes in
+        // Settings or on a card that says so. A read-only run is still a run:
+        // file_read and grep_search upload repository content on every step.
+        if spawnsWorkOffDevice(arguments: arguments, defaults: defaults) { return true }
+        let selection = SpawnSubagentTool.backendSelection(from: arguments, defaults: defaults)
+        if !selection.modelBacked {
+            // The legacy execution path ignores `preset` and `allowed_tools`
+            // and dispatches strictly by `SubagentRoleArchetype.match(from: role)`.
+            // The Test Runner executes shell commands directly via `/bin/zsh -c`,
+            // so it always requires operator approval regardless of any
+            // `preset` or `allowed_tools` the caller passed.
+            let archetype = SubagentRoleArchetype.match(from: arguments["role"] as? String ?? "")
+            return archetype == .testRunner
+        }
+        let preset = AgentRolePresetCatalog.preset(
+            named: arguments["preset"] as? String,
+            role: arguments["role"] as? String ?? ""
+        )
+        let definition = AgentRolePresetCatalog.definition(for: preset)
+        // A WALL-CLOCK BUDGET THE MODEL CHOSE is a decision the operator makes.
+        // The local engine is single-flight and a scheduler ticket is held for
+        // the run's WHOLE life, so one unattended 24 h run blocks every later
+        // local spawn for the queue's whole admission budget, a wait nothing
+        // the operator ever saw can justify. The preset's own default is the
+        // unattended bound; above it the card appears with the number on it.
+        if requestsWallClockAbovePresetDefault(arguments) { return true }
+        let explicit = ((arguments["allowed_tools"] as? [String]) ?? [])
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let intended = explicit.isEmpty ? definition.toolNames : explicit
+        return !Set(intended).isDisjoint(with: AgentToolSurface.writeCapable)
+    }
+
+    /// Whether a spawn asked for more wall clock than its preset's default.
+    /// The number is read the same way `budgetOverrides` reads it, so the
+    /// approval decision and the budget the run actually gets cannot disagree.
+    private static func requestsWallClockAbovePresetDefault(_ arguments: [String: Any]) -> Bool {
+        guard let requested = requestedWallClockSeconds(from: arguments) else { return false }
+        let preset = AgentRolePresetCatalog.preset(
+            named: arguments["preset"] as? String,
+            role: arguments["role"] as? String ?? ""
+        )
+        return requested > AgentRolePresetCatalog.definition(for: preset).maxWallClockSeconds
+    }
+
+    /// The `budget.max_wall_clock_seconds` a spawn asked for, if it named one.
+    /// Read the same way `budgetOverrides` reads it, so the approval decision
+    /// and the budget the run actually gets cannot disagree about the number.
+    private static func requestedWallClockSeconds(from arguments: [String: Any]) -> Int? {
+        guard let budget = arguments["budget"] as? [String: Any] else { return nil }
+        if let value = budget["max_wall_clock_seconds"] as? Int { return value }
+        if let value = budget["max_wall_clock_seconds"] as? NSNumber { return value.intValue }
+        return nil
+    }
+
+    /// Steering a running legacy Test Runner executes shell commands extracted
+    /// from the directive via `/bin/zsh -c`, bypassing `SubagentToolExecutor`.
+    /// Gate those directives on operator approval in Code Mode; in Plan Mode,
+    /// `SendSubagentMessageTool` refuses to message Code Mode subagents outright.
+    static func sendSubagentMessageRequiresApproval(
+        arguments: [String: Any],
+        mode: AgentMode
+    ) -> Bool {
+        guard mode != .plan else { return false }
+        guard let idStr = arguments["subagent_id"] as? String,
+              let uuid = UUID(uuidString: idStr),
+              let subagent = SubagentManager.shared.getSubagent(byId: uuid) else {
+            return false
+        }
+        return subagent.modelPlan == nil
+            && subagent.archetype == .testRunner
+            && subagent.canRunShellCommands
+    }
+
+    /// Whether this spawn resolves to the Cloud backend, following the same
+    /// rule `backendSelection` uses: an explicit `cloud` wins, `local`/`legacy`
+    /// never do, and an omitted or `auto` backend takes the Settings choice.
+    static func spawnResolvesToCloud(
+        arguments: [String: Any],
+        defaults: UserDefaults = .standard
+    ) -> Bool {
+        let raw = (arguments["backend"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        switch raw {
+        case "cloud":
+            return true
+        case "local", "legacy":
+            return false
+        default:
+            let stored = defaults.string(forKey: SubagentBackendSettings.backendKey)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            return stored == "cloud"
+        }
+    }
+
+    /// True when this spawn's `backend` argument forces Cloud while the stored
+    /// Settings choice does not already say Cloud. An omitted or `auto` backend
+    /// follows Settings, so that path needs no extra card.
+    static func spawnsWorkOffDevice(
+        arguments: [String: Any],
+        defaults: UserDefaults = .standard
+    ) -> Bool {
+        let raw = (arguments["backend"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard raw == "cloud" else { return false }
+        let stored = defaults.string(forKey: SubagentBackendSettings.backendKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return stored != "cloud"
     }
 
     /// Whether Turbo Mode may skip the approval prompt for this call.
@@ -3826,19 +5112,38 @@ public final class AgentHarness {
     /// https://attacker` followed by `subq_decide` in the same assistant
     /// message sent the key off-host with no card at all, because the pin only
     /// preserved the destination the card *would* have shown. A `subq_decide`
-    /// aimed anywhere but SubQ's own origin is therefore never bypassable;
-    /// every other tool keeps the old behaviour.
+    /// aimed anywhere but SubQ's own origin is therefore never bypassable, and
+    /// neither is one that uploads image bytes — the card exists because files
+    /// leave this Mac. Every other tool keeps the old behaviour.
     public static func turboModeMayBypassApproval(
         toolName: String,
         arguments: [String: Any],
         mode: AgentMode,
-        subQEndpoint: URL? = nil
+        subQEndpoint: URL? = nil,
+        rawArguments: String? = nil,
+        defaults: UserDefaults = .standard
     ) -> Bool {
+        // Landing isolated work is the one write the contract reserves for its
+        // own card: Turbo is a blanket switch over ROUTINE writes, and a patch
+        // appearing in the operator's tree with no card is not routine. Checked
+        // before `requiresApproval` so plan mode's withholding cannot turn this
+        // into a bypass either.
+        if toolName == "apply_subagent_changes" { return false }
+        // A spawn that forces work off-device is the same class: its card
+        // exists precisely because repository content leaves the machine, and
+        // Turbo is a switch over ROUTINE writes. The stored Settings choice is
+        // the operator's standing decision, so only a `backend` argument that
+        // overrides it keeps the card under Turbo.
+        if toolName == "spawn_subagent",
+           spawnsWorkOffDevice(arguments: arguments, defaults: defaults) {
+            return false
+        }
         guard requiresApproval(
             toolName: toolName,
             arguments: arguments,
             mode: mode,
-            subQEndpoint: subQEndpoint
+            subQEndpoint: subQEndpoint,
+            rawArguments: rawArguments
         ) else { return true }
         // A call that rewrites THIS app's preferences is the one class of state
         // change Turbo must never wave through: the switch itself lives in the
@@ -3848,8 +5153,31 @@ public final class AgentHarness {
         // operator still sees the command and may say yes.
         if targetsApplicationPreferences(toolName: toolName, arguments: arguments) { return false }
         guard toolName == "subq_decide" else { return true }
+        // Uploading local image bytes is the same class as a spawn that forces
+        // work off-device: the card exists because files LEAVE this Mac, and
+        // Turbo is a switch over routine writes. It used to be bypassable
+        // whenever the endpoint was SubQ's own, which made the upload card
+        // unreachable in the configuration where it is the only disclosure.
+        if Self.subqDecideCarriesImages(arguments: arguments, rawArguments: rawArguments) { return false }
         let endpoint = subQEndpoint ?? SubQDecisionSettings.endpoint()
         return SubQDecisionSettings.origin(endpoint) == SubQDecisionSettings.officialOrigin
+    }
+
+    /// Whether this call carries at least one image, from either the decoded
+    /// arguments or the wire form (the approval center only keeps the
+    /// stringified copy, where an array is a description).
+    ///
+    /// Both questions go to `SubQDecideTool`'s own predicates, the same pair
+    /// `subqDecideRequiresApproval` asks: a local run's card carries
+    /// `[String: String]`, where `arguments["images"]` is a described STRING and
+    /// the wire form is XML rather than JSON, so a narrower check here waved
+    /// exactly those uploads through Turbo.
+    static func subqDecideCarriesImages(
+        arguments: [String: Any],
+        rawArguments: String? = nil
+    ) -> Bool {
+        if SubQDecideTool.uploadsImages(arguments: arguments) { return true }
+        return SubQDecideTool.uploadsImages(rawArguments: rawArguments)
     }
 
     // MARK: - App-preference protection
@@ -3872,6 +5200,17 @@ public final class AgentHarness {
         case "file_write", "file_edit":
             guard let path = arguments["path"] as? String else { return false }
             return pathWritesApplicationPreferences(path)
+        case "spawn_subagent", "send_subagent_message":
+            // Delegation is not a way around this: a legacy Test Runner lifts
+            // a backticked command out of the task text and runs it through
+            // `zsh -c`, and a message steers a run that is already doing so.
+            // The free-text arguments are the only place a command can hide.
+            let fields = toolName == "spawn_subagent"
+                ? ["task_description", "context_summary"]
+                : ["message"]
+            return fields.contains { key in
+                (arguments[key] as? String).map(shellCommandWritesApplicationPreferences) ?? false
+            }
         default:
             return false
         }
@@ -3879,7 +5218,7 @@ public final class AgentHarness {
 
     /// The bundle id, lowercased: it is both the `defaults` domain and the
     /// preference plist's own file name.
-    private static let applicationPreferencesDomain = "drp.dynamoe"
+    private nonisolated static let applicationPreferencesDomain = "drp.dynamoe"
 
     /// True for a shell command that would rewrite this app's preferences.
     ///
@@ -3893,7 +5232,7 @@ public final class AgentHarness {
     /// tools are not inspected at all. It exists to stop the ordinary case (an
     /// agent composing a `defaults write`), which is what the Turbo self-revert
     /// was, and is not a sandbox.
-    static func shellCommandWritesApplicationPreferences(_ command: String) -> Bool {
+    nonisolated static func shellCommandWritesApplicationPreferences(_ command: String) -> Bool {
         let lowered = command.lowercased()
         if lowered.contains("cfprefsd"),
            lowered.contains("killall") || lowered.contains("pkill") {
@@ -3923,11 +5262,24 @@ public final class AgentHarness {
 
     /// True when a `subq_decide` call sends local file bytes or would send the
     /// state to an origin other than SubQ's own.
+    ///
+    /// `rawArguments` is the WIRE form and is consulted as well as the decoded
+    /// dictionary: the approval plumbing stores a `[String: String]` display
+    /// copy, where `images` is a Swift array DESCRIPTION rather than an array,
+    /// so a Turbo decision made from that copy saw no images and waved through
+    /// the one card whose whole purpose is the upload.
     public static func subqDecideRequiresApproval(
         arguments: [String: Any],
-        endpoint: URL
+        endpoint: URL,
+        rawArguments: String? = nil
     ) -> Bool {
-        if let images = arguments["images"] as? [Any], !images.isEmpty { return true }
+        // Both forms, because neither alone covers every dialect: a local
+        // model's XML/DSML/Gemma call has non-JSON `rawArguments` (so the raw
+        // check answers false) while `arguments` is the decoded dictionary,
+        // and a `[String: String]` display copy loses the array's type (so the
+        // typed check answers false where the raw one parses).
+        if SubQDecideTool.uploadsImages(arguments: arguments) { return true }
+        if SubQDecideTool.uploadsImages(rawArguments: rawArguments) { return true }
         // Origin, not host: `https://api.subq.ai:8443` is a different service
         // and must not ride in on the official host's approval.
         return SubQDecisionSettings.origin(endpoint) != SubQDecisionSettings.officialOrigin
@@ -3954,6 +5306,43 @@ public final class AgentHarness {
     /// because subagents execute through this same harness concurrently, each in
     /// its own task, with its own parent mode.
     @TaskLocal static var executingTurnMode: AgentMode?
+
+    /// The coordinator TURN and SESSION whose tool is executing, bound by
+    /// `executeTool` exactly like the mode above.
+    ///
+    /// `currentTurnId` is a single stored value overwritten at every send, and
+    /// tool execution overlaps the NEXT send: the engine goes idle while tools
+    /// run, so an operator can send again and replace the stored identity
+    /// while an older turn's `spawn_subagent` is still executing. A child
+    /// spawned there was stamped with the newer turn's id, and Stop then
+    /// cancelled a run the newer turn never started. The task that runs a tool
+    /// is the only thing that knows which turn it belongs to, so the turn
+    /// carries the identity through it instead of reading the global.
+    @TaskLocal static var executingTurnId: UUID?
+    @TaskLocal static var executingSessionId: UUID?
+
+    /// True while the tool being executed belongs to a run-scoped harness (a
+    /// subagent run or a legacy pipeline step) rather than the app's own turn.
+    ///
+    /// Such a harness has no global turn of its own to fall back to: a nested
+    /// `spawn_subagent` must inherit the RUN's parent identity, and reading
+    /// `AgentHarness.shared.currentTurnId` would stamp it with whichever
+    /// operator turn happens to be current.
+    /// Read from `nonisolated` git/process helpers, which have no actor and no
+    /// global turn to consult: the value is a `@TaskLocal`, so reading it
+    /// anywhere is safe and is exactly what those call sites need.
+    @TaskLocal nonisolated static var executingInRunScope = false
+
+    /// True while the tool being executed ran WITHOUT a human decision.
+    ///
+    /// The approval sites (the local turn, the cloud turn) know this and pass
+    /// it to `executeTool`; nothing downstream can reconstruct it, because a
+    /// bypassed card and an approved one leave the same state behind. It
+    /// selects the run-scoped ALLOWLIST for any child the call spawns
+    /// (`shell_run`, `find_files`, git), so a command that was never reviewed
+    /// cannot read the operator's `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN` or
+    /// `SSH_AUTH_SOCK` just because Turbo Mode is on.
+    @TaskLocal static var executingUnreviewedToolCall = false
 
     /// Definitions currently exposed to the model for the turn in flight.
     /// The explicit `availableToolDefinitions(mode:)` is what a caller uses
@@ -4012,7 +5401,7 @@ public final class AgentHarness {
                 && !PlanModePolicy.withholds(name, in: mode)
                 && Self.toolUnavailableReason(name) == nil
         }.count
-        if unloadedCount > 0 {
+        if unloadedCount > 0 && !isRunScoped {
             prompt += """
             NOTE: \(unloadedCount) additional tool(s) are installed but NOT loaded, so their schemas are not shown above and they cannot currently be called.
 
@@ -4047,7 +5436,7 @@ public final class AgentHarness {
         // web_search query after query trying to obtain page content until the
         // search budget guardrail force-disabled web_search mid-task. Tell it
         // exactly how to gain fetch capability instead.
-        if loadedTools["web_search"] != nil && loadedTools["web_fetch"] == nil && mode == .code {
+        if loadedTools["web_search"] != nil && loadedTools["web_fetch"] == nil && mode == .code && !isRunScoped {
             prompt += """
             Web research readiness: `web_fetch` (full page content) is NOT loaded yet, so you cannot read pages. Before you need page content, call `tools_load` with `{\"names\": [\"web_fetch\"]}` and then fetch the exact URLs `web_search` returned. Do NOT keep issuing `web_search` queries to obtain page content — search snippets are all web_search can give you.
 
@@ -4119,7 +5508,7 @@ public final class AgentHarness {
             - The withheld tools are not declared in this request's `tools` array, so the provider will not offer them. Investigate with the declared tools above, then write the plan.
             """
         }
-        if unloadedCount > 0 {
+        if unloadedCount > 0 && !isRunScoped {
             prompt += """
 
             - \(unloadedCount) additional tool(s) are installed but not loaded. Call `tools_discover` to list them by category, then `tools_load` with a `names` array to add the schemas you need (one batched call) before using them.
@@ -4202,6 +5591,226 @@ public final class AgentHarness {
         - Timezone: \(tzName)\(tzAbbr.isEmpty ? "" : " (\(tzAbbr))")
         - Temporal Context: Today's reference date is \(readableDateTime). When conducting web research (`web_search`), fetching web pages (`web_fetch`), synthesizing recent developments, or reasoning about relative dates ("today", "yesterday", "recent", "this year"), always use \(year) and this reference timestamp.
         """
+    }
+
+    /// Tells a run-scoped worker where its workspace lives on disk and, for an
+    /// isolated git worktree, warns it not to target the coordinator's main
+    /// repository path. Without this, a worker that sees the repository path in
+    /// `context_summary` (or is told to use absolute paths) writes straight into
+    /// the coordinator's working tree instead of its worktree.
+    private func workerWorkspaceSection() -> String {
+        guard isRunScoped, let workspace = defaultWorkingDirectory else { return "" }
+        if isWorkspaceIsolated {
+            var lines: [String] = [
+                "# Workspace",
+                "",
+                "Working directory (isolated git worktree): \(workspace.path)"
+            ]
+            if let branch = workspaceBranch, !branch.isEmpty {
+                lines.append("Worktree branch: \(branch)")
+            }
+            lines.append("All relative paths in tool calls resolve against this worktree.")
+            lines.append("- Keep every file read, write, edit, and git call inside \(workspace.path) (use relative paths from the repository root, or absolute paths under \(workspace.path)).")
+            if let repoRoot = workspaceRepositoryRoot {
+                lines.append("- Do NOT read or write paths under the coordinator's main repository (\(repoRoot.path)): targeting that path escapes your isolated worktree, triggers a containment-escape approval prompt, and leaves the worktree empty.")
+            }
+            return lines.joined(separator: "\n") + "\n\n"
+        }
+        return """
+        # Workspace
+
+        Working directory: \(workspace.path)
+        Relative paths in tool calls resolve against this directory.
+
+
+        """
+    }
+
+    /// The system prompt for a model-backed subagent run.
+    ///
+    /// Deliberately separate from `buildSystemPrompt`: a worker is not the
+    /// coordinator, so it must not be given the coordinator's subagent-delivery
+    /// policy, nor told to present results to the user. It is told to do its
+    /// assigned task with its tools, cite real evidence, and finish with
+    /// `complete`.
+    public func buildWorkerSystemPrompt(
+        baseSystem: String,
+        role: String,
+        mode: AgentMode,
+        isLingModel: Bool = false,
+        isGemma4Model: Bool = false,
+        isDeepSeekV41Model: Bool = false,
+        currentDate: Date = Date()
+    ) -> String {
+        var prompt = AgentHarness.formattedDateTimeContext(date: currentDate) + "\n\n"
+        let cleanBase = baseSystem.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleanBase.isEmpty {
+            prompt += cleanBase + "\n\n"
+        }
+        prompt += """
+        # Subagent Role
+
+        You are a subagent working on behalf of a coordinator agent inside DynaMoE. Your role is: \(AgentHarness.sanitizeText(role)).
+
+        The coordinator owns the conversation with the user; you do not. Work only on the task you were given, with the tools listed below, and return a report the coordinator can use. Do not ask the user questions and do not wait for approval you cannot receive.
+
+        """
+        prompt += workerWorkspaceSection()
+        if mode == .plan {
+            prompt += PlanModePolicy.directive(toolNames: availableToolDefinitions(mode: mode).map { $0.function.name }) + "\n\n"
+        }
+        prompt += buildToolsSection(mode: mode)
+        prompt += Self.workerToolCallSyntaxSection(
+            isLingModel: isLingModel,
+            isGemma4Model: isGemma4Model,
+            isDeepSeekV41Model: isDeepSeekV41Model
+        )
+        prompt += """
+
+        # Tool Results
+
+        Tool results arrive as plain text: a `[tool_name] status` header, `key: value` metadata lines, then one or more `--- field ---` sections. Read `--- content ---` as the actual file or page text. `<<<TRUNCATED: …>>>` and `next_start_line` are harness annotations: page through with `start_line` rather than assuming the document is broken.
+
+        # Subagent Rules
+
+        - Read real files and run real commands. Never describe code or output you have not actually inspected with a tool in this run.
+        - Every finding you report must cite its evidence: a file and line, a URL, or the command whose output produced it.
+        - Prefer a small number of targeted tool calls over broad exploration. You have a bounded step and token budget.
+        - Do not attempt to spawn another subagent. Delegation is one level.
+        - Do not call `tools_discover` or `tools_load`; your tool set is fixed for this run.
+        \(Self.workerCompletionRule(mode: mode))
+        - If a tool is refused by policy, do not retry it. Continue with the tools you have and report the limitation.
+
+        """
+        return prompt
+    }
+
+    /// The completion rule for a worker prompt, matched to the tool surface the
+    /// run actually has. Plan mode withholds `complete` and the execution
+    /// backstop refuses it with "do not retry", so an unconditional "call
+    /// `complete`" left a local plan run whose only named ending was a
+    /// refusal — the cloud worker had the plan directive but the same
+    /// contradictory rule. The plan-mode ending is the one the backstop itself
+    /// teaches: a plain-text reply ending in the ready marker.
+    private static func workerCompletionRule(mode: AgentMode) -> String {
+        if PlanModePolicy.withholds("complete", in: mode) {
+            return "- Finish with a plain-text reply that reports what you found or the plan you produced. `complete` is withheld in this run and every write tool is refused: do not call either. End the final reply with \(PlanMarkers.ready) on its own last line."
+        }
+        return "- When the task is complete, call `complete` with a summary that states what you found or changed, and what you could not verify. If you cannot complete the task, still call `complete` and say why, with the evidence you gathered."
+    }
+
+    private static func workerToolCallSyntaxSection(
+        isLingModel: Bool,
+        isGemma4Model: Bool,
+        isDeepSeekV41Model: Bool
+    ) -> String {
+        if isDeepSeekV41Model {
+            return "\n\n" + DeepSeekV41ToolDialect.instructions() + "\n\n"
+        }
+        if isLingModel {
+            return """
+
+
+            # Tool Calls
+
+            To call a function, reply only in this native format with no suffix:
+
+            <tool_call>example_function_name
+            <arg_key>example_parameter_1</arg_key>
+            <arg_value>value_1</arg_value>
+            </tool_call>
+
+            The function name follows <tool_call> directly, then one <arg_key>/<arg_value> pair per argument. Required parameters must be present. Any reasoning for the call goes BEFORE it, never after.
+
+            """
+        }
+        if isGemma4Model {
+            return """
+
+
+            # Tool Calls
+
+            To call a function, reply only in this native format with no suffix:
+
+            <|tool_call>call:example_function_name{example_parameter_1:<|"|>value_1<|"|>}<tool_call|>
+
+            String values are wrapped in <|"|> quotes; numbers, booleans and nested objects are written bare. Required parameters must be present. Any reasoning for the call goes BEFORE it, never after.
+
+            """
+        }
+        return """
+
+
+        # Tool Calls
+
+        To call a function, reply only in this format with no suffix:
+
+        <tool_call>
+        <function=example_function_name>
+        <parameter=example_parameter_1>
+        value_1
+        </parameter>
+        </function>
+        </tool_call>
+
+        The <function=...></function> block must be nested inside <tool_call></tool_call>. Required parameters must be present. Any reasoning for the call goes BEFORE it, never after.
+
+        """
+    }
+
+    public func buildCloudWorkerSystemPrompt(
+        baseSystem: String,
+        role: String,
+        mode: AgentMode,
+        currentDate: Date = Date()
+    ) -> String {
+        var prompt = AgentHarness.formattedDateTimeContext(date: currentDate) + "\n\n"
+        let cleanBase = baseSystem.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleanBase.isEmpty {
+            prompt += cleanBase + "\n\n"
+        }
+        prompt += """
+        # Subagent Role
+
+        You are a subagent working on behalf of a coordinator agent inside DynaMoE. Your role is: \(AgentHarness.sanitizeText(role)).
+
+        The coordinator owns the conversation with the user; you do not. Work only on the task you were given and return a report the coordinator can use. Do not ask the user questions.
+
+        """
+        prompt += workerWorkspaceSection()
+        if mode == .plan {
+            prompt += PlanModePolicy.directive(toolNames: availableToolDefinitions(mode: mode).map { $0.function.name }) + "\n\n"
+        }
+        let pathRule: String
+        if isRunScoped, let workspace = defaultWorkingDirectory {
+            if isWorkspaceIsolated {
+                pathRule = "- Prefer relative paths (which resolve inside your worktree \(workspace.path)) or absolute paths under \(workspace.path). Never pass paths under the coordinator's main repository."
+            } else {
+                pathRule = "- Use relative paths (resolved against \(workspace.path)) or absolute paths inside \(workspace.path)."
+            }
+        } else {
+            pathRule = "- Use absolute paths."
+        }
+        prompt += """
+
+        # Tools
+
+        Call tools through the provider's native function-calling interface, using the functions declared in this request. Never emit XML or prose instead of a call. Only the declared functions are callable; do not try to load or discover others.
+
+        - Issue the call rather than narrating it.
+        - Read every result before deciding the next step, and never repeat an identical call hoping for a different answer.
+        \(pathRule)
+        - A refused tool is final for this run: continue with what you have and report the limitation.
+
+        # Subagent Rules
+
+        - Every finding must cite its evidence: a file and line, a URL, or the command whose output produced it.
+        - Keep the tool calls targeted; you have a bounded step and token budget.
+        - Do not attempt to spawn another subagent.
+        \(Self.workerCompletionRule(mode: mode))
+
+        """
+        return prompt
     }
 
     public func buildSystemPrompt(baseSystem: String, modelName: String? = nil, currentDate: Date = Date(), isLingModel: Bool = false, isGemma4Model: Bool = false, isDeepSeekV41Model: Bool = false, mode: AgentMode = .code) -> String {
@@ -5098,27 +6707,474 @@ public final class AgentHarness {
 
     /// Runs one parsed call.
     ///
-    /// `mode` is the TURN's mode. Callers that know it pass it by value, because
-    /// `activeMode` is process-global and another turn can move it; a nil value
-    /// keeps the historical behaviour of reading the active mode.
-    public func executeTool(call: ParsedToolCall, workingDirectory: URL? = nil, maxOutputLength: Int? = nil, mode: AgentMode? = nil, approvedSubQEndpoint: URL? = nil) async -> (resultJSON: String, record: ToolCallRecord, isCompleted: Bool) {
+    /// `mode`, `turnId` and `sessionId` are the TURN's. Callers that know them
+    /// pass them by value, because `activeMode` / `currentTurnId` /
+    /// `currentSessionId` are process-global and another turn can move them
+    /// while this call is still awaiting; nil keeps the historical behaviour
+    /// of reading the global.
+    ///
+    /// `unreviewed` is the APPROVAL's answer, not the tool's: the caller that
+    /// decided no card was needed (or that Turbo bypassed one) passes true, and
+    /// every child this call spawns then gets the allowlist instead of the
+    /// operator's environment. It defaults to false because a caller that does
+    /// not know is a caller that showed the card.
+    public func executeTool(call: ParsedToolCall, workingDirectory: URL? = nil, maxOutputLength: Int? = nil, mode: AgentMode? = nil, turnId: UUID? = nil, sessionId: UUID? = nil, approvedSubQEndpoint: URL? = nil, approvedApplyDestination: SubagentApplyExpectation? = nil, unreviewed: Bool = false) async -> (resultJSON: String, record: ToolCallRecord, isCompleted: Bool) {
+        // A tool runs between steps, with the engine idle. That is the one
+        // moment a registry rebuild deferred during a generation can land.
+        flushDeferredGrammarSync()
         let effectiveMode = mode ?? activeMode
         // Bound for the whole call so a tool that takes no `mode:` parameter
         // (`tools_discover`, `tools_load`) answers for THIS turn rather than for
         // whatever `activeMode` holds when its own `await` resumes.
         //
+        // The turn identity is bound for the same reason: `spawn_subagent`
+        // reads it to stamp the run's parent, and a send that happened while
+        // this tool was awaiting must not rewrite that stamp.
+        //
         // The SubQ endpoint is bound for the same reason: the approval card
         // displays a destination, and the call must use THAT one rather than
         // re-read `UserDefaults` after the operator approved a different host.
+        //
+        // The apply destination is the third: the card names the branch the
+        // patch will land on, so a `git checkout` while the card sat open is
+        // refused instead of landing the patch somewhere the operator never saw.
         return await AgentHarness.$executingTurnMode.withValue(effectiveMode) {
-            await SubQDecideTool.$pinnedEndpoint.withValue(approvedSubQEndpoint) {
-                await self.runToolInTurn(
-                    call: call,
-                    workingDirectory: workingDirectory,
-                    maxOutputLength: maxOutputLength,
-                    effectiveMode: effectiveMode
-                )
+            await AgentHarness.$executingTurnId.withValue(turnId ?? AgentHarness.executingTurnId) {
+                // ONE effective session for the whole call, fallbacks included.
+                // `spawn_subagent` used to fall back to `currentSessionId` on
+                // its own while the sibling lookup tools compared strictly
+                // against this binding, so an unscoped caller could spawn runs
+                // its own status/apply tools could not see. Binding the
+                // fallback here makes every tool agree by construction.
+                await AgentHarness.$executingSessionId.withValue(
+                    sessionId ?? AgentHarness.executingSessionId ?? AgentHarness.shared.currentSessionId
+                ) {
+                    await AgentHarness.$executingInRunScope.withValue(isRunScoped) {
+                        await AgentHarness.$executingUnreviewedToolCall.withValue(unreviewed) {
+                            await SubQDecideTool.$pinnedEndpoint.withValue(approvedSubQEndpoint) {
+                                await ApplySubagentChangesTool.$pinnedDestination.withValue(approvedApplyDestination) {
+                                    await self.runToolInTurn(
+                                        call: call,
+                                        workingDirectory: workingDirectory,
+                                        maxOutputLength: maxOutputLength,
+                                        effectiveMode: effectiveMode
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
             }
+        }
+    }
+
+    private enum RunScopeDecision {
+        case allow
+        case deny(String)
+        case ask(AgentApprovalRequest)
+    }
+
+    /// True when every write this call can perform is inside `workspace`.
+    ///
+    /// Only a tool whose whole write surface is a named path can be proved.
+    /// `file_write` / `file_edit` name their destination directly, and a
+    /// `git_commit` is scoped by git to the worktree it runs in. A shell
+    /// command is arbitrary code that also takes its own `cwd`, so it answers
+    /// false: the spawn-only policy may not call it safe, and the operator
+    /// gets the same per-change card a write on the main tree gets.
+    ///
+    /// A `.git` path component answers false even inside the prefix: a linked
+    /// worktree's `.git` is a regular FILE in the sandbox, and rewriting it
+    /// makes every later git call in the worktree run somewhere else — a
+    /// cardless `git add -A` stages the operator's tree, a cardless
+    /// `git_commit` lands on their branch, and deleting the pointer orphans
+    /// work nothing can land. "Inside the workspace" must therefore mean
+    /// inside the work files, not inside the sandbox's own plumbing.
+    private static func writesStayInsideWorkspace(
+        _ call: ParsedToolCall,
+        workspace: URL,
+        workingDirectory: URL?
+    ) -> Bool {
+        switch call.name {
+        case "file_write", "file_edit":
+            guard let path = call.arguments["path"] as? String, !path.isEmpty else { return false }
+            let resolved = resolvePath(path, workingDirectory: workingDirectory)
+            guard !pathTouchesGitMetadata(resolved) else { return false }
+            return contains(resolved, in: workspace)
+        case "git_commit":
+            // The tool takes only a message: no path, no `cwd`. The repository
+            // it can write is the one containing the run's fixed working
+            // directory, so the write surface IS the workspace by construction.
+            // The guard that matters — and the one a `.git` rewrite attacks —
+            // is the linkage/HEAD re-check `runToolInTurn` performs first.
+            return workingDirectory != nil
+        default:
+            return false
+        }
+    }
+
+    /// True when any path component of `url` is, or passes through, git
+    /// metadata: a component spelled exactly `.git` (the git directory of a
+    /// repository or submodule). `.gitignore` / `.gitattributes` /
+    /// `.gitmodules` are ordinary files and do not match. Symlinks are
+    /// resolved through `resolvedForContainment`, so a link named `build`
+    /// that points into `.git` cannot smuggle a write past the check.
+    ///
+    /// The component match folds case: on case-insensitive APFS a leaf that
+    /// does not exist yet (`<worktree>/.GIT`) is the same directory the write
+    /// would create, and a case-sensitive compare let it through uncarded.
+    static func pathTouchesGitMetadata(_ url: URL) -> Bool {
+        resolvedForContainment(url).pathComponents.contains {
+            $0.lowercased() == ".git"
+        }
+    }
+
+    /// The path with every EXISTING component resolved, so a symlink anywhere
+    /// in the path is followed even when the final component does not exist
+    /// yet, which is the one a `file_write` is about to create.
+    ///
+    /// Resolved ONE COMPONENT AT A TIME, and that order is the whole point.
+    /// `standardizedFileURL` collapses `..` lexically, so `<worktree>/link/../x`
+    /// becomes `<worktree>/x` before any symlink is consulted; the kernel,
+    /// however, follows `link` first and then applies `..`, which lands
+    /// outside the worktree. That disagreement let a write past both the
+    /// containment check and the `.git` guard with no card. Walking the
+    /// components keeps the two in step: each component is resolved before
+    /// the next `..` is applied, so `..` is only ever lexical over a path that
+    /// has no symlinks left in it. `URL.resolvingSymlinksInPath()` resolves
+    /// NOTHING when the leaf is absent (verified against Foundation on this
+    /// OS), which is why the walk resolves only what exists and keeps the
+    /// absent tail as written.
+    ///
+    /// A DANGLING symlink is the case Foundation hides: `fileExists` follows
+    /// the link and reports false, and `resolvingSymlinksInPath` leaves it
+    /// where it is, but an `O_CREAT` write follows it and creates the target.
+    /// The link's own destination is read with `destinationOfSymbolicLink`
+    /// and resolved instead. `remainingSymlinkHops` bounds the chain so a
+    /// self-referential link cannot recurse forever; on exhaustion the target
+    /// stays unresolved, which fails containment rather than passing it.
+    static func resolvedForContainment(_ url: URL) -> URL {
+        resolvedForContainment(url, remainingSymlinkHops: 64)
+    }
+
+    private static func resolvedForContainment(_ url: URL, remainingSymlinkHops: Int) -> URL {
+        let fileManager = FileManager.default
+        var resolved = URL(fileURLWithPath: "/", isDirectory: true)
+        // Every caller hands in an absolute URL; a relative one is kept as a
+        // path under the current directory so the walk still starts at the root.
+        if !url.path.hasPrefix("/") {
+            resolved = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        }
+        let components: [String] = url.path.hasPrefix("/")
+            ? Array(url.pathComponents.dropFirst())
+            : url.pathComponents
+        for component in components {
+            switch component {
+            case "", ".":
+                continue
+            case "..":
+                // `resolved` holds no symlinks, so this is the same parent the
+                // kernel would reach. Never climb above the root.
+                if resolved.path != "/" {
+                    resolved.deleteLastPathComponent()
+                }
+            default:
+                let next = resolved.appendingPathComponent(component)
+                if fileManager.fileExists(atPath: next.path) {
+                    resolved = next.resolvingSymlinksInPath()
+                } else if remainingSymlinkHops > 0,
+                          let destination = try? fileManager.destinationOfSymbolicLink(atPath: next.path) {
+                    // Build `target` without `relativeTo:` or `.standardizedFileURL`
+                    // so lexical `..` segments are not collapsed before the
+                    // recursive walk resolves intermediate symlinks.
+                    let target: URL = destination.hasPrefix("/")
+                        ? URL(fileURLWithPath: destination)
+                        : next.deletingLastPathComponent().appendingPathComponent(destination)
+                    resolved = resolvedForContainment(
+                        target,
+                        remainingSymlinkHops: remainingSymlinkHops - 1
+                    )
+                } else {
+                    resolved = next
+                }
+            }
+        }
+        return resolved
+    }
+
+    /// Containment after resolving every existing path component, so a path
+    /// that escapes with `..` or through a symlink is not read as inside —
+    /// including when the leaf is a file the write has not created yet.
+    private static func contains(_ url: URL, in workspace: URL) -> Bool {
+        let root = resolvedForContainment(workspace).path
+        let resolved = resolvedForContainment(url).path
+        guard !root.isEmpty else { return false }
+        return resolved == root || resolved.hasPrefix(root.hasSuffix("/") ? root : root + "/")
+    }
+
+    /// The destination a read tool names, when that destination is not the
+    /// run's work content: a path outside `workspace`, or any path touching git
+    /// metadata. Nil when the read is confined.
+    ///
+    /// `path` is the only argument that widens a read's scope, and every tool in
+    /// `pathReadToolNames` takes it as an optional override of the workspace, so
+    /// an omitted path is confined by construction. `.git` counts as outside for
+    /// reads for the same reason it does for writes: `.git/config` is where a
+    /// remote URL's embedded credential lives, and the metadata is not what the
+    /// run was asked to read.
+    static func readEscapeDestination(_ call: ParsedToolCall, workspace: URL?) -> String? {
+        guard let raw = call.arguments["path"] as? String, !raw.isEmpty else { return nil }
+        let resolved = resolvePath(raw, workingDirectory: workspace)
+        if pathTouchesGitMetadata(resolved) {
+            return "\(resolved.path) — git metadata, which can hold credentials"
+        }
+        guard let workspace else {
+            // No workspace means no containment claim to make: card it rather
+            // than assume confinement.
+            return resolved.path
+        }
+        return contains(resolved, in: workspace) ? nil : resolved.path
+    }
+
+    /// True when `rawPath` (resolved against `workspace`) stays inside
+    /// `workspace` after symlink resolution and does not touch `.git`.
+    static func isPathInsideWorkspace(_ rawPath: String, workspace: URL) -> Bool {
+        let resolved = resolvePath(rawPath, workingDirectory: workspace)
+        return !pathTouchesGitMetadata(resolved) && contains(resolved, in: workspace)
+    }
+
+    /// Successful `file_write` / `file_edit` destination paths in `transcript`
+    /// that landed outside `worktreePath`.
+    static func escapedWritePaths(in transcript: [AgentTranscriptEntry], worktreePath: URL) -> [String] {
+        var seen: Set<String> = []
+        var escaped: [String] = []
+        for entry in transcript {
+            guard let record = entry.toolRecord,
+                  record.status == .success,
+                  record.name == "file_write" || record.name == "file_edit",
+                  let rawPath = record.arguments["path"], !rawPath.isEmpty else {
+                continue
+            }
+            if !isPathInsideWorkspace(rawPath, workspace: worktreePath) {
+                let resolved = resolvedForContainment(resolvePath(rawPath, workingDirectory: worktreePath)).path
+                if seen.insert(resolved).inserted {
+                    escaped.append(resolved)
+                }
+            }
+        }
+        return escaped
+    }
+
+    /// Builds a two-paragraph containment-escape reason so the card summary stays
+    /// concise while `Escape Details:` names the isolated worktree, target path,
+    /// and (when applicable) the main repository being modified directly.
+    private func containmentEscapeReason(
+        summary: String,
+        rawPath: String?,
+        resolvedDisplayPath: String?,
+        workspace: URL?,
+        workingDirectory: URL?,
+        isWrite: Bool
+    ) -> String {
+        guard let workspace else { return summary }
+        var details: [String] = [
+            "\(isWorkspaceIsolated ? "Isolated worktree" : "Workspace"): \(workspace.path)"
+        ]
+        let resolvedURL: URL? = rawPath.flatMap { raw in
+            guard !raw.isEmpty else { return nil }
+            return Self.resolvePath(raw, workingDirectory: workingDirectory ?? workspace)
+        }
+        if let target = resolvedDisplayPath ?? resolvedURL.map({ Self.resolvedForContainment($0).path }) {
+            details.append("Requested target: \(target)")
+        }
+        if isWorkspaceIsolated,
+           let repoRoot = workspaceRepositoryRoot,
+           let resolvedURL,
+           Self.contains(resolvedURL, in: repoRoot) {
+            if isWrite {
+                details.append("WARNING: This targets the coordinator's main repository (\(repoRoot.path)) instead of the isolated worktree. Approving it writes directly to the main working tree and bypasses apply_subagent_changes.")
+            } else {
+                details.append("WARNING: This reads from the coordinator's main repository (\(repoRoot.path)) instead of the isolated worktree.")
+            }
+        }
+        return summary + "\n\n" + details.joined(separator: "\n")
+    }
+
+    /// `mode` is the TURN's effective mode, not the process's: a run's own mode
+    /// is what its card is judged under, and `activeMode` is whichever turn
+    /// happened to be current.
+    private func runScopeDecision(
+        for call: ParsedToolCall,
+        workingDirectory: URL?,
+        mode effectiveMode: AgentMode
+    ) -> RunScopeDecision {
+        guard isRunScoped else { return .allow }
+        if Self.runScopedForbiddenToolNames.contains(call.name) {
+            return .deny("'\(call.name)' is not available inside a subagent run")
+        }
+        if loadedTools[call.name] == nil {
+            return .deny("'\(call.name)' is not in this run's allowed tools")
+        }
+        let stateChanging = Self.isStateChanging(toolName: call.name)
+        let appPreferences = Self.targetsApplicationPreferences(toolName: call.name, arguments: call.arguments)
+        // The endpoint the call will USE, not the stored setting: `executeTool`
+        // pins the approved one for this call, and a verdict computed from a
+        // different URL could clear a custom host the call then sends to (or
+        // card an official one it never touches) if the operator moved the
+        // setting while the card was up.
+        let subQNeedsApproval = call.name == "subq_decide" && Self.requiresApproval(
+            toolName: call.name,
+            arguments: call.arguments,
+            mode: effectiveMode,
+            subQEndpoint: SubQDecideTool.pinnedEndpoint ?? SubQDecisionSettings.endpoint(),
+            rawArguments: call.rawArguments
+        )
+        let strArgs = call.arguments.mapValues { String(describing: $0) }
+        func ask(_ reason: String, containmentEscape: Bool = false) -> RunScopeDecision {
+            .ask(AgentApprovalRequest(
+                runId: runId ?? UUID(),
+                toolName: call.name,
+                arguments: strArgs,
+                workingDirectory: workingDirectory?.path,
+                reason: reason,
+                containmentEscape: containmentEscape,
+                // The display copy above loses every type, so the Turbo verdict
+                // gets the wire form too; otherwise it cannot see an `images`
+                // array and waves the upload card through.
+                rawArguments: call.rawArguments
+            ))
+        }
+        // The READ half of containment, decided before the policy switch
+        // because every policy is a rule about WRITES and none of them says
+        // anything about reads. `resolvePath` returns absolute and `~`-expanded
+        // paths verbatim, so a read-only run could name `~/.ssh/id_ed25519`
+        // with no card and post it out with its own egress tools.
+        if Self.pathReadToolNames.contains(call.name),
+           let escape = Self.readEscapeDestination(
+                call,
+                workspace: workingDirectory ?? defaultWorkingDirectory
+           ) {
+            // Taint FIRST: the card may be approved, and an approved read of a
+            // key is not an approved upload of it. Every later egress call in
+            // this run is carded from here on.
+            runReadOutsideWorkspace = true
+            // Both halves of containment are `containmentEscape`, so Turbo Mode
+            // cannot wave either through: a blank card is the same leak as no
+            // card, and the setting exists to skip ROUTINE writes.
+            let reason = containmentEscapeReason(
+                summary: "it reads outside the run's work files (\(escape))",
+                rawPath: call.arguments["path"] as? String,
+                resolvedDisplayPath: escape,
+                workspace: workingDirectory ?? defaultWorkingDirectory,
+                workingDirectory: workingDirectory,
+                isWrite: false
+            )
+            return ask(reason, containmentEscape: true)
+        }
+        // A secret committed inside the workspace is readable cardlessly, so
+        // containment alone does not stop the leak: once anything outside the
+        // workspace has been read, egress is the other half and gets a card.
+        if runReadOutsideWorkspace, Self.egressToolNames.contains(call.name) {
+            return ask(
+                "this run has read content from outside its workspace, and this call sends data off this Mac",
+                containmentEscape: true
+            )
+        }
+        switch runApprovalPolicy {
+        case .deny, .auto:
+            if stateChanging { return .deny("this run has no write capability") }
+            if appPreferences { return .deny("it would rewrite DynaMoE's own preferences") }
+            if subQNeedsApproval { return ask("it uploads the state or local image bytes") }
+            return .allow
+        case .spawnOnly:
+            if appPreferences { return ask("it would rewrite DynaMoE's own preferences") }
+            if subQNeedsApproval { return ask("it uploads the state or local image bytes") }
+            if stateChanging {
+                guard isWorkspaceIsolated else {
+                    return ask("it changes state outside an isolated workspace", containmentEscape: true)
+                }
+                // The worktree's `.git` pointer is a regular file inside the
+                // containment prefix, so it passes the containment check below
+                // while being the one file whose rewrite breaks the sandbox's
+                // promise: git would stage and commit wherever the retargeted
+                // pointer says, and the run's work could stop being landable at
+                // all. It gets its own card FIRST, with the stakes named.
+                if call.name == "file_write" || call.name == "file_edit",
+                   let path = call.arguments["path"] as? String, !path.isEmpty,
+                   Self.pathTouchesGitMetadata(Self.resolvePath(path, workingDirectory: workingDirectory)) {
+                    return ask(
+                        "it writes the sandbox's own git metadata, which can redirect the run's commits into the operator's repository or make its work unlandable",
+                        containmentEscape: true
+                    )
+                }
+                // Isolation is a promise about THIS CALL's destination, not the
+                // existence of a worktree. `resolvePath` returns an absolute
+                // path verbatim, so a `file_write` naming the operator's tree
+                // would otherwise edit it with no card — in the configuration
+                // presented as safe. Only a call whose writes are provably
+                // confined may skip the card.
+                guard let workspace = workingDirectory ?? defaultWorkingDirectory,
+                      Self.writesStayInsideWorkspace(call, workspace: workspace, workingDirectory: workingDirectory) else {
+                    let reason = containmentEscapeReason(
+                        summary: "it can change state outside the run's isolated workspace",
+                        rawPath: call.arguments["path"] as? String,
+                        resolvedDisplayPath: nil,
+                        workspace: workingDirectory ?? defaultWorkingDirectory,
+                        workingDirectory: workingDirectory,
+                        isWrite: true
+                    )
+                    return ask(reason, containmentEscape: true)
+                }
+            }
+            return .allow
+        case .everyStateChange:
+            if stateChanging {
+                // SUBAGENTS.md §7 reserves these for a real card in EVERY
+                // policy: a shell is arbitrary code with its own cwd, a
+                // `.git` rewrite can redirect every later git call, and a
+                // write outside the run's workspace escapes the containment
+                // this policy promises. Turbo is a switch over routine writes,
+                // so none of them is bypassable.
+                if call.name == "shell_run" {
+                    return ask("it runs an arbitrary shell command", containmentEscape: true)
+                }
+                if call.name == "file_write" || call.name == "file_edit",
+                   let path = call.arguments["path"] as? String, !path.isEmpty,
+                   Self.pathTouchesGitMetadata(Self.resolvePath(path, workingDirectory: workingDirectory)) {
+                    return ask(
+                        "it writes git metadata, which can redirect the run's commits into another repository",
+                        containmentEscape: true
+                    )
+                }
+                if call.name == "file_write" || call.name == "file_edit" || call.name == "git_commit" {
+                    // `.spawnOnly` already refuses to let an unprovable
+                    // destination ride a cardless approval. An UNSCOPED run
+                    // reached this branch instead, so the same write got a
+                    // CONTAINMENT ESCAPE card in the isolated case and a
+                    // Turbo-bypassable one here — the documented rule is that
+                    // an escape is never bypassed, whatever the run's shape.
+                    guard let workspace = workingDirectory ?? defaultWorkingDirectory,
+                          Self.writesStayInsideWorkspace(
+                            call,
+                            workspace: workspace,
+                            workingDirectory: workingDirectory
+                          ) else {
+                        let reason = containmentEscapeReason(
+                            summary: "it can change state outside the run's workspace",
+                            rawPath: call.arguments["path"] as? String,
+                            resolvedDisplayPath: nil,
+                            workspace: workingDirectory ?? defaultWorkingDirectory,
+                            workingDirectory: workingDirectory,
+                            isWrite: true
+                        )
+                        return ask(reason, containmentEscape: true)
+                    }
+                }
+                return ask("it changes files, the repository or the system")
+            }
+            if appPreferences { return ask("it would rewrite DynaMoE's own preferences") }
+            if subQNeedsApproval { return ask("it uploads the state or local image bytes") }
+            return .allow
         }
     }
 
@@ -5193,6 +7249,114 @@ public final class AgentHarness {
                 executionDurationSeconds: CFAbsoluteTimeGetCurrent() - startTime
             )
             return (json, rec, false)
+        }
+        switch runScopeDecision(for: call, workingDirectory: wd, mode: effectiveMode) {
+        case .allow:
+            break
+        case .deny(let reason):
+            let err = "SUBAGENT POLICY: '\(call.name)' is not permitted in this run (\(reason)) and was not executed. Do not retry it; continue with the tools you have, or report what you could not do."
+            let json = AgentHarness.toolErrorJSON(tool: call.name, error: err)
+            let rec = ToolCallRecord(
+                name: call.name,
+                arguments: strArgs,
+                rawArguments: call.rawArguments,
+                status: .withheld,
+                output: AgentHarness.renderToolResultForModel(json),
+                error: err,
+                executionDurationSeconds: CFAbsoluteTimeGetCurrent() - startTime
+            )
+            return (json, rec, false)
+        case .ask(let request):
+            let approved = await (runApprovalHandler?(request) ?? false)
+            guard approved else {
+                let err = "Action rejected: the operator declined '\(call.name)' in this subagent run. Do not retry it; continue with another approach or report what you could not do."
+                let json = AgentHarness.toolErrorJSON(tool: call.name, error: err)
+                let rec = ToolCallRecord(
+                    name: call.name,
+                    arguments: strArgs,
+                    rawArguments: call.rawArguments,
+                    status: .rejected,
+                    output: AgentHarness.renderToolResultForModel(json),
+                    error: err,
+                    executionDurationSeconds: CFAbsoluteTimeGetCurrent() - startTime
+                )
+                return (json, rec, false)
+            }
+            // The approval races a Stop: an Approve click that lands while the
+            // run's task is being cancelled must not execute the write it
+            // approved. The decision was made for a run the operator has
+            // already abandoned, so it is reported back as not executed rather
+            // than performed.
+            if Task.isCancelled {
+                let err = "Action not executed: this run was stopped while '\(call.name)' was awaiting approval. Do not retry it."
+                let json = AgentHarness.toolErrorJSON(tool: call.name, error: err)
+                let rec = ToolCallRecord(
+                    name: call.name,
+                    arguments: strArgs,
+                    rawArguments: call.rawArguments,
+                    status: .rejected,
+                    output: AgentHarness.renderToolResultForModel(json),
+                    error: err,
+                    executionDurationSeconds: CFAbsoluteTimeGetCurrent() - startTime
+                )
+                return (json, rec, false)
+            }
+        }
+        // A cardless `git_commit` inside an isolated worktree is provably
+        // confined only while the worktree's `.git` file still points where
+        // `git worktree add` put it — and that pointer is a regular file
+        // inside the sandbox, so an APPROVED `.git` write (or an approved
+        // shell command) can have retargeted it since. Verifying here is what
+        // keeps the exploit two steps long instead of one: the approved
+        // tamper no longer buys a cardless commit staging into the operator's
+        // shared index and landing on their checked-out branch.
+        if call.name == "git_commit", isRunScoped, isWorkspaceIsolated {
+            // A cardless commit is authorised by an isolated worktree whose
+            // linkage can be RE-VERIFIED here. Without the recorded repository
+            // root that verification cannot run, and a check that cannot run is
+            // a failed check, not a pass: the old `if let repositoryRoot`
+            // silently skipped the whole guard and let the commit land
+            // unauthorised. Fail closed, with the worktree kept.
+            guard let workspace = workingDirectory ?? defaultWorkingDirectory,
+                  let repositoryRoot = workspaceRepositoryRoot else {
+                let err = "SUBAGENT POLICY: git_commit was not executed because this run's repository root is unknown, so its worktree's linkage to the operator's repository could not be verified. Nothing was staged or committed; the worktree and its files were kept. Use the report's diff (or apply_subagent_changes) instead."
+                let json = AgentHarness.toolErrorJSON(tool: call.name, error: err)
+                let rec = ToolCallRecord(
+                    name: call.name,
+                    arguments: strArgs,
+                    rawArguments: call.rawArguments,
+                    status: .withheld,
+                    output: AgentHarness.renderToolResultForModel(json),
+                    error: err,
+                    executionDurationSeconds: CFAbsoluteTimeGetCurrent() - startTime
+                )
+                return (json, rec, false)
+            }
+            let worktree = AgentWorktree(
+                runId: runId ?? UUID(),
+                repositoryRoot: repositoryRoot,
+                path: workspace,
+                branch: workspaceBranch ?? "",
+                baseCommit: ""
+            )
+            var problem = await WorkspaceIsolation.worktreeLinkageProblem(worktree)
+            if problem == nil {
+                problem = await WorkspaceIsolation.worktreeHeadProblem(worktree)
+            }
+            if let problem {
+                let err = "SUBAGENT POLICY: git_commit was not executed because the worktree is no longer the checkout it was created as (\(problem)). Nothing was staged or committed; the worktree and its files were kept."
+                let json = AgentHarness.toolErrorJSON(tool: call.name, error: err)
+                let rec = ToolCallRecord(
+                    name: call.name,
+                    arguments: strArgs,
+                    rawArguments: call.rawArguments,
+                    status: .withheld,
+                    output: AgentHarness.renderToolResultForModel(json),
+                    error: err,
+                    executionDurationSeconds: CFAbsoluteTimeGetCurrent() - startTime
+                )
+                return (json, rec, false)
+            }
         }
         // maxOutputLength (and maxToolOutputLength) is a TOKEN budget; tools work in
         // characters, so convert with a conservative chars-per-token estimate.
@@ -5573,6 +7737,50 @@ public final class AgentHarness {
         return URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(expanded)
     }
 
+    /// Where an approval card should say this call will act.
+    ///
+    /// The run's working directory is the DEFAULT, not the answer: a
+    /// `file_write` names its own destination and a `shell_run` may carry a
+    /// `cwd`, and a containment card exists precisely so the operator can see
+    /// where a call leaves the sandbox. Rendering the sandbox for an absolute
+    /// path outside it told the operator the opposite of what is at stake.
+    ///
+    /// The path readers are matched through `pathReadToolNames` rather than a
+    /// second hand-written list: the three that array gained later
+    /// (`lint_diagnostics`, `git_diff`, `git_status`) raise a containment card
+    /// on the same `path` argument and were still naming the sandbox on it,
+    /// which is the one thing this function exists to stop.
+    public static func approvalDestination(
+        toolName: String,
+        arguments: [String: String],
+        workingDirectory: String?
+    ) -> String? {
+        let base = workingDirectory.map { URL(fileURLWithPath: $0, isDirectory: true) }
+        switch toolName {
+        case "file_write", "file_edit":
+            guard let path = arguments["path"], !path.isEmpty else {
+                return workingDirectory
+            }
+            return resolvePath(path, workingDirectory: base).path
+        case _ where pathReadToolNames.contains(toolName):
+            // A read's path is the reason its card exists, so the card must
+            // name where it points rather than the sandbox it leaves.
+            guard let path = arguments["path"], !path.isEmpty else {
+                return workingDirectory
+            }
+            return resolvePath(path, workingDirectory: base).path
+        case "shell_run":
+            guard let cwd = arguments["cwd"], !cwd.isEmpty else {
+                return workingDirectory
+            }
+            return (cwd as NSString).expandingTildeInPath
+        case "subq_decide":
+            return SubQDecisionSettings.endpoint().absoluteString
+        default:
+            return workingDirectory
+        }
+    }
+
     /// Identifies files that cannot be meaningfully rendered as text, so tools can return
     /// a structured "unsupported type" result instead of a generic decoding error.
     /// Returns a short human-readable kind name (e.g. "PNG image"), or nil when the file
@@ -5622,13 +7830,13 @@ public final class AgentHarness {
     }
 
     /// Matches inline `data:...;base64,...` payloads of 256+ base64 characters.
-    private static let inlineBase64Regex: NSRegularExpression? = {
+    private nonisolated static let inlineBase64Regex: NSRegularExpression? = {
         try? NSRegularExpression(pattern: "data:[a-zA-Z0-9.+/-]{1,64};base64,([A-Za-z0-9+/=]{256,})", options: [])
     }()
 
     /// Matches standalone base64 runs of 768+ characters (embedded binary blobs that
     /// no model can read and that otherwise flood the truncation tail with gibberish).
-    private static let longBase64Regex: NSRegularExpression? = {
+    private nonisolated static let longBase64Regex: NSRegularExpression? = {
         try? NSRegularExpression(pattern: "[A-Za-z0-9+/=]{768,}", options: [])
     }()
 
@@ -5641,7 +7849,7 @@ public final class AgentHarness {
     /// output made a file the model was asked to edit come back different from
     /// the bytes on disk, and a `file_edit` anchor copied from that view could
     /// never match.
-    public static func sanitizeText(_ text: String) -> String {
+    nonisolated public static func sanitizeText(_ text: String) -> String {
         sanitize(text, markers: PromptMarkers.sanitizeControlMarkers)
     }
 
@@ -5653,7 +7861,7 @@ public final class AgentHarness {
         sanitize(text, markers: PromptMarkers.sanitizeLocalFileMarkers)
     }
 
-    private static func sanitize(_ text: String, markers: (String) -> String) -> String {
+    private nonisolated static func sanitize(_ text: String, markers: (String) -> String) -> String {
         // Every family's control markers, not just ChatML: a tool result or a
         // skill description carrying a turn marker or a fullwidth role marker
         // forges a boundary just as well.
@@ -5811,7 +8019,7 @@ public final class AgentHarness {
     /// budget allows (cut at a line boundary when possible), a short tail preserves
     /// the end of the output, and the splice is wrapped in an unambiguous marker that
     /// cannot be mistaken for file content.
-    public static func truncateText(_ text: String, limit: Int) -> String {
+    nonisolated public static func truncateText(_ text: String, limit: Int) -> String {
         let byteLimit = max(200, limit)
         guard text.utf8.count > byteLimit else { return text }
 
@@ -5885,7 +8093,7 @@ public final class AgentHarness {
         return WebFetchTool.extractStructuredSections(from: markdown)
     }
 
-    public static func toolSuccessJSON(tool: String, data: [String: Any]) -> String {
+    nonisolated public static func toolSuccessJSON(tool: String, data: [String: Any]) -> String {
         let dict: [String: Any] = [
             "status": "success",
             "tool": tool,
@@ -5898,7 +8106,7 @@ public final class AgentHarness {
         return "{\"status\": \"success\", \"tool\": \"\(tool)\"}"
     }
 
-    public static func toolErrorJSON(tool: String, error: String, extra: [String: Any]? = nil) -> String {
+    nonisolated public static func toolErrorJSON(tool: String, error: String, extra: [String: Any]? = nil) -> String {
         // Every error path funnels here: a tool's own `localizedDescription`, a
         // server's 500 body, a parser's quoted line. Those are untrusted text,
         // and an unsanitized one could close the tool-response span and forge a
@@ -5923,7 +8131,7 @@ public final class AgentHarness {
     }
 
     /// Recursively sanitizes the string values of an error payload.
-    private static func sanitizeErrorValue(_ value: Any) -> Any {
+    private nonisolated static func sanitizeErrorValue(_ value: Any) -> Any {
         switch value {
         case let text as String:
             return sanitizeText(text)
@@ -6023,7 +8231,7 @@ public final class AgentHarness {
     /// `renderToolResultForModel` re-sanitizes whatever the tool already
     /// sanitized, so this list is what keeps that second pass from undoing the
     /// first.
-    static let localFileContentToolNames: Set<String> = [
+    nonisolated static let localFileContentToolNames: Set<String> = [
         "shell_run", "file_read", "file_write", "file_edit", "find_files",
         "grep_search", "codebase_search", "git_status", "git_diff",
         "find_symbol_definition", "find_references", "lint_diagnostics"
@@ -6036,7 +8244,7 @@ public final class AgentHarness {
     ///
     /// Idempotent: input that is not a tool-result JSON object (already-rendered text,
     /// plain prose) is returned unchanged, so results can be stored rendered and re-embedded.
-    public static func renderToolResultForModel(_ resultJSON: String) -> String {
+    nonisolated public static func renderToolResultForModel(_ resultJSON: String) -> String {
         guard let data = resultJSON.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let toolName = obj["tool"] as? String, !toolName.isEmpty else {
@@ -6088,12 +8296,12 @@ public final class AgentHarness {
         return sanitize(lines.joined(separator: "\n"), markers: markers)
     }
 
-    private static func isLongTextValue(_ value: Any?) -> Bool {
+    private nonisolated static func isLongTextValue(_ value: Any?) -> Bool {
         guard let s = value as? String else { return false }
         return s.contains("\n") || s.count > 240
     }
 
-    private static func appendRendered(
+    private nonisolated static func appendRendered(
         key: String,
         value: Any?,
         indent: Int,
@@ -6144,7 +8352,7 @@ public final class AgentHarness {
         }
     }
 
-    private static func appendLongBody(
+    private nonisolated static func appendLongBody(
         value: Any,
         indent: Int,
         to lines: inout [String],
@@ -6163,11 +8371,11 @@ public final class AgentHarness {
         }
     }
 
-    private static func isCompactScalar(_ value: Any) -> Bool {
+    private nonisolated static func isCompactScalar(_ value: Any) -> Bool {
         value is String || value is NSNumber
     }
 
-    private static func renderCompact(_ value: Any) -> String {
+    private nonisolated static func renderCompact(_ value: Any) -> String {
         switch value {
         case let s as String:
             return s
@@ -6190,15 +8398,33 @@ public final class AgentHarness {
         executableURL: URL,
         arguments: [String],
         currentDirectory: URL,
-        timeoutSeconds: TimeInterval = 120
+        timeoutSeconds: TimeInterval = 120,
+        environment: [String: String]? = nil
     ) async throws -> (exitCode: Int32, stdout: String, stderr: String) {
+        // A cancelled task must not spawn a child. `withTaskCancellationHandler`
+        // invokes its cancellation handler synchronously when the task is
+        // already cancelled, so spawning from here reached `killProcessTree`
+        // before `process.run()` and `terminate()` raised an uncatchable
+        // NSInvalidArgumentException on the never-launched task. The callers
+        // that land here from a cancellation path (`WorkspaceIsolation.git`)
+        // treat a thrown CancellationError as "stopped", which is the truth.
+        if Task.isCancelled { throw CancellationError() }
         let process = Process()
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
 
         // 1. Curated environment shared with ControlledProcessRunner: GUI-app PATH
-        //    injection plus non-interactive flags (see toolEnvironment()).
-        let env = ControlledProcessRunner.toolEnvironment()
+        //    injection plus non-interactive flags (see toolEnvironment()). A
+        //    caller that needs a scrubbed child (git must not inherit GIT_DIR)
+        //    passes its own instead. A child spawned while a SUBAGENT run is
+        //    executing — or while a call nobody reviewed is executing (Turbo
+        //    Mode bypassed its card) — gets the scoped allowlist. A reviewed
+        //    call keeps the toolchain (SSH agent, proxies) and loses only the
+        //    credential-shaped variables.
+        let env = environment ?? ControlledProcessRunner.toolEnvironment(
+            scoped: AgentHarness.executingInRunScope,
+            unreviewed: AgentHarness.executingUnreviewedToolCall
+        )
 
         process.environment = env
         process.executableURL = executableURL
@@ -6208,56 +8434,114 @@ public final class AgentHarness {
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
 
-        final class ProcessState: @unchecked Sendable {
+        // Nonisolated on purpose: a type declared inside this MainActor-isolated
+        // function inherits the default isolation, which makes every member
+        // main-actor-isolated and every mutation from the pipe readers, the
+        // timer, the process-wait closure and the cancellation handler a
+        // Swift 6 error. The NSLock below is the real guard.
+        nonisolated final class ProcessState: @unchecked Sendable {
             let lock = NSLock()
             var stdoutData = Data()
             var stderrData = Data()
             var isFinished = false
             var isTimedOut = false
             var isCancelled = false
-            var timerWorkItem: DispatchWorkItem?
+            /// The timeout wait. A Task rather than a `DispatchWorkItem` +
+            /// `asyncAfter`: libdispatch retains a scheduled item — and
+            /// everything it captured, including the `Process` and both
+            /// `Pipe`s with their descriptors — until its deadline even after
+            /// `cancel()`. Every spawned child therefore leaked two file
+            /// descriptors for the length of the timeout, and a suite that
+            /// spawned a few hundred git processes exhausted the host's fd
+            /// limit. A cancelled sleeping Task releases its captures at once.
+            var timerTask: Task<Void, Never>?
+            /// True once `process.run()` returned. `terminate()` raises an
+            /// uncatchable ObjC exception on a process that never launched, so
+            /// every kill path has to know whether there is anything to kill.
+            var hasLaunched = false
+            /// True once a cancellation or timeout asked for the process tree's
+            /// death. Recorded even before launch so the run block can honour a
+            /// kill that raced its own `process.run()`.
+            var killRequested = false
 
             func cancelTimer() {
-                timerWorkItem?.cancel()
-                timerWorkItem = nil
+                lock.lock()
+                let task = timerTask
+                timerTask = nil
+                lock.unlock()
+                task?.cancel()
+            }
+
+            /// Marks the turn timed out if it is still running. True means the
+            /// caller should kill the process tree.
+            func beginTimeoutIfRunning() -> Bool {
+                lock.lock()
+                defer { lock.unlock() }
+                guard !isFinished else { return false }
+                isTimedOut = true
+                return true
+            }
+
+            /// Records the launch; returns whether a kill was requested while
+            /// the process was not yet running, so the run block can apply it.
+            func noteLaunched() -> Bool {
+                lock.lock()
+                defer { lock.unlock() }
+                hasLaunched = true
+                return killRequested
             }
         }
 
         let state = ProcessState()
 
-        // Asynchronously drain stdout and stderr without blocking to prevent 64KB pipe buffer deadlocks
-        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
-            let chunk = handle.availableData
-            if !chunk.isEmpty {
-                state.lock.lock()
-                state.stdoutData.append(chunk)
-                state.lock.unlock()
-            }
+        // Two blocking readers, joined below, rather than `readabilityHandler`s.
+        // Clearing a handler does NOT wait for an invocation already in flight,
+        // so a handler that had taken bytes out of the pipe but not yet appended
+        // them let the call return an empty stdout for a command that wrote
+        // plenty (`WorkspaceIsolationTests` caught it as an empty `.git`
+        // pointer). A blocking read is only legal off the main actor, and
+        // reading to EOF is what keeps a 64KB pipe buffer from deadlocking.
+        let drainGroup = DispatchGroup()
+        drainGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            let data = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+            state.lock.lock()
+            state.stdoutData.append(data)
+            state.lock.unlock()
+            drainGroup.leave()
         }
-
-        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
-            let chunk = handle.availableData
-            if !chunk.isEmpty {
-                state.lock.lock()
-                state.stderrData.append(chunk)
-                state.lock.unlock()
-            }
+        drainGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            let data = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            state.lock.lock()
+            state.stderrData.append(data)
+            state.lock.unlock()
+            drainGroup.leave()
         }
 
         let cleanupPipes: @Sendable () -> Void = {
-            stdoutPipe.fileHandleForReading.readabilityHandler = nil
-            stderrPipe.fileHandleForReading.readabilityHandler = nil
-
-            let remOut = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-            let remErr = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-
-            state.lock.lock()
-            state.stdoutData.append(remOut)
-            state.stderrData.append(remErr)
-            state.lock.unlock()
+            // The process has exited, so both read ends are at EOF. Waiting is
+            // the join: whatever a reader has not yet appended is appended
+            // before this returns. Bounded, because a descendant that inherited
+            // the write end can hold it open after the parent exits, and a run
+            // must not hang forever on work it did not start.
+            if drainGroup.wait(timeout: .now() + 5) == .timedOut {
+                try? stdoutPipe.fileHandleForWriting.close()
+                try? stderrPipe.fileHandleForWriting.close()
+                _ = drainGroup.wait(timeout: .now() + 1)
+            }
         }
 
         let killProcessTree: @Sendable () -> Void = {
+            state.lock.lock()
+            state.killRequested = true
+            let hasLaunched = state.hasLaunched
+            state.lock.unlock()
+            // Nothing to signal before `process.run()` (terminate() aborts the
+            // process on a never-launched task) or after the process exited.
+            // The pre-launch case is honoured by the run block, which applies
+            // the kill the moment the launch succeeds.
+            guard hasLaunched, process.isRunning else { return }
             let pid = process.processIdentifier
             if pid > 0 {
                 kill(-pid, SIGTERM)
@@ -6276,24 +8560,33 @@ public final class AgentHarness {
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 if timeoutSeconds > 0 {
-                    let item = DispatchWorkItem {
-                        state.lock.lock()
-                        guard !state.isFinished else {
-                            state.lock.unlock()
-                            return
+                    // See `ProcessState.timerTask`: a scheduled
+                    // `DispatchWorkItem` would retain the process and its pipes
+                    // until the deadline even when cancelled.
+                    let bounded = timeoutSeconds.isFinite
+                        ? min(max(timeoutSeconds, 0.001), 86_400)
+                        : 86_400
+                    let timeoutTask = Task.detached(priority: .utility) {
+                        try? await Task.sleep(for: .seconds(bounded))
+                        guard !Task.isCancelled else { return }
+                        if state.beginTimeoutIfRunning() {
+                            killProcessTree()
                         }
-                        state.isTimedOut = true
-                        state.lock.unlock()
-
-                        killProcessTree()
                     }
-                    state.timerWorkItem = item
-                    DispatchQueue.global().asyncAfter(deadline: .now() + timeoutSeconds, execute: item)
+                    state.lock.lock()
+                    state.timerTask = timeoutTask
+                    state.lock.unlock()
                 }
 
                 DispatchQueue.global(qos: .userInitiated).async {
                     do {
                         try process.run()
+                        // A cancellation (or timeout) that landed between the
+                        // entry check and this launch is applied here: the
+                        // kill path could not act on a not-yet-launched task.
+                        if state.noteLaunched() {
+                            killProcessTree()
+                        }
                         process.waitUntilExit()
 
                         state.cancelTimer()
@@ -6318,10 +8611,12 @@ public final class AgentHarness {
                         }
                     } catch {
                         state.cancelTimer()
-                        stdoutPipe.fileHandleForReading.readabilityHandler = nil
-                        stderrPipe.fileHandleForReading.readabilityHandler = nil
+                        // Closing the parent's write end is what EOFs the
+                        // readers after a launch that never produced a child;
+                        // waiting joins them before the pipe deallocates.
                         try? stdoutPipe.fileHandleForWriting.close()
                         try? stderrPipe.fileHandleForWriting.close()
+                        _ = drainGroup.wait(timeout: .now() + 1)
 
                         state.lock.lock()
                         state.isFinished = true

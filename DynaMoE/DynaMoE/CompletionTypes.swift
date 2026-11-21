@@ -116,6 +116,10 @@ internal struct CompletionTurnRequest: Sendable {
     /// (agent continuations) rather than encoded from the prompt string —
     /// consumed by the prompt-dump diagnostics and future request tracing.
     var isSplicedContinuation: Bool
+    /// Whether this turn may be preempted by an operator's send. A subagent
+    /// step is background; chat, the local server and every other turn are
+    /// interactive. See `EngineTurnSlot.swift`.
+    var turnPriority: TurnPriority
     /// New in the API path: arbitrary stop sequences, matched incrementally
     /// against decoded text. Empty for chat turns (EOS/end-tag guards govern).
     var stopSequences: [String]
@@ -156,7 +160,8 @@ internal struct CompletionTurnRequest: Sendable {
         stopSequences: [String] = [],
         asOfDate: Date? = nil,
         images: [TurnImage] = [],
-        imageSpans: [TurnImageSpan] = []
+        imageSpans: [TurnImageSpan] = [],
+        turnPriority: TurnPriority = .interactive
     ) {
         self.promptTokenIds = promptTokenIds
         self.formattedPrompt = formattedPrompt
@@ -172,6 +177,7 @@ internal struct CompletionTurnRequest: Sendable {
         self.asOfDate = asOfDate
         self.images = images
         self.imageSpans = imageSpans
+        self.turnPriority = turnPriority
     }
 }
 
@@ -519,7 +525,10 @@ internal final class CompletionTurnHandle: @unchecked Sendable {
         self.task = task
     }
 
-    func cancel() {
+    /// Nonisolated because a caller's cancellation handler runs off the main
+    /// actor; `Task.cancel()` is safe from any context and the handle is
+    /// immutable.
+    nonisolated func cancel() {
         task.cancel()
     }
 }

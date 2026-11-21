@@ -260,7 +260,14 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
             configuration.httpShouldSetCookies = false
             let cacheKey = "\(chatURL.absoluteString)|\(requestTimeout)"
             self.session = CloudSessionCache.shared.session(for: cacheKey) {
-                URLSession(configuration: configuration)
+                // The delegate is what refuses a redirect that would carry the
+                // Bearer key to another host, another port or a plaintext hop;
+                // a plain URLSession follows 3xx and would hand it over.
+                URLSession(
+                    configuration: configuration,
+                    delegate: BearerRedirectGuard(),
+                    delegateQueue: nil
+                )
             }
         }
     }
@@ -281,12 +288,13 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
         let topP: Double?
         let presencePenalty: Double?
         let maxTokens: Int?
+        let stop: [String]?
         let tools: [ToolDefinition]?
         let toolChoice: String?
         let promptCacheKey: String?
 
         enum CodingKeys: String, CodingKey {
-            case model, messages, stream, temperature, tools
+            case model, messages, stream, temperature, stop, tools
             case streamOptions = "stream_options"
             case topP = "top_p"
             case presencePenalty = "presence_penalty"
@@ -413,6 +421,7 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
             topP: params.topP,
             presencePenalty: params.presencePenalty,
             maxTokens: params.maxTokens,
+            stop: (params.stop?.isEmpty == false) ? params.stop : nil,
             tools: (tools?.isEmpty == false) ? tools : nil,
             toolChoice: (tools?.isEmpty == false) ? "auto" : nil,
             promptCacheKey: wantsCacheKey ? params.sessionKey : nil
@@ -617,8 +626,15 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                             }
                             let failure = CloudTurnFailure.httpStatus(
                                 code: http.statusCode,
-                                summary: MCPHTTPTransport.summarizeErrorBody(body)
+                                summary: CloudChatClient.redactedErrorSummary(body, apiKey: self.apiKey)
                             )
+                            // A 429's Retry-After is the provider telling us
+                            // exactly how long its window needs. The receipt
+                            // carries it to the backend's retry, which used to
+                            // ignore the header and sleep a fixed 0.75 s.
+                            if let delay = CloudRetryAfter.seconds(from: http) {
+                                receipt?.record(retryAfterSeconds: delay)
+                            }
                             receipt?.record(failure: failure)
                             continuation.yield(.failed(failure))
                             continuation.finish()
@@ -684,8 +700,16 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                                 }
                             } catch let failure as CloudTurnFailure {
                                 sawFailure = true
-                                receipt?.record(failure: failure)
-                                continuation.yield(.failed(failure))
+                                let sanitized: CloudTurnFailure
+                                if case .invalidResponse(let detail) = failure {
+                                    sanitized = .invalidResponse(
+                                        CloudChatClient.redactedErrorSummary(detail, apiKey: self.apiKey)
+                                    )
+                                } else {
+                                    sanitized = failure
+                                }
+                                receipt?.record(failure: sanitized)
+                                continuation.yield(.failed(sanitized))
                                 return false
                             } catch {
                                 sawFailure = true
@@ -856,6 +880,7 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
         }
         return rejected
     }
+
 
     nonisolated static func shouldRetryWithoutAffinity(status: Int, body: String) -> Bool {
         !rejectedAffinityHeaders(
@@ -1083,7 +1108,7 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                 let body = String(decoding: data.prefix(4096), as: UTF8.self)
                 throw CloudTurnFailure.httpStatus(
                     code: http.statusCode,
-                    summary: MCPHTTPTransport.summarizeErrorBody(body)
+                    summary: CloudChatClient.redactedErrorSummary(body, apiKey: self.apiKey)
                 )
             }
             return data
@@ -1153,11 +1178,52 @@ nonisolated final class AnthropicCloudChatService: CloudChatServicing, @unchecke
 
 // MARK: - Client Facade
 
+/// `Retry-After` in seconds, clamped to a minute.
+///
+/// The header comes in two spellings: delta-seconds, and an HTTP-date. A date
+/// is converted against the local clock, which is the best a client can do; a
+/// date already in the past is zero. The clamp keeps a provider that asks for
+/// an hour from parking the run that long — one retry is the whole budget this
+/// loop has.
+nonisolated enum CloudRetryAfter {
+    static func seconds(from response: HTTPURLResponse) -> Double? {
+        guard let raw = response.value(forHTTPHeaderField: "Retry-After")?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+        let seconds: Double?
+        if let delta = Double(raw) {
+            seconds = delta
+        } else {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.timeZone = TimeZone(secondsFromGMT: 0)
+            formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+            seconds = formatter.date(from: raw)?.timeIntervalSinceNow
+        }
+        guard let seconds, seconds.isFinite else { return nil }
+        return min(max(seconds, 0), 60)
+    }
+}
+
 /// One turn's worth of provider client. Construct per turn (or per
 /// connection test): the underlying URLSession is shared per endpoint, so a
 /// multi-step agent run reuses connections, while a per-turn client means a
 /// rotated key is picked up without restarting anything.
 public nonisolated final class CloudChatClient: @unchecked Sendable {
+    /// Summarizes a non-2xx provider response body and redacts credentials
+    /// before the text reaches run records, UI errors, or coordinator prompts.
+    /// A proxy that echoes `Authorization: Bearer …` in a 400/5xx body must
+    /// never leak the API key into durable state or `[SUBAGENT_RESULT]`.
+    public static func redactedErrorSummary(_ rawBody: String, apiKey: String) -> String {
+        // Redact BEFORE truncating so a credential straddling the summary
+        // boundary cannot leak its prefix.
+        var cleaned = SubQDecisionClient.redactedErrorDetail(rawBody, apiKey: apiKey)
+        cleaned = cleaned.replacingOccurrences(
+            of: #"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{6,}"#,
+            with: "Bearer [redacted]",
+            options: .regularExpression
+        )
+        return MCPHTTPTransport.summarizeErrorBody(cleaned)
+    }
     /// Idle (between-bytes) timeout for a chat turn. Generous on purpose: a
     /// large prompt or a reasoning model can take longer than half a minute to
     /// first token, and the timeout only has to catch a wedged connection.

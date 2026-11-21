@@ -273,7 +273,18 @@ public final class CompletionEngine: @unchecked Sendable {
     private let stateLock = NSLock()
     private var currentGenerationTask: Task<Void, Never>?
     private var currentGenerationId: UInt64 = 0
-    private var generationCounter: UInt64 = 0
+    /// The generation id whose task has already ENDED, set as the id is minted
+    /// and cleared when the next one is.
+    ///
+    /// `launchTurn` starts the turn's task and only then registers it under
+    /// `stateLock`, and the task may run to completion in between (an early
+    /// throw is the easy case). `turnDidEnd` would clear `currentGenerationTask`,
+    /// and the registration that followed would put the finished task back —
+    /// leaving `isActive` true for the process's life, i.e. every later turn
+    /// refused. Registration therefore consults this, and so does
+    /// `isCurrentGenerationUnchecked`: a turn whose task is running but not yet
+    /// registered is still the current generation.
+    private var endedGenerationId: UInt64 = 0
     /// Cooperative Stop for the work that runs on `runOnLargeStack`'s dedicated
     /// thread. That thread is a plain `Thread`, not an executor-managed one, so
     /// `Task.isCancelled` always reads false there and the layer loops would lose
@@ -281,6 +292,11 @@ public final class CompletionEngine: @unchecked Sendable {
     /// interrupt path awaits the outgoing task, a replacement send would sit behind
     /// the whole chunk. Set by `cancelActiveTurn`, cleared when a turn is minted.
     private var activeTurnCancelled = false
+    /// Whether the active turn may be preempted. A subagent step is background:
+    /// an operator's send cancels it and the run reports what it lost, rather
+    /// than the send failing with "another caller is holding the generation
+    /// slot" and leaving the operator to retry.
+    private var activeTurnPriority: TurnPriority = .interactive
 
     /// Ownership of the single-flight slot while a turn is being PREPARED, i.e.
     /// after a caller has been told the slot is free and before `launchTurn` mints
@@ -324,15 +340,24 @@ public final class CompletionEngine: @unchecked Sendable {
 
     private init() {}
 
-    /// True while a turn is running OR one is being prepared under a claim.
+    /// True while a turn is running, one is being prepared under a claim, or a
+    /// scoped tool mask still owns the grammar registry.
     ///
     /// The second half matters to the server queue: it asks this before deciding to
     /// launch, and a claim taken by another caller is exactly as busy as a running
     /// turn.
+    ///
+    /// The third is the tail of the same turn. The engine's task ends inside
+    /// `withTurnToolMask`'s body, so there is a window where the slot reads free
+    /// while the run's vocabulary is still installed; a launch there would
+    /// generate against another turn's tools and then have the base registry
+    /// restored underneath it. A scoped mask is therefore occupancy.
     public var isActive: Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return currentGenerationTask != nil || turnSlotLedger.isClaimed
+        return currentGenerationTask != nil
+            || turnSlotLedger.isClaimed
+            || GrammarConstrainedSampler.isScopedMaskInstalled
     }
 
     public var hasLoadedModel: Bool {
@@ -408,6 +433,12 @@ public final class CompletionEngine: @unchecked Sendable {
 
     /// Tokenizer bridge for API callers that build their own prompts
     /// (the server owns templating via ChatPromptFormatter).
+    ///
+    /// Main-actor isolated, like `DynaMoeTokenizer.encode`/`decode` themselves
+    /// (the generated bindings are unannotated, so this target's default
+    /// isolation applies to them too). A caller that wants the encoding off the
+    /// main actor would have to start at the bindings; making THIS method
+    /// `nonisolated` only moves the warning one level down.
     public func tokenize(_ text: String) throws -> [UInt32] {
         stateLock.lock()
         let tok = tokenizer
@@ -456,11 +487,23 @@ public final class CompletionEngine: @unchecked Sendable {
     ///
     /// `nonisolated` because the load task is detached and the claim is a lock box:
     /// the only state it touches is `stateLock` and the ledger, both guarded.
-    nonisolated func reserveTurnSlot() -> TurnSlotClaim? {
+    ///
+    /// `priority` travels with the claim so a prober can tell a BACKGROUND turn in
+    /// preparation (a subagent step, which an operator's send may stop) from a chat
+    /// turn, a server request or a model load, none of which may be. Without it the
+    /// whole preparation window — a DeepSeek turn's runtime and image span is
+    /// seconds — was invisible to preemption, and a send that could have been
+    /// running waited out its slot budget instead.
+    nonisolated func reserveTurnSlot(priority: TurnPriority = .interactive) -> TurnSlotClaim? {
         stateLock.lock()
         defer { stateLock.unlock() }
         guard currentGenerationTask == nil else { return nil }
-        return turnSlotLedger.tryClaim()
+        // A scoped tool mask outlives the engine task by the length of
+        // `withTurnToolMask`'s unwind. Reserving in that window would launch a
+        // turn into the run's vocabulary; treating the mask as occupancy makes
+        // the caller wait the few milliseconds instead.
+        guard !GrammarConstrainedSampler.isScopedMaskInstalled else { return nil }
+        return turnSlotLedger.tryClaim(priority: priority)
     }
 
     /// Launches one turn, taking the single-flight slot on the way in.
@@ -486,7 +529,7 @@ public final class CompletionEngine: @unchecked Sendable {
         claim: TurnSlotClaim? = nil
     ) throws -> CompletionLaunch {
         stateLock.lock()
-        guard let held = claim ?? turnSlotLedger.tryClaim() else {
+        guard let held = claim ?? turnSlotLedger.tryClaim(priority: request.turnPriority) else {
             stateLock.unlock()
             throw CompletionLaunchError.engineNotReady(
                 "❌ Another caller is holding the generation slot — a turn being prepared, or "
@@ -502,6 +545,19 @@ public final class CompletionEngine: @unchecked Sendable {
             stateLock.unlock()
             throw CompletionLaunchError.engineNotReady(
                 "❌ This turn's reservation on the generation slot was given back before it could start. Try again in a moment."
+            )
+        }
+        // The claim's priority is the ONLY thing that tells another prober
+        // whether this turn may be preempted, and the request's is what the
+        // engine records as the live turn's. A reservation taken for one and
+        // launched as the other would make an interactive turn look
+        // cancellable (or a background one uncancellable) for its whole
+        // length. Both are set by the same caller, so a mismatch is a bug
+        // worth a named refusal rather than a guess.
+        guard held.priority == request.turnPriority else {
+            stateLock.unlock()
+            throw CompletionLaunchError.engineNotReady(
+                "❌ This turn's reservation was taken for a different priority than the turn itself, so it will not start. Try again in a moment."
             )
         }
         if currentGenerationTask != nil {
@@ -703,9 +759,22 @@ public final class CompletionEngine: @unchecked Sendable {
                 // generated token. An attachment this engine already encoded is
                 // reused: a conversation that keeps a picture in context re-renders it
                 // every turn.
+                // Publish the turn's priority BEFORE image encoding so a
+                // foreground preemption check can see a background DS turn
+                // during its vision encode (up to ~7 s on device). Reset on any
+                // early throw before the turn task takes ownership.
                 stateLock.lock()
                 let cachedSpans = cachedImageSpans
+                activeTurnPriority = request.turnPriority
                 stateLock.unlock()
+                var deepSeekTurnLaunched = false
+                defer {
+                    if !deepSeekTurnLaunched {
+                        stateLock.lock()
+                        activeTurnPriority = .interactive
+                        stateLock.unlock()
+                    }
+                }
                 var freshSpans: [String: DeepSeekV41ImagePrompt.ImageSpan] = [:]
                 func spanKey(_ image: DeepSeekV41ImageInput) -> String {
                     "\(snapshotDir.path)|\(image.sha256)"
@@ -826,11 +895,25 @@ public final class CompletionEngine: @unchecked Sendable {
                 // this turn's required-parameter gate.
                 let deepSeekGrammarToken = GrammarConstrainedSampler.shared.beginGeneration()
                 stateLock.lock()
-                generationCounter &+= 1
-                let myGenerationId = generationCounter
+                // Committing and minting the id are one step. A preemption
+                // refuses a committed claim, so a turn that has become live
+                // can never have its id overwritten by the turn it preempted.
+                guard held.commit() else {
+                    stateLock.unlock()
+                    throw CompletionLaunchError.engineNotReady(
+                        "❌ This turn's reservation on the generation slot was given back before it could start. Try again in a moment."
+                    )
+                }
+                // The turn's id IS the claim's ticket, like the generic path: a
+                // token taken before this launch must still name this turn
+                // after it, and an id one past the ticket named nothing.
+                let myGenerationId = held.ticket
                 currentGenerationId = myGenerationId
+                endedGenerationId = 0
                 activeTurnCancelled = false
+                activeTurnPriority = request.turnPriority
                 stateLock.unlock()
+                deepSeekTurnLaunched = true
 
                 // The pin proposes how much of this prompt a previous turn may have
                 // left resident; the executor decides. It is the only thing that
@@ -844,9 +927,32 @@ public final class CompletionEngine: @unchecked Sendable {
                     ),
                     promptTokenIds: expandedPromptIds.map { Int($0) }
                 )
+                // The runner's own resume rule decides what the cache ends up
+                // holding, not the executor's token-based answer alone: an
+                // image turn always starts from position 0 (the pin is keyed on
+                // TOKEN IDS, which cannot tell two pictures apart), so a pin
+                // that survives a token-match here would point at rows the
+                // runner is about to zero. Invalidate against the number the
+                // RUNNER will actually preserve.
+                //
+                // WHERE it runs matters, the same way it does on the generic
+                // path: not here, but at the runner's own cache-change hook.
+                // This launch can still be refused — the DS runner gates on an
+                // empty prompt, a prompt past the position limit and an image
+                // row outside the prompt BEFORE it resets anything — and a
+                // refused turn overwrites no rows, so invalidating here would
+                // drop a still-valid pin and make the next turn re-prefill a
+                // prefix that is still resident. `onCacheWillChange` fires
+                // past those gates, immediately before the resume/reset.
+                let runnerReused = boundRows.isEmpty ? reusablePrefix : 0
 
                 let prep = TurnPrepInfo(
-                    prefixTokensReused: reusablePrefix,
+                    // What the runner actually preserved, not what the pin
+                    // offered: an image turn re-prefills its span (the pin is
+                    // keyed on token ids, and two pictures share ids), so
+                    // reporting `reusablePrefix` billed cached tokens for rows
+                    // that were recomputed.
+                    prefixTokensReused: runnerReused,
                     promptTokenCount: expandedPromptIds.count,
                     effectiveKVPrecision: runtime.cachePrecision == .fp16 ? .fp16 : .fp8,
                     provisionedSequenceLength: runtime.contextLength
@@ -990,6 +1096,12 @@ public final class CompletionEngine: @unchecked Sendable {
                                 let rate: Double? = done > 0 && elapsed > 0.05
                                     ? Double(done) / elapsed
                                     : nil
+                                // This family never reached the generic prefill
+                                // path's `PrefillThroughput.note`, so spawn pricing
+                                // on a DeepSeek checkpoint always used the 5 tok/s
+                                // fallback. The final rate is this process's own
+                                // measurement, which is what that store is for.
+                                if isFinal, let rate { PrefillThroughput.note(tokensPerSecond: rate) }
                                 emit(.prefillProgress(
                                     status: dsPrefillStatus(done: done, total: total, rate: rate),
                                     speed: rate,
@@ -1044,6 +1156,13 @@ public final class CompletionEngine: @unchecked Sendable {
                             },
                             isCancelled: {
                                 Task.isCancelled || !isCurrentGeneration(myGenerationId)
+                            },
+                            // Past the runner's own refusal gates, immediately
+                            // before it resumes or resets the cache. Invalidating
+                            // at launch instead dropped a still-valid pin for a
+                            // turn the runner went on to refuse.
+                            onCacheWillChange: {
+                                PrefixCacheManager.shared.invalidateIfNotPreserved(runnerReused)
                             }
                         )
                         emit(.prefillProgress(status: nil, speed: nil, rssGB: nil))
@@ -1054,9 +1173,13 @@ public final class CompletionEngine: @unchecked Sendable {
                         // ended the turn on an unforwarded token leaves the pin one
                         // longer than the cache, and the cut in `reusablePrefix` takes
                         // the shorter of the two. Recorded before the cancel check as
-                        // well, because a stopped turn still leaves a sequence behind.
+                        // well, because a stopped turn still leaves a sequence behind
+                        // — but only as far as that sequence actually reaches: a
+                        // cancellation during PREFILL pins the positions the executor
+                        // wrote, not the whole prompt, or the next spawn prices
+                        // re-prefill against tokens that were never resident.
                         PrefixCacheManager.shared.recordTurn(
-                            promptTokenIds: dsPromptIds,
+                            promptTokenIds: Array(dsPromptIds.prefix(output.storedPromptTokens)),
                             generatedTokenIds: output.generatedTokenIds,
                             sessionId: dsSessionId,
                             asOfDate: dsAsOfDate
@@ -1149,9 +1272,12 @@ public final class CompletionEngine: @unchecked Sendable {
                     }
                 }
                 // The engine is single-flight: register the turn so a second launch
-                // is refused and `cancelActiveTurn` reaches this task.
+                // is refused and `cancelActiveTurn` reaches this task. The task may
+                // already have finished (it is started above), so a turn that ended
+                // is never registered — `endedGenerationId` is what makes that
+                // visible, because `turnDidEnd` has already cleared the field.
                 stateLock.lock()
-                if currentGenerationId == myGenerationId {
+                if currentGenerationId == myGenerationId && endedGenerationId != myGenerationId {
                     currentGenerationTask = handleTask
                 }
                 stateLock.unlock()
@@ -2475,6 +2601,20 @@ public final class CompletionEngine: @unchecked Sendable {
             neededSeqLen = clampedSeqLen
         }
 
+        // The reset below keeps only `prefixTokensReused` rows. If that is
+        // less than the pin claims, the old pin describes rows this turn
+        // overwrites (or a fresh allocation zeroed), so it must not be offered
+        // to its owner later. A cancelled turn never reaches recordTurn, which
+        // is what used to leave such a pin behind; see
+        // `invalidateIfNotPreserved`.
+        //
+        // Placement matters: this runs AFTER every gate that can refuse the
+        // turn. The affordability checks above throw for a prompt this
+        // machine cannot hold, and a refused launch overwrites no rows —
+        // invalidating the pin on the way to a 400 dropped a still-valid pin
+        // for a refusal the operator could fix by lowering the prompt.
+        PrefixCacheManager.shared.invalidateIfNotPreserved(prefixTokensReused)
+
         KVCacheManager.shared.reset(
             device: device,
             config: modelConfig,
@@ -2492,10 +2632,28 @@ public final class CompletionEngine: @unchecked Sendable {
         // Old ordering preserved: KV reset (above) -> grammar token -> turn id.
         let grammarGenerationToken = GrammarConstrainedSampler.shared.beginGeneration()
         stateLock.lock()
-        generationCounter &+= 1
-        let myGenerationId = generationCounter
+        // Committing and minting the id are one step. A preemption refuses a
+        // committed claim, so a turn that has become live can never have its id
+        // overwritten by the turn it preempted (see `TurnSlotLedger.commit`).
+        guard held.commit() else {
+            stateLock.unlock()
+            throw CompletionLaunchError.engineNotReady(
+                "❌ This turn's reservation on the generation slot was given back before it could start. Try again in a moment."
+            )
+        }
+        // The generation id IS the claim's ticket, not a number derived from
+        // it. A preempting caller holds a token from before this launch (a
+        // claim's ticket) and compares it after, when the turn may already be a
+        // task (a generation id): two counters made that comparison refuse to
+        // stop the very turn it named. Tickets are unique in the ledger and
+        // never reused, so one doubles as an id without a second source — and
+        // an id must never be minted NEXT to a ticket, or a stale id would name
+        // the following turn's claim.
+        let myGenerationId = held.ticket
         currentGenerationId = myGenerationId
+        endedGenerationId = 0
         activeTurnCancelled = false
+        activeTurnPriority = request.turnPriority
         stateLock.unlock()
 
         let prep = TurnPrepInfo(
@@ -11078,6 +11236,11 @@ if layer.attnGateProjTensor != nil,
                                 let prefillStr = "Ingesting prompt: Token \(idx + 1)/\(totalTokens) (\(pct)%) • \(speedStr) tok/s"
                                 let currentRss = WorkingSetManager.shared.effectiveResidentMemoryGB
 
+                                // The measured rate, kept for the local subagent
+                                // spawn's re-prefill estimate: a run has to price
+                                // the coordinator's next turn before it starts, and
+                                // the only honest input is what this machine did.
+                                PrefillThroughput.note(tokensPerSecond: promptSpeed)
                                 emit(.prefillProgress(status: prefillStr, speed: promptSpeed, rssGB: currentRss))
                             }
                         }
@@ -11101,7 +11264,16 @@ if layer.attnGateProjTensor != nil,
                             let chunkEnd = min(chunkStart + chunkCap, prefillTokens.count)
                             let chunk = Array(prefillTokens[chunkStart..<chunkEnd])
                             let chunkOk = runOnLargeStack {
-                                runLayerWisePrefill(promptTokens: chunk, startPos: UInt32(startPos) + UInt32(chunkStart), chunkIndex: chunkIndex, chunkCount: totalPrefillChunks, prefillProgress: { s, sp, rs in emit(.prefillProgress(status: s, speed: sp, rssGB: rs)) })
+                                runLayerWisePrefill(promptTokens: chunk, startPos: UInt32(startPos) + UInt32(chunkStart), chunkIndex: chunkIndex, chunkCount: totalPrefillChunks, prefillProgress: { s, sp, rs in
+                                    // The local subagent spawn prices its
+                                    // re-prefill from the last rate this
+                                    // process measured. The batched branch is
+                                    // now the normal one, so a missing note
+                                    // here left every spawn priced at the
+                                    // 5 tok/s fallback.
+                                    if sp > 0 { PrefillThroughput.note(tokensPerSecond: sp) }
+                                    emit(.prefillProgress(status: s, speed: sp, rssGB: rs))
+                                })
                             }
                             if !chunkOk {
                                 // The chunk returns false for a cancelled turn as well as for
@@ -11570,7 +11742,7 @@ if layer.attnGateProjTensor != nil,
             )))
         }
         stateLock.lock()
-        if currentGenerationId == myGenerationId {
+        if currentGenerationId == myGenerationId && endedGenerationId != myGenerationId {
             currentGenerationTask = handleTask
         }
         stateLock.unlock()
@@ -11589,7 +11761,151 @@ if layer.attnGateProjTensor != nil,
         stateLock.unlock()
     }
 
-    /// Suspends until no turn is active (model switch/load safety).
+    /// True while the turn holding the engine is one an operator's send may
+    /// preempt, i.e. a subagent step.
+    ///
+    /// A turn in PREPARATION counts too: it holds a claim and no task yet, and
+    /// that window is seconds long (a DeepSeek runtime, an image span), so
+    /// watching only `currentGenerationTask` hid exactly the work that could be
+    /// stopped. The claim's own priority is what decides — a chat turn, a server
+    /// request or a model load answering `.interactive` is still never
+    /// cancellable from here.
+    public var hasActiveBackgroundTurn: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        if currentGenerationTask != nil { return activeTurnPriority == .background }
+        return turnSlotLedger.claimedPriority == .background
+    }
+
+    /// Cancels the active turn only when it is background.
+    ///
+    /// Returns false when the turn belongs to chat, the API server or a model
+    /// load, so an interactive retry can never stop a turn that outranks it.
+    /// Cancellation is cooperative, so the caller must follow this with
+    /// `awaitIdle()` before launching its own turn.
+    @discardableResult
+    public func cancelBackgroundTurn() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        if let task = currentGenerationTask {
+            guard activeTurnPriority == .background else { return false }
+            task.cancel()
+            activeTurnCancelled = true
+            return true
+        }
+        // A background turn being PREPARED holds no task yet — only its claim —
+        // and `hasActiveBackgroundTurn` counts that window, so a cancel that
+        // only looked at the task was inert exactly when the caller had been
+        // told there was something to stop. Dropping the claim makes the
+        // pending launch refuse itself; the preparation finishes harmlessly.
+        return turnSlotLedger.cancelClaim(ifPriority: .background)
+    }
+
+    /// A token naming the background turn that holds — or is about to hold —
+    /// the engine slot. Nil when the holder is interactive or there is none.
+    ///
+    /// A preempting send has to `await` between deciding to preempt (it
+    /// cancels the queued runs first) and cancelling the turn, and an
+    /// `await` is long enough for the holder to change. `cancelBackgroundTurn()`
+    /// names a PRIORITY, so it would have stopped whatever background turn
+    /// held the slot by then rather than the one the caller looked at; this
+    /// token lets `cancelBackgroundTurn(token:)` answer "not that one" instead.
+    public var activeBackgroundTurnToken: UInt64? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        if currentGenerationTask != nil {
+            return activeTurnPriority == .background ? currentGenerationId : nil
+        }
+        guard turnSlotLedger.claimedPriority == .background else { return nil }
+        return turnSlotLedger.claimedTicket
+    }
+
+    /// Cancels the background turn with this token, and nothing else.
+    ///
+    /// False means the named turn is no longer the holder, so the caller must
+    /// NOT treat the engine as draining: the honest answer is "that turn is
+    /// gone", which the send path turns into a notice rather than killing
+    /// somebody else's work.
+    @discardableResult
+    public func cancelBackgroundTurn(token: UInt64) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        // One token space, one comparison. A caller's token can come from
+        // either accessor, and the two used to be different counters (a
+        // claim's ticket, then the generation id), so a turn whose preparation
+        // finished during the caller's `await` was answered "not that one" and
+        // never stopped. `launchTurn` continues the ledger's ticket as the
+        // generation id, so a token stays valid across that handover.
+        if let task = currentGenerationTask {
+            guard activeTurnPriority == .background, currentGenerationId == token else { return false }
+            task.cancel()
+            activeTurnCancelled = true
+            return true
+        }
+        // The same priority rule as the task branch: matching a ticket is not
+        // authority to stop an interactive preparation (a chat send, an API
+        // request, a model load).
+        guard turnSlotLedger.claimedPriority == .background else { return false }
+        return turnSlotLedger.cancelClaim(ticket: token)
+    }
+
+    /// Cancels one specific turn, addressed by the generation id its launch
+    /// returned.
+    ///
+    /// `cancelBackgroundTurn` names a PRIORITY, which is right for preemption —
+    /// an operator's send outranks whatever background work is current — and
+    /// wrong for a caller that owns a particular turn. By the time a cancelled
+    /// subagent run unwinds, the slot may already belong to its successor, so a
+    /// priority-scoped cancel could stop the wrong turn. The id makes ownership
+    /// explicit, and a stale id is a no-op.
+    @discardableResult
+    public func cancelTurn(id: UInt64) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard id == currentGenerationId, let task = currentGenerationTask else { return false }
+        task.cancel()
+        activeTurnCancelled = true
+        return true
+    }
+
+#if DEBUG
+    /// Tests only: installs a turn the engine did not launch.
+    ///
+    /// Ownership-scoped cancellation has two branches — an id that matches a
+    /// registered turn, and one that does not. The test bundle has no model,
+    /// and `launchTurn` refuses before minting a task, so without this seam a
+    /// test can only reach "no task at all" and cannot observe the successor
+    /// case it documents.
+    func installTurnForTesting(
+        id: UInt64,
+        task: Task<Void, Never>,
+        priority: TurnPriority = .interactive
+    ) {
+        stateLock.lock()
+        currentGenerationId = id
+        currentGenerationTask = task
+        activeTurnPriority = priority
+        activeTurnCancelled = false
+        stateLock.unlock()
+    }
+
+    func clearTurnForTesting() {
+        stateLock.lock()
+        currentGenerationTask = nil
+        activeTurnPriority = .interactive
+        activeTurnCancelled = false
+        stateLock.unlock()
+    }
+#endif
+
+    /// Waits (bounded) for no turn to be active, for model switch/load safety.
+    ///
+    /// The wait is capped at `unboundedIdleWaitSeconds` and returns even when
+    /// the engine is still busy, logging a warning: a leaked claim must not
+    /// wedge every later caller. A caller that has to KNOW the engine is free
+    /// before it touches shard buffers or the runtime must call
+    /// `awaitIdle(boundedBy:)` and check its result instead of relying on this
+    /// one.
     ///
     /// "Active" is `isActive`, not just the registered task. A turn is UNREGISTERED
     /// for the whole of its preparation — `launchTurn` builds the DeepSeek runtime,
@@ -11605,18 +11921,54 @@ if layer.attnGateProjTensor != nil,
     /// guards is a multi-second operation on the main actor and the poll yields,
     /// which is what lets the preparation it is waiting for finish.
     public func awaitIdle() async {
-        while true {
-            stateLock.lock()
-            let pending = currentGenerationTask
-            let preparing = turnSlotLedger.isClaimed
-            stateLock.unlock()
-            if let task = pending {
-                _ = await task.value
-                continue
-            }
-            guard preparing else { break }
+        // Bounded even here. A claim is released by its holder, and a holder
+        // that reserved and then threw on a path missing its `defer` would
+        // wedge this loop forever — a leaked claim must degrade to a timeout,
+        // not to a hang, for every later caller. Long enough to never cut a
+        // real turn short (a DeepSeek launch alone is ~17 s), short enough
+        // that a wedge is reported rather than waited out.
+        if !(await awaitIdle(boundedBy: Self.unboundedIdleWaitSeconds)) {
+            DiagLog.warning(
+                "engine.slot",
+                "awaitIdle gave up after \(Int(Self.unboundedIdleWaitSeconds)) s with the slot still held; proceeding"
+            )
+        }
+    }
+
+    /// The cap `awaitIdle()` applies when its caller named no deadline: a
+    /// backstop against a leaked claim, not a budget for real work.
+    nonisolated static let unboundedIdleWaitSeconds: TimeInterval = 120
+
+    /// The same wait with a deadline, for a caller that must not block forever.
+    ///
+    /// Returns false when the deadline passed with the engine still busy. The
+    /// preemption path needs this: it cancels a background turn and then waits
+    /// for the drain, but the party that ends up holding the slot can be one it
+    /// cannot cancel (the API server's request, a model load), and an unbounded
+    /// wait there locks every composer behind a notice about a subagent that is
+    /// not the reason.
+    @discardableResult
+    public func awaitIdle(boundedBy seconds: TimeInterval?) async -> Bool {
+        let deadline = seconds.map { Date().addingTimeInterval($0) }
+        while isActive {
+            if let deadline, Date() >= deadline { return false }
+            // `Task.sleep` throws `CancellationError` WITHOUT suspending when
+            // the task is already cancelled, and `try?` swallows it — the loop
+            // then spins synchronously on the main actor until the deadline
+            // (60 s in the preemption path, unbounded for a teardown). A
+            // cancelled waiter has no reason to keep waiting: whatever it was
+            // waiting for is either the thing that cancelled it or work it can
+            // no longer influence.
+            if Task.isCancelled { return false }
+            // Poll rather than awaiting the turn's task: the await is not
+            // cancellation-aware, so a holder this caller cannot stop (the API
+            // server's request) would park the wait past its own deadline.
+            // Five milliseconds is the same cadence the claim half already
+            // uses, and yielding is what lets the preparation being waited on
+            // finish.
             try? await Task.sleep(nanoseconds: 5_000_000)
         }
+        return true
     }
 
     private func turnDidBegin(_ id: UInt64) {
@@ -11628,14 +11980,21 @@ if layer.attnGateProjTensor != nil,
         defer { stateLock.unlock() }
         if currentGenerationId == id {
             currentGenerationTask = nil
+            endedGenerationId = id
+            activeTurnPriority = .interactive
         }
     }
 
     /// True while the given turn still owns the engine slot.
+    ///
+    /// The task is not the test: a turn is registered only AFTER its task starts,
+    /// so a running-but-unregistered turn would read as inactive, and its identity
+    /// is the generation id alone (`endedGenerationId` says whether that turn is
+    /// over yet).
     fileprivate func isCurrentGenerationUnchecked(_ id: UInt64) -> Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return id == currentGenerationId && currentGenerationTask != nil
+        return id == currentGenerationId && endedGenerationId != id
     }
 
     /// True when turn `id` must stop at its next layer boundary.
@@ -11677,6 +12036,10 @@ if layer.attnGateProjTensor != nil,
         cachedDeepSeekRuntime = nil
         cachedImageSpans.removeAll()
         stateLock.unlock()
+        // The prefill rate belongs to the checkpoint that measured it. A spawn
+        // priced from the previous model's rate could under-price a much larger
+        // one (or over-price a smaller one) until the next prefill corrects it.
+        PrefillThroughput.reset()
         retired?.runtime.shutdown()
     }
 

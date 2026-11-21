@@ -1941,11 +1941,10 @@ final class ServerController: ObservableObject {
         _ schemas: [GrammarToolSchema],
         _ body: () async throws -> T
     ) async rethrows -> T {
-        guard !schemas.isEmpty else { return try await body() }
-        let previous = GrammarConstrainedSampler.shared.snapshotRegistry()
-        GrammarConstrainedSampler.shared.registerToolSchemas(schemas)
-        defer { GrammarConstrainedSampler.shared.restoreRegistry(previous) }
-        return try await body()
+        // One implementation, shared with the local subagent backend: the
+        // restore is what keeps a client's tool vocabulary from rewriting the
+        // in-app registry for every later turn.
+        try await GrammarConstrainedSampler.withTurnToolMask(schemas, body)
     }
 
     nonisolated private static func buildTurnPlan(_ apiRequest: OpenAIChatRequest) throws -> TurnPlan {
@@ -2176,7 +2175,15 @@ final class ServerController: ObservableObject {
             try await withTurnToolMask(plan.maskSchemas) {
                 let launch: CompletionLaunch
                 do {
-                    launch = try CompletionEngine.shared.launchTurn(plan.request, claim: claim)
+                    // `launchTurn` is MainActor-isolated (the engine's state is
+                    // main-actor state under the project's default isolation),
+                    // and this closure is a nonisolated queue body. Hopping is
+                    // the same step `LocalAgentBackend` takes; calling straight
+                    // through raced main-actor callers on `KVCacheManager` and
+                    // the generation fields.
+                    launch = try await MainActor.run {
+                        try CompletionEngine.shared.launchTurn(plan.request, claim: claim)
+                    }
                 } catch {
                     throw wireLaunchError(error)
                 }
@@ -2494,7 +2501,12 @@ final class ServerController: ObservableObject {
                         row.model = plan.modelName
                     }
                     try await ServerController.withTurnToolMask(plan.maskSchemas) {
-                        let launch = try CompletionEngine.shared.launchTurn(plan.request, claim: claim)
+                        // MainActor hop: see `runTurn`. Every streaming writer
+                        // launches through this same step so no queue body
+                        // touches the engine's main-actor state directly.
+                        let launch = try await MainActor.run {
+                            try CompletionEngine.shared.launchTurn(plan.request, claim: claim)
+                        }
                         if Task.isCancelled {
                             launch.handle.cancel()
                             return
@@ -2790,7 +2802,12 @@ final class ServerController: ObservableObject {
                         row.model = plan.modelName
                     }
                     try await ServerController.withTurnToolMask(plan.maskSchemas) {
-                        let launch = try CompletionEngine.shared.launchTurn(plan.request, claim: claim)
+                        // MainActor hop: see `runTurn`. Every streaming writer
+                        // launches through this same step so no queue body
+                        // touches the engine's main-actor state directly.
+                        let launch = try await MainActor.run {
+                            try CompletionEngine.shared.launchTurn(plan.request, claim: claim)
+                        }
                         if Task.isCancelled {
                             launch.handle.cancel()
                             return
@@ -3113,7 +3130,12 @@ final class ServerController: ObservableObject {
                         row.model = plan.modelName
                     }
                     try await ServerController.withTurnToolMask(plan.maskSchemas) {
-                        let launch = try CompletionEngine.shared.launchTurn(plan.request, claim: claim)
+                        // MainActor hop: see `runTurn`. Every streaming writer
+                        // launches through this same step so no queue body
+                        // touches the engine's main-actor state directly.
+                        let launch = try await MainActor.run {
+                            try CompletionEngine.shared.launchTurn(plan.request, claim: claim)
+                        }
                         if Task.isCancelled {
                             launch.handle.cancel()
                             return

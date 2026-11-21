@@ -187,6 +187,14 @@ struct TimelineStepCardView: View {
 
     @State private var isExpanded: Bool = false
     @State private var isCopied: Bool = false
+    /// Loaded off the main actor when this card is an apply card. Reading the
+    /// run's record is a synchronous store read, and a view body is the one
+    /// place that must not wait on the store's write queue.
+    @State private var applyDestinationSummary: String?
+    /// The summary read has FINISHED (whatever it found). Approving an apply
+    /// card before the destination is known decided against an incomplete
+    /// card; the frames are few, but this is a write.
+    @State private var applyDestinationResolved = false
 
     private var iconName: String {
         switch call.name {
@@ -246,6 +254,42 @@ struct TimelineStepCardView: View {
             return names.count == 1 ? first : "\(first) +\(names.count - 1)"
         case "complete":
             return call.arguments["summary"] ?? "Completed"
+        case "spawn_subagent":
+            let role = call.arguments["role"] ?? "Subagent"
+            let preference = (call.arguments["backend"] ?? "").lowercased()
+            // The card must name the backend the SPAWN will actually use.
+            // Reading only the explicit argument said "on-device" for an
+            // `auto` spawn that Settings had pointed at Cloud, or for one on a
+            // machine with no checkpoint loaded.
+            let usesCloud: Bool
+            switch preference {
+            case "cloud":
+                usesCloud = true
+            case "local":
+                usesCloud = false
+            default:
+                let engine = CompletionEngine.shared
+                usesCloud = !(engine.loadedModelInfo != nil && engine.promptModelConfig != nil)
+            }
+            if usesCloud {
+                if case .configured(let address) = SubagentBackendSettings.preferredCloudModel() {
+                    return "\(role) · off-device · \(address)"
+                }
+                return "\(role) · off-device"
+            }
+            return role
+        case "apply_subagent_changes":
+            let raw = call.arguments["subagent_id"] ?? call.arguments["run_id"]
+            if let raw,
+               let id = UUID(uuidString: raw),
+               let live = SubagentManager.shared.getSubagent(byId: id) {
+                if let branch = live.modelPlan?.isolation.worktreeBranch {
+                    return "\(live.role) · \(branch)"
+                }
+                return live.role
+            }
+            if let branch = call.arguments["branch"] { return branch }
+            return "Apply isolated changes"
         default:
             return call.rawArguments
         }
@@ -279,6 +323,33 @@ struct TimelineStepCardView: View {
         } else {
             chunked
         }
+    }
+
+    /// What the approval card says about where the action lands. The generic
+    /// card has only the tool's arguments, and `apply_subagent_changes` passes
+    /// just an id: the branch, the destination tree and the changed files come
+    /// from the run's own record so the operator can decide.
+    private var approvalDestinationSummary: String? {
+        if call.name == "subq_decide" {
+            return SubQDecideTool.approvalDetail(
+                rawArguments: call.rawArguments,
+                endpointString: call.pinnedEndpoint
+            )
+        }
+        return applyDestinationSummary
+    }
+
+    /// The run this card would apply, when it is one.
+    ///
+    /// Trimmed exactly as the tool trims it: a padded id (`" <uuid>"`) parses
+    /// here and in `ApplySubagentChangesTool.execute` or neither, because the
+    /// Approve gate keys on this being non-nil — an untrimmed parse made it nil
+    /// and enabled Approve with no destination shown, and the tool then trimmed
+    /// and landed the patch blind.
+    private var applyRunId: UUID? {
+        guard call.name == "apply_subagent_changes",
+              let raw = call.arguments["subagent_id"] ?? call.arguments["run_id"] else { return nil }
+        return UUID(uuidString: raw.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     /// The expanded arguments. Each value is chunked rather than drawn as one
@@ -404,12 +475,7 @@ struct TimelineStepCardView: View {
                         toolName: call.name,
                         arguments: call.arguments,
                         targetSummary: primarySummary,
-                        destinationSummary: call.name == "subq_decide"
-                            ? SubQDecideTool.approvalDetail(
-                                rawArguments: call.rawArguments,
-                                endpointString: call.pinnedEndpoint
-                            )
-                            : nil,
+                        destinationSummary: approvalDestinationSummary,
                         diffPreview: call.arguments["diff"] ?? call.arguments["content"],
                         commandPreview: call.arguments["command"]
                     ),
@@ -420,7 +486,8 @@ struct TimelineStepCardView: View {
                     onReject: {
                         ActionApprovalManager.shared.reject(id: call.id)
                         onReject?()
-                    }
+                    },
+                    approveEnabled: applyRunId == nil || applyDestinationResolved
                 )
                 .padding(.top, 2)
             }
@@ -517,6 +584,46 @@ struct TimelineStepCardView: View {
                 }
                 .padding(.horizontal, 4)
             }
+        }
+        // The apply card names where the patch lands, and that answer lives in
+        // the run's record. The read is a synchronous store access, so it runs
+        // off the main actor; the card draws the note when it lands rather
+        // than parking the frame behind the store's write queue.
+        .task(id: applyRunId) {
+            applyDestinationResolved = false
+            guard let runId = applyRunId else {
+                applyDestinationSummary = nil
+                applyDestinationResolved = true
+                return
+            }
+            let summary = await Task.detached(priority: .utility) { () -> String? in
+                guard let record = AgentRunStore.shared.loadAny(runId: runId) else { return nil }
+                // A dirty destination is the usual reason an apply conflicts,
+                // and this is the last moment the operator can stash. The note
+                // reads only the RECORDED root; a legacy record's `.git`
+                // pointer is sandbox-writable and is not a destination.
+                let note = await SubagentApplyControl.destinationNote(for: record.repositoryRoot)
+                let branch: String?
+                let branchResolved: Bool
+                if let root = record.repositoryRoot {
+                    branch = await WorkspaceIsolation.currentBranch(
+                        of: URL(fileURLWithPath: root, isDirectory: true)
+                    )
+                    branchResolved = true
+                } else {
+                    branch = nil
+                    branchResolved = false
+                }
+                return SubagentApplyControl.approvalSummary(
+                    for: record,
+                    destinationBranch: branch,
+                    destinationBranchResolved: branchResolved,
+                    destinationNote: note
+                )
+            }.value
+            guard !Task.isCancelled else { return }
+            applyDestinationSummary = summary
+            applyDestinationResolved = true
         }
     }
 }

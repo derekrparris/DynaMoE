@@ -9,6 +9,7 @@ import SwiftUI
 import SwiftData
 import Combine
 import Sparkle
+import UserNotifications
 
 final class UpdaterViewModel: ObservableObject {
     static let shared = UpdaterViewModel()
@@ -139,6 +140,12 @@ struct DynaMoEApp: App {
         if !isTesting {
             SkillsRegistry.shared.bootstrap()
         }
+
+        // A finish banner is only useful if its click lands somewhere. The
+        // delegate opens the inspector on the run the notice names.
+        if !isTesting {
+            UNUserNotificationCenter.current().delegate = SubagentNotificationDelegate.shared
+        }
     }
 
     var sharedModelContainer: ModelContainer = {
@@ -216,6 +223,17 @@ struct DynaMoEApp: App {
                     openWindow(id: "dynamoe-help")
                 }
                 .keyboardShortcut("?", modifiers: .command)
+            }
+            // The inspector toggle's tooltip promises ⌘D, and a tooltip is not a
+            // binding: the button was the only way in from the keyboard. The
+            // menu item is the binding, and it toggles the same state.
+            CommandGroup(after: .toolbar) {
+                Button("Toggle Subagent Inspector") {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        SubagentManager.shared.isDrawerOpen.toggle()
+                    }
+                }
+                .keyboardShortcut("d", modifiers: .command)
             }
         }
 

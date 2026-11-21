@@ -228,6 +228,11 @@ nonisolated public struct ChatMessage: Identifiable, Codable, Equatable, Sendabl
     /// otherwise restore a partial summary as an ordinary settled system
     /// message. `ChatSessionStore.normalizedForRestore` drops these on load.
     public var isTransient: Bool?
+    /// A prompt-only directive: a turn the model reads but the transcript never
+    /// shows and a restore never keeps. The start-of-turn subagent relay rides
+    /// here so a report that landed after the coordinator finished still reaches
+    /// it, without inventing a message the user appears to have sent.
+    public var isPromptOnly: Bool?
     /// True on the one visible digest card `/compact` leaves at the head of a
     /// compacted conversation. The row is a `.system` message, so every prompt
     /// and transcript builder skips it (the same digests already ride in
@@ -254,6 +259,7 @@ nonisolated public struct ChatMessage: Identifiable, Codable, Equatable, Sendabl
         thinkingTimeSeconds: Double? = nil,
         prefillStatus: String? = nil,
         isTransient: Bool? = nil,
+        isPromptOnly: Bool? = nil,
         isCompactionSummary: Bool? = nil,
         toolCalls: [ToolCallRecord]? = nil,
         attachments: [ImageAttachmentRef]? = nil,
@@ -272,6 +278,7 @@ nonisolated public struct ChatMessage: Identifiable, Codable, Equatable, Sendabl
         self.thinkingTimeSeconds = thinkingTimeSeconds
         self.prefillStatus = prefillStatus
         self.isTransient = isTransient
+        self.isPromptOnly = isPromptOnly
         self.isCompactionSummary = isCompactionSummary
         self.toolCalls = toolCalls
         self.attachments = attachments
