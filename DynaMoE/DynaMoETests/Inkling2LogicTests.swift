@@ -1804,3 +1804,170 @@ final class Inkling2TurnTests: XCTestCase {
         }
     }
 }
+
+// MARK: - Host forward on the synthetic checkpoint
+
+/// A small, structurally complete Inkling 2 checkpoint loaded by BOTH the Swift
+/// host graph and the pinned Transformers reference, so a hypothesis about the
+/// graph costs seconds instead of a six-minute real-checkpoint run.
+///
+/// The fixture is written by `Tools/inkling2_synthetic.py`; it stores the
+/// experts in the checkpoint's packed layouts, so each side runs its own
+/// dequantizer. The expected values come from the reference run over the same
+/// directory (`Tools/inkling2_synthetic_golden.py`), never from this code.
+///
+/// It also checks the fixture-catalog rules: every tensor placed, no duplicates,
+/// the expert layouts inferred from strides, and the full/sliding tensor split in
+/// both directions.
+final class Inkling2SyntheticForwardTests: XCTestCase {
+
+    static let fixturePath = "/tmp/inkling2_synth"
+    static let goldenPath = "/tmp/inkling2_synth_goldens.json"
+
+    private func fixture() throws -> URL {
+        let path = URL(fileURLWithPath: Self.fixturePath)
+        guard FileManager.default.fileExists(atPath: path.appendingPathComponent("config.json").path) else {
+            throw XCTSkip("no synthetic checkpoint at \(Self.fixturePath): run Tools/inkling2_synthetic.py")
+        }
+        return path
+    }
+
+    /// Builds a summary that describes the fixture's tensors without opening a
+    /// shard: the catalog only needs names, dtypes and shapes, and the Rust
+    /// loader would split the fused expert banks anyway, which is exactly what
+    /// the coalescing path is tested against on the real checkpoint.
+    private func fixtureSummary(_ directory: URL) throws -> (ModelSummary, Inkling2Config) {
+        let config = try Inkling2Config.decode(
+            contentsOf: directory.appendingPathComponent("config.json")
+        )
+        let indexData = try Data(contentsOf: directory.appendingPathComponent("model.safetensors.index.json"))
+        let index = try XCTUnwrap(JSONSerialization.jsonObject(with: indexData) as? [String: Any])
+        let weightMap = try XCTUnwrap(index["weight_map"] as? [String: String])
+        let handle = try FileHandle(forReadingFrom: directory.appendingPathComponent("model-00001-of-00001.safetensors"))
+        defer { try? handle.close() }
+        let lengthData = try XCTUnwrap(try handle.read(upToCount: 8))
+        var headerLength: UInt64 = 0
+        for (offset, byte) in lengthData.enumerated() { headerLength |= UInt64(byte) << (8 * UInt64(offset)) }
+        let headerData = try XCTUnwrap(try handle.read(upToCount: Int(headerLength)))
+        let header = try XCTUnwrap(JSONSerialization.jsonObject(with: headerData) as? [String: Any])
+        var tensors: [TensorMetadata] = []
+        for name in weightMap.keys.sorted() {
+            guard let entry = header[name] as? [String: Any],
+                  let dtype = entry["dtype"] as? String,
+                  let shape = entry["shape"] as? [Int],
+                  let offsets = entry["data_offsets"] as? [Int] else { continue }
+            let width = Inkling2SnapshotWeights.elementWidth(dtype)
+            let elements = shape.reduce(1, *)
+            tensors.append(TensorMetadata(
+                name: name,
+                shapeDisplay: "[" + shape.map(String.init).joined(separator: ", ") + "]",
+                dtype: dtype,
+                sizeMb: Double(elements * width) / (1024 * 1024),
+                shardIndex: 0,
+                offsetStart: UInt64(offsets[0]),
+                offsetEnd: UInt64(offsets[1]),
+                category: "fixture",
+                layerIndex: nil,
+                expertId: nil
+            ))
+        }
+        let summary = ModelSummary(
+            sizeGb: 0.001, tensorCount: UInt32(tensors.count), layerCount: UInt32(config.numHiddenLayers),
+            maxExpertId: UInt32(config.numRoutedExperts), shards: [], tensors: tensors, layers: []
+        )
+        return (summary, config)
+    }
+
+    func testTheFixtureCatalogIsExhaustiveAndStrict() throws {
+        let directory = try fixture()
+        let (summary, config) = try fixtureSummary(directory)
+        let catalog = Inkling2WeightCatalog(
+            mainFile: summary.tensors.map { Inkling2TensorRef(metadata: $0) },
+            layerCount: config.numHiddenLayers
+        )
+        XCTAssertTrue(catalog.unconsumed.isEmpty, "unplaced: \(catalog.unconsumed.prefix(8))")
+        XCTAssertTrue(catalog.duplicateRoles.isEmpty)
+        let problems = catalog.validate(config: config)
+        XCTAssertTrue(problems.isEmpty, "problems: \(problems.prefix(8))")
+        // Both layouts are represented and inferred from strides.
+        for layer in 0..<config.numHiddenLayers {
+            let layout = try Inkling2ExpertQuantLayout.infer(
+                w13: try XCTUnwrap(catalog.tensor(.expertW13, layer: layer)),
+                w13Scale: try XCTUnwrap(catalog.tensor(.expertW13Scale, layer: layer)),
+                w2: try XCTUnwrap(catalog.tensor(.expertW2, layer: layer)),
+                w2Scale: try XCTUnwrap(catalog.tensor(.expertW2Scale, layer: layer)),
+                config: config
+            ).get()
+            XCTAssertEqual(layout, layer < 10 ? .nvfp4 : .mxfp8, "layer \(layer)")
+        }
+    }
+
+    func testTheHostForwardMatchesTheReferenceOnTheFixture() throws {
+        guard FileManager.default.fileExists(atPath: Self.goldenPath),
+              let data = try? Data(contentsOf: URL(fileURLWithPath: Self.goldenPath)),
+              let golden = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw XCTSkip("no fixture goldens at \(Self.goldenPath): run Tools/inkling2_synthetic_golden.py")
+        }
+        let directory = try fixture()
+        let (summary, config) = try fixtureSummary(directory)
+        let catalog = Inkling2WeightCatalog(
+            mainFile: summary.tensors.map { Inkling2TensorRef(metadata: $0) },
+            layerCount: config.numHiddenLayers
+        )
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let weightsPath = directory.appendingPathComponent("model-00001-of-00001.safetensors")
+        let handle = try FileHandle(forReadingFrom: weightsPath)
+        defer { try? handle.close() }
+        let fileLength = try XCTUnwrap(try FileManager.default.attributesOfItem(
+            atPath: weightsPath.path
+        )[.size] as? NSNumber).intValue
+        let mapped = try XCTUnwrap(mmap(nil, fileLength, PROT_READ, MAP_PRIVATE, handle.fileDescriptor, 0),
+                                   "could not map \(weightsPath.path)")
+        XCTAssertNotEqual(mapped, MAP_FAILED)
+        defer { munmap(mapped, fileLength) }
+        let buffer = try XCTUnwrap(device.makeBuffer(
+            bytesNoCopy: mapped, length: fileLength, options: .storageModeShared, deallocator: nil
+        ))
+        let source = Inkling2SnapshotWeights(config: config, catalog: catalog, shardBuffers: [0: buffer])
+        let forward = try Inkling2CPUForward(config: config, weights: source)
+
+        var visits: [[Float]] = []
+        var postAttention: [[Float]] = []
+        forward.onVisitComplete = { (_: Int, _: Int, _: Int, output: [Float]) in visits.append(output) }
+        forward.onPostAttention = { (_: Int, value: [Float]) in postAttention.append(value) }
+        let ids = try XCTUnwrap(golden["ids"] as? [Int])
+        var logits: [Float] = []
+        for (position, id) in ids.enumerated() {
+            logits = try forward.forwardToken(token: UInt32(id), position: position)
+        }
+
+        func rel(_ a: [Float], _ r: [NSNumber]) -> Float {
+            let reference = r.map { $0.floatValue }
+            let scale = reference.reduce(Float(0)) { max($0, abs($1)) }
+            var worst: Float = 0
+            for (actual, expected) in zip(a, reference) {
+                worst = max(worst, abs(actual - expected))
+            }
+            return scale > 0 ? worst / scale : worst
+        }
+        let goldenVisits = try XCTUnwrap(golden["visits"] as? [[NSNumber]])
+        let goldenAttention = try XCTUnwrap(golden["postAttention"] as? [[NSNumber]])
+        for index in 0..<min(visits.count, goldenVisits.count) {
+            let error = rel(visits[index], goldenVisits[index])
+            if error > 2e-2 {
+                XCTFail("visit \(index) is \(error) relative from the reference")
+                return
+            }
+        }
+        for index in 0..<min(postAttention.count, goldenAttention.count) {
+            let error = rel(postAttention[index], goldenAttention[index])
+            if error > 2e-2 {
+                XCTFail("visit \(index) post-attention is \(error) relative from the reference")
+                return
+            }
+        }
+        let expected = try XCTUnwrap(golden["logits"] as? [NSNumber])
+        let worst = rel(logits, expected)
+        XCTAssertLessThanOrEqual(worst, 2e-2, "final logits")
+    }
+}

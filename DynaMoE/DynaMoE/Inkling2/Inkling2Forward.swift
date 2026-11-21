@@ -118,6 +118,9 @@ nonisolated public final class Inkling2CPUForward {
     /// Called with the raw attention output and the raw mixture output of each
     /// visit, for the sub-stage comparison. Off in production.
     public var onVisitSubStages: ((_ visitIndex: Int, _ attention: [Float], _ mixture: [Float]) -> Void)?
+    /// Called with the post-attention convolution of each visit, i.e. the
+    /// attention half's final value before the residual stack.
+    public var onPostAttention: ((_ visitIndex: Int, _ value: [Float]) -> Void)?
     /// Called with named intermediates of one visit, at the same points the
     /// reference exposes as modules. Off in production; used to bisect a
     /// mismatch inside a layer instead of only at its output.
@@ -314,6 +317,7 @@ nonisolated public final class Inkling2CPUForward {
             keyInput: keyInput, valueInput: valueInput, position: position
         )
         let postAttention = try shortConvolution(layer: layer, state: state, index: 2, values: attentionOutput)
+        onPostAttention?(visitIndex, postAttention)
         onInternal?(visitIndex, "postAttention", postAttention)
 
         // The boundary check is on `blockResidual`, the layer's INPUT, and the
