@@ -560,6 +560,33 @@ nonisolated struct AgentRunRecord: Identifiable, Codable, Equatable, Sendable {
         let summary = recorded.isEmpty ? (trimmedError ?? "") : recorded
         return summary.isEmpty ? nil : summary
     }
+
+    /// The relay line's payload, or nil when nothing is owed — the same
+    /// decision as `relaySummaryText`, with the fields the send path would
+    /// otherwise have to re-decode the whole record for.
+    ///
+    /// The store's index keeps these, so a synchronous send never reads disk:
+    /// it has the summary, the role, the status and the timestamp already.
+    nonisolated var relayOwed: RelayOwed? {
+        guard let summary = relaySummaryText else { return nil }
+        return RelayOwed(
+            runId: id,
+            role: role,
+            status: status,
+            summary: summary,
+            timestamp: completedAt ?? startedAt ?? createdAt
+        )
+    }
+}
+
+/// One report the relay still owes a conversation, as the store's index keeps
+/// it: everything a `[SUBAGENT_RESULT]` line needs, decoded once.
+nonisolated struct RelayOwed: Sendable, Equatable {
+    let runId: UUID
+    let role: String
+    let status: AgentRunStatus
+    let summary: String
+    let timestamp: Date
 }
 
 nonisolated extension AgentRunRecord {

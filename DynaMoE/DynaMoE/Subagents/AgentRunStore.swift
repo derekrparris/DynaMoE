@@ -130,10 +130,18 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     /// saves captured before it are still queued; a UUID apiece is cheap.
     private let maximumTombstones = 10_000
     /// Terminal records whose report has not been relayed, keyed by session
-    /// bucket. Built once from disk (off the main actor at launch) and kept
-    /// current by `writeNow`/`delete`. The report relay asks this instead of
-    /// decoding every record in a conversation on each send.
-    private var unrelayedBySession: [String: Set<UUID>] = [:]
+    /// bucket and carrying the text the relay will inject. Built once from
+    /// disk (off the main actor at launch) and kept current by
+    /// `writeNow`/`delete`. The report relay asks this instead of decoding
+    /// every record in a conversation on each send.
+    ///
+    /// It carries the PAYLOAD, not just the id, because the send path is
+    /// synchronous by contract: with ids alone it had to `ioQueue.sync` and
+    /// JSON-decode each owed record on the main actor before the first frame
+    /// of the turn could draw. Everything here was already decoded once — by
+    /// the launch scan or by the write that produced the record — so keeping
+    /// the few fields the relay line needs makes that read free.
+    private var unrelayedBySession: [String: [UUID: RelayOwed]] = [:]
     private var relayIndexBuilt = false
     /// Runs that became relayed while the initial off-lock scan was reading
     /// them. Publishing the scan cannot resurrect one: `markRelayed` lands
@@ -691,31 +699,49 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     /// How many records the relay still owes one conversation. Cheap after the
     /// first call: the index is built once and maintained by this store.
     func unrelayedRunIds(sessionId: UUID?) -> Set<UUID> {
+        Set(owedRelays(sessionId: sessionId).map(\.runId))
+    }
+
+    /// The reports the relay still owes one conversation, with the text it will
+    /// inject — answered from the index, so a caller on the send path pays no
+    /// disk read and no JSON decode. See `unrelayedBySession`.
+    func owedRelays(sessionId: UUID?) -> [RelayOwed] {
+        let owed: [UUID: RelayOwed]
         // Steady state: the launch prewarm has finished, so answering is one
-        // lock and a set lookup. Before that, a caller on the MAIN THREAD is
-        // answered from what the index has learned so far and the scan is
-        // started in the background: this is called while a send is being
-        // prepared, and a few hundred JSON decodes there blocked the first
-        // frame. A record missed on this one send is still unrelayed, so the
-        // next send injects it — the report is never dropped, only delayed.
+        // lock and a dictionary lookup. Before that, a caller on the MAIN
+        // THREAD is answered from what the index has learned so far and the
+        // scan is started in the background: this is called while a send is
+        // being prepared, and a few hundred JSON decodes there blocked the
+        // first frame. A record missed on this one send is still unrelayed, so
+        // the next send injects it — the report is never dropped, only
+        // delayed.
         signatureLock.lock()
         if relayIndexBuilt {
-            let ids = unrelayedBySession[Self.relayBucket(sessionId)] ?? []
+            owed = unrelayedBySession[Self.relayBucket(sessionId)] ?? [:]
             signatureLock.unlock()
-            return ids
+        } else {
+            signatureLock.unlock()
+            if Thread.isMainThread {
+                prepareRelayIndex()
+                signatureLock.lock()
+                owed = unrelayedBySession[Self.relayBucket(sessionId)] ?? [:]
+                signatureLock.unlock()
+            } else {
+                owed = onQueue { [self] in
+                    buildRelayIndexIfNeeded()
+                    signatureLock.lock()
+                    defer { signatureLock.unlock() }
+                    return unrelayedBySession[Self.relayBucket(sessionId)] ?? [:]
+                }
+            }
         }
-        signatureLock.unlock()
-        if Thread.isMainThread {
-            prepareRelayIndex()
-            signatureLock.lock()
-            defer { signatureLock.unlock() }
-            return unrelayedBySession[Self.relayBucket(sessionId)] ?? []
-        }
-        return onQueue { [self] in
-            buildRelayIndexIfNeeded()
-            signatureLock.lock()
-            defer { signatureLock.unlock() }
-            return unrelayedBySession[Self.relayBucket(sessionId)] ?? []
+        // Oldest first: the relay line is injected into a turn, and a report
+        // that arrived earlier should read earlier. Sorted by id on a tie so
+        // two runs finished in the same instant are still deterministic.
+        return owed.values.sorted {
+            $0.timestamp == $1.timestamp
+                ? $0.runId.uuidString < $1.runId.uuidString
+                : $0.timestamp < $1.timestamp
         }
     }
 
@@ -758,8 +784,8 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
 
     /// Every terminal, unrelayed record on disk, grouped by session bucket.
     /// No lock is held while this reads.
-    private func scanRelayCandidates() -> [String: Set<UUID>] {
-        var found: [String: Set<UUID>] = [:]
+    private func scanRelayCandidates() -> [String: [UUID: RelayOwed]] {
+        var found: [String: [UUID: RelayOwed]] = [:]
         guard let directories = try? fileManager.contentsOfDirectory(atPath: rootURL.path) else { return found }
         for name in directories {
             let directory = rootURL.appendingPathComponent(name, isDirectory: true)
@@ -771,18 +797,18 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
                 guard let data = try? Data(contentsOf: directory.appendingPathComponent(file)),
                       let record = try? JSONDecoder().decode(AgentRunRecord.self, from: data),
                       record.schemaVersion <= AgentRunRecord.currentSchemaVersion,
-                      record.relaySummaryText != nil else { continue }
-                found[Self.relayBucket(record.parentSessionId), default: []].insert(record.id)
+                      let owed = record.relayOwed else { continue }
+                found[Self.relayBucket(record.parentSessionId), default: [:]][record.id] = owed
             }
         }
         return found
     }
 
-    private func publishRelayIndexLocked(_ candidates: [String: Set<UUID>]) {
+    private func publishRelayIndexLocked(_ candidates: [String: [UUID: RelayOwed]]) {
         guard !relayIndexBuilt else { return }
-        for (bucket, ids) in candidates {
-            for id in ids where !relaySettledDuringBuild.contains(id) {
-                unrelayedBySession[bucket, default: []].insert(id)
+        for (bucket, owed) in candidates {
+            for (id, entry) in owed where !relaySettledDuringBuild.contains(id) {
+                unrelayedBySession[bucket, default: [:]][id] = entry
             }
         }
         relaySettledDuringBuild.removeAll()
@@ -791,12 +817,16 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
 
     private func addRelayLocked(_ record: AgentRunRecord) {
         let bucket = Self.relayBucket(record.parentSessionId)
-        unrelayedBySession[bucket, default: []].insert(record.id)
+        if let owed = record.relayOwed {
+            unrelayedBySession[bucket, default: [:]][record.id] = owed
+        } else {
+            unrelayedBySession[bucket]?[record.id] = nil
+        }
     }
 
     private func removeRelayLocked(runId: UUID, sessionId: UUID?) {
         let bucket = Self.relayBucket(sessionId)
-        unrelayedBySession[bucket]?.remove(runId)
+        unrelayedBySession[bucket]?.removeValue(forKey: runId)
         if unrelayedBySession[bucket]?.isEmpty == true {
             unrelayedBySession.removeValue(forKey: bucket)
         }
@@ -808,7 +838,7 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     /// (a duplicate report on every later send).
     private func removeRelayEverywhereLocked(runId: UUID) {
         for bucket in Array(unrelayedBySession.keys) {
-            unrelayedBySession[bucket]?.remove(runId)
+            unrelayedBySession[bucket]?.removeValue(forKey: runId)
             if unrelayedBySession[bucket]?.isEmpty == true {
                 unrelayedBySession.removeValue(forKey: bucket)
             }

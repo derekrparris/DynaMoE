@@ -128,16 +128,19 @@ final class SubagentApprovalCenter: ObservableObject {
                 try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
                 return false
             }
-            let first = await group.next() ?? false
-            group.cancelAll()
-            // A click that lands as the timeout fires is not lost: the group
-            // returns the FIRST result, so if the sleep won by a hair, the
-            // operator's decision is still recorded in the manager and is
-            // consumed here instead of being reported as a decline.
-            if !first, let decided = ActionApprovalManager.shared.rememberedDecision(id: entry.id) {
-                return decided
+            // The FIRST result only decides that the race is over. It is not the
+            // answer: a click that lands as the timeout fires can be consumed by
+            // the approval arm while the sleep arm returns first, and reading
+            // just the first result reported that approval as a decline.
+            var approved = false
+            while let settled = await group.next() {
+                approved = approved || settled
+                group.cancelAll()
             }
-            return first
+            if approved { return true }
+            // A click landing after both arms settled is still honoured: the
+            // decision is remembered for an id whose waiter has left.
+            return ActionApprovalManager.shared.rememberedDecision(id: entry.id) ?? false
         }
         return approved
     }

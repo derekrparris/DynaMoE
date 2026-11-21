@@ -85,11 +85,50 @@ nonisolated final class TurnSlotClaim: @unchecked Sendable {
     ///
     /// The holder needs to tell that from "somebody else holds the slot now":
     /// the first means its work was preempted and should be reported as
-    /// cancelled, the second is an ordinary busy engine. `cancelClaim` is the
-    /// only writer, and it compares tickets, so a later claim's cancellation
-    /// can never make this one answer true.
+    /// cancelled, the second is an ordinary busy engine.
+    ///
+    /// The answer is carried BY THIS CLAIM, not looked up in the ledger's
+    /// history, so it is exact for as long as the claim exists: a later claim's
+    /// cancellation cannot reach it, and neither can one that happened while
+    /// this holder was busy elsewhere. An earlier design kept a bounded ring of
+    /// cancelled tickets plus a watermark for the ones it had aged out, and the
+    /// watermark could not tell a preempted ticket from one that was RELEASED
+    /// normally before a later preemption — which is the case that matters,
+    /// because the one caller asks after a launch failed, and a real failure
+    /// (a model swapped mid-run) would have been reported as "Cancelled" with
+    /// its error discarded.
     var wasCancelled: Bool {
-        ledger.wasCancelled(ticket)
+        cancellation.isSet
+    }
+
+    /// The flag the ledger sets when it preempts this claim. Owned by the
+    /// claim, written only by `TurnSlotLedger.cancelClaim`, read only here.
+    private let cancellation = ClaimCancellationFlag()
+
+    /// Called by the ledger, under its lock, when it drops this claim.
+    fileprivate func markPreempted() {
+        cancellation.set()
+    }
+}
+
+/// A one-shot, thread-safe flag carried by a claim.
+///
+/// `nonisolated` for the same reason as the claim itself: the target is
+/// main-actor by default and this is read from a background run's task.
+nonisolated final class ClaimCancellationFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    func set() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+
+    var isSet: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
     }
 }
 
@@ -105,29 +144,16 @@ nonisolated final class TurnSlotLedger: @unchecked Sendable {
     /// Why the outstanding claim was taken, so a prober can tell a background
     /// run's preparation from a chat turn's.
     private var outstandingPriority: TurnPriority = .interactive
-    /// Tickets that were dropped by a preemption rather than released by their
-    /// holder. Kept so the holder can tell "I was cancelled" from "I lost a
-    /// race": both leave it not holding the slot, and only the first means its
-    /// work should be reported as cancelled instead of failed.
+    /// The outstanding claim itself, so a preemption can mark THAT claim as
+    /// cancelled rather than leaving a note in a shared history. A claim is
+    /// kept by its caller after it is released (the one reader asks
+    /// `wasCancelled` only once a launch has failed), so the answer has to
+    /// travel with the object.
     ///
-    /// Bounded: an entry matters only until its holder looks, and a holder that
-    /// never looks would otherwise grow this for the process's life. The oldest
-    /// are dropped past `cancelledTicketLimit`, which can only lose a
-    /// distinction for a claim cancelled that long ago.
-    private var cancelledTickets: [UInt64] = []
-    private static let cancelledTicketLimit = 64
-    /// The highest ticket ever dropped by a preemption.
-    ///
-    /// The ring above is exact but bounded, so a holder that looks LATE (after
-    /// 64 more cancellations) would be told its ticket was never cancelled and
-    /// report a preemption as a failure. Ticket numbers only grow, so "at or
-    /// below the watermark" answers for the ones the ring has aged out. The
-    /// ring is still consulted first: within the limit the answer stays exact,
-    /// and the watermark only speaks for tickets older than everything the
-    /// ring holds. It can over-report for a ticket that was RELEASED normally
-    /// before a later one was cancelled, which is why the only caller asks
-    /// about a claim it did not release itself.
-    private var cancelledWatermark: UInt64 = 0
+    /// A strong reference is deliberate: while a claim is outstanding the
+    /// ledger IS a holder, and it drops the reference the moment the claim
+    /// stops being outstanding, so nothing outlives its usefulness.
+    private var outstandingClaim: TurnSlotClaim?
     /// True once the holder has reached the point where its turn becomes the
     /// live generation. Past it a preemption is refused rather than dropped:
     /// the turn owns the KV cache by then, and dropping the claim would let a
@@ -146,7 +172,9 @@ nonisolated final class TurnSlotLedger: @unchecked Sendable {
         outstanding = nextTicket
         outstandingPriority = priority
         outstandingCommitted = false
-        return TurnSlotClaim(ledger: self, ticket: nextTicket, priority: priority)
+        let claim = TurnSlotClaim(ledger: self, ticket: nextTicket, priority: priority)
+        outstandingClaim = claim
+        return claim
     }
 
     /// True while any claim is outstanding, i.e. a turn is being prepared.
@@ -172,6 +200,7 @@ nonisolated final class TurnSlotLedger: @unchecked Sendable {
         outstanding = 0
         outstandingPriority = .interactive
         outstandingCommitted = false
+        outstandingClaim = nil
     }
 
     /// Marks the claim as past its point of no return.
@@ -207,9 +236,13 @@ nonisolated final class TurnSlotLedger: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard outstanding != 0, outstandingPriority == priority, !outstandingCommitted else { return false }
-        noteCancelledLocked(outstanding)
+        // The flag lives on the claim, so the holder reads it exactly however
+        // much later it looks, and a ticket that was merely RELEASED can never
+        // read as cancelled.
+        outstandingClaim?.markPreempted()
         outstanding = 0
         outstandingPriority = .interactive
+        outstandingClaim = nil
         return true
     }
 
@@ -230,35 +263,11 @@ nonisolated final class TurnSlotLedger: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard ticket != 0, outstanding == ticket, !outstandingCommitted else { return false }
-        noteCancelledLocked(ticket)
+        outstandingClaim?.markPreempted()
         outstanding = 0
         outstandingPriority = .interactive
+        outstandingClaim = nil
         return true
-    }
-
-    /// Whether `ticket` was dropped by a preemption rather than released.
-    func wasCancelled(_ ticket: UInt64) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        if let oldest = cancelledTickets.first, ticket >= oldest {
-            // Inside the ring's coverage: answer exactly, so a ticket that was
-            // merely released is never reported as cancelled.
-            return cancelledTickets.contains(ticket)
-        }
-        // Aged out (or the ring is empty): the watermark is all that is left,
-        // and it is right for a ticket that was cancelled. A released ticket
-        // below it would read as cancelled — accepted, because the one caller
-        // asks only about a claim it did not release itself.
-        return ticket != 0 && ticket <= cancelledWatermark
-    }
-
-    /// Records a dropped ticket. Caller holds the lock.
-    private func noteCancelledLocked(_ ticket: UInt64) {
-        cancelledTickets.append(ticket)
-        cancelledWatermark = max(cancelledWatermark, ticket)
-        if cancelledTickets.count > Self.cancelledTicketLimit {
-            cancelledTickets.removeFirst(cancelledTickets.count - Self.cancelledTicketLimit)
-        }
     }
 
     func holds(_ ticket: UInt64) -> Bool {

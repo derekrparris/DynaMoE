@@ -200,9 +200,14 @@ enum SubagentNotifier {
         // already drained the queue, and then it would drop a request posted in
         // between. `deliverPendingNotifications` mutates the same array from a
         // `DispatchQueue.main.async`, so this stays on that queue — ordered
-        // with it.
+        // with it — and states that fact to the compiler with
+        // `assumeIsolated` instead of mutating main-actor state from a
+        // nonisolated closure (which only compiles because the target is in
+        // Swift 5 mode).
         DispatchQueue.main.async {
-            pendingRequests.removeAll { $0.identifier == identifier }
+            MainActor.assumeIsolated {
+                pendingRequests.removeAll { $0.identifier == identifier }
+            }
         }
     }
 

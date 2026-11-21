@@ -398,7 +398,19 @@ struct ContentView: View {
         // Another queued send still needs the flag: repoint it rather than
         // clearing it, or the composer loses its Stop control for the rest of
         // that send's wait. When none remain, the state is genuinely idle.
-        if let next = deferredRelaunchSessions.values.first {
+        //
+        // WHICH one is not arbitrary. There is one engine slot and one flag, and
+        // every composer matches on `generatingSessionId`, so naming a session
+        // at random showed Stop in one conversation and a plain Send in
+        // another — whose send was then refused, because the refusal is global
+        // (`isGeneratingText`) even though the display is per-session. The
+        // selected conversation wins when it has queued work (that is where the
+        // operator is looking, and where the Stop belongs), and the rest are
+        // ordered by session id so the answer is stable rather than
+        // dictionary-dependent.
+        let queued = Set(deferredRelaunchSessions.values)
+        if let next = (selectedSessionId.flatMap { queued.contains($0) ? $0 : nil })
+            ?? queued.min(by: { $0.uuidString < $1.uuidString }) {
             isGeneratingText = true
             generatingSessionId = next
             return
@@ -2525,10 +2537,11 @@ struct ContentView: View {
     /// to deliver. Live instances come first and their ids suppress the stored
     /// copy, so one run is never injected twice.
     /// The send path's form: `handleSendMessage` is synchronous by contract,
-    /// so this cannot await. It reads the owed records in ONE hop onto the IO
-    /// queue (`load(runIds:sessionId:)`) rather than one `sync` per id, which
-    /// is the only cost this path can remove without going async. Every other
-    /// caller uses the async twin below and takes the read off the main actor.
+    /// so this cannot await — but it does not block either. Both sources it
+    /// reads are in memory (live instances, and the store's relay index, which
+    /// keeps each owed report's text beside its id), so no disk read and no
+    /// JSON decode happens on the main actor. Every other caller uses the
+    /// async twin below.
     private func gatherCompletedSubagentRelayResponsesSynchronously(forSession sessionId: UUID?) -> [String] {
         guard let sessionId else { return [] }
         var seen = Set<UUID>()
@@ -2570,22 +2583,19 @@ struct ContentView: View {
             }
         }
 
-        let owed = Set(AgentRunStore.shared.unrelayedRunIds(sessionId: sessionId)).subtracting(seen)
-        let restored = AgentRunStore.shared.load(
-            runIds: owed.sorted { $0.uuidString < $1.uuidString },
-            sessionId: sessionId
-        )
-        for id in owed.sorted(by: { $0.uuidString < $1.uuidString }) {
-            guard let record = restored[id],
-                  let summary = record.relaySummaryText else { continue }
+        // The store's relay index already holds what each owed report will
+        // inject (its summary, role, status and timestamp), so this reads no
+        // disk and decodes nothing: it used to `ioQueue.sync` per owed record
+        // on the main actor, which delayed the first frame of the turn.
+        for owed in AgentRunStore.shared.owedRelays(sessionId: sessionId)
+        where !seen.contains(owed.runId) {
             if let text = line(
-                role: record.role,
-                id: record.id,
-                status: record.status.rawValue,
-                summary: summary
+                role: owed.role,
+                id: owed.runId,
+                status: owed.status.rawValue,
+                summary: owed.summary
             ) {
-                let timestamp = record.completedAt ?? record.startedAt ?? record.createdAt
-                entries.append((timestamp: timestamp, text: text))
+                entries.append((timestamp: owed.timestamp, text: text))
             }
         }
         return entries

@@ -499,8 +499,17 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                     finishedRun = true
                     break
                 }
-                if !context.allowedTools.contains(call.name) {
-                    let error = "Tool '\(call.name)' is not in this run's allowed tools (\(context.allowedTools.sorted().joined(separator: ", ")))."
+                // What this step can actually call, from the same definitions
+                // the prompt advertised: a `tools_load` inside the loop arms a
+                // tool mid-run, and checking a snapshot taken at spawn refused
+                // it while the model had just been shown its schema. The static
+                // grant stays in the union so a tool plan mode deliberately
+                // withheld still reaches plan mode's own refusal, which says
+                // what to do instead of "not allowed".
+                let callableNames = Set(toolDefinitions.map(\.function.name))
+                    .union(context.allowedTools)
+                if !callableNames.contains(call.name) {
+                    let error = "Tool '\(call.name)' is not in this run's allowed tools (\(callableNames.sorted().joined(separator: ", ")))."
                     if await rejectCall(call, offset: offset, recordStatus: .withheld, error: error) {
                         break
                     }
@@ -557,23 +566,23 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                     call,
                     remainingSeconds: remainingBeforeTool
                 )
+                let wasStopped = Task.isCancelled
                 // The deadline arm fires on CANCELLATION too (`Task.sleep`
                 // returns the moment the run's task is stopped), so a Stop
                 // racing the deadline otherwise reads as a wall-clock failure
                 // and drops the tool's record. Cancellation is the honest
                 // outcome, and a tool that managed to return before the Stop
                 // keeps its record in the transcript.
-                if Task.isCancelled {
-                    if let settled = raced.value {
-                        var record = settled.record
-                        record.id = running.id
-                        usage.toolCalls += 1
-                        await context.noteToolOutcome(record, call: call)
-                        append(kind: .toolResult, step: step, record: record)
-                        emit(.toolFinished(record))
-                    } else {
-                        append(kind: .status, step: step, text: "The run was stopped while '\(call.name)' was running.")
-                    }
+                //
+                // A tool that SETTLED is not the Stop's casualty: a finished
+                // `complete` is kept in the transcript, and reporting the run
+                // as cancelled threw away the answer it had just produced. So
+                // the cancellation branch is only for a call with no settled
+                // result, and a settled one falls through to the ordinary
+                // handling — where a Stop that did not end the run is applied
+                // after the record, below.
+                if wasStopped, case .completed = raced {} else if wasStopped {
+                    append(kind: .status, step: step, text: "The run was stopped while '\(call.name)' was running.")
                     status = .cancelled
                     failure = "The run was cancelled."
                     recordAbandoned(
@@ -639,6 +648,22 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                     recordAbandoned(
                         turn.calls[(offset + 1)...],
                         reason: "the run ended at '\(call.name)' before this call could execute."
+                    )
+                    finishedRun = true
+                    break
+                }
+
+                // A Stop that raced this call without ending it at a terminal
+                // tool: the record above is kept, and the run ends here rather
+                // than starting the next call. This is the rest of the same
+                // decision — a settled tool is reported for what it did, and
+                // the Stop is reported as the Stop it was.
+                if wasStopped {
+                    status = .cancelled
+                    failure = "The run was cancelled."
+                    recordAbandoned(
+                        turn.calls[(offset + 1)...],
+                        reason: "the run was cancelled."
                     )
                     finishedRun = true
                     break
@@ -1234,21 +1259,54 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
         deadlineNanoseconds: UInt64,
         _ work: @escaping @Sendable () async -> T
     ) async -> RacedResult<T> {
-        await withTaskGroup(of: T?.self) { group in
-            group.addTask { await work() }
+        await withTaskGroup(of: RaceSettlement<T>.self) { group in
             group.addTask {
-                try? await Task.sleep(nanoseconds: deadlineNanoseconds)
-                return nil
+                let value = await work()
+                // Read at the moment the work RETURNS: true means the deadline
+                // cancelled it, false means it finished on its own.
+                return .work(value, sawCancellation: Task.isCancelled)
             }
-            let first = await group.next()
-            if let answer = first ?? nil {
+            group.addTask {
+                do {
+                    try await Task.sleep(nanoseconds: deadlineNanoseconds)
+                } catch {
+                    return .deadlineCancelled
+                }
+                return .deadlineExpired
+            }
+            var expired = false
+            var workValue: T?
+            var workSawCancellation = false
+            while let settled = await group.next() {
+                switch settled {
+                case .deadlineExpired: expired = true
+                case .deadlineCancelled: break
+                case .work(let value, let sawCancellation):
+                    workValue = value
+                    workSawCancellation = sawCancellation
+                }
                 group.cancelAll()
-                return .completed(answer)
             }
-            group.cancelAll()
-            let remaining = (await group.next()) ?? nil
-            return .timedOut(remaining)
+            // One level of unwrap, which is right even when `T` is itself an
+            // optional: a nil answer is `.some(nil)` here, not an absent one.
+            guard let settledValue = workValue else { return .timedOut(nil) }
+            // A work result the deadline RACED but did not interrupt is a
+            // finished result: when the timer and the work settle in the same
+            // instant the timer can be dequeued first, and reporting that as
+            // timedOut failed work that had already completed. Only a result
+            // that observed the cancellation is the deadline's casualty.
+            if !expired || !workSawCancellation { return .completed(settledValue) }
+            return .timedOut(settledValue)
         }
+    }
+
+    /// One child's answer in the `firstResult` race. The deadline arm has to
+    /// say whether it EXPIRED or was CANCELLED by the other arm, or a clean
+    /// completion would look like a timeout the moment the sleep was torn down.
+    private enum RaceSettlement<T: Sendable>: Sendable {
+        case work(T, sawCancellation: Bool)
+        case deadlineExpired
+        case deadlineCancelled
     }
 
     /// Why a run with a cost ceiling cannot enforce it because its cost is

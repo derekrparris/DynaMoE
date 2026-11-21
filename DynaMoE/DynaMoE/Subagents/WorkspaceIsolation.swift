@@ -241,24 +241,20 @@ nonisolated enum WorkspaceIsolation {
     /// True when `candidate` is a working tree of the SAME repository as
     /// `worktree`. It rejects both the linked worktree itself and a bare git
     /// directory, either of which would make `apply` write to the wrong tree.
+    ///
+    /// The worktree's `.git` entry state is deliberately NOT checked here. It
+    /// used to be, behind `candidate == worktree`, and that branch could never
+    /// run: every caller passes a repository ROOT or a parent, never the
+    /// worktree itself — and the first guard below returns for the worktree
+    /// anyway. Reading it as protection was worse than having none, so it is
+    /// gone rather than reordered: the paths that run git INSIDE the worktree
+    /// (`owningRepository`, the linkage checks) inspect the entry themselves,
+    /// and this function runs git in the CANDIDATE, which for the recorded-root
+    /// path is the operator's own repository — a `.git` a run cannot replace.
     private static func isMainWorktree(_ candidate: URL, owning worktree: URL) async -> Bool {
         // The worktree itself is a working tree of the same repository; it is
         // not the place a patch may land.
         guard candidate.standardizedFileURL != worktree.standardizedFileURL else { return false }
-        // `rev-parse` below runs in the candidate only when the candidate IS the
-        // worktree's own tree (the hostile-entry case). The main repository is
-        // the operator's, not the run's, so its `.git` is not something a run
-        // could have replaced — and it is a DIRECTORY there, which the entry
-        // state reads as hostile: guarding every candidate made a legitimate
-        // apply refuse its own repository.
-        if candidate.standardizedFileURL == worktree.standardizedFileURL {
-            switch await worktreeGitEntryState(candidate) {
-            case .regularFile:
-                break
-            case .missing, .unreadable, .hostile:
-                return false
-            }
-        }
         guard let (topCode, topOut, _) = try? await git(
             ["rev-parse", "--show-toplevel"],
             in: candidate
