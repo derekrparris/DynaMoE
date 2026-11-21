@@ -108,6 +108,7 @@ nonisolated public final class Inkling2CPUForward {
     /// The visit `runVisit` is currently executing, so the attention and mixture
     /// helpers can label their captures without threading it through.
     private var visitIndexForDebug = 0
+    private var positionForDebug = 0
     /// Every visit's KV and convolution state, plus the token history.
     public let sequence: Inkling2SequenceState
     /// One state bundle per visit, indexed by `cacheSlot`.
@@ -171,6 +172,7 @@ nonisolated public final class Inkling2CPUForward {
     /// The 48-visit schedule over one position's embedding, then the final
     /// residual read, norm, unembedding and softcap.
     public func forwardHidden(_ embedding: [Float], position: Int) throws -> [Float] {
+        positionForDebug = position
         var hidden = embedding
         // The attention-residual stack: one entry per append, as the reference
         // builds it (a boundary layer contributes its input twice).
@@ -200,9 +202,14 @@ nonisolated public final class Inkling2CPUForward {
             hidden = output
         }
 
+        onInternal?(0, "endOfPassOne@\(position)", Array(hidden.prefix(4)))
         for pass in 1..<config.numPasses {
             let previousBlocks = Array(blockStates.dropFirst(preLoopBlockCount + 1))
+            if pass == 1, let onInternal {
+                onInternal(0, "loop_stackCount", [Float(blockStates.count), Float(preLoopBlockCount), Float(previousBlocks.count)])
+            }
             let previousHidden = hidden
+            onInternal?(0, "previousHidden@\(position)", Array(previousHidden.prefix(4)))
             hidden = preLoopHidden
             blockStates = preLoopBlocks
             for layer in coreStart..<coreEnd {
@@ -351,8 +358,23 @@ nonisolated public final class Inkling2CPUForward {
         onInternal?(visitIndex, "postMlpConv", mixture)
         onInternal?(visitIndex, "residual", residual)
         let output = zip(residual, mixture).map(+)
+        if visitIndex == 0 {
+            onInternal?(visitIndex, "add_residual", Array(residual.prefix(4)))
+            onInternal?(visitIndex, "add_mixture", Array(mixture.prefix(4)))
+            onInternal?(visitIndex, "add_sum", Array(output.prefix(4)))
+        }
         onVisitComplete?(visitIndex, layer, pass, output)
         return (output, attentionQueries)
+    }
+
+    /// The visit a core layer's first pass (or any pass) occupies, for the
+    /// diagnostic labels: pass two's first core layer is the plan's entry after
+    /// the pre-loop layers and pass one.
+    func visitIndexOfCoreLayer(_ coreIndex: Int) -> Int {
+        // The first cross-pass read happens in pass two, so the label is the
+        // first-pass visit plus one pass of core visits.
+        let firstPass = plan.first { $0.physicalLayer == config.loopCoreStart + coreIndex && $0.pass == 2 }
+        return firstPass?.visit ?? 0
     }
 
     public func isCore(_ layer: Int) -> Bool {
@@ -453,7 +475,16 @@ nonisolated public final class Inkling2CPUForward {
             let source = unpacking.fromMainTensor[offset] ? main : kv
             return Array(source[(row * width)..<((row + 1) * width)])
         }
-        return blockRead(blockStates: blockStates, partial: partial, queries: queries)
+        let read = blockRead(blockStates: blockStates, partial: partial, queries: queries)
+        if coreIndex == 0, let onInternal {
+            // A read happens once per core layer per pass PER POSITION, so the
+            // label carries the position: a bare name kept position 0's value
+            // while every other capture held the last position's.
+            onInternal(visitIndexOfCoreLayer(coreIndex), "message0@\(positionForDebug)", read[0])
+            onInternal(visitIndexOfCoreLayer(coreIndex), "message0_stackCount@\(positionForDebug)", [Float(blockStates.count)])
+            onInternal(visitIndexOfCoreLayer(coreIndex), "message0_partial@\(positionForDebug)", Array(partial.prefix(4)))
+        }
+        return read
     }
 
     // MARK: Convolutions

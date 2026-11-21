@@ -24,7 +24,15 @@ OUT = sys.argv[1] if len(sys.argv) > 1 else "/tmp/inkling2_synth"
 # layer per six, two experts of top-1, and widths that keep every scale stride
 # an exact integer (hidden 64, intermediate 32 for 16-input NVFP4 blocks).
 HIDDEN, LAYERS, HEADS, KV, HEAD_DIM = 64, 12, 4, 2, 16
-D_REL, REL_EXTENT, WINDOW = 4, 8, 8
+# `d_rel` and the window equal the real checkpoint's 16 and... no: the window is
+# kept small so a ring wraps inside a short prompt, but `rel_extent` equals the
+# window for the same reason the checkpoint's sliding layers do (the reference
+# uses the window as a sliding layer's extent).
+# The real relative extent (1024), and the window equal to it because the
+# reference uses the WINDOW as a sliding layer's extent. No ring wraps in an
+# 8-token prompt: a wrapping ring is a separate question, and this fixture
+# exists to bisect the composition, not to re-test the rollover.
+D_REL, REL_EXTENT, WINDOW = 16, 1024, 1024
 EXPERTS, TOP_K, INTER, GATE_RANK = 2, 1, 32, 2
 VOCAB, UNPADDED = 128, 120
 BLOCK, CORE_START, CORE_END, PASSES = 6, 6, 12, 3
@@ -58,14 +66,11 @@ def put(name, array, dtype):
 def rnd(*shape, scale=0.2):
     return rng.normal(0, scale, size=shape)
 
-E4M3_CODES = np.array([0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
-                      16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
-                      32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,
-                      48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,
-                      64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,
-                      80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,
-                      96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,
-                      112,113,114,115,116,117,118,119,120,121,122,123,124,125,126], dtype=np.uint8)
+# E4M3 codes for magnitudes below 1 (exponent field up to 6, i.e. |x| < 1), so a
+# fixture of random bytes stays in a realistic weight range. The whole code space
+# includes values up to 448, which multiplied a hundred experts into overflow.
+E4M3_CODES = np.arange(0, 0x37, dtype=np.uint8)          # +0 .. 0.875
+E4M3_CODES = np.concatenate([E4M3_CODES, E4M3_CODES | 0x80])  # both signs
 
 # ---- Model level -----------------------------------------------------------
 put("model.llm.embed.weight", to_bf16(rnd(VOCAB, HIDDEN)), "BF16")
@@ -131,9 +136,13 @@ for layer in range(LAYERS):
         put(f"{p}.mlp.experts.w2_weight_outer_scale_denominator", to_f32([2688.0]), "F32")
     else:
         put(f"{p}.mlp.experts.w13_weight", rng.choice(E4M3_CODES, size=(EXPERTS, gateUpRows, HIDDEN)), "F8_E4M3")
-        put(f"{p}.mlp.experts.w13_weight_scale", rng.integers(120, 130, size=(EXPERTS, gateUpRows, HIDDEN//32), dtype=np.uint8), "U8")
+        # E8M0 scales around 2^-4 (code 123): a realistic magnitude, so the
+        # fixture stays in a sane numeric range. Random exponents near 127
+        # multiply the E4M3 values by 2^0..2^2 and the reference overflows to
+        # millions by layer 11, which makes every later comparison meaningless.
+        put(f"{p}.mlp.experts.w13_weight_scale", rng.integers(121, 125, size=(EXPERTS, gateUpRows, HIDDEN//32), dtype=np.uint8), "U8")
         put(f"{p}.mlp.experts.w2_weight", rng.choice(E4M3_CODES, size=(EXPERTS, HIDDEN, INTER)), "F8_E4M3")
-        put(f"{p}.mlp.experts.w2_weight_scale", rng.integers(120, 130, size=(EXPERTS, HIDDEN, INTER//32), dtype=np.uint8), "U8")
+        put(f"{p}.mlp.experts.w2_weight_scale", rng.integers(121, 125, size=(EXPERTS, HIDDEN, INTER//32), dtype=np.uint8), "U8")
 
 # ---- Vision tower ----------------------------------------------------------
 # One or two pre-norm blocks and the projector, at widths the config derives:
@@ -144,8 +153,11 @@ VISION_PROJ, POSEMB_GRID = 64, 4
 merge = 2
 put("model.visual.backbone.embeddings.class_embedding", to_bf16(rnd(VISION_WIDTH, scale=0.1)), "BF16")
 put("model.visual.backbone.embeddings.cls_position_embedding", to_bf16(rnd(VISION_WIDTH, scale=0.1)), "BF16")
+# The tower's patch is `native_patch_size` pixels square over a temporal patch
+# of `temporal_patch_size` frames and 3 channels: the loaded shape is
+# [width, 20*20*3], not the merge-scaled one.
 put("model.visual.backbone.embeddings.patch_embedding.weight",
-    to_bf16(rnd(VISION_WIDTH, merge * 20 * merge * 20 * 3)), "BF16")
+    to_bf16(rnd(VISION_WIDTH, 20 * 20 * 3)), "BF16")
 put("model.visual.backbone.embeddings.position_embedding",
     to_bf16(rnd(POSEMB_GRID * POSEMB_GRID, VISION_WIDTH, scale=0.1)), "BF16")
 put("model.visual.backbone.ln_pre.weight", to_bf16(1 + rnd(VISION_WIDTH, scale=0.1)), "BF16")
@@ -158,7 +170,9 @@ for b in range(VISION_BLOCKS):
         put(f"{p}.{stage}.weight", to_bf16(1 + rnd(VISION_WIDTH, scale=0.1)), "BF16")
         put(f"{p}.{stage}.bias", to_bf16(rnd(VISION_WIDTH, scale=0.05)), "BF16")
     for stage in ("ls_1", "ls_2"):
-        put(f"{p}.{stage}.gamma", to_bf16(1 + rnd(1, scale=0.05)), "BF16")
+        # `LayerScale` holds one learned scalar PER CHANNEL, and the checkpoint
+        # stores it as `[width]` (the loaded module reports [width] too).
+        put(f"{p}.{stage}.gamma", to_bf16(1 + rnd(VISION_WIDTH, scale=0.05)), "BF16")
     for name in ("q", "k", "v", "out"):
         put(f"{p}.self_attn.{name}_proj.weight", to_bf16(rnd(VISION_WIDTH, VISION_WIDTH)), "BF16")
         put(f"{p}.self_attn.{name}_proj.bias", to_bf16(rnd(VISION_WIDTH, scale=0.05)), "BF16")

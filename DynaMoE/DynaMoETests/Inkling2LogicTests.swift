@@ -1864,8 +1864,11 @@ final class Inkling2SyntheticForwardTests: XCTestCase {
                 dtype: dtype,
                 sizeMb: Double(elements * width) / (1024 * 1024),
                 shardIndex: 0,
-                offsetStart: UInt64(offsets[0]),
-                offsetEnd: UInt64(offsets[1]),
+                // ABSOLUTE file offsets, which is what the Rust summary reports
+                // (the safetensors header's own data_offsets are relative to the
+                // data section): the 8-byte length prefix and the header come first.
+                offsetStart: 8 + UInt64(headerLength) + UInt64(offsets[0]),
+                offsetEnd: 8 + UInt64(headerLength) + UInt64(offsets[1]),
                 category: "fixture",
                 layerIndex: nil,
                 expertId: nil
@@ -1924,18 +1927,55 @@ final class Inkling2SyntheticForwardTests: XCTestCase {
         let mapped = try XCTUnwrap(mmap(nil, fileLength, PROT_READ, MAP_PRIVATE, handle.fileDescriptor, 0),
                                    "could not map \(weightsPath.path)")
         XCTAssertNotEqual(mapped, MAP_FAILED)
-        defer { munmap(mapped, fileLength) }
+        // Deliberately NOT munmap'ed: the zero-copy buffer points into this
+        // mapping for as long as the forward runs, and unmapping it in a defer
+        // would pull the bytes out from under it. The mapping lives for the
+        // test process, which is the same lifetime a shard has in the app.
         let buffer = try XCTUnwrap(device.makeBuffer(
             bytesNoCopy: mapped, length: fileLength, options: .storageModeShared, deallocator: nil
         ))
         let source = Inkling2SnapshotWeights(config: config, catalog: catalog, shardBuffers: [0: buffer])
         let forward = try Inkling2CPUForward(config: config, weights: source)
 
-        var visits: [[Float]] = []
         var postAttention: [[Float]] = []
-        forward.onVisitComplete = { (_: Int, _: Int, _: Int, output: [Float]) in visits.append(output) }
-        forward.onPostAttention = { (_: Int, value: [Float]) in postAttention.append(value) }
+        // The LAST position's outputs, keyed by VISIT: the golden holds one entry
+        // per visit for the final position, and a plain append would mix the
+        // first position's values with the last one's (which is exactly the
+        // misalignment that made two comparisons disagree earlier).
+        // The golden's visits are grouped by PHYSICAL LAYER, in call order within
+        // a layer (a core layer appears once per pass). Rebuilding that same list
+        // from the execution order is the only way to compare like with like: a
+        // dict keyed by visit index reorders the core's three passes.
+        // The golden holds the FINAL position's values, one entry per visit, so
+        // only the last `plan.count` calls are kept: the calls run
+        // position-major (every visit of a position before the next position).
+        var callLog: [(layer: Int, output: [Float])] = []
+        forward.onVisitComplete = { (_: Int, layer: Int, _: Int, output: [Float]) in
+            callLog.append((layer, output))
+        }
+        forward.onPostAttention = { (visit: Int, value: [Float]) in
+            // Keep the LAST position's visit 0, not the first position's: the
+            // comparison is against the golden's final-position capture.
+            if visit == 0 { if postAttention.isEmpty { postAttention.append(value) } else { postAttention[0] = value } }
+        }
+        var internals: [String: [Float]] = [:]
+        forward.onInternal = { (visit: Int, name: String, value: [Float]) in
+            // Both the first and the second visit: the divergence now starts at
+            // visit 7, which is the seventh visit's own index.
+            if visit == 0 || visit == 7 || name.hasPrefix("message") || name.hasPrefix("previousHidden") {
+                internals["\(visit):\(name)"] = value
+                if visit == 0 { internals[name] = value }
+            }
+        }
         let ids = try XCTUnwrap(golden["ids"] as? [Int])
+        // The source reads the fixture's own bytes: a zero here would mean the
+        // catalog addressed the wrong tensor, not that the graph is wrong.
+        let embeddingRow = try source.row(.tokenEmbedding, layer: nil, index: ids[0])
+        let sconv = try source.matrix(.attnSconv, layer: 0)
+        print("FIXTURE embed row", embeddingRow.prefix(4), " sconv[0...3]", sconv.prefix(4))
+        let embedRef = try XCTUnwrap(catalog.tensor(.tokenEmbedding))
+        print("FIXTURE embed ref", embedRef.name, embedRef.dtype, embedRef.shape, "offset", embedRef.byteOffset ?? 0,
+              "shard", embedRef.shardIndex ?? 0, "buffer length", buffer.length)
         var logits: [Float] = []
         for (position, id) in ids.enumerated() {
             logits = try forward.forwardToken(token: UInt32(id), position: position)
@@ -1951,7 +1991,40 @@ final class Inkling2SyntheticForwardTests: XCTestCase {
             return scale > 0 ? worst / scale : worst
         }
         let goldenVisits = try XCTUnwrap(golden["visits"] as? [[NSNumber]])
+        let finalPositionCalls = Array(callLog.suffix(forward.plan.count))
+        var visits: [[Float]] = []
+        for layer in 0..<config.numHiddenLayers {
+            visits.append(contentsOf: finalPositionCalls.filter { $0.layer == layer }.map(\.output))
+        }
         let goldenAttention = try XCTUnwrap(golden["postAttention"] as? [[NSNumber]])
+        // The numbers themselves, printed BEFORE any assert (a failing assert
+        // returns early, which has already cost two runs).
+        func short(_ values: [Float]) -> [Float] { values.prefix(4).map { ($0 * 1e5).rounded() / 1e5 } }
+        func shortJSON(_ values: [NSNumber]) -> [Float] { values.prefix(4).map { ($0.floatValue * 1e5).rounded() / 1e5 } }
+        print("FIXTURE visits[0] mine", short(visits[0]), " ref", shortJSON(goldenVisits[0]))
+        print("FIXTURE MINE visit11", short(visits[11]), " REF visit11", shortJSON(goldenVisits[11]))
+        for name in ["endOfPassOne@3", "previousHidden@3", "loop_stackCount", "message0@3", "message0_stackCount@3", "message0_partial@3"] {
+            print("FIXTURE MINE \(name)", internals[name].map(short) ?? [])
+        }
+        print("FIXTURE REF message0", [0.70003, -0.03322, -0.08491, -0.54429])
+        for name in ["q_linear", "k_linear", "k_sconv", "k_norm", "v_norm", "rel_linear", "sink", "gate", "scores_head0", "weights_head0", "attn_raw"] {
+            if let value = internals[name] { print("FIXTURE MINE L0 \(name)", short(value)) }
+            if let value = internals["7:\(name)"] { print("FIXTURE MINE L7 \(name)", short(value)) }
+        }
+        print("FIXTURE MINE postAttn", short(postAttention[0]))
+        // Internal consistency: the captured operands of the final add must sum
+        // to the captured visit output. If they do not, a capture is misaligned
+        // and every comparison drawn from it is meaningless.
+        if let residual = internals["add_residual"], let mixture = internals["add_mixture"],
+           let sum = internals["add_sum"] {
+            print("FIXTURE ADD residual", short(residual), "mixture", short(mixture), "sum", short(sum))
+            print("FIXTURE ADD consistent:", short(zip(residual, mixture).map(+)) == short(sum))
+        }
+        // The numbers themselves, so a failure can be read without a rerun:
+        // the fixture is small and deterministic. Printed BEFORE the asserts
+        // because a failing assert returns early.
+        print("FIXTURE visits[0]     mine", short(visits[0]), " ref", shortJSON(goldenVisits[0]))
+        print("FIXTURE postAttn[0]   mine", short(postAttention[0]), " ref", shortJSON(goldenAttention[0]))
         for index in 0..<min(visits.count, goldenVisits.count) {
             let error = rel(visits[index], goldenVisits[index])
             if error > 2e-2 {
@@ -1968,6 +2041,7 @@ final class Inkling2SyntheticForwardTests: XCTestCase {
         }
         let expected = try XCTUnwrap(golden["logits"] as? [NSNumber])
         let worst = rel(logits, expected)
+        print("FIXTURE MINE logits", short(logits), " REF logits", shortJSON(expected))
         XCTAssertLessThanOrEqual(worst, 2e-2, "final logits")
     }
 }
