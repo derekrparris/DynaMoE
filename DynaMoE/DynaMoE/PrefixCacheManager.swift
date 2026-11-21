@@ -193,6 +193,26 @@ nonisolated public final class PrefixCacheManager: @unchecked Sendable {
         return pinnedTokenIds.count
     }
 
+    /// The session that owns the pin, i.e. whose next turn can reuse it.
+    ///
+    /// The pin is global and single: a caller that records a different session
+    /// displaces it, so a spawn has to know WHOSE prefix it is about to cost
+    /// (SUBAGENTS.md invariant 10). Nil before anything has been pinned.
+    public var currentPinnedSession: UUID? {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeSessionId
+    }
+
+    /// The pinned ids. A caller that has to put the process-wide pin back the
+    /// way it found it (a test teardown, a diagnostic capture) reads this
+    /// beside `currentPinnedSession`.
+    public var pinnedTokens: [UInt32] {
+        lock.lock()
+        defer { lock.unlock() }
+        return pinnedTokenIds
+    }
+
     /// Resets/invalidates the pinned prefix (e.g. on new chat or context clearance).
     public func invalidate(sessionId: UUID? = nil) {
         lock.lock()
@@ -213,6 +233,39 @@ nonisolated public final class PrefixCacheManager: @unchecked Sendable {
             self.pinnedAsOfDate = nil
             pendingAsOfDates.removeAll(keepingCapacity: true)
         }
+    }
+
+    /// Drops the pin when a launch carries fewer rows forward than the pin
+    /// claims.
+    ///
+    /// `preservePrefixCount` is what the KV reset actually retains. When it is
+    /// smaller than the pin, the rows above it are either overwritten by this
+    /// turn's prefill or were never copied because the reset allocated fresh
+    /// (zero-filled) buffers — yet `activeSessionId` and `pinnedTokenIds` still
+    /// describe the old sequence. The owner's next turn would match that list
+    /// exactly and attend over rows that no longer hold it.
+    ///
+    /// The cancelled-turn case is what made this routine: a cancelled turn
+    /// records nothing and invalidates nothing, so a partial preservation used
+    /// to outlive it. Invalidating here also covers a turn from ANOTHER session
+    /// resetting the cache, which is the same state arriving by a different
+    /// route. A launch that preserves the whole pin is left alone: it can only
+    /// append, so the pinned rows stay valid even if that turn never finishes.
+    ///
+    /// There is deliberately no "keep it if it matched" escape: a pin that is
+    /// longer than what was preserved is unsound whether it grew after the
+    /// match or was simply matched partially, because prefill overwrites (or a
+    /// fresh allocation zeroes) every row above `preservedCount` either way.
+    /// The only safe keep is `claimed <= preservedCount`, which the guard
+    /// above already takes.
+    public func invalidateIfNotPreserved(_ preservedCount: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        let claimed = pinnedTokenIds.count
+        guard claimed > 0, preservedCount < claimed else { return }
+        pinnedTokenIds.removeAll(keepingCapacity: true)
+        activeSessionId = nil
+        pinnedAsOfDate = nil
     }
 
     /// Resets telemetry metrics.

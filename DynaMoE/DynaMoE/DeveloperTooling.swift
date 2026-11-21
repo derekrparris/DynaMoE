@@ -54,6 +54,37 @@ public final class GitController {
 
     private init() {}
 
+    /// The curated tool environment with every `GIT_*` variable removed.
+    ///
+    /// An inherited `GIT_DIR` / `GIT_WORK_TREE` redirects a "git in this
+    /// directory" call into another repository entirely. The worktree apply
+    /// path already strips them; the commit tool did not, so a cardless
+    /// `git_commit` inside a run's sandbox could stage and commit into the
+    /// operator's checkout. Every git child this controller spawns gets this.
+    /// `GIT_AUTHOR_*` / `GIT_COMMITTER_*` are not a redirection and are
+    /// deliberately supplied by the run-scoped environment, so a run's commit
+    /// carries the operator's identity instead of failing with none. Stripping
+    /// them here undid that on every call.
+    static func gitEnvironment() -> [String: String] {
+        let identityKeys: Set<String> = [
+            "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"
+        ]
+        var environment = ControlledProcessRunner.toolEnvironment(
+            scoped: AgentHarness.executingInRunScope,
+            unreviewed: AgentHarness.executingUnreviewedToolCall
+        )
+        for key in environment.keys where key.hasPrefix("GIT_") && !identityKeys.contains(key) {
+            environment.removeValue(forKey: key)
+        }
+        // A cardless `git_status` / `git_diff` must not take the index lock to
+        // refresh stat data. Optional locks exist to speed up the NEXT git
+        // command, and a read tool in a background run has no business making
+        // the operator's own git invocations wait on that rewrite.
+        environment["GIT_OPTIONAL_LOCKS"] = "0"
+        return environment
+    }
+
     // MARK: - Git Status
 
     public func status(workingDirectory: URL) async throws -> GitStatusResult {
@@ -61,7 +92,8 @@ public final class GitController {
             executableURL: gitURL,
             arguments: ["status", "--porcelain=v1", "-b"],
             currentDirectory: workingDirectory,
-            timeoutSeconds: 30
+            timeoutSeconds: 30,
+            environment: Self.gitEnvironment()
         )
 
         guard exitCode == 0 else {
@@ -182,11 +214,24 @@ public final class GitController {
         target: String? = nil,
         maxLines: Int = 500
     ) async throws -> GitDiffResult {
-        var args = ["diff"]
+        // `--no-ext-diff --no-textconv`: a repository's own `.git/config` can
+        // name a `diff.external` command (or a textconv driver), and this tool
+        // is cardless in auto mode and in Plan Mode — running an arbitrary
+        // configured program from it would be a cardless execution.
+        var args = ["diff", "--no-ext-diff", "--no-textconv"]
         if staged {
             args.append("--staged")
         }
         if let target = target, !target.isEmpty {
+            // A target is a commit or branch, never an option. `--output=<path>`
+            // here would write any user-writable file on the Mac, cardless.
+            guard !target.hasPrefix("-") else {
+                throw NSError(
+                    domain: "GitController",
+                    code: 400,
+                    userInfo: [NSLocalizedDescriptionKey: "Safety Rail: 'target' must be a commit or branch name, not an option ('\(target)')."]
+                )
+            }
             args.append(target)
         }
         if let path = path, !path.isEmpty {
@@ -198,7 +243,8 @@ public final class GitController {
             executableURL: gitURL,
             arguments: args,
             currentDirectory: workingDirectory,
-            timeoutSeconds: 30
+            timeoutSeconds: 30,
+            environment: Self.gitEnvironment()
         )
 
         guard exitCode == 0 else {
@@ -265,7 +311,8 @@ public final class GitController {
                 executableURL: gitURL,
                 arguments: addArgs,
                 currentDirectory: workingDirectory,
-                timeoutSeconds: 30
+                timeoutSeconds: 30,
+                environment: Self.gitEnvironment()
             )
             guard addCode == 0 else {
                 throw NSError(
@@ -279,7 +326,8 @@ public final class GitController {
                 executableURL: gitURL,
                 arguments: ["add", "-A"],
                 currentDirectory: workingDirectory,
-                timeoutSeconds: 30
+                timeoutSeconds: 30,
+                environment: Self.gitEnvironment()
             )
             guard addCode == 0 else {
                 throw NSError(
@@ -301,11 +349,23 @@ public final class GitController {
         }
 
         // 3. Create the commit
+        //
+        // No hooks inside a subagent run: a repository's `pre-commit` (or a
+        // `core.hooksPath` pointing into the tree, `.husky` and `.githooks` do)
+        // is arbitrary shell, and in an isolated writer both `file_write` in
+        // the worktree and this commit are cardless — so a hook would be a
+        // cardless execution channel around `shell_run`'s per-call card. The
+        // operator's own commits keep their hooks.
+        var commitArgs = ["commit", "-m", cleanMessage]
+        if AgentHarness.executingInRunScope {
+            commitArgs.insert(contentsOf: ["-c", "core.hooksPath=/dev/null"], at: 0)
+        }
         let (commitCode, commitOut, commitErr) = try await AgentHarness.runProcess(
             executableURL: gitURL,
-            arguments: ["commit", "-m", cleanMessage],
+            arguments: commitArgs,
             currentDirectory: workingDirectory,
-            timeoutSeconds: 30
+            timeoutSeconds: 30,
+            environment: Self.gitEnvironment()
         )
 
         guard commitCode == 0 else {
@@ -521,7 +581,7 @@ public final class SymbolIntelligenceEngine {
         var result: [URL] = []
         guard let enumerator = FileManager.default.enumerator(
             at: directory,
-            includingPropertiesForKeys: [.isRegularFileKey],
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
             options: [.skipsHiddenFiles, .skipsPackageDescendants]
         ) else { return [] }
 
@@ -532,6 +592,13 @@ public final class SymbolIntelligenceEngine {
             if forbiddenSubstrings.contains(where: { path.contains($0) }) {
                 continue
             }
+            // A symlink INSIDE the workspace can point anywhere. Reading one
+            // here leaked a file outside it through find_references and
+            // find_symbol_definition without ever passing the containment gate
+            // the read tools use, so links are skipped: their targets are not
+            // the workspace's source.
+            let values = try? url.resourceValues(forKeys: [.isSymbolicLinkKey])
+            if values?.isSymbolicLink == true { continue }
             if supportedExtensions.contains(url.pathExtension.lowercased()) {
                 result.append(url)
             }

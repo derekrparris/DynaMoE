@@ -12,6 +12,32 @@ import SwiftUI
 
 // MARK: - Action Approval Continuation Manager
 
+/// Who a parked decision belongs to, for a cancellation that must not reach
+/// another conversation's card.
+///
+/// A chat's Stop cancels the cards ITS turn raised, including the ones a
+/// background subagent it spawned is parked on. `cancelAll` is for a process
+/// shutdown, where every card really is going away.
+/// `nonisolated` because Stop and cancellation reach it from the tool loop and
+/// background run tasks, neither of which shares the main actor.
+public nonisolated struct ActionApprovalScope: Hashable, Sendable {
+    let rawValue: String
+
+    public static func session(_ id: UUID) -> ActionApprovalScope {
+        ActionApprovalScope(rawValue: "s:\(id.uuidString)")
+    }
+
+    public static func subagentRun(_ id: UUID) -> ActionApprovalScope {
+        ActionApprovalScope(rawValue: "r:\(id.uuidString)")
+    }
+
+    /// The operator's own Apply card. It names a run, but a Stop that owns that
+    /// run did not raise this card and must not answer it.
+    public static func operatorApply(_ id: UUID) -> ActionApprovalScope {
+        ActionApprovalScope(rawValue: "a:\(id.uuidString)")
+    }
+}
+
 /// The one place a human-in-the-loop decision is parked.
 ///
 /// `nonisolated` because a waiter is resumed from the tool loop, from a Stop,
@@ -33,11 +59,63 @@ public nonisolated final class ActionApprovalManager: @unchecked Sendable {
     /// the oldest entries are dead weight rather than a leak that grows.
     private var pendingDecisions: [UUID: Bool] = [:]
     private var pendingDecisionOrder: [UUID] = []
-    private static let rememberedDecisionLimit = 8
+    /// The scope each id belongs to, recorded when the CARD is rendered (before
+    /// the waiter registers) so a scoped cancel can find the click-before-wait
+    /// window too. Removed with the decision or by the waiter's own exit.
+    private var scopes: [UUID: ActionApprovalScope] = [:]
+    /// Bounded because ids are single-use, but comfortably above the number of
+    /// cards that can be pending at once (the subagent center caps at 32): a
+    /// decision evicted before its waiter registers parks that run until its
+    /// timeout, which is the exact failure the memory exists to prevent.
+    private static let rememberedDecisionLimit = 64
 
     private init() {}
 
-    public func waitForApproval(id: UUID) async -> Bool {
+    /// Records who an id belongs to. Call before showing its card: the card is
+    /// visible (and clickable, and stoppable) before `waitForApproval` has
+    /// registered a continuation.
+    public func register(id: UUID, scope: ActionApprovalScope) {
+        lock.lock()
+        scopes[id] = scope
+        lock.unlock()
+    }
+
+    /// Drops a scope record for an id whose card went away without a waiter
+    /// ever registering — and any decision remembered for it, which nothing
+    /// could consume once the card is gone (ids are single-use, so it would
+    /// otherwise sit until eviction).
+    public func unregister(id: UUID) {
+        lock.lock()
+        scopes.removeValue(forKey: id)
+        if pendingDecisions.removeValue(forKey: id) != nil {
+            pendingDecisionOrder.removeAll { $0 == id }
+        }
+        lock.unlock()
+    }
+
+    /// A decision remembered for an id whose waiter has not registered yet,
+    /// or nil. A caller racing a timeout reads this so a click that landed
+    /// first is honoured rather than reported as a decline.
+    public func rememberedDecision(id: UUID) -> Bool? {
+        lock.lock()
+        defer { lock.unlock() }
+        return pendingDecisions[id]
+    }
+
+    /// Drops an id whose waiter has left. Synchronous on purpose: calling
+    /// `lock.lock()` from an `async` frame's `defer` is a Swift 6 error, so the
+    /// deferred cleanup goes through this helper.
+    private func finishWaiting(id: UUID) {
+        lock.lock()
+        cancelledWaits.remove(id)
+        scopes.removeValue(forKey: id)
+        lock.unlock()
+    }
+
+    public func waitForApproval(
+        id: UUID,
+        scope: ActionApprovalScope? = nil
+    ) async -> Bool {
         // A pending prompt is part of a running agent operation even though
         // the engine is idle, so a config reload must wait for the decision.
         AgentActivity.shared.begin(.approval)
@@ -47,9 +125,10 @@ public nonisolated final class ActionApprovalManager: @unchecked Sendable {
             // it below with nobody left to consume it. The handler cannot run
             // once `withTaskCancellationHandler` returns, so dropping the id
             // here is what keeps this set bounded.
-            lock.lock()
-            cancelledWaits.remove(id)
-            lock.unlock()
+            finishWaiting(id: id)
+        }
+        if let scope {
+            register(id: id, scope: scope)
         }
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
@@ -91,6 +170,35 @@ public nonisolated final class ActionApprovalManager: @unchecked Sendable {
         decide(id: id, approved: false)
     }
 
+    /// Declines every card in one scope and nothing else. A Stop in chat A
+    /// must not answer chat B's parked card, and it must still win over a
+    /// click that arrived before the waiter registered.
+    public func cancel(scope: ActionApprovalScope) {
+        lock.lock()
+        let ids = scopes.filter { $0.value == scope }.map(\.key)
+        var resumed: [CheckedContinuation<Bool, Never>] = []
+        for id in ids {
+            // Only an id with no waiter left needs the cancelled mark: one
+            // that was resumed here has nobody to consume it, and ids are
+            // single-use, so inserting anyway grew the set for the process's
+            // lifetime with every scoped Stop.
+            if let continuation = pendingContinuations.removeValue(forKey: id) {
+                resumed.append(continuation)
+            } else {
+                // A card whose waiter has not registered yet must still resolve
+                // as declined; the waiter consumes this on arrival.
+                cancelledWaits.insert(id)
+            }
+            pendingDecisions.removeValue(forKey: id)
+            pendingDecisionOrder.removeAll { $0 == id }
+            scopes.removeValue(forKey: id)
+        }
+        lock.unlock()
+        for continuation in resumed {
+            continuation.resume(returning: false)
+        }
+    }
+
     public func cancelAll() {
         lock.lock()
         let all = pendingContinuations
@@ -99,8 +207,12 @@ public nonisolated final class ActionApprovalManager: @unchecked Sendable {
         // turn being stopped: cancelling wins over a click that arrived first,
         // or a stopped turn would execute the call it was stopped for.
         cancelledWaits.formUnion(pendingDecisions.keys)
+        // A scoped card whose waiter has not registered yet is in the same
+        // window: it is about to be answered by a turn that is going away.
+        cancelledWaits.formUnion(scopes.keys)
         pendingDecisions.removeAll()
         pendingDecisionOrder.removeAll()
+        scopes.removeAll()
         lock.unlock()
         for (_, cont) in all {
             cont.resume(returning: false)
@@ -124,6 +236,7 @@ public nonisolated final class ActionApprovalManager: @unchecked Sendable {
             if pendingDecisionOrder.count > Self.rememberedDecisionLimit {
                 let oldest = pendingDecisionOrder.removeFirst()
                 pendingDecisions.removeValue(forKey: oldest)
+                scopes.removeValue(forKey: oldest)
             }
         }
         lock.unlock()
@@ -142,6 +255,9 @@ public struct PendingActionConfirmation: Identifiable, Equatable {
     public let destinationSummary: String?
     public let diffPreview: String?
     public let commandPreview: String?
+    /// True when a subagent call targets a path or command outside its sandbox
+    /// (e.g. writing to the main repository from an isolated worktree).
+    public let isContainmentEscape: Bool
 
     public init(
         id: UUID = UUID(),
@@ -150,7 +266,8 @@ public struct PendingActionConfirmation: Identifiable, Equatable {
         targetSummary: String,
         destinationSummary: String? = nil,
         diffPreview: String? = nil,
-        commandPreview: String? = nil
+        commandPreview: String? = nil,
+        isContainmentEscape: Bool = false
     ) {
         self.id = id
         self.toolName = toolName
@@ -159,6 +276,7 @@ public struct PendingActionConfirmation: Identifiable, Equatable {
         self.destinationSummary = destinationSummary
         self.diffPreview = diffPreview
         self.commandPreview = commandPreview
+        self.isContainmentEscape = isContainmentEscape
     }
 }
 
@@ -166,6 +284,10 @@ public struct ActionConfirmationView: View {
     public let confirmation: PendingActionConfirmation
     public let onApprove: () -> Void
     public let onReject: () -> Void
+    /// False while the card is still gathering the context the decision needs
+    /// (an apply card waits for its run's destination before it can be
+    /// approved). Reject stays available: the operator can always decline.
+    public var approveEnabled: Bool = true
 
     @AppStorage("dynamoe_agent_turbo_mode") private var isTurboModeEnabled: Bool = false
 
@@ -173,13 +295,13 @@ public struct ActionConfirmationView: View {
         VStack(alignment: .leading, spacing: 10) {
             // Header: Warning & Tool Badge
             HStack(spacing: 8) {
-                Image(systemName: "exclamationmark.shield.fill")
+                Image(systemName: confirmation.isContainmentEscape ? "exclamationmark.triangle.fill" : "exclamationmark.shield.fill")
                     .font(.system(size: 14, weight: .bold))
-                    .foregroundColor(.orange)
+                    .foregroundColor(confirmation.isContainmentEscape ? .red : .orange)
 
-                Text("Action Requires Confirmation")
+                Text(confirmation.isContainmentEscape ? "Containment Escape — Outside Sandbox" : "Action Requires Confirmation")
                     .font(.system(size: 12.5, weight: .bold))
-                    .foregroundColor(.primary)
+                    .foregroundColor(confirmation.isContainmentEscape ? .red : .primary)
 
                 Spacer()
 
@@ -235,9 +357,10 @@ public struct ActionConfirmationView: View {
 
                 Text(confirmation.targetSummary)
                     .font(.system(size: 11.5, weight: .medium, design: .monospaced))
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
+                    .foregroundColor(confirmation.isContainmentEscape ? .primary : .secondary)
+                    .lineLimit(confirmation.isContainmentEscape ? nil : 1)
                     .truncationMode(.middle)
+                    .fixedSize(horizontal: false, vertical: confirmation.isContainmentEscape)
             }
 
             // Destination (a third-party upload, a custom endpoint)
@@ -245,7 +368,7 @@ public struct ActionConfirmationView: View {
                 HStack(alignment: .top, spacing: 6) {
                     Image(systemName: "arrow.up.forward.square")
                         .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(.orange)
+                        .foregroundColor(confirmation.isContainmentEscape ? .red : .orange)
                     Text(destination)
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundColor(.primary)
@@ -253,7 +376,7 @@ public struct ActionConfirmationView: View {
                 }
                 .padding(7)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.orange.opacity(0.08))
+                .background((confirmation.isContainmentEscape ? Color.red : Color.orange).opacity(0.08))
                 .cornerRadius(5)
             }
 
@@ -274,9 +397,9 @@ public struct ActionConfirmationView: View {
                 }
             } else if let diff = confirmation.diffPreview {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Proposed Changes:")
+                    Text(confirmation.isContainmentEscape ? "Escape Details:" : "Proposed Changes:")
                         .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(.secondary)
+                        .foregroundColor(confirmation.isContainmentEscape ? .red : .secondary)
                     ScrollView(.vertical, showsIndicators: true) {
                         Text(diff)
                             .font(.system(size: 10.5, design: .monospaced))
@@ -301,11 +424,13 @@ public struct ActionConfirmationView: View {
                     }
                     .padding(.horizontal, 10)
                     .padding(.vertical, 5)
-                    .background(Color.green.opacity(0.85))
+                    .background(Color.green.opacity(approveEnabled ? 0.85 : 0.3))
                     .foregroundColor(.white)
                     .cornerRadius(6)
                 }
                 .buttonStyle(.plain)
+                .disabled(!approveEnabled)
+                .help(approveEnabled ? "Run this action" : "Gathering the details this decision needs…")
 
                 Button(action: onReject) {
                     HStack(spacing: 5) {
@@ -330,7 +455,7 @@ public struct ActionConfirmationView: View {
         .cornerRadius(8)
         .overlay(
             RoundedRectangle(cornerRadius: 8)
-                .stroke(Color.orange.opacity(0.35), lineWidth: 1.5)
+                .stroke((confirmation.isContainmentEscape ? Color.red : Color.orange).opacity(confirmation.isContainmentEscape ? 0.6 : 0.35), lineWidth: 1.5)
         )
     }
 }

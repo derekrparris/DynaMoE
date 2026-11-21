@@ -1038,7 +1038,7 @@ public extension DiscoveredModel {
 
     /// Resolves this entry to its (provider, upstream model id), or nil for
     /// local weights / Apple Foundation Model entries.
-    var cloudResolution: (provider: CloudProvider, providerModelId: String)? {
+    nonisolated var cloudResolution: (provider: CloudProvider, providerModelId: String)? {
         if let parsed = CloudModelAddress.parseModelId(id) { return parsed }
         return CloudModelAddress.parsePath(snapshotPath)
     }

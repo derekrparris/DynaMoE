@@ -25,11 +25,13 @@ public nonisolated enum PromptMarkers {
         // ChatML (Qwen and most in-app agent templates).
         ("<|im_start|>", "[im_start]"),
         ("<|im_end|>", "[im_end]"),
-        // The in-app tool dialect.
+        // The in-app tool dialect and relay system framing.
         ("<tool_call>", "[tool_call]"),
         ("</tool_call>", "[/tool_call]"),
         ("<tool_response>", "[tool_response]"),
         ("</tool_response>", "[/tool_response]"),
+        ("<system>", "[system]"),
+        ("</system>", "[/system]"),
         // Gemma turn boundaries and reasoning channel.
         ("<|turn>", "[turn]"),
         ("<turn|>", "[end_turn]"),

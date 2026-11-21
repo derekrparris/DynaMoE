@@ -347,6 +347,12 @@ struct ChatDetailView: View {
         rows.reserveCapacity(session.messages.count)
 
         for message in session.messages {
+            if message.isPromptOnly == true {
+                // A directive written for one model step, not a turn the user
+                // sent. It still reaches the prompt builder; the transcript is
+                // not the place to show it.
+                continue
+            }
             if message.isCompactionSummary == true {
                 // A digest card is chrome, not a turn: it is never split, and
                 // its own card already bounds the summary's height.
@@ -1010,7 +1016,7 @@ struct ChatDetailView: View {
                         .buttonStyle(.plain)
                     }
 
-                    // Background Subagents & Task Manager Toggle Button
+                    // Background Subagents & Inspector Toggle Button
                     Button(action: {
                         withAnimation(.easeInOut(duration: 0.2)) {
                             subagentManager.isDrawerOpen.toggle()
@@ -1038,7 +1044,7 @@ struct ChatDetailView: View {
                         .cornerRadius(6)
                     }
                     .buttonStyle(.plain)
-                    .help("Toggle Background Task Manager Drawer (⌘D)")
+                    .help("Toggle the Subagent Inspector (⌘D)")
                 }
                 .padding(.horizontal, 24)
                 .padding(.vertical, 12)
@@ -1824,7 +1830,7 @@ struct ChatDetailView: View {
 
             if subagentManager.isDrawerOpen {
                 Divider()
-                SubagentDrawerView(onClose: {
+                SubagentInspectorView(sessionId: session?.id, onClose: {
                     withAnimation(.easeInOut(duration: 0.2)) {
                         subagentManager.isDrawerOpen = false
                     }
@@ -6049,24 +6055,33 @@ struct ToolCallCardView: View {
                     }
 
                     if call.name == "spawn_subagent" {
-                        Button(action: {
-                            withAnimation(.easeInOut(duration: 0.2)) {
-                                SubagentManager.shared.isDrawerOpen = true
+                        if let runId = SubagentRunLink.runId(from: call) {
+                            SubagentInlineRunCard(runId: runId, onOpenInspector: {
+                                SubagentManager.shared.selectedSubagentId = runId
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    SubagentManager.shared.isDrawerOpen = true
+                                }
+                            })
+                        } else {
+                            Button(action: {
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    SubagentManager.shared.isDrawerOpen = true
+                                }
+                            }) {
+                                HStack(spacing: 5) {
+                                    Image(systemName: "square.2.layers.3d")
+                                        .font(.system(size: 10, weight: .semibold))
+                                    Text("Open the Subagent Inspector")
+                                        .font(.system(size: 10.5, weight: .medium))
+                                }
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 4)
+                                .background(Color.purple.opacity(0.12))
+                                .foregroundColor(.purple)
+                                .cornerRadius(6)
                             }
-                        }) {
-                            HStack(spacing: 5) {
-                                Image(systemName: "square.2.layers.3d")
-                                    .font(.system(size: 10, weight: .semibold))
-                                Text("Inspect Subagent in Task Manager Drawer")
-                                    .font(.system(size: 10.5, weight: .medium))
-                            }
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 4)
-                            .background(Color.purple.opacity(0.12))
-                            .foregroundColor(.purple)
-                            .cornerRadius(6)
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
                     }
 
                     // Stdout / Output

@@ -187,6 +187,24 @@ struct SettingsSheetView: View {
     @AppStorage("dynamoe_agent_turbo_mode") private var isTurboModeEnabled: Bool = false
     @AppStorage("dynamoe_agent_grammar_masking") private var isGrammarMaskingEnabled: Bool = true
     @AppStorage("dynamoe_agent_working_directory") private var agentWorkingDirectory: String = ""
+    // Delegated runs (SUBAGENTS.md §11). The backend key is the same one
+    // `spawn_subagent` reads when its argument says "auto"; an empty value
+    // keeps the legacy role pipelines, which is the only choice that sends no
+    // work to a model the operator did not pick.
+    @AppStorage(SubagentBackendSettings.backendKey) private var subagentBackend: String = ""
+    @AppStorage(SubagentBackendSettings.cloudModelKey) private var subagentCloudModel: String = ""
+    @AppStorage(SubagentBackendSettings.cloudCostCeilingKey) private var subagentCloudCostCeiling: Double = SubagentBackendSettings.defaultCloudCostUSD
+    /// The per-conversation aggregate cap. Stored as 0 when it has never been
+    /// set, which is what `sessionCloudCostCeiling` reads as "derive it from
+    /// the per-run cap" — the field therefore shows the derived number rather
+    /// than an empty box.
+    @AppStorage(SubagentBackendSettings.sessionCloudCostCeilingKey) private var subagentCloudSessionCostCeiling: Double = 0
+    @AppStorage(LocalSubagentCostEstimate.limitDefaultsKey) private var subagentLocalCostLimit: Double = LocalSubagentCostEstimate.defaultLimitSeconds
+    @AppStorage("dynamoe_subagent_notifications") private var subagentNotifications: Bool = false
+    @AppStorage("dynamoe_subagent_cloud_per_provider") private var subagentCloudPerProvider: Int = 3
+    @AppStorage("dynamoe_subagent_cloud_global") private var subagentCloudGlobal: Int = 6
+    @AppStorage("dynamoe_subagent_retention_runs") private var subagentRetentionRuns: Int = 200
+    @AppStorage("dynamoe_subagent_retention_days") private var subagentRetentionDays: Int = 30
     @AppStorage("dynamoe_max_tool_output_length") private var maxToolOutputLength: Int = 4000
     @AppStorage(AgentStepBudget.finiteStepsDefaultsKey) private var maxAgentSteps: Int = AgentStepBudget.defaultFiniteSteps
     @AppStorage(AgentStepBudget.unlimitedDefaultsKey) private var isMaxAgentStepsUnlimited: Bool = false
@@ -198,6 +216,9 @@ struct SettingsSheetView: View {
     @AppStorage("dynamoe_jetspec_expert_cap") private var jetSpecMaxExpertCap: Int = 8
     @ObservedObject private var indexer = CodebaseIndexer.shared
     @ObservedObject private var dogfoodRunner = ModelDogfoodBenchmarkRunner.shared
+    // Observed: this card's counts and Open/Close label read the manager, and
+    // an unobserved singleton never redrew when a run started or finished.
+    @ObservedObject private var subagentManager = SubagentManager.shared
     @ObservedObject private var updaterViewModel = UpdaterViewModel.shared
     @State private var showDogfoodReportModal: Bool = false
     /// A refused benchmark run has a reason the operator can act on (a live
@@ -209,6 +230,146 @@ struct SettingsSheetView: View {
     /// reads the same number the run enforces.
     private var agentStepCap: Int? {
         AgentStepBudget.resolvedCap(unlimited: isMaxAgentStepsUnlimited, configured: maxAgentSteps)
+    }
+
+    /// Parse-level validation for the free-text Cloud model field. A stored
+    /// value that names no configured cloud model is refused at spawn time
+    /// (never silently replaced with the default), so it is surfaced here,
+    /// where it is typed, instead of being discovered from a failed run.
+    private var subagentCloudModelWarning: String? {
+        let trimmed = subagentCloudModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              CloudModelAddress.parseModelId(trimmed) == nil,
+              CloudModelAddress.parsePath(trimmed) == nil else { return nil }
+        return "'\(trimmed)' is not a configured cloud model. Subagent runs that need the cloud will refuse until it is fixed or cleared."
+    }
+
+    // MARK: - Delegated run controls
+
+    /// Every control here is read at use time (resolver, scheduler, store), so a
+    /// change applies to the next spawn rather than needing a relaunch.
+    private var subagentSettings: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            subagentSettingRow("Run backend") {
+                Picker("", selection: $subagentBackend) {
+                    Text("Role pipelines (no model)").tag("")
+                    Text("Local model").tag("local")
+                    Text("Cloud model").tag("cloud")
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .font(.system(size: 11))
+            }
+
+            subagentSettingRow("Cloud model") {
+                TextField("cloud-model-<provider>-<model>", text: $subagentCloudModel)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11))
+                    .frame(maxWidth: 260)
+                Text("A configured cloud model, spelled 'cloud-model-<provider>-<upstream id>' or 'cloud://<provider>/<upstream id>'. There is no automatic fallback: empty means a cloud spawn refuses by name.")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let cloudModelWarning = subagentCloudModelWarning {
+                Text(cloudModelWarning)
+                    .font(.system(size: 10))
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            subagentSettingRow("Cloud spend cap") {
+                TextField("none", value: $subagentCloudCostCeiling, format: .number.precision(.fractionLength(0...2)))
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11, design: .monospaced))
+                    .frame(maxWidth: 90)
+                    // The Stepper is what documents the bound; this is what
+                    // ENFORCES it, so a typed or pasted value cannot outlive
+                    // the range the field shows.
+                    .onChange(of: subagentCloudCostCeiling) { _, value in
+                        let clamped = SubagentBackendSettings.clampedCloudCostCeiling(value)
+                        if clamped != value { subagentCloudCostCeiling = clamped }
+                    }
+                Text("USD per cloud run, applied whenever a spawn does not set max_cost_usd. 0 means no cap. While a cap is set, a cloud run on a model with no recorded price is refused rather than run unbounded.")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            subagentSettingRow("Session spend cap") {
+                TextField("auto", value: $subagentCloudSessionCostCeiling, format: .number.precision(.fractionLength(0...2)))
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11, design: .monospaced))
+                    .frame(maxWidth: 90)
+                    .onChange(of: subagentCloudSessionCostCeiling) { _, value in
+                        let capped = min(max(0, value), SubagentBackendSettings.maximumSessionCloudCostUSD)
+                        if capped != value { subagentCloudSessionCostCeiling = capped }
+                    }
+                Text("USD across every cloud run in one conversation, so a coordinator cannot multiply the per-run cap by spawning many. 0 derives it from the per-run cap (4x); it is capped at \(Int(SubagentBackendSettings.maximumSessionCloudCostUSD)).")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            subagentSettingRow("Local cost limit") {
+                Stepper(value: $subagentLocalCostLimit, in: 10...1800, step: 10) {
+                    Text(String(format: "%.0f s", subagentLocalCostLimit))
+                        .font(.system(size: 11, design: .monospaced))
+                }
+                .frame(maxWidth: 150)
+            }
+
+            subagentSettingRow("Concurrency") {
+                // The engine is single-flight, so a local permit above one only
+                // queues runs at the engine until their 120 s wait expires.
+                Text("Local 1 (one engine turn at a time)")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                Stepper("Cloud/provider \(subagentCloudPerProvider)", value: $subagentCloudPerProvider, in: 1...8)
+                    .font(.system(size: 11))
+                    .onChange(of: subagentCloudPerProvider) { _, _ in reloadSubagentSchedulerLimits() }
+                Stepper("Cloud total \(subagentCloudGlobal)", value: $subagentCloudGlobal, in: 1...16)
+                    .font(.system(size: 11))
+                    .onChange(of: subagentCloudGlobal) { _, _ in reloadSubagentSchedulerLimits() }
+            }
+
+            Toggle("Notify when a run finishes while DynaMoE isn't frontmost", isOn: $subagentNotifications)
+                .font(.system(size: 11))
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .help("Off by default. The Dock bounce still happens whenever the app is in the background.")
+
+            subagentSettingRow("Keep runs") {
+                Stepper("\(subagentRetentionRuns) runs", value: $subagentRetentionRuns, in: 20...2000, step: 20)
+                    .font(.system(size: 11))
+                Stepper("\(subagentRetentionDays) days", value: $subagentRetentionDays, in: 1...365)
+                    .font(.system(size: 11))
+            }
+
+            Text("A local run holds the engine one step at a time, so the coordinator re-prefills after it. The cost limit is how long that wait may be before the spawn card asks first. The cloud spend cap is the one ceiling every cloud run gets even when the spawn names none. Runs are listed in the Subagent Inspector and survive relaunch; a concurrency change applies to the next spawn.")
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func reloadSubagentSchedulerLimits() {
+        Task { await AgentScheduler.shared.reloadLimits() }
+    }
+
+    private func subagentSettingRow<Content: View>(
+        _ label: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(.primary)
+                .frame(width: 120, alignment: .leading)
+            content()
+            Spacer(minLength: 0)
+        }
     }
 
     // Local Inference Server bindings & live dashboard state
@@ -1922,11 +2083,11 @@ struct SettingsSheetView: View {
                     Spacer()
 
                     Button(action: {
-                        SubagentManager.shared.isDrawerOpen.toggle()
+                        subagentManager.isDrawerOpen.toggle()
                     }) {
                         HStack(spacing: 4) {
                             Image(systemName: "sidebar.trailing")
-                            Text(SubagentManager.shared.isDrawerOpen ? "Close Task Manager" : "Open Task Manager")
+                            Text(subagentManager.isDrawerOpen ? "Close Inspector" : "Open Inspector")
                         }
                         .font(.system(size: 11, weight: .medium))
                     }
@@ -1940,9 +2101,9 @@ struct SettingsSheetView: View {
                 HStack(spacing: 12) {
                     HStack(spacing: 4) {
                         Circle()
-                            .fill(SubagentManager.shared.activeSubagentsCount > 0 ? Color.blue : Color.secondary.opacity(0.4))
+                            .fill(subagentManager.activeSubagentsCount > 0 ? Color.blue : Color.secondary.opacity(0.4))
                             .frame(width: 8, height: 8)
-                        Text("\(SubagentManager.shared.activeSubagentsCount) Active Subagents")
+                        Text("\(subagentManager.activeSubagentsCount) Active Subagents")
                             .font(.system(size: 11, weight: .medium))
                             .foregroundColor(.primary)
                     }
@@ -1950,10 +2111,14 @@ struct SettingsSheetView: View {
                     Text("•")
                         .foregroundColor(.secondary.opacity(0.5))
 
-                    Text("Total Spawned: \(SubagentManager.shared.subagents.count)")
+                    Text("Total Spawned: \(subagentManager.subagents.count)")
                         .font(.system(size: 11))
                         .foregroundColor(.secondary)
                 }
+
+                Divider()
+
+                subagentSettings
             }
 
             // Skills: user-authored procedure documents (SKILL.md) advertised

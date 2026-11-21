@@ -1406,23 +1406,23 @@ final class SubQDecisionTests: XCTestCase {
 
     func testRedirectsToAnotherHostAreRefused() {
         let origin = URL(string: "https://api.subq.ai/v1/systemone")
-        XCTAssertTrue(SubQRedirectGuard.isAllowedRedirect(
+        XCTAssertTrue(BearerRedirectGuard.isAllowedRedirect(
             from: origin,
             to: URL(string: "https://api.subq.ai/v1/other")
         ))
-        XCTAssertFalse(SubQRedirectGuard.isAllowedRedirect(
+        XCTAssertFalse(BearerRedirectGuard.isAllowedRedirect(
             from: origin,
             to: URL(string: "https://evil.example/collect")
         ))
-        XCTAssertFalse(SubQRedirectGuard.isAllowedRedirect(from: origin, to: nil))
-        XCTAssertFalse(SubQRedirectGuard.isAllowedRedirect(from: nil, to: origin))
+        XCTAssertFalse(BearerRedirectGuard.isAllowedRedirect(from: origin, to: nil))
+        XCTAssertFalse(BearerRedirectGuard.isAllowedRedirect(from: nil, to: origin))
         // A same-host redirect that drops TLS hands the Bearer key to the
         // network in clear.
-        XCTAssertFalse(SubQRedirectGuard.isAllowedRedirect(
+        XCTAssertFalse(BearerRedirectGuard.isAllowedRedirect(
             from: origin,
             to: URL(string: "http://api.subq.ai/v1/systemone")
         ))
-        XCTAssertTrue(SubQRedirectGuard.isAllowedRedirect(
+        XCTAssertTrue(BearerRedirectGuard.isAllowedRedirect(
             from: URL(string: "http://127.0.0.1:8787/v1/systemone"),
             to: URL(string: "http://127.0.0.1:8787/v1/other")
         ))
@@ -1495,7 +1495,7 @@ final class SubQDecisionTests: XCTestCase {
 
     func testARedirectToAnotherPortIsRefused() {
         let origin = URL(string: "https://api.subq.ai/v1/systemone")
-        XCTAssertFalse(SubQRedirectGuard.isAllowedRedirect(
+        XCTAssertFalse(BearerRedirectGuard.isAllowedRedirect(
             from: origin,
             to: URL(string: "https://api.subq.ai:8443/v1/systemone")
         ))
@@ -2254,6 +2254,184 @@ final class SkillsProcessEnvironmentTests: XCTestCase {
         XCTAssertFalse(environment.values.contains(key))
         XCTAssertTrue(environment["PATH"]?.contains("/opt/homebrew/bin") == true)
         XCTAssertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
+    }
+
+    /// An ordinary tool child runs a command the operator approved per call.
+    /// Taking the user's environment away broke `git push` over SSH, proxies,
+    /// virtualenvs and `SDKROOT` for every chat turn; the allowlist is for
+    /// run-scoped children only.
+    func testAnInteractiveToolChildKeepsTheUsersEnvironment() {
+        let inherited = [
+            "HOME": "/Users/operator",
+            "PATH": "/usr/bin:/bin",
+            "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock",
+            "HTTPS_PROXY": "http://proxy.local:8080",
+            "VIRTUAL_ENV": "/Users/operator/venv",
+            "SDKROOT": "/Applications/Xcode.app/SDKs/MacOSX.sdk",
+            "SUBQ_API_KEY": "should-not-leak"
+        ]
+        let environment = ControlledProcessRunner.toolEnvironment(
+            inherited: inherited,
+            userHome: "/Users/operator"
+        )
+        XCTAssertEqual(environment["SSH_AUTH_SOCK"], "/tmp/ssh-agent.sock")
+        XCTAssertEqual(environment["HTTPS_PROXY"], "http://proxy.local:8080")
+        XCTAssertEqual(environment["VIRTUAL_ENV"], "/Users/operator/venv")
+        XCTAssertEqual(environment["SDKROOT"], "/Applications/Xcode.app/SDKs/MacOSX.sdk")
+        XCTAssertNil(environment["SUBQ_API_KEY"], "the app's own credential is never handed over")
+        XCTAssertEqual(
+            environment["PATH"],
+            "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/Users/operator/.cargo/bin:/Users/operator/.local/bin:/usr/bin:/bin"
+        )
+    }
+
+    /// A reviewed command is still not entitled to the operator's credentials.
+    /// The card shows the command, not what the command will do with an
+    /// `AWS_SECRET_ACCESS_KEY`, and `npm test` in a repository the model just
+    /// read is the ordinary shape of that leak.
+    func testAnInteractiveToolChildLosesCredentialShapedVariables() {
+        let inherited = [
+            "HOME": "/Users/operator",
+            "PATH": "/usr/bin:/bin",
+            "AWS_SECRET_ACCESS_KEY": "aws-secret",
+            "AWS_ACCESS_KEY_ID": "aws-key-id",
+            "AWS_REGION": "us-east-1",
+            "GITHUB_TOKEN": "gh-token",
+            "GH_TOKEN": "gh-token-2",
+            "OPENAI_API_KEY": "sk-openai",
+            "NPM_TOKEN": "npm-token",
+            "DATABASE_PASSWORD": "hunter2",
+            "GOOGLE_APPLICATION_CREDENTIALS": "/tmp/gcp.json",
+            "SOME_PAT": "pat-value",
+            "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock",
+            "HTTPS_PROXY": "http://proxy.local:8080",
+            "KUBECONFIG": "/Users/operator/.kube/config",
+            "LANG": "en_US.UTF-8"
+        ]
+        let environment = ControlledProcessRunner.toolEnvironment(
+            inherited: inherited,
+            userHome: "/Users/operator"
+        )
+        for name in [
+            "AWS_SECRET_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "GITHUB_TOKEN", "GH_TOKEN",
+            "OPENAI_API_KEY", "NPM_TOKEN", "DATABASE_PASSWORD",
+            "GOOGLE_APPLICATION_CREDENTIALS", "SOME_PAT"
+        ] {
+            XCTAssertNil(environment[name], "\(name) is a credential and must not reach a child")
+        }
+        // The toolchain variables a real command needs are not credentials.
+        XCTAssertEqual(environment["SSH_AUTH_SOCK"], "/tmp/ssh-agent.sock")
+        XCTAssertEqual(environment["HTTPS_PROXY"], "http://proxy.local:8080")
+        XCTAssertEqual(environment["KUBECONFIG"], "/Users/operator/.kube/config")
+        XCTAssertEqual(environment["AWS_REGION"], "us-east-1")
+        XCTAssertEqual(environment["LANG"], "en_US.UTF-8")
+    }
+
+    /// A command nobody reviewed — Turbo Mode bypassed its card — chooses its
+    /// own work with no human looking, so it gets the subagent allowlist rather
+    /// than the operator's environment.
+    func testAnUnreviewedToolChildGetsTheAllowlist() {
+        let inherited = [
+            "HOME": "/Users/operator",
+            "PATH": "/usr/bin:/bin",
+            "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock",
+            "HTTPS_PROXY": "http://proxy.local:8080",
+            "LANG": "en_US.UTF-8"
+        ]
+        let environment = ControlledProcessRunner.toolEnvironment(
+            unreviewed: true,
+            inherited: inherited,
+            userHome: "/Users/operator"
+        )
+        XCTAssertEqual(environment["HOME"], "/Users/operator")
+        XCTAssertEqual(environment["LANG"], "en_US.UTF-8")
+        XCTAssertNil(environment["SSH_AUTH_SOCK"])
+        XCTAssertNil(environment["HTTPS_PROXY"])
+    }
+
+    func testCredentialShapedNamesAreRecognised() {
+        for name in [
+            "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "db_password", "MY_API_KEY",
+            "X_API_KEY", "SOME_PAT", "AWS_ACCESS_KEY_ID", "GCP_CREDENTIALS"
+        ] {
+            XCTAssertTrue(ControlledProcessRunner.isCredentialShaped(name), name)
+        }
+        for name in [
+            "SSH_AUTH_SOCK", "HTTPS_PROXY", "KUBECONFIG", "PATH", "HOME",
+            "AWS_REGION", "GIT_AUTHOR_EMAIL", "PWD", "TERM"
+        ] {
+            XCTAssertFalse(ControlledProcessRunner.isCredentialShaped(name), name)
+        }
+    }
+
+    /// A subagent chooses its own command inside a sandbox, so its children
+    /// get the allowlist: no agent socket, no proxy credential, no toolchain
+    /// variable that could carry a token.
+    func testARunScopedToolChildGetsAnAllowlist() {
+        let inherited = [
+            "HOME": "/Users/operator",
+            "PATH": "/usr/bin:/bin",
+            "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock",
+            "HTTPS_PROXY": "http://proxy.local:8080",
+            "VIRTUAL_ENV": "/Users/operator/venv",
+            "SDKROOT": "/Applications/Xcode.app/SDKs/MacOSX.sdk",
+            "SUBQ_API_KEY": "should-not-leak",
+            "LANG": "en_US.UTF-8",
+            "GIT_AUTHOR_NAME": "Operator"
+        ]
+        let environment = ControlledProcessRunner.toolEnvironment(
+            scoped: true,
+            inherited: inherited,
+            userHome: "/Users/operator"
+        )
+        XCTAssertEqual(environment["HOME"], "/Users/operator")
+        XCTAssertEqual(environment["LANG"], "en_US.UTF-8")
+        XCTAssertEqual(
+            environment["GIT_AUTHOR_NAME"], "Operator",
+            "a run's commit keeps the operator's identity"
+        )
+        XCTAssertNil(environment["SSH_AUTH_SOCK"])
+        XCTAssertNil(environment["HTTPS_PROXY"])
+        XCTAssertNil(environment["VIRTUAL_ENV"])
+        XCTAssertNil(environment["SDKROOT"])
+        XCTAssertNil(environment["SUBQ_API_KEY"])
+        XCTAssertEqual(environment["PATH"]?.hasPrefix("/opt/homebrew/bin:") == true, true)
+    }
+
+    /// `runProcess` is the helper every tool child actually spawns through, so
+    /// the scoped decision has to be visible THERE, not only in the pure
+    /// environment builder.
+    @MainActor
+    func testRunProcessSwitchesToTheAllowlistInsideARunScope() async throws {
+        let directory = FileManager.default.temporaryDirectory
+        let probe = URL(fileURLWithPath: "/usr/bin/env")
+
+        let interactive = try await AgentHarness.runProcess(
+            executableURL: probe,
+            arguments: [],
+            currentDirectory: directory,
+            timeoutSeconds: 10
+        )
+        XCTAssertTrue(
+            interactive.stdout.contains("XCTestConfigurationFilePath=")
+                || interactive.stdout.contains("XCTestBundlePath="),
+            "the operator's turn keeps the environment it inherited"
+        )
+
+        let scoped = try await AgentHarness.$executingInRunScope.withValue(true) {
+            try await AgentHarness.runProcess(
+                executableURL: probe,
+                arguments: [],
+                currentDirectory: directory,
+                timeoutSeconds: 10
+            )
+        }
+        XCTAssertFalse(
+            scoped.stdout.contains("XCTestConfigurationFilePath=")
+                || scoped.stdout.contains("XCTestBundlePath="),
+            "a run-scoped child gets the allowlist, not the process environment"
+        )
+        XCTAssertTrue(scoped.stdout.contains("HOME="))
     }
 }
 
