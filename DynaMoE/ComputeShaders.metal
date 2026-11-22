@@ -14109,3 +14109,40 @@ kernel void inkling_router_topk_f32(
         }
     }
 }
+
+// A per-head L2 clip with a learned scale, Inkling 2's q/k normalization:
+// `x *= scale[head * headDim + d]`, then `x *= min(threshold / (||x|| + 1e-6), 1)`
+// per head, then (full layers only) `x *= tau` where
+// `tau = 1 + alpha * log(max((position + 1) / floor, 1))`.
+// One threadgroup per head; the lanes split the head dimension.
+kernel void inkling_l2_clip_scale_f32(
+    device float* vector [[buffer(0)]],
+    device const float* scale [[buffer(1)]],
+    constant uint32_t& headDim [[buffer(2)]],
+    constant float& threshold [[buffer(3)]],
+    constant float& tau [[buffer(4)]],
+    threadgroup float* shared [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgSize [[threads_per_threadgroup]],
+    uint head [[threadgroup_position_in_grid]]
+) {
+    device float* row = vector + ((uint64_t)head * headDim);
+    device const float* headScale = scale + ((uint64_t)head * headDim);
+    for (uint d = tid; d < headDim; d += tgSize) { row[d] *= headScale[d]; }
+    float localSum = 0.0f;
+    for (uint d = tid; d < headDim; d += tgSize) { localSum += row[d] * row[d]; }
+    float norm = sqrt(threadgroup_reduce_sum(localSum, shared, tid, tgSize));
+    float factor = min(threshold / (norm + 1e-6f), 1.0f) * tau;
+    for (uint d = tid; d < headDim; d += tgSize) { row[d] *= factor; }
+}
+
+// `output[i] *= sigmoid(gate[i])`, the attention's output gate.
+kernel void inkling_gate_multiply_f32(
+    device float* output [[buffer(0)]],
+    device const float* gate [[buffer(1)]],
+    constant uint32_t& count [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= count) { return; }
+    output[gid] *= 1.0f / (1.0f + exp(-gate[gid]));
+}

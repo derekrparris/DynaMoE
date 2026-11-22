@@ -544,7 +544,7 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         let host = try Inkling2CPUForward(config: config, weights: hostSource)
         let deviceWeights = Inkling2DeviceWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
         let metal = try Inkling2MetalForward(
-            device: device, library: library, queue: queue, weights: deviceWeights
+            device: device, library: library, queue: queue, weights: deviceWeights, host: host
         )
         let workspace = try Inkling2DeviceWorkspace(device: device, config: config)
 
