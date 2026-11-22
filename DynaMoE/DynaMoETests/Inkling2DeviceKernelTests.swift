@@ -1346,4 +1346,129 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         XCTAssertEqual(deviceStack.count, oracleStack.count)
         XCTAssertLessThanOrEqual(worst / scale, 3e-3, "the device visit against the host graph")
     }
+
+    // MARK: The app's own turn path
+
+    /// The whole app path for this family, once on the host and once with the
+    /// device visit runner installed: `CompletionEngine.launchTurn` with the
+    /// checkpoint loaded the way the app loads it, and the same greedy answer
+    /// from both.
+    ///
+    /// This is the only case that covers the wiring -- the engine's cache of
+    /// the forward and the device half, the runner's installation inside the
+    /// turn task, and the KV budget -- and it is where a mistake in that
+    /// plumbing shows up, since the halves themselves are verified elsewhere.
+    ///
+    /// Opt-in: a host turn is minutes per token, so the default suite stays
+    /// fast. `touch /tmp/dynamoe_inkling2_engine_turn` to run it.
+    func testTheEngineAnswersTheSameOnTheHostAndOnTheDevice() async throws {
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_engine_turn"),
+            "opt-in engine turn; touch /tmp/dynamoe_inkling2_engine_turn to run"
+        )
+        let snapshot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(Inkling2PublishedTensorTests.snapshotRelativePath)
+        guard FileManager.default.fileExists(atPath: snapshot.path) else {
+            throw XCTSkip("Inkling 2 snapshot is not downloaded at \(snapshot.path)")
+        }
+        guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("No Metal GPU device") }
+
+        let tokenizer = try DynaMoeTokenizer(
+            tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+        )
+        let modelConfig = try XCTUnwrap(ModelConfig.load(from: snapshot))
+        XCTAssertTrue(modelConfig.isInkling2Model)
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let indexed = try engine.getSummary()
+        let summary = try InferenceEngine.segmentShardsForMetal(
+            indexed, maxBufferLength: UInt64(device.maxBufferLength)
+        )
+        var buffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            let length = Int(shard.length)
+            guard length > 0, length <= Int(device.maxBufferLength),
+                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)),
+                  let buffer = device.makeBuffer(
+                      bytesNoCopy: pointer, length: length, options: .storageModeShared, deallocator: nil
+                  ) else { continue }
+            buffers[shard.index] = buffer
+        }
+        CompletionEngine.shared.configure(
+            summary: summary, modelConfig: modelConfig, tokenizer: tokenizer,
+            shardBuffers: buffers, activeLoadedModelPath: snapshot.path
+        )
+        defer {
+            CompletionEngine.shared.configure(
+                summary: nil, modelConfig: nil, tokenizer: nil,
+                shardBuffers: [:], activeLoadedModelPath: nil
+            )
+        }
+
+        let rendered = try Inkling2Prompt().render(
+            turns: [.user([.text("The capital of France is")])], effort: 0
+        )
+        let promptIds = try tokenizer.encode(text: rendered)
+        func request(_ ids: [UInt32]) -> CompletionTurnRequest {
+            CompletionTurnRequest(
+                promptTokenIds: ids,
+                formattedPrompt: rendered,
+                sessionId: nil,
+                sampling: TurnSampling(
+                    temperature: 0, topP: 1, minP: 0, topK: 1,
+                    repetitionPenalty: 1, maxTokens: 2
+                ),
+                memory: TurnMemorySettings(
+                    executionMode: .residentRAM, budgetMode: .unrestricted, kvPrecision: .fp32
+                ),
+                agentToolsEnabled: false,
+                thinkingEnabled: false,
+                agentStep: 0,
+                forceSynthesis: false,
+                isSplicedContinuation: false,
+                stopSequences: [],
+                asOfDate: nil,
+                images: []
+            )
+        }
+        func answer(_ request: CompletionTurnRequest) async throws -> (ids: [UInt32], text: String) {
+            var ids: [UInt32] = []
+            var text = ""
+            for await event in try CompletionEngine.shared.launchTurn(request).stream {
+                switch event {
+                case .finished(let result):
+                    ids = result.generatedTokenIds
+                    text = result.rawDecodedText
+                case .failedTurn(let failure):
+                    XCTFail("the turn failed: \(failure.message)")
+                default:
+                    break
+                }
+            }
+            return (ids, text)
+        }
+
+        // Two arms of ONE process, the host graph forced by the debug seam:
+        // a difference between them is a difference in the visit executor, not
+        // in the machine or the checkpoint.
+        let defaults = UserDefaults.standard
+        let seam = "dynamoe_inkling2_device_off"
+        let savedSeam = defaults.object(forKey: seam)
+        defer {
+            if let savedSeam { defaults.set(savedSeam, forKey: seam) }
+            else { defaults.removeObject(forKey: seam) }
+        }
+        defaults.set(true, forKey: seam)
+        var started = CFAbsoluteTimeGetCurrent()
+        let hostArm = try await answer(request(promptIds))
+        let hostSeconds = CFAbsoluteTimeGetCurrent() - started
+        defaults.set(false, forKey: seam)
+        started = CFAbsoluteTimeGetCurrent()
+        let deviceArm = try await answer(request(promptIds))
+        let deviceSeconds = CFAbsoluteTimeGetCurrent() - started
+        print("🔎 [inkling2 turn] host: \(hostArm.ids) \(hostArm.text.debugDescription) in \(String(format: "%.1f", hostSeconds)) s")
+        print("🔎 [inkling2 turn] device: \(deviceArm.ids) \(deviceArm.text.debugDescription) in \(String(format: "%.1f", deviceSeconds)) s")
+        XCTAssertFalse(hostArm.ids.isEmpty, "the host turn produced no tokens")
+        XCTAssertEqual(deviceArm.ids, hostArm.ids, "the device visit runner changed the answer")
+        withExtendedLifetime(engine) {}
+    }
 }

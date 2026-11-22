@@ -144,10 +144,11 @@ nonisolated public final class Inkling2CPUForward {
     /// deciding what to run, and this decides how. A substitution must leave the
     /// visit state exactly where the host would -- the KV rows, the four
     /// convolution histories -- or a later visit reads a different sequence.
-    public var visitRunner: ((
+    public typealias VisitRunner = (
         _ layer: Int, _ pass: Int, _ hidden: [Float], _ blockStates: inout [[Float]],
         _ messages: [[Float]]?, _ position: Int
-    ) throws -> (output: [Float], attentionQueries: Int))?
+    ) throws -> (output: [Float], attentionQueries: Int)
+    public var visitRunner: VisitRunner?
 
     public init(
         config: Inkling2Config,

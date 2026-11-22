@@ -88,10 +88,11 @@ public extension Inkling2PositionForward {
 // MARK: - The host forward as a position source
 
 extension Inkling2CPUForward: Inkling2PositionForward {
-    /// The published schedule's context ceiling, bounded by what this process
-    /// can hold: the plan decides, and Phase 2 has no KV budget yet, so the
-    /// checkpoint's declared maximum is the authority.
-    public var positionLimit: Int { config.maxPositionEmbeddings }
+    /// The context ceiling: what the forward was provisioned for when the
+    /// engine set a KV budget, the checkpoint's declared maximum otherwise. A
+    /// turn past it ends as length-capped rather than as a refusal one position
+    /// later.
+    public var positionLimit: Int { options.maxPositions ?? config.maxPositionEmbeddings }
 
     public var storedPositions: Int { states.first?.committedPositions ?? 0 }
 

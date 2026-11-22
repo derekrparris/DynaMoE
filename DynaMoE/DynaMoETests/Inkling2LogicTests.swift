@@ -1576,6 +1576,52 @@ final class Inkling2HostForwardTests: XCTestCase {
         return try Inkling2CPUForward(config: config, weights: source)
     }
 
+    /// A visit runner is a SUBSTITUTION, not a hook beside the work: the loop
+    /// must run the installed one for every visit of a token and must produce
+    /// the same logits when it simply delegates to the host graph.
+    ///
+    /// The delegate is the host's own `runVisit`, so a runner that was called
+    /// but ignored, called twice, or called with the wrong pass would move the
+    /// logits or the state -- the comparison is bit-exact.
+    func testAVisitRunnerReplacesEveryVisit() throws {
+        let forward = try makeForward()
+        let tokenizer = try DynaMoeTokenizer(
+            tokenizerPath: try snapshot().appendingPathComponent("tokenizer.json").path
+        )
+        let ids = try tokenizer.encode(text: "Hi there").map { UInt32($0) }
+
+        var baseline: [[Float]] = []
+        forward.reset()
+        for (position, id) in ids.enumerated() {
+            baseline.append(try forward.forwardToken(token: id, position: position))
+        }
+
+        var calls: [(layer: Int, pass: Int, position: Int)] = []
+        forward.reset()
+        forward.visitRunner = { layer, pass, hidden, blockStates, messages, position in
+            calls.append((layer, pass, position))
+            return try forward.runVisit(
+                layer: layer, pass: pass, hidden: hidden, blockStates: &blockStates,
+                messages: messages, position: position
+            )
+        }
+        var substituted: [[Float]] = []
+        for (position, id) in ids.enumerated() {
+            substituted.append(try forward.forwardToken(token: id, position: position))
+        }
+        forward.visitRunner = nil
+
+        // One token runs the whole 48-visit schedule; two tokens, twice that.
+        XCTAssertEqual(calls.count, ids.count * forward.plan.count)
+        XCTAssertEqual(Set(calls.map(\.layer)).count, forward.config.numHiddenLayers)
+        // Every pass of the looped core is visited, not only the first.
+        let corePasses = Set(
+            calls.filter { forward.isCore($0.layer) }.map { $0.pass }
+        )
+        XCTAssertEqual(corePasses, Set(0..<forward.config.numPasses))
+        XCTAssertEqual(substituted, baseline, "a delegating visit runner must not change the logits")
+    }
+
     private func relativeError(_ actual: [Float], _ reference: [Float]) -> Float {
         guard actual.count == reference.count, !reference.isEmpty else { return .infinity }
         let scale = reference.reduce(Float(0)) { max($0, abs($1)) }

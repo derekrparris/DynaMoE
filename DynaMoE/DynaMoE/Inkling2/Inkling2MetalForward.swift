@@ -213,7 +213,14 @@ nonisolated public final class Inkling2DeviceWorkspace {
     /// The attention's per-row scores, for a parity check of the stage inside.
     public let scoreDump: MTLBuffer
 
-    public init(device: MTLDevice, config: Inkling2Config) throws {
+    /// `stagedPositions` bounds the KV staging, i.e. the longest sequence one
+    /// attention dispatch can read. The default is the checkpoint's declared
+    /// maximum, but a turn is capped by its KV budget, so the engine passes the
+    /// cap it provisioned for -- the declared maximum at these widths is
+    /// gigabytes of staging for rows that can never exist.
+    public init(
+        device: MTLDevice, config: Inkling2Config, stagedPositions: Int? = nil
+    ) throws {
         let hiddenBytes = config.hiddenSize * MemoryLayout<Float>.stride
         let attentionWidth = config.numAttentionHeads * config.headDim
         func make(_ length: Int, _ label: String) throws -> MTLBuffer {
@@ -244,7 +251,7 @@ nonisolated public final class Inkling2DeviceWorkspace {
         // checkpoint's declared maximum is the safe bound and a few dozen MB at
         // FP32, which is the same order as the host's own rows.
         let kvWidth = config.numKeyValueHeads * config.headDim
-        stagedCapacity = config.maxPositionEmbeddings
+        stagedCapacity = max(1, stagedPositions ?? config.maxPositionEmbeddings)
         let stagedBytes = stagedCapacity * kvWidth * MemoryLayout<Float>.stride
         stagedKeys = try make(stagedBytes, "staged keys")
         stagedValues = try make(stagedBytes, "staged values")
@@ -316,17 +323,22 @@ nonisolated public final class Inkling2ScalarArena {
     /// outlive the commit.
     public func make<Element>(staging values: [Element]) -> MTLBuffer? {
         // A zero-length `makeBuffer(bytes:)` is not allowed, and an empty
-        // history reads no row, so one zeroed element is a safe stand-in.
-        let padded = values.isEmpty
-            ? [Element](repeating: unsafeBitCast(0, to: Element.self), count: 1)
-            : values
-        let length = padded.count * MemoryLayout<Element>.stride
-        return padded.withUnsafeBytes { raw in
-            guard let buffer = device.makeBuffer(bytes: raw.baseAddress!, length: length,
-                                                options: .storageModeShared) else { return nil }
-            buffers.append(buffer)
-            return buffer
+        // history reads no row, so one zeroed element is a safe stand-in. It is
+        // allocated zeroed rather than `unsafeBitCast(0, to: Element.self)`,
+        // which traps for any element wider than an Int (a Float's zero is
+        // four bytes and an Int's is eight).
+        let buffer: MTLBuffer?
+        if values.isEmpty {
+            buffer = device.makeBuffer(
+                length: MemoryLayout<Element>.stride, options: .storageModeShared
+            )
+        } else {
+            buffer = values.withUnsafeBytes { raw in
+                device.makeBuffer(bytes: raw.baseAddress!, length: raw.count, options: .storageModeShared)
+            }
         }
+        if let buffer { buffers.append(buffer) }
+        return buffer
     }
 
     /// Drops the retained buffers: call once the command buffer has completed.

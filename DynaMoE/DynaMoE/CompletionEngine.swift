@@ -333,6 +333,11 @@ public final class CompletionEngine: @unchecked Sendable {
     /// the HOST graph (no Metal), so it holds no device memory beyond the shard
     /// buffers the app already mapped.
     private var cachedInklingForward: (path: String, contextLength: Int, forward: Inkling2CPUForward)?
+    /// The device half of the same forward, built beside it from the same
+    /// checkpoint: the host graph is the schedule and the oracle, and the
+    /// executor substitutes a visit. Nil when Metal is unavailable, and the
+    /// turn then runs wholly on the host.
+    private var cachedInklingDevice: (path: String, contextLength: Int, executor: Inkling2MetalForward, workspace: Inkling2DeviceWorkspace)?
 
     /// Encoded image spans, keyed by `snapshot path | image sha256`.
     ///
@@ -658,10 +663,15 @@ public final class CompletionEngine: @unchecked Sendable {
             // Keyed by the context it was provisioned for, like the DeepSeek
             // runtime, because a turn that needs more rows needs a bigger cache.
             var forward: Inkling2CPUForward?
+            var deviceHalf: (executor: Inkling2MetalForward, workspace: Inkling2DeviceWorkspace)?
             stateLock.lock()
             if let cached = cachedInklingForward,
                cached.path == snapshotDir.path, cached.contextLength >= contextLength {
                 forward = cached.forward
+                if let device = cachedInklingDevice,
+                   device.path == snapshotDir.path, device.contextLength >= contextLength {
+                    deviceHalf = (device.executor, device.workspace)
+                }
             }
             stateLock.unlock()
             if forward == nil {
@@ -683,6 +693,30 @@ public final class CompletionEngine: @unchecked Sendable {
                     "⚠️ Inkling 2 Mini's forward could not be built."
                 )
             }
+            // The device half, built beside the host one. Its absence is not an
+            // error: the host graph is a complete (slow) turn, and a machine
+            // without Metal still answers.
+            if deviceHalf == nil,
+               let device = MTLCreateSystemDefaultDevice(),
+               let queue = device.makeCommandQueue(),
+               let library = device.makeDefaultLibrary() {
+                let deviceWeights = Inkling2DeviceWeights(
+                    config: inklingConfig, catalog: catalog, shardBuffers: loadedShards
+                )
+                if let executor = try? Inkling2MetalForward(
+                    device: device, library: library, queue: queue, weights: deviceWeights, host: forward
+                ), let workspace = try? Inkling2DeviceWorkspace(
+                    device: device, config: inklingConfig, stagedPositions: contextLength
+                ) {
+                    stateLock.lock()
+                    cachedInklingDevice = (
+                        path: snapshotDir.path, contextLength: contextLength,
+                        executor: executor, workspace: workspace
+                    )
+                    stateLock.unlock()
+                    deviceHalf = (executor, workspace)
+                }
+            }
 
             // Same ordering as the DeepSeek branch: grammar token, then the id.
             let inklingGrammarToken = GrammarConstrainedSampler.shared.beginGeneration()
@@ -699,6 +733,25 @@ public final class CompletionEngine: @unchecked Sendable {
             activeTurnCancelled = false
             activeTurnPriority = request.turnPriority
             stateLock.unlock()
+
+            // The visit runner: when the device half exists, each visit of the
+            // loop runs on the GPU and the host graph keeps the schedule. It is
+            // installed INSIDE the turn task and cleared when that task ends --
+            // the forward is cached across turns, and a runner left behind
+            // would drive a workspace whose turn is over.
+            // `dynamoe_inkling2_device_off` is a debug seam: it forces a turn onto
+            // the host graph even when the device half exists, which is what lets
+            // one test compare the two arms of the SAME process.
+            let deviceHalfForTurn = UserDefaults.standard.bool(forKey: "dynamoe_inkling2_device_off")
+                ? nil : deviceHalf
+            let inklingVisitRunner: Inkling2CPUForward.VisitRunner? = deviceHalfForTurn.map { half in
+                { layer, pass, hidden, blockStates, messages, position in
+                    try half.executor.runVisit(
+                        layer: layer, pass: pass, hidden: hidden, blockStates: &blockStates,
+                        messages: messages, position: position, workspace: half.workspace
+                    )
+                }
+            }
 
             let reusablePrefix = forward.reusablePrefix(
                 proposedPrefix: PrefixCacheManager.shared.findCommonPrefix(
@@ -739,7 +792,9 @@ public final class CompletionEngine: @unchecked Sendable {
                     engineSelf.isCurrentGenerationUnchecked(id)
                 }
                 engineSelf.turnDidBegin(myGenerationId)
+                forward.visitRunner = inklingVisitRunner
                 defer {
+                    forward.visitRunner = nil
                     engineSelf.turnDidEnd(id: myGenerationId)
                     continuation.finish()
                 }
@@ -12407,8 +12462,10 @@ if layer.attnGateProjTensor != nil,
         let retired = cachedDeepSeekRuntime
         cachedDeepSeekRuntime = nil
         // The Inkling forward goes with them: its weights are the loaded shards,
-        // and its per-visit state belongs to the sequence it was building.
+        // and its per-visit state belongs to the sequence it was building. The
+        // device half holds buffers over the same shards, so it goes too.
         cachedInklingForward = nil
+        cachedInklingDevice = nil
         cachedImageSpans.removeAll()
         stateLock.unlock()
         // The prefill rate belongs to the checkpoint that measured it. A spawn
