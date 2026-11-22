@@ -13943,7 +13943,10 @@ kernel void inkling_attention_f32(
         // The store must not race the NEXT row's reduction: the helper's last
         // barrier protects its own read, not a write that happens after it.
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid == 0) { scores[row] = score; if (dumpsScores) { scoreDump[row] = score; } }
+        if (tid == 0) { scores[row] = score; }
+        // The dump is head 0 only, which is what the host captures: every
+        // head's threadgroup 0 would otherwise write the same slots.
+        if (dumpsScores && head == 0 && tid == 0) { scoreDump[row] = score; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         localMax = max(localMax, score);
     }

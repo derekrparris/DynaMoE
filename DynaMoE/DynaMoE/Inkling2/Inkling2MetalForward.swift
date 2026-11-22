@@ -106,6 +106,11 @@ nonisolated public final class Inkling2DeviceWorkspace {
     public let value: MTLBuffer
     public let gate: MTLBuffer
     public let attentionOutput: MTLBuffer
+    /// The convolved K/V, kept apart from the projections that feed them: the
+    /// visit's convolution history advances by the PRE-convolution value, so
+    /// the projection must survive the convolution to be pushed.
+    public let convolvedKey: MTLBuffer
+    public let convolvedValue: MTLBuffer
     public let projectionOutput: MTLBuffer
     /// Scratch for the reduction kernels' warp sums.
     public let reductionScratch: MTLBuffer
@@ -144,6 +149,8 @@ nonisolated public final class Inkling2DeviceWorkspace {
         value = try make(config.numKeyValueHeads * config.headDim * MemoryLayout<Float>.stride, "value")
         gate = try make(attentionWidth * MemoryLayout<Float>.stride, "output gate")
         attentionOutput = try make(attentionWidth * MemoryLayout<Float>.stride, "attention output")
+        convolvedKey = try make(config.numKeyValueHeads * config.headDim * MemoryLayout<Float>.stride, "convolved key")
+        convolvedValue = try make(config.numKeyValueHeads * config.headDim * MemoryLayout<Float>.stride, "convolved value")
         projectionOutput = try make(hiddenBytes, "projection output")
         reductionScratch = try make(32 * MemoryLayout<Float>.stride, "reduction scratch")
         // The attention reads at most the window plus the compressed rows; the
@@ -552,10 +559,14 @@ nonisolated public final class Inkling2MetalForward {
     }
 
     /// The short convolution on device, static or dynamic, for one of a visit's
-    /// four convolution states. Returns the scalar buffers the dispatch reads, to
-    /// be kept alive until the commit, and PUSHES the input into the host state's
-    /// history -- the state stays the authority, so a device pass and a host pass
-    /// over the same visit leave it in the same place.
+    /// four convolution states.
+    ///
+    /// It stages what the dispatch reads and does NOT touch the host state:
+    /// the state has to advance by the value the GPU actually produced, and
+    /// that value does not exist until the command buffer completes. A first
+    /// cut pushed the input here, which left the history one commit stale --
+    /// exact for the first rows, wrong from the point the convolution reads
+    /// them. The caller pushes after the wait.
     func convolve(
         encoder: MTLComputeCommandEncoder,
         state: Inkling2VisitState,
@@ -603,9 +614,6 @@ nonisolated public final class Inkling2MetalForward {
             MTLSize(width: valuesCount, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
         )
-        // The state stays the authority even on a device pass, so the next
-        // convolution (host or device) sees the same history either way.
-        state.pushConvolution(index, value: readBack(values, count: valuesCount))
         _ = isFull
         _ = headDim
     }
@@ -688,7 +696,9 @@ nonisolated public final class Inkling2MetalForward {
             arena: arena
         )
 
-        // K: project, convolve, L2 clip.
+        // K: project into `key`, convolve into `convolvedKey`, L2 clip there.
+        // The two buffers are separate because the visit's history advances by
+        // the PRE-convolution value, which the convolution would overwrite.
         try gemm(
             encoder: encoder, role: .attnWkDv, layer: layer,
             input: keyInputBuffer, inputOffset: 0,
@@ -699,18 +709,18 @@ nonisolated public final class Inkling2MetalForward {
         try convolve(
             encoder: encoder, state: state, index: 0,
             values: workspace.key, valuesCount: kvHeads * headDim,
-            layer: layer, isFull: isFull, headDim: headDim, output: workspace.key, arena: arena
+            layer: layer, isFull: isFull, headDim: headDim, output: workspace.convolvedKey, arena: arena
         )
         // The keys are clipped PLAINLY: the reference multiplies only the
         // queries by `q_l2_clip.scale`, so passing that scale here made K 0.47
         // off while Q was exact.
         try l2ClipPlain(
-            encoder: encoder, vector: workspace.key,
+            encoder: encoder, vector: workspace.convolvedKey,
             headDim: headDim, heads: kvHeads, threshold: config.qkL2ClipThreshold,
             arena: arena
         )
 
-        // V: project, convolve, unweighted per-head norm.
+        // V: project into `value`, convolve into `convolvedValue`, norm there.
         try gemm(
             encoder: encoder, role: .attnWvDv, layer: layer,
             input: valueInputBuffer, inputOffset: 0,
@@ -721,17 +731,26 @@ nonisolated public final class Inkling2MetalForward {
         try convolve(
             encoder: encoder, state: state, index: 1,
             values: workspace.value, valuesCount: kvHeads * headDim,
-            layer: layer, isFull: isFull, headDim: headDim, output: workspace.value, arena: arena
+            layer: layer, isFull: isFull, headDim: headDim, output: workspace.convolvedValue, arena: arena
         )
-        try headNorm(encoder: encoder, vector: workspace.value, headDim: headDim, heads: kvHeads, arena: arena)
+        try headNorm(encoder: encoder, vector: workspace.convolvedValue, headDim: headDim, heads: kvHeads, arena: arena)
 
-        // The position attends over ITSELF, so its own K/V joins the cache
-        // before the bias is computed -- the host's `attention` appends at
-        // exactly this point. Without it the device attends over one row fewer
-        // than the host and the sequence never grows.
+        encoder.endEncoding()
+        encoded = true
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let error = commandBuffer.error { throw error }
+
+        // The host state advances NOW, from what the GPU actually produced:
+        // the convolution histories take the projections, and the position's own
+        // K/V joins the cache before the attention is encoded -- the host's
+        // `attention` appends at exactly this point, and a row staged before the
+        // write would be the previous position's.
+        state.pushConvolution(0, value: readBack(workspace.key, count: kvHeads * headDim))
+        state.pushConvolution(1, value: readBack(workspace.value, count: kvHeads * headDim))
         _ = state.append(
-            key: readBack(workspace.key, count: kvHeads * headDim),
-            value: readBack(workspace.value, count: kvHeads * headDim)
+            key: readBack(workspace.convolvedKey, count: kvHeads * headDim),
+            value: readBack(workspace.convolvedValue, count: kvHeads * headDim)
         )
 
         // The relative states and the sink logits are small host-side
@@ -744,41 +763,47 @@ nonisolated public final class Inkling2MetalForward {
         let bankValues = try hostMatrix(.attnRelLogitsProj, layer: layer)
         let bankBuffer = try staging(workspace.bank, bankValues)
 
-        // The KV rows this position attends over, staged.
+        // The KV rows this position attends over, staged: the second command
+        // buffer, because the attention reads the row the first one wrote.
         let rows = workspace.stage(state)
+        let (tailBuffer, tailEncoder) = try commandComponents()
+        let tailArena = Inkling2ScalarArena(device: device)
+        defer { tailArena.clear() }
+        var tailEncoded = false
+        defer { if !tailEncoded { tailEncoder.endEncoding() } }
 
         try attention(
-            encoder: encoder, workspace: workspace, state: state, rows: rows,
+            encoder: tailEncoder, workspace: workspace, state: state, rows: rows,
             position: position, relative: relativeBuffer, bank: bankBuffer,
-            sink: sinkBuffer, output: workspace.attentionOutput, arena: arena,
+            sink: sinkBuffer, output: workspace.attentionOutput, arena: tailArena,
             dumpsScores: dumpsAttentionScores
         )
 
         // The output gate, then the grouped output projection.
         try gemm(
-            encoder: encoder, role: .attnGate, layer: layer,
+            encoder: tailEncoder, role: .attnGate, layer: layer,
             input: queryInputBuffer, inputOffset: 0,
             output: workspace.gate, outputOffset: 0,
             rows: heads * headDim, columns: hidden,
-            arena: arena
+            arena: tailArena
         )
         try gateMultiply(
-            encoder: encoder, output: workspace.attentionOutput,
-            gate: workspace.gate, count: heads * headDim, arena: arena
+            encoder: tailEncoder, output: workspace.attentionOutput,
+            gate: workspace.gate, count: heads * headDim, arena: tailArena
         )
         try gemm(
-            encoder: encoder, role: .attnWoUd, layer: layer,
+            encoder: tailEncoder, role: .attnWoUd, layer: layer,
             input: workspace.attentionOutput, inputOffset: 0,
             output: workspace.projectionOutput, outputOffset: 0,
             rows: hidden, columns: heads * headDim,
-            arena: arena
+            arena: tailArena
         )
 
-        encoder.endEncoding()
-        encoded = true
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        if let error = commandBuffer.error { throw error }
+        tailEncoder.endEncoding()
+        tailEncoded = true
+        tailBuffer.commit()
+        tailBuffer.waitUntilCompleted()
+        if let error = tailBuffer.error { throw error }
         return readBack(workspace.projectionOutput, count: hidden)
     }
 

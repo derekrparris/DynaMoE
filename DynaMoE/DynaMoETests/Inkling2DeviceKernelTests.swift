@@ -748,16 +748,23 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         let stageRows: [String] = [
             stageError("q_norm", metal.readBack(workspace.query, count: config.swaNumAttentionHeads * config.swaHeadDim),
                        oracleStages["q_norm"] ?? []),
-            stageError("k_norm", metal.readBack(workspace.key, count: config.swaNumKeyValueHeads * config.swaHeadDim),
+            // The clipped key and the normed value are the CONVOLVED buffers: the
+            // projection buffers hold the pre-convolution values the visit's
+            // history takes.
+            stageError("k_norm", metal.readBack(workspace.convolvedKey, count: config.swaNumKeyValueHeads * config.swaHeadDim),
                        oracleStages["k_norm"] ?? []),
-            stageError("v_norm", metal.readBack(workspace.value, count: config.swaNumKeyValueHeads * config.swaHeadDim),
+            stageError("v_norm", metal.readBack(workspace.convolvedValue, count: config.swaNumKeyValueHeads * config.swaHeadDim),
                        oracleStages["v_norm"] ?? []),
             stageError("relative", metal.readBack(workspace.relativeStates, count: config.swaNumAttentionHeads * config.dRel),
                        oracleStages["relative_states"] ?? []),
             stageError("sink", metal.readBack(workspace.sinkLogits, count: config.swaNumAttentionHeads),
                        oracleStages["sink"] ?? []),
-            stageError("attn_raw", metal.readBack(workspace.attentionOutput, count: config.swaNumAttentionHeads * config.swaHeadDim),
-                       oracleStages["attn_raw"] ?? [])
+            // The workspace buffer holds the RAW output only until the gate runs,
+            // and it is multiplied in place: read after the whole half, it is
+            // `attn_gated`, so comparing it against `attn_raw` compares two
+            // different stages.
+            stageError("attn_gated", metal.readBack(workspace.attentionOutput, count: config.swaNumAttentionHeads * config.swaHeadDim),
+                       oracleStages["attn_gated"] ?? [])
         ]
         print("🔎 [inkling2 device] stages: " + stageRows.joined(separator: " "))
         // The attention's scores, head 0: the bias against the softmax against
@@ -782,26 +789,18 @@ final class Inkling2DeviceKernelTests: XCTestCase {
             let mine = name == "q_norm"
                 ? metal.readBack(workspace.query, count: config.swaNumAttentionHeads * config.swaHeadDim)
                 : metal.readBack(
-                    name == "k_norm" ? workspace.key : workspace.value,
+                    name == "k_norm" ? workspace.convolvedKey : workspace.convolvedValue,
                     count: config.swaNumKeyValueHeads * config.swaHeadDim
                 )
             XCTAssertLessThanOrEqual(rel(mine, reference), 1e-3, "\(name) against the host")
         }
 
-        // The attention's own output is the ONE stage still open: the same
-        // kernel is exact (1.7e-6) when fed the host's rows, and inside the half
-        // it is not, so the remaining difference is in what the half stages for
-        // it. Marked non-strict rather than deleted or bar-loosened: it runs,
-        // prints its numbers above, and stops being expected-failure the moment
-        // it passes.
-        let attentionError = worst / scale
-        if attentionError <= 2e-3 {
-            XCTAssertLessThanOrEqual(attentionError, 2e-3, "the device attention half against the host")
-        } else {
-            XCTExpectFailure("the attention output is the one open stage of the device half") {
-                XCTAssertLessThanOrEqual(attentionError, 2e-3, "the device attention half against the host")
-            }
-        }
+        // The whole half, end to end. It was expected-failure until the two
+        // state mutations that ran before their command buffer were moved after
+        // it: the KV row and the convolution histories were read from buffers
+        // the GPU had not written yet, which is exact for the first rows and
+        // wrong from the point a convolution reads them.
+        XCTAssertLessThanOrEqual(worst / scale, 2e-3, "the device attention half against the host")
         withExtendedLifetime(engine) {}
     }
 
