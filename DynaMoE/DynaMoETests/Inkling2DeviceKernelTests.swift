@@ -267,6 +267,89 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         }
     }
 
+    // MARK: Attention
+
+    /// The relative-bias/sink attention against the host rule, at a shape with
+    /// grouped KV heads (2 query heads per KV head), a window start past zero
+    /// and a row count past `extent` so the bias is zeroed on the oldest rows.
+    /// The relative vector and bank are wide-ranging, so a bias applied to the
+    /// wrong row or with the wrong distance cannot cancel.
+    func testTheRelativeBiasSinkAttentionMatchesTheHostRule() throws {
+        let (device, _, _) = try environment()
+        let heads = 4, groups = 2, headDim = 16, kvHeads = heads / groups
+        let kvWidth = kvHeads * headDim
+        let keyRows = 12, windowStart = 7, position = 15, dRel = 4, extent = 8
+        let query = values(heads * headDim, seed: 21)
+        let keys = values(keyRows * kvWidth, seed: 22)
+        let vals = values(keyRows * kvWidth, seed: 23)
+        let relative = values(heads * dRel, seed: 24)
+        let bank = values(dRel * extent, seed: 25)
+        let sink = values(heads, seed: 26)
+
+        let queryBuffer = try buffer(device, query)
+        let keyBuffer = try buffer(device, keys)
+        let valueBuffer = try buffer(device, vals)
+        let relativeBuffer = try buffer(device, relative)
+        let bankBuffer = try buffer(device, bank)
+        let sinkBuffer = try buffer(device, sink)
+        let outputBuffer = try buffer(device, [Float](repeating: 0, count: heads * headDim))
+        let scalars: [UInt32] = [UInt32(heads), UInt32(groups), UInt32(headDim), UInt32(kvWidth),
+                                UInt32(keyRows), UInt32(windowStart), UInt32(position),
+                                UInt32(dRel), UInt32(extent)]
+        let scalarBuffers = try scalars.enumerated().map { index, value in
+            try buffer(device, [value])
+        }
+        try run("inkling_attention_f32", threads: (heads, 1, 1), threadgroup: (32, 1, 1),
+                threadgroupMemory: (32 + keyRows) * MemoryLayout<Float>.stride,
+                byThreadgroup: true) { encoder in
+            encoder.setBuffer(queryBuffer, offset: 0, index: 0)
+            encoder.setBuffer(keyBuffer, offset: 0, index: 1)
+            encoder.setBuffer(valueBuffer, offset: 0, index: 2)
+            encoder.setBuffer(relativeBuffer, offset: 0, index: 3)
+            encoder.setBuffer(bankBuffer, offset: 0, index: 4)
+            encoder.setBuffer(sinkBuffer, offset: 0, index: 5)
+            encoder.setBuffer(outputBuffer, offset: 0, index: 6)
+            for (index, b) in scalarBuffers.enumerated() { encoder.setBuffer(b, offset: 0, index: 7 + index) }
+        }
+        let actual = read(outputBuffer, heads * headDim)
+
+        // The host rule, written from Inkling2Forward.attention's own lines.
+        var expected = [Float](repeating: 0, count: heads * headDim)
+        for head in 0..<heads {
+            let kvHead = head / groups
+            let q = Array(query[(head * headDim)..<((head + 1) * headDim)])
+            var scores = [Float](repeating: 0, count: keyRows)
+            for row in 0..<keyRows {
+                var dot: Float = 0
+                for d in 0..<headDim { dot += q[d] * keys[row * kvWidth + kvHead * headDim + d] }
+                let distance = position - (windowStart + row)
+                var bias: Float = 0
+                if distance >= 0 && distance < extent {
+                    for r in 0..<dRel { bias += relative[head * dRel + r] * bank[r * extent + distance] }
+                }
+                scores[row] = dot / Float(headDim).squareRoot() + bias
+            }
+            var combined = scores
+            combined.append(sink[head])
+            let maximum = combined.max() ?? 0
+            let exponentials = combined.map { exp($0 - maximum) }
+            let denominator = exponentials.reduce(0, +)
+            for row in 0..<keyRows {
+                let weight = exponentials[row] / denominator
+                for d in 0..<headDim {
+                    expected[head * headDim + d] += weight * vals[row * kvWidth + kvHead * headDim + d]
+                }
+            }
+        }
+        for index in 0..<(heads * headDim) {
+            XCTAssertEqual(actual[index], expected[index], accuracy: 2e-5, "element \(index)")
+        }
+        // The fixture really does exercise both branches: some rows inside the
+        // extent and some zeroed outside it.
+        XCTAssertGreaterThan(position, windowStart + 0)
+        XCTAssertLessThan(position - (windowStart + Int(keyRows) - 1), 0)
+    }
+
     // MARK: The block read
 
     /// The block-attention residual read against the host rule, with TWO

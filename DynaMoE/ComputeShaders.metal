@@ -13879,3 +13879,79 @@ kernel void inkling_block_read_f32(
         out[i] = accumulator;
     }
 }
+
+// Inkling 2's attention: relative-position bias plus a per-head sink, no RoPE.
+// One threadgroup per head; the lanes split the head dimension.
+//
+//   score(row) = dot(q, key[row]) / sqrt(headDim) + bias(row)
+//   bias(row)  = rel[head] . bank[distance(row)]   for 0 <= distance < extent
+//   softmax over [scores..., sink[head]]           (the sink has a zero value)
+//   out        = sum(row) softmax(row) * value[row]
+//
+// `keys` and `values` are the visit's own cache, one row per retained
+// position, `kvWidth` wide; head `h` reads KV head `h / groups`. The key rows a
+// position may attend over are `keyStart..<keyStart + keyRows`, and a row's
+// distance is `position - (windowStart + rowOffset)`.
+kernel void inkling_attention_f32(
+    device const float* query [[buffer(0)]],
+    device const float* keys [[buffer(1)]],
+    device const float* values [[buffer(2)]],
+    device const float* relative [[buffer(3)]],
+    device const float* bank [[buffer(4)]],
+    device const float* sinkLogits [[buffer(5)]],
+    device float* outVector [[buffer(6)]],
+    constant uint32_t& heads [[buffer(7)]],
+    constant uint32_t& groups [[buffer(8)]],
+    constant uint32_t& headDim [[buffer(9)]],
+    constant uint32_t& kvWidth [[buffer(10)]],
+    constant uint32_t& keyRows [[buffer(11)]],
+    constant uint32_t& windowStart [[buffer(12)]],
+    constant uint32_t& position [[buffer(13)]],
+    constant uint32_t& dRel [[buffer(14)]],
+    constant uint32_t& extent [[buffer(15)]],
+    threadgroup float* shared [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgSize [[threads_per_threadgroup]],
+    uint head [[threadgroup_position_in_grid]]
+) {
+    if (head >= heads) { return; }
+    uint kvHead = head / groups;
+    device const float* q = query + ((uint64_t)head * headDim);
+    device const float* rel = relative + ((uint64_t)head * dRel);
+    device float* out = outVector + ((uint64_t)head * headDim);
+    float scaling = rsqrt((float)headDim);
+
+    // Every row's score, then the softmax with the sink appended. The scores
+    // are staged in threadgroup memory so the weighted sum does not recompute
+    // them (a recompute inside the element loop would interleave reductions).
+    // The caller allocates 32 warp sums followed by `keyRows` score slots.
+    threadgroup float* scores = shared + 32;
+    float localMax = -INFINITY;
+    for (uint row = 0; row < keyRows; row++) {
+        device const float* key = keys + ((uint64_t)row * kvWidth) + ((uint64_t)kvHead * headDim);
+        float localDot = 0.0f;
+        for (uint d = tid; d < headDim; d += tgSize) { localDot += q[d] * key[d]; }
+        float dot = threadgroup_reduce_sum(localDot, shared, tid, tgSize);
+        int distance = (int)position - (int)(windowStart + row);
+        float bias = 0.0f;
+        if (distance >= 0 && distance < (int)extent) {
+            for (uint r = 0; r < dRel; r++) { bias += rel[r] * bank[r * extent + (uint)distance]; }
+        }
+        float score = dot * scaling + bias;
+        if (tid == 0) { scores[row] = score; }
+        localMax = max(localMax, score);
+    }
+    float maximum = max(localMax, sinkLogits[head]);
+    // Not reduced: each score was reduced, so every lane holds the same max.
+    float denominator = exp(sinkLogits[head] - maximum);
+    for (uint row = 0; row < keyRows; row++) { denominator += exp(scores[row] - maximum); }
+
+    for (uint d = tid; d < headDim; d += tgSize) {
+        float accumulator = 0.0f;
+        for (uint row = 0; row < keyRows; row++) {
+            float weight = exp(scores[row] - maximum) / denominator;
+            accumulator += weight * values[((uint64_t)row * kvWidth) + ((uint64_t)kvHead * headDim) + d];
+        }
+        out[d] = accumulator;
+    }
+}
