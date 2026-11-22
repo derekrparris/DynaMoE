@@ -63,6 +63,16 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         )
     }
 
+    /// A byte offset, which the bank kernels take as a `constant`: a tensor's
+    /// offset inside a shard is not buffer-aligned.
+    private func buffer(_ device: MTLDevice, _ values: [UInt64]) throws -> MTLBuffer {
+        try XCTUnwrap(
+            device.makeBuffer(bytes: values, length: values.count * MemoryLayout<UInt64>.stride,
+                              options: .storageModeShared),
+            "could not make a buffer"
+        )
+    }
+
     /// Dispatches a grid of THREADS (`dispatchThreads`) or of THREADGROUPS
     /// (`dispatchThreadgroups`). A kernel that indexes by
     /// `threadgroup_position_in_grid` needs the latter: with `dispatchThreads`
@@ -114,7 +124,23 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         let input = values(rows * width)
         let gain = values(width, seed: 5)
         let inputBuffer = try buffer(device, input)
-        let gainBuffer = try buffer(device, gain)
+        // The gain is BF16 in the checkpoint, and the kernel reads it as stored
+        // bytes at a constant offset (a tensor offset is not buffer-aligned), so
+        // the fixture stages the BF16 encoding behind a leading pad and the host
+        // rule multiplies by the same rounded values.
+        let gainPad = 2
+        var gainBytes = [UInt16](repeating: 0, count: gainPad)
+        for value in gain {
+            let bits = value.bitPattern
+            // Round to nearest even, the same rounding the checkpoint's store did.
+            let rounding = UInt32(0x7FFF) + ((bits >> 16) & 1)
+            gainBytes.append(UInt16(truncatingIfNeeded: (bits + rounding) >> 16))
+        }
+        let gainBuffer = try XCTUnwrap(device.makeBuffer(
+            bytes: gainBytes, length: gainBytes.count * MemoryLayout<UInt16>.stride, options: .storageModeShared
+        ))
+        let gainOffsetBuffer = try buffer(device, [UInt64(gainPad) * UInt64(MemoryLayout<UInt16>.stride)])
+        let roundedGain = gainBytes.dropFirst(gainPad).map { Float(bitPattern: UInt32($0) << 16) }
         let outputBuffer = try buffer(device, [Float](repeating: 0, count: rows * width))
         let dimBuffer = try buffer(device, [UInt32(width)])
         let epsBuffer = try buffer(device, [Float(1e-6)])
@@ -125,11 +151,12 @@ final class Inkling2DeviceKernelTests: XCTestCase {
             encoder.setBuffer(outputBuffer, offset: 0, index: 2)
             encoder.setBuffer(dimBuffer, offset: 0, index: 3)
             encoder.setBuffer(epsBuffer, offset: 0, index: 4)
+            encoder.setBuffer(gainOffsetBuffer, offset: 0, index: 5)
         }
         let actual = read(outputBuffer, rows * width)
         for row in 0..<rows {
             let expected = Inkling2Math.rmsNorm(
-                Array(input[(row * width)..<((row + 1) * width)]), gain: gain, eps: 1e-6
+                Array(input[(row * width)..<((row + 1) * width)]), gain: roundedGain, eps: 1e-6
             )
             for index in 0..<width {
                 XCTAssertEqual(actual[row * width + index], expected[index], accuracy: 1e-5,
@@ -374,20 +401,26 @@ final class Inkling2DeviceKernelTests: XCTestCase {
             let amax: Float = 3.5, denominator: Float = 4.0
 
             // Bytes whose exponents stay finite, so a decoded value is a number.
-            var weight = [UInt8](repeating: 0, count: rows * weightRowStride)
-            for index in 0..<weight.count {
-                weight[index] = UInt8(0x21 + (index &* 13) % 0x5C)
+            // The bank carries a leading pad the kernel must skip: an expert's
+            // rows start partway into a fused tensor, and a kernel that ignored
+            // the offset would read the pad as weights and still be plausible.
+            let weightPad = 5, scalePad = 3
+            var weight = [UInt8](repeating: 0x7F, count: weightPad + rows * weightRowStride)
+            for index in 0..<(rows * weightRowStride) {
+                weight[weightPad + index] = UInt8(0x21 + (index &* 13) % 0x5C)
             }
-            var scales = [UInt8](repeating: 0, count: rows * scaleRowStride)
-            for index in 0..<scales.count {
+            var scales = [UInt8](repeating: 0x7F, count: scalePad + rows * scaleRowStride)
+            for index in 0..<(rows * scaleRowStride) {
                 // E4M3 near 2^0 for NVFP4; E8M0 (a biased exponent) for MXFP8.
-                scales[index] = layout == .nvfp4 ? UInt8(118 + index % 9) : UInt8(124 + index % 5)
+                scales[scalePad + index] = layout == .nvfp4 ? UInt8(118 + index % 9) : UInt8(124 + index % 5)
             }
             let input = values(logicalColumns, seed: 31)
 
+            // The host rule reads the SAME slice the kernel does: the pad is
+            // addressing, not data.
             let matrix = Inkling2PackedExpertMatrix(
-                layout: layout, weight: weight, weightRowStride: weightRowStride,
-                scales: scales, scaleRowStride: scaleRowStride,
+                layout: layout, weight: Array(weight[weightPad...]), weightRowStride: weightRowStride,
+                scales: Array(scales[scalePad...]), scaleRowStride: scaleRowStride,
                 rows: rows, logicalColumns: logicalColumns,
                 expertAmax: amax, outerScaleDenominator: denominator
             )
@@ -409,6 +442,8 @@ final class Inkling2DeviceKernelTests: XCTestCase {
                 bytes: [layout == .nvfp4], length: 1, options: .storageModeShared))
             let outerScale = layout.requiresAmaxDenominator ? amax / denominator : 1
             let outerBuffer = try buffer(device, [outerScale])
+            let weightOffsetBuffer = try buffer(device, [UInt64(weightPad)])
+            let scaleOffsetBuffer = try buffer(device, [UInt64(scalePad)])
 
             try run("inkling_expert_row_f32", threads: (rows, 1, 1), threadgroup: (64, 1, 1),
                     threadgroupMemory: 32 * MemoryLayout<Float>.stride, byThreadgroup: true) { encoder in
@@ -419,6 +454,8 @@ final class Inkling2DeviceKernelTests: XCTestCase {
                 for (index, b) in scalarBuffers.enumerated() { encoder.setBuffer(b, offset: 0, index: 4 + index) }
                 encoder.setBuffer(layoutBuffer, offset: 0, index: 8)
                 encoder.setBuffer(outerBuffer, offset: 0, index: 9)
+                encoder.setBuffer(weightOffsetBuffer, offset: 0, index: 10)
+                encoder.setBuffer(scaleOffsetBuffer, offset: 0, index: 11)
             }
             let actual = read(outputBuffer, rows)
             for row in 0..<rows {
@@ -454,12 +491,21 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         let scores = base + second
 
         let scoresBuffer = try buffer(device, scores)
-        let biasBuffer = try buffer(device, bias)
+        // The bias carries a leading pad: the checkpoint's bias lives partway
+        // into its shard, and a kernel reading from zero would only pass if it
+        // were first. The pad is wide-ranging so a kernel that ignored the
+        // offset would move the selection.
+        let biasPad = 3
+        let biasBuffer = try buffer(device, [Float](repeating: 9.5, count: biasPad) + bias)
         let indicesBuffer = try buffer(device, [UInt32](repeating: 99, count: positions * topK))
         let weightsBuffer = try buffer(device, [Float](repeating: 0, count: positions * topK))
         let scalars = [UInt32(numExperts), UInt32(topK)]
         let scalarBuffers = try scalars.map { try buffer(device, [$0]) }
         let scaleBuffer = try buffer(device, [routeScale])
+        // A non-zero bias offset: the checkpoint's bias lives partway into its
+        // shard, and a kernel that read from zero would be exact only if it
+        // happened to be first.
+        let biasOffsetBuffer = try buffer(device, [UInt64(biasPad) * UInt64(MemoryLayout<Float>.stride)])
         try run("inkling_router_topk_f32", threads: (positions, 1, 1), threadgroup: (64, 1, 1),
                 threadgroupMemory: (32 + numExperts) * MemoryLayout<Float>.stride,
                 byThreadgroup: true) { encoder in
@@ -469,6 +515,7 @@ final class Inkling2DeviceKernelTests: XCTestCase {
             encoder.setBuffer(weightsBuffer, offset: 0, index: 3)
             for (index, b) in scalarBuffers.enumerated() { encoder.setBuffer(b, offset: 0, index: 4 + index) }
             encoder.setBuffer(scaleBuffer, offset: 0, index: 6)
+            encoder.setBuffer(biasOffsetBuffer, offset: 0, index: 7)
         }
         let actualIndices = Array(UnsafeBufferPointer(
             start: indicesBuffer.contents().bindMemory(to: UInt32.self, capacity: positions * topK),
@@ -1020,5 +1067,209 @@ final class Inkling2DeviceKernelTests: XCTestCase {
                 )
             }
         }
+    }
+
+    // MARK: Mixture pieces
+
+    /// The router's in-place sigmoid against `Inkling2Math.sigmoid`, at a width
+    /// that is not a multiple of the threadgroup so the tail runs.
+    func testTheSigmoidInPlaceMatchesTheHostRule() throws {
+        let (device, _, _) = try environment()
+        let count = 69
+        let input = values(count, seed: 17).map { $0 * 6 }
+        let inputBuffer = try buffer(device, input)
+        let countBuffer = try buffer(device, [UInt32(count)])
+        try run("inkling_sigmoid_inplace_f32", threads: (count, 1, 1), threadgroup: (32, 1, 1)) { encoder in
+            encoder.setBuffer(inputBuffer, offset: 0, index: 0)
+            encoder.setBuffer(countBuffer, offset: 0, index: 1)
+        }
+        let actual = read(inputBuffer, count)
+        for index in 0..<count {
+            XCTAssertEqual(actual[index], Inkling2Math.sigmoid(input[index]), accuracy: 1e-6, "element \(index)")
+        }
+    }
+
+    /// The weighted accumulate against its definition, at a width with a tail.
+    func testTheWeightedAccumulateMatchesTheHostRule() throws {
+        let (device, _, _) = try environment()
+        let count = 37
+        let accumulator = values(count, seed: 18)
+        let source = values(count, seed: 19)
+        let weight: Float = -2.25
+        let accumulatorBuffer = try buffer(device, accumulator)
+        let sourceBuffer = try buffer(device, source)
+        let weightBuffer = try buffer(device, [weight])
+        let countBuffer = try buffer(device, [UInt32(count)])
+        try run("inkling_weighted_accumulate_f32", threads: (count, 1, 1), threadgroup: (32, 1, 1)) { encoder in
+            encoder.setBuffer(accumulatorBuffer, offset: 0, index: 0)
+            encoder.setBuffer(sourceBuffer, offset: 0, index: 1)
+            encoder.setBuffer(weightBuffer, offset: 0, index: 2)
+            encoder.setBuffer(countBuffer, offset: 0, index: 3)
+        }
+        let actual = read(accumulatorBuffer, count)
+        for index in 0..<count {
+            XCTAssertEqual(
+                actual[index], accumulator[index] + weight * source[index], accuracy: 1e-6, "element \(index)"
+            )
+        }
+    }
+
+    /// The interleaved SwiGLU against `Inkling2Math.softcappedSwiGLU`, on a
+    /// buffer laid out gate/up PAIRS -- the checkpoint's fused bank order, which
+    /// the half-buffer kernel reads as two halves.
+    func testTheInterleavedSwiGLUMatchesTheHostRule() throws {
+        let (device, _, _) = try environment()
+        let intermediate = 33
+        var gateUp = [Float](repeating: 0, count: intermediate * 2)
+        let gateValues = values(intermediate, seed: 20).map { $0 * 12 }
+        let upValues = values(intermediate, seed: 21).map { $0 * 30 }
+        for index in 0..<intermediate {
+            gateUp[2 * index] = gateValues[index]
+            gateUp[2 * index + 1] = upValues[index]
+        }
+        let gateUpBuffer = try buffer(device, gateUp)
+        let outputBuffer = try buffer(device, [Float](repeating: 0, count: intermediate))
+        let intermediateBuffer = try buffer(device, [UInt32(intermediate)])
+        let gateCapBuffer = try buffer(device, [Float(4)])
+        let upCapBuffer = try buffer(device, [Float(25)])
+        try run("inkling_softcapped_swiglu_interleaved_f32", threads: (intermediate, 1, 1), threadgroup: (64, 1, 1)) { encoder in
+            encoder.setBuffer(gateUpBuffer, offset: 0, index: 0)
+            encoder.setBuffer(outputBuffer, offset: 0, index: 1)
+            encoder.setBuffer(intermediateBuffer, offset: 0, index: 2)
+            encoder.setBuffer(gateCapBuffer, offset: 0, index: 3)
+            encoder.setBuffer(upCapBuffer, offset: 0, index: 4)
+        }
+        let actual = read(outputBuffer, intermediate)
+        for index in 0..<intermediate {
+            let expected = Inkling2Math.softcappedSwiGLU(
+                gate: gateValues[index], up: upValues[index], gateSoftcap: 4, upSoftcap: 25
+            )
+            XCTAssertEqual(actual[index], expected, accuracy: 1e-4, "element \(index)")
+        }
+        // The layout is what separates this from the half-buffer kernel: a pair
+        // read as two halves would mix gate 0 with up of a different index.
+        XCTAssertNotEqual(
+            actual[0],
+            Inkling2Math.softcappedSwiGLU(
+                gate: gateUp[0], up: gateUp[intermediate], gateSoftcap: 4, upSoftcap: 25
+            ),
+            accuracy: 1e-6,
+            "the fixture must distinguish pair order from half order"
+        )
+    }
+
+    // MARK: The MLP half
+
+    /// The MLP half against the host graph's own stages, on the real
+    /// checkpoint: the block read and the message gate stay on the host, so the
+    /// comparison covers the norm, the router and its selection, and the expert
+    /// mixture through to the post-MLP convolution and the residual add.
+    func testTheDeviceMLPHalfMatchesTheHost() throws {
+        let snapshot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(Inkling2PublishedTensorTests.snapshotRelativePath)
+        guard FileManager.default.fileExists(atPath: snapshot.path) else {
+            throw XCTSkip("Inkling 2 snapshot is not downloaded at \(snapshot.path)")
+        }
+        let (device, library, queue) = try environment()
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let summary = try engine.getSummary()
+        let config = try Inkling2Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let catalog = Inkling2WeightCatalog(
+            mainFile: summary.tensors.map { Inkling2TensorRef(metadata: $0) },
+            layerCount: config.numHiddenLayers
+        )
+        var shardBuffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            guard shard.length > 0,
+                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)) else { continue }
+            if let buffer = device.makeBuffer(
+                bytesNoCopy: pointer, length: Int(shard.length), options: .storageModeShared, deallocator: nil
+            ) { shardBuffers[shard.index] = buffer }
+        }
+        let source = Inkling2SnapshotWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
+        let oracle = try Inkling2CPUForward(config: config, weights: source)
+        let reference = try Inkling2CPUForward(config: config, weights: source)
+        let deviceWeights = Inkling2DeviceWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
+        let metal = try Inkling2MetalForward(
+            device: device, library: library, queue: queue, weights: deviceWeights, host: reference
+        )
+        let workspace = try Inkling2DeviceWorkspace(device: device, config: config)
+
+        let tokenizer = try DynaMoeTokenizer(
+            tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+        )
+        let ids = try tokenizer.encode(text: "Hi there")
+        for (position, id) in ids.enumerated() {
+            _ = try oracle.forwardToken(token: UInt32(id), position: position)
+            _ = try reference.forwardToken(token: UInt32(id), position: position)
+        }
+        let position = ids.count
+        let layer = 0
+        let hiddenWidth = config.hiddenSize
+        let residual = values(hiddenWidth, seed: 61)
+        // A stack with two entries, so the block read is not a single-row read.
+        let blockStates = [values(hiddenWidth, seed: 62), values(hiddenWidth, seed: 63)]
+
+        // The host's own visit, captured stage by stage: the oracle runs FIRST
+        // and its `mlp_input` is what the device half is fed, because the read
+        // is the host's (it mutates the stack and the message state).
+        var oracleStages: [String: [Float]] = [:]
+        oracle.onInternal = { _, name, value in oracleStages[name] = value }
+        var stack = blockStates
+        let visitOutput = try oracle.runVisit(
+            layer: layer, pass: 0, hidden: residual, blockStates: &stack, messages: nil, position: position
+        ).output
+        let mlpInput = try XCTUnwrap(oracleStages["mlp_input"], "the host captured no MLP input")
+        // Not the visit's INPUT: at a block boundary the host adds back only the
+        // post-attention value, and the read's stack carries the input. The two
+        // are different vectors, and the half takes the add's one.
+        let residualToAdd = try XCTUnwrap(oracleStages["residual"], "the host captured no residual")
+
+        // The device half drives the reference's visit state (it advances the
+        // convolution history itself), which the oracle never touched.
+        let actual = try metal.mlpHalf(
+            layer: layer, state: reference.states[0], mlpInput: mlpInput,
+            residual: residualToAdd, workspace: workspace
+        )
+
+        // The host's own tail, appended to its captured mixture, is the value
+        // the half returns: `runVisit`'s output is residual + convolved
+        // mixture, and so is the half's.
+        let scale = visitOutput.reduce(Float(0)) { max($0, abs($1)) }
+        let worst = zip(actual, visitOutput).reduce(Float(0)) { max($0, abs($1.0 - $1.1)) }
+        print("🔎 [inkling2 device] mlp half: \(worst / scale) relative against the visit output")
+        XCTAssertLessThanOrEqual(worst / scale, 3e-3, "the device MLP half against the host graph")
+
+        // The named stages the half gets wrong first, in order.
+        func stageError(_ name: String, _ mine: [Float], _ reference: [Float]) -> String {
+            guard !reference.isEmpty else { return "\(name): no reference" }
+            let stageScale = reference.reduce(Float(0)) { max($0, abs($1)) }
+            let delta = zip(mine, reference).reduce(Float(0)) { max($0, abs($1.0 - $1.1)) }
+            return String(format: "%@:%.2e", name, stageScale > 0 ? delta / stageScale : delta)
+        }
+        let topK = config.numExpertsPerToken
+        // The norm's output is the router's only input, so it is compared
+        // FIRST when the selection diverges: a wrong norm moves every score.
+        let kernelMixtureInput = Inkling2Math.rmsNorm(
+            oracleStages["mlp_input"] ?? [], gain: try source.matrix(.mlpNorm, layer: layer),
+            eps: config.rmsNormEps
+        )
+        let stageRows: [String] = [
+            stageError("norm", metal.readBack(workspace.attentionInput, count: hiddenWidth), kernelMixtureInput),
+            stageError("route_scores", metal.readBack(workspace.routerScores, count: config.numRoutedExperts),
+                       oracleStages["route_scores"] ?? []),
+            stageError("route_indices", metal.readBackIndices(workspace.routeIndices, count: topK).map(Float.init),
+                       oracleStages["route_indices"] ?? []),
+            stageError("route_weights", metal.readBack(workspace.routeWeights, count: topK),
+                       oracleStages["route_weights"] ?? []),
+            stageError("mixture", metal.readBack(workspace.residualAccumulator, count: hiddenWidth),
+                       oracleStages["mixtureOut"] ?? []),
+            stageError("postMlpConv", metal.readBack(workspace.hidden, count: hiddenWidth),
+                       oracleStages["postMlpConv"] ?? [])
+        ]
+        print("🔎 [inkling2 device] mlp stages: " + stageRows.joined(separator: " "))
+        withExtendedLifetime(engine) {}
     }
 }

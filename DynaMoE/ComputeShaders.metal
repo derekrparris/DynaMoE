@@ -13673,10 +13673,13 @@ kernel void gqa_attention_prefill_standard_fp8(
 // row, the gain read as plain floats.
 kernel void inkling_rmsnorm_f32(
     device const float* inVector [[buffer(0)]],
-    device const float* gain [[buffer(1)]],
+    device const uchar* gain [[buffer(1)]],
     device float* outVector [[buffer(2)]],
     constant uint32_t& dim [[buffer(3)]],
     constant float& eps [[buffer(4)]],
+    // The gain's byte offset inside its shard, as a constant: a tensor offset
+    // is not 256-byte aligned, so it cannot be the bind offset.
+    constant uint64_t& gainOffset [[buffer(5)]],
     threadgroup float* sharedWarpSums [[threadgroup(0)]],
     uint tid [[thread_position_in_threadgroup]],
     uint tgSize [[threads_per_threadgroup]],
@@ -13684,6 +13687,7 @@ kernel void inkling_rmsnorm_f32(
 ) {
     device const float* inRow = inVector + ((uint64_t)tgIdx * dim);
     device float* outRow = outVector + ((uint64_t)tgIdx * dim);
+    device const uchar* gainRow = gain + gainOffset;
     float localSum = 0.0f;
     for (uint i = tid; i < dim; i += tgSize) {
         float v = inRow[i];
@@ -13692,7 +13696,7 @@ kernel void inkling_rmsnorm_f32(
     float totalSum = threadgroup_reduce_sum(localSum, sharedWarpSums, tid, tgSize);
     float invRms = rsqrt(totalSum / (float)dim + eps);
     for (uint i = tid; i < dim; i += tgSize) {
-        outRow[i] = inRow[i] * invRms * gain[i];
+        outRow[i] = inRow[i] * invRms * read_bf16_unaligned(gainRow + (uint64_t)i * 2);
     }
 }
 
@@ -14025,13 +14029,18 @@ kernel void inkling_expert_row_f32(
     constant uint32_t& blockSize [[buffer(7)]],
     constant bool& layoutIsNVFP4 [[buffer(8)]],
     constant float& outerScale [[buffer(9)]],
+    // A fused expert bank is one tensor per layer, so an expert's rows start
+    // partway into it -- and a tensor's byte offset inside a shard is not
+    // buffer-aligned, so it travels as a constant rather than a bind offset.
+    constant uint64_t& weightOffset [[buffer(10)]],
+    constant uint64_t& scaleOffset [[buffer(11)]],
     threadgroup float* shared [[threadgroup(0)]],
     uint tid [[thread_position_in_threadgroup]],
     uint tgSize [[threads_per_threadgroup]],
     uint row [[threadgroup_position_in_grid]]
 ) {
-    uint weightBase = row * weightRowStride;
-    uint scaleBase = row * scaleRowStride;
+    uint64_t weightBase = weightOffset + (uint64_t)row * weightRowStride;
+    uint64_t scaleBase = scaleOffset + (uint64_t)row * scaleRowStride;
     float localSum = 0.0f;
     for (uint column = tid; column < logicalColumns; column += tgSize) {
         uint block = column / blockSize;
@@ -14066,20 +14075,27 @@ kernel void inkling_router_topk_f32(
     constant uint32_t& numExperts [[buffer(4)]],
     constant uint32_t& topK [[buffer(5)]],
     constant float& routeScale [[buffer(6)]],
+    // The bias's byte offset inside its shard, as a constant: a tensor offset
+    // is not 256-byte aligned, so it cannot be the bind offset. F32 data, so
+    // the offset is a multiple of four and the pointer cast is aligned.
+    constant uint64_t& biasOffset [[buffer(7)]],
     threadgroup float* shared [[threadgroup(0)]],
     uint tid [[thread_position_in_threadgroup]],
     uint tgSize [[threads_per_threadgroup]],
     uint position [[threadgroup_position_in_grid]]
 ) {
     device const float* rowScores = scores + ((uint64_t)position * numExperts);
-    device const float* rowBias = bias;
+    device const float* rowBias = bias + (biasOffset / 4);
     device uint32_t* indices = outIndices + ((uint64_t)position * topK);
     device float* weights = outWeights + ((uint64_t)position * topK);
 
-    // Steered rank per expert, staged for the single-thread selection.
+    // Steered rank per expert, staged for the single-thread selection. A
+    // STRIDE, not `tid < numExperts`: the threadgroup is 64 wide and the
+    // checkpoint has 128 experts, so a guard would leave half the ranks
+    // uninitialized -- and the selection then reads whatever was there.
     threadgroup float* rank = shared + 32;
-    if (tid < numExperts) {
-        rank[tid] = rowScores[tid] + (tid < numExperts ? rowBias[tid] : 0.0f);
+    for (uint e = tid; e < numExperts; e += tgSize) {
+        rank[e] = rowScores[e] + rowBias[e];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -14179,4 +14195,51 @@ kernel void inkling_l2_clip_f32(
     float norm = sqrt(threadgroup_reduce_sum(localSum, shared, tid, tgSize));
     float factor = min(threshold / (norm + 1e-6f), 1.0f);
     for (uint d = tid; d < headDim; d += tgSize) { row[d] *= factor; }
+}
+
+// The router's activation, in place: the selection reads steered ranks but the
+// weights are the SELECTED RAW scores' shares, so the scores must stay the
+// sigmoid outputs the host holds, not the steered values.
+kernel void inkling_sigmoid_inplace_f32(
+    device float* scores [[buffer(0)]],
+    constant uint32_t& count [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= count) { return; }
+    scores[gid] = 1.0f / (1.0f + exp(-scores[gid]));
+}
+
+// `accumulator += weight * source`, elementwise. The mixture's per-expert
+// contribution is scaled by its routing weight as it is folded in, so the
+// weighted copy never has to exist on its own.
+kernel void inkling_weighted_accumulate_f32(
+    device float* accumulator [[buffer(0)]],
+    device const float* source [[buffer(1)]],
+    constant float& weight [[buffer(2)]],
+    constant uint32_t& count [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= count) { return; }
+    accumulator[gid] += weight * source[gid];
+}
+
+// The fused `w13` bank interleaves gate and up along its output dimension (even
+// rows gate, odd rows up), so a SwiGLU over it reads PAIRS rather than two
+// halves. Same arithmetic as `inkling_softcapped_swiglu_f32`, different layout:
+// keeping them one kernel with a stride flag would put a branch in the inner
+// loop of the hottest small kernel.
+kernel void inkling_softcapped_swiglu_interleaved_f32(
+    device const float* gateUp [[buffer(0)]],
+    device float* outVector [[buffer(1)]],
+    constant uint32_t& intermediate [[buffer(2)]],
+    constant float& gateSoftcap [[buffer(3)]],
+    constant float& upSoftcap [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= intermediate) { return; }
+    float gate = gateUp[2 * gid];
+    float up = gateUp[2 * gid + 1];
+    float gated = tanh(gate / gateSoftcap) * gateSoftcap;
+    float activated = gated * (1.0f / (1.0f + exp(-gate)));
+    outVector[gid] = activated * (tanh(up / upSoftcap) * upSoftcap);
 }

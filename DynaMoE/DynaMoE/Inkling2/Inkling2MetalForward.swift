@@ -87,6 +87,77 @@ nonisolated public struct Inkling2DeviceWeights {
         }
         return ref.dtype
     }
+
+    /// One expert's slice of a FUSED bank, as the kernel addresses it: the
+    /// bank's buffer and base offset, plus this expert's own byte offset, row
+    /// strides and outer scale.
+    ///
+    /// The catalog holds a bank whole (`[experts][rows][columns]`), so expert
+    /// `e` starts at `e * rows * columns * width`; a tensor offset inside a
+    /// shard is not 256-byte aligned, so every one of these travels as a
+    /// `constant` and the kernel adds it. The layout is inferred from the
+    /// published dtypes exactly as the host source infers it -- a bank read as
+    /// the wrong layout dequantizes to plausible numbers, not to a crash.
+    public func expertBank(
+        _ role: Inkling2TensorRole, layer: Int, expert: Int
+    ) throws -> (buffer: MTLBuffer, baseOffset: UInt64, expertOffset: UInt64,
+                 rowStride: Int, scaleBuffer: MTLBuffer, scaleBaseOffset: UInt64,
+                 scaleExpertOffset: UInt64, scaleRowStride: Int,
+                 layout: Inkling2ExpertQuantLayout, amax: Float, denominator: Float) {
+        let scaleRole: Inkling2TensorRole = role == .expertW13 ? .expertW13Scale : .expertW2Scale
+        let ref = catalog.tensor(role, layer: layer)
+        let scaleRef = catalog.tensor(scaleRole, layer: layer)
+        guard let bank = ref, let scale = scaleRef, bank.shape.count == 3, scale.shape.count == 3,
+              expert >= 0, expert < bank.shape[0] else {
+            throw Inkling2ForwardError.missingWeight("\(role.rawValue) layer \(layer) expert \(expert)")
+        }
+        guard let shard = bank.shardIndex, let buffer = shardBuffers[shard],
+              let baseOffset = bank.byteOffset else {
+            throw Inkling2ForwardError.missingWeight("\(bank.name): its shard is not mapped")
+        }
+        guard let scaleShard = scale.shardIndex, let scaleBuffer = shardBuffers[scaleShard],
+              let scaleBaseOffset = scale.byteOffset else {
+            throw Inkling2ForwardError.missingWeight("\(scale.name): its shard is not mapped")
+        }
+        let rows = bank.shape[1]
+        let columns = bank.shape[2]
+        let width = Inkling2SnapshotWeights.elementWidth(bank.dtype)
+        let scaleRows = scale.shape[1]
+        let scaleColumns = scale.shape[2]
+        let scaleWidth = Inkling2SnapshotWeights.elementWidth(scale.dtype)
+
+        let w13 = try catalog.tensor(.expertW13, layer: layer)
+        let w13Scale = try catalog.tensor(.expertW13Scale, layer: layer)
+        let w2 = try catalog.tensor(.expertW2, layer: layer)
+        let w2Scale = try catalog.tensor(.expertW2Scale, layer: layer)
+        guard let w13, let w13Scale, let w2, let w2Scale else {
+            throw Inkling2ForwardError.missingWeight("a bank or its scale is missing on layer \(layer)")
+        }
+        let layout: Inkling2ExpertQuantLayout
+        switch Inkling2ExpertQuantLayout.infer(
+            w13: w13, w13Scale: w13Scale, w2: w2, w2Scale: w2Scale, config: config
+        ) {
+        case .success(let inferred): layout = inferred
+        case .failure(let error): throw Inkling2ForwardError.unsupported(error.description)
+        }
+
+        var amax: Float = 1
+        var denominator: Float = 1
+        if layout == .nvfp4 {
+            let amaxRole: Inkling2TensorRole = role == .expertW13 ? .expertW13Amax : .expertW2Amax
+            let denominatorRole: Inkling2TensorRole =
+                role == .expertW13 ? .expertW13OuterScaleDenominator : .expertW2OuterScaleDenominator
+            amax = try hostMatrix(amaxRole, layer: layer)[expert]
+            denominator = try hostMatrix(denominatorRole, layer: layer)[0]
+        }
+        return (
+            buffer, baseOffset, UInt64(expert) * UInt64(rows) * UInt64(columns) * UInt64(width),
+            columns,
+            scaleBuffer, scaleBaseOffset,
+            UInt64(expert) * UInt64(scaleRows) * UInt64(scaleColumns) * UInt64(scaleWidth),
+            scaleColumns, layout, amax, denominator
+        )
+    }
 }
 
 // MARK: - Workspace
@@ -111,6 +182,15 @@ nonisolated public final class Inkling2DeviceWorkspace {
     /// the projection must survive the convolution to be pushed.
     public let convolvedKey: MTLBuffer
     public let convolvedValue: MTLBuffer
+    /// The MLP half's staging: router scores, the top-k selection, one expert's
+    /// gate/up rows and its down projection, and the running mixture.
+    public let routerScores: MTLBuffer
+    public let routeIndices: MTLBuffer
+    public let routeWeights: MTLBuffer
+    public let expertGateUp: MTLBuffer
+    public let expertIntermediate: MTLBuffer
+    public let expertDown: MTLBuffer
+    public let residualAccumulator: MTLBuffer
     public let projectionOutput: MTLBuffer
     /// Scratch for the reduction kernels' warp sums.
     public let reductionScratch: MTLBuffer
@@ -151,6 +231,13 @@ nonisolated public final class Inkling2DeviceWorkspace {
         attentionOutput = try make(attentionWidth * MemoryLayout<Float>.stride, "attention output")
         convolvedKey = try make(config.numKeyValueHeads * config.headDim * MemoryLayout<Float>.stride, "convolved key")
         convolvedValue = try make(config.numKeyValueHeads * config.headDim * MemoryLayout<Float>.stride, "convolved value")
+        routerScores = try make(config.numRoutedExperts * MemoryLayout<Float>.stride, "router scores")
+        routeIndices = try make(config.numExpertsPerToken * MemoryLayout<UInt32>.stride, "route indices")
+        routeWeights = try make(config.numExpertsPerToken * MemoryLayout<Float>.stride, "route weights")
+        expertGateUp = try make(2 * config.moeIntermediateSize * MemoryLayout<Float>.stride, "expert gate/up")
+        expertIntermediate = try make(config.moeIntermediateSize * MemoryLayout<Float>.stride, "expert intermediate")
+        expertDown = try make(hiddenBytes, "expert down")
+        residualAccumulator = try make(hiddenBytes, "residual accumulator")
         projectionOutput = try make(hiddenBytes, "projection output")
         reductionScratch = try make(32 * MemoryLayout<Float>.stride, "reduction scratch")
         // The attention reads at most the window plus the compressed rows; the
@@ -268,6 +355,9 @@ nonisolated public final class Inkling2MetalForward {
         "inkling_rmsnorm_f32",
         "inkling_rmsnorm_no_gain_f32",
         "inkling_softcapped_swiglu_f32",
+        "inkling_softcapped_swiglu_interleaved_f32",
+        "inkling_sigmoid_inplace_f32",
+        "inkling_weighted_accumulate_f32",
         "inkling_short_conv_f32",
         "inkling_message_gate_f32",
         "inkling_l2_clip_scale_f32",
@@ -581,9 +671,18 @@ nonisolated public final class Inkling2MetalForward {
     ) throws {
         let kernelSize = config.convKernelSize
         let history = state.history(index)
-        // The K/V convolutions have their own weights; index 2/3 are the
-        // post-attention and post-MLP streams, which share the hidden-width one.
-        let taps = try hostMatrix(index == 0 ? .attnKSconvWeight : (index == 1 ? .attnVSconvWeight : .attnSconv), layer: layer)
+        // One weight per stream: K and V have their own, and the post-attention
+        // and post-MLP streams are DIFFERENT tensors too (`attn_sconv` and
+        // `mlp_sconv`) even though both are hidden-wide. Folding the last two
+        // onto one made the post-MLP convolution read the attention's taps.
+        let tapsRole: Inkling2TensorRole
+        switch index {
+        case 0: tapsRole = .attnKSconvWeight
+        case 1: tapsRole = .attnVSconvWeight
+        case 2: tapsRole = .attnSconv
+        default: tapsRole = .mlpSconv
+        }
+        let taps = try hostMatrix(tapsRole, layer: layer)
         // Staged through the ARENA, which owns every buffer a dispatch reads
         // until after the wait: a local buffer is freed when this function
         // returns, and the GPU may not have run the dispatch yet -- a
@@ -855,5 +954,278 @@ nonisolated public final class Inkling2MetalForward {
             MTLSize(width: heads, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
         )
+    }
+
+    // MARK: The MLP half
+
+    /// The MLP half of one visit: the MLP norm, the router and its selection,
+    /// the expert mixture, the post-MLP convolution and the residual add.
+    ///
+    /// `mlpInput` is the block-read result (and its message gate) the host
+    /// computed, and `residual` is the vector the host adds back -- two values,
+    /// not one: at a block boundary the read's stack carries the layer's input
+    /// while the add is the post-attention value alone. The read itself stays on
+    /// the host with the stack it reads; the kernel that would do it exists and
+    /// is tested, and moving it here would stage the whole stack to save a
+    /// softmax over a few dozen rows.
+    public func mlpHalf(
+        layer: Int,
+        state: Inkling2VisitState,
+        mlpInput: [Float],
+        residual: [Float],
+        workspace: Inkling2DeviceWorkspace
+    ) throws -> [Float] {
+        let hiddenWidth = config.hiddenSize
+        let intermediate = config.moeIntermediateSize
+        let experts = config.numRoutedExperts
+        let topK = config.numExpertsPerToken
+
+        // 1. The MLP norm, then the router and its selection, in one buffer.
+        let mlpInputBuffer = try staging(workspace.hidden, mlpInput)
+        let (commandBuffer, encoder) = try commandComponents()
+        let arena = Inkling2ScalarArena(device: device)
+        defer { arena.clear() }
+        var encoded = false
+        defer { if !encoded { encoder.endEncoding() } }
+        let normGain = try weights.tensor(.mlpNorm, layer: layer)
+        try rmsNorm(
+            encoder: encoder, input: mlpInputBuffer, inputOffset: 0,
+            gain: normGain.buffer, gainOffset: Int(normGain.offset),
+            output: workspace.attentionInput, outputOffset: 0, width: hiddenWidth, arena: arena
+        )
+        try gemm(
+            encoder: encoder, role: .routerWeight, layer: layer,
+            input: workspace.attentionInput, inputOffset: 0,
+            output: workspace.routerScores, outputOffset: 0,
+            rows: experts, columns: hiddenWidth, arena: arena
+        )
+        try sigmoidInPlace(encoder: encoder, vector: workspace.routerScores, count: experts, arena: arena)
+        let biasTensor = try weights.tensor(.routerBias, layer: layer)
+        try routerTopK(
+            encoder: encoder, scores: workspace.routerScores,
+            bias: biasTensor.buffer, biasOffset: Int(biasTensor.offset),
+            indices: workspace.routeIndices, weights: workspace.routeWeights,
+            numExperts: experts, topK: topK, routeScale: config.routeScale, arena: arena
+        )
+        encoder.endEncoding()
+        encoded = true
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let error = commandBuffer.error { throw error }
+
+        // The selection is a device value the host needs to address the bank.
+        let indices = readBackIndices(workspace.routeIndices, count: topK)
+        let routeWeights = readBack(workspace.routeWeights, count: topK)
+
+        // 2. The experts. Each one is gate/up over the normed input, the
+        //    softcapped SwiGLU, the down projection, and a weighted fold into
+        //    the accumulator. All of it is one command buffer per expert, and
+        //    the folds are serialized by the queue.
+        let accumulatorPointer = workspace.residualAccumulator.contents()
+            .bindMemory(to: Float.self, capacity: hiddenWidth)
+        for index in 0..<hiddenWidth { accumulatorPointer[index] = 0 }
+        for (slot, expert) in indices.enumerated() {
+            let weight = routeWeights[slot]
+            let (expertBuffer, expertEncoder) = try commandComponents()
+            let expertArena = Inkling2ScalarArena(device: device)
+            var expertEncoded = false
+            defer {
+                if !expertEncoded { expertEncoder.endEncoding() }
+                expertArena.clear()
+            }
+            let gateUp = try weights.expertBank(.expertW13, layer: layer, expert: expert)
+            try expertRow(
+                encoder: expertEncoder,
+                weight: gateUp.buffer, weightOffset: gateUp.baseOffset + gateUp.expertOffset,
+                scales: gateUp.scaleBuffer, scaleOffset: gateUp.scaleBaseOffset + gateUp.scaleExpertOffset,
+                input: workspace.attentionInput, output: workspace.expertGateUp,
+                rows: 2 * intermediate, logicalColumns: hiddenWidth,
+                layout: gateUp.layout,
+                outerScale: gateUp.layout.requiresAmaxDenominator && gateUp.denominator > 0
+                    ? gateUp.amax / gateUp.denominator : 1,
+                weightRowStride: gateUp.rowStride, scaleRowStride: gateUp.scaleRowStride,
+                arena: expertArena
+            )
+            try softcappedSwiGLUInterleaved(
+                encoder: expertEncoder, gateUp: workspace.expertGateUp,
+                output: workspace.expertIntermediate, intermediate: intermediate, arena: expertArena
+            )
+            let down = try weights.expertBank(.expertW2, layer: layer, expert: expert)
+            try expertRow(
+                encoder: expertEncoder,
+                weight: down.buffer, weightOffset: down.baseOffset + down.expertOffset,
+                scales: down.scaleBuffer, scaleOffset: down.scaleBaseOffset + down.scaleExpertOffset,
+                input: workspace.expertIntermediate, output: workspace.expertDown,
+                rows: hiddenWidth, logicalColumns: intermediate,
+                layout: down.layout,
+                outerScale: down.layout.requiresAmaxDenominator && down.denominator > 0
+                    ? down.amax / down.denominator : 1,
+                weightRowStride: down.rowStride, scaleRowStride: down.scaleRowStride,
+                arena: expertArena
+            )
+            try weightedAccumulate(
+                encoder: expertEncoder, accumulator: workspace.residualAccumulator,
+                source: workspace.expertDown, weight: weight, count: hiddenWidth,
+                arena: expertArena
+            )
+            expertEncoder.endEncoding()
+            expertEncoded = true
+            expertBuffer.commit()
+            expertBuffer.waitUntilCompleted()
+            if let error = expertBuffer.error { throw error }
+        }
+
+        // 3. The post-MLP convolution, then the residual add. The convolution's
+        //    history takes the mixture (pre-convolution), so it is pushed only
+        //    after the buffer completes.
+        let (tailBuffer, tailEncoder) = try commandComponents()
+        let tailArena = Inkling2ScalarArena(device: device)
+        defer { tailArena.clear() }
+        var tailEncoded = false
+        defer { if !tailEncoded { tailEncoder.endEncoding() } }
+        try convolve(
+            encoder: tailEncoder, state: state, index: 3,
+            values: workspace.residualAccumulator, valuesCount: hiddenWidth,
+            layer: layer, isFull: false, headDim: config.headDim,
+            output: workspace.hidden, arena: tailArena
+        )
+        tailEncoder.endEncoding()
+        tailEncoded = true
+        tailBuffer.commit()
+        tailBuffer.waitUntilCompleted()
+        if let error = tailBuffer.error { throw error }
+        state.pushConvolution(3, value: readBack(workspace.residualAccumulator, count: hiddenWidth))
+
+        let convolved = readBack(workspace.hidden, count: hiddenWidth)
+        return zip(residual, convolved).map(+)
+    }
+
+    /// `out = rmsnorm(input, gain)`, one threadgroup over the row.
+    func rmsNorm(
+        encoder: MTLComputeCommandEncoder,
+        input: MTLBuffer, inputOffset: Int,
+        gain: MTLBuffer, gainOffset: Int,
+        output: MTLBuffer, outputOffset: Int,
+        width: Int,
+        arena: Inkling2ScalarArena
+    ) throws {
+        encoder.setComputePipelineState(try pipeline("inkling_rmsnorm_f32"))
+        encoder.setBuffer(input, offset: inputOffset, index: 0)
+        // A tensor's offset inside its shard is not buffer-aligned, so the gain
+        // binds at zero and its offset travels as a constant.
+        encoder.setBuffer(gain, offset: 0, index: 1)
+        encoder.setBuffer(output, offset: outputOffset, index: 2)
+        encoder.setBuffer(arena.make(UInt32(width)), offset: 0, index: 3)
+        encoder.setBuffer(arena.make(config.rmsNormEps), offset: 0, index: 4)
+        encoder.setBuffer(arena.make(UInt64(gainOffset)), offset: 0, index: 5)
+        encoder.setThreadgroupMemoryLength(32 * MemoryLayout<Float>.stride, index: 0)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: 1, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
+        )
+    }
+
+    func sigmoidInPlace(
+        encoder: MTLComputeCommandEncoder, vector: MTLBuffer, count: Int, arena: Inkling2ScalarArena
+    ) throws {
+        encoder.setComputePipelineState(try pipeline("inkling_sigmoid_inplace_f32"))
+        encoder.setBuffer(vector, offset: 0, index: 0)
+        encoder.setBuffer(arena.make(UInt32(count)), offset: 0, index: 1)
+        encoder.dispatchThreads(
+            MTLSize(width: count, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
+        )
+    }
+
+    func weightedAccumulate(
+        encoder: MTLComputeCommandEncoder, accumulator: MTLBuffer, source: MTLBuffer,
+        weight: Float, count: Int, arena: Inkling2ScalarArena
+    ) throws {
+        encoder.setComputePipelineState(try pipeline("inkling_weighted_accumulate_f32"))
+        encoder.setBuffer(accumulator, offset: 0, index: 0)
+        encoder.setBuffer(source, offset: 0, index: 1)
+        encoder.setBuffer(arena.make(weight), offset: 0, index: 2)
+        encoder.setBuffer(arena.make(UInt32(count)), offset: 0, index: 3)
+        encoder.dispatchThreads(
+            MTLSize(width: count, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
+        )
+    }
+
+    func softcappedSwiGLUInterleaved(
+        encoder: MTLComputeCommandEncoder, gateUp: MTLBuffer, output: MTLBuffer,
+        intermediate: Int, arena: Inkling2ScalarArena
+    ) throws {
+        encoder.setComputePipelineState(try pipeline("inkling_softcapped_swiglu_interleaved_f32"))
+        encoder.setBuffer(gateUp, offset: 0, index: 0)
+        encoder.setBuffer(output, offset: 0, index: 1)
+        encoder.setBuffer(arena.make(UInt32(intermediate)), offset: 0, index: 2)
+        encoder.setBuffer(arena.make(config.mlpGateSoftcap), offset: 0, index: 3)
+        encoder.setBuffer(arena.make(config.mlpUpSoftcap), offset: 0, index: 4)
+        encoder.dispatchThreads(
+            MTLSize(width: intermediate, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
+        )
+    }
+
+    func routerTopK(
+        encoder: MTLComputeCommandEncoder, scores: MTLBuffer, bias: MTLBuffer, biasOffset: Int,
+        indices: MTLBuffer, weights: MTLBuffer, numExperts: Int, topK: Int,
+        routeScale: Float, arena: Inkling2ScalarArena
+    ) throws {
+        encoder.setComputePipelineState(try pipeline("inkling_router_topk_f32"))
+        encoder.setBuffer(scores, offset: 0, index: 0)
+        encoder.setBuffer(bias, offset: 0, index: 1)
+        encoder.setBuffer(indices, offset: 0, index: 2)
+        encoder.setBuffer(weights, offset: 0, index: 3)
+        encoder.setBuffer(arena.make(UInt32(numExperts)), offset: 0, index: 4)
+        encoder.setBuffer(arena.make(UInt32(topK)), offset: 0, index: 5)
+        encoder.setBuffer(arena.make(routeScale), offset: 0, index: 6)
+        // The bias binds at zero with its offset as a constant: a tensor's
+        // offset inside its shard is not buffer-aligned.
+        encoder.setBuffer(arena.make(UInt64(biasOffset)), offset: 0, index: 7)
+        encoder.setThreadgroupMemoryLength(
+            (32 + numExperts) * MemoryLayout<Float>.stride, index: 0
+        )
+        encoder.dispatchThreadgroups(
+            MTLSize(width: 1, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
+        )
+    }
+
+    func expertRow(
+        encoder: MTLComputeCommandEncoder,
+        weight: MTLBuffer, weightOffset: UInt64,
+        scales: MTLBuffer, scaleOffset: UInt64,
+        input: MTLBuffer, output: MTLBuffer, rows: Int, logicalColumns: Int,
+        layout: Inkling2ExpertQuantLayout, outerScale: Float,
+        weightRowStride: Int, scaleRowStride: Int,
+        arena: Inkling2ScalarArena
+    ) throws {
+        encoder.setComputePipelineState(try pipeline("inkling_expert_row_f32"))
+        encoder.setBuffer(weight, offset: 0, index: 0)
+        encoder.setBuffer(scales, offset: 0, index: 1)
+        encoder.setBuffer(input, offset: 0, index: 2)
+        encoder.setBuffer(output, offset: 0, index: 3)
+        encoder.setBuffer(arena.make(UInt32(logicalColumns)), offset: 0, index: 4)
+        encoder.setBuffer(arena.make(UInt32(weightRowStride)), offset: 0, index: 5)
+        encoder.setBuffer(arena.make(UInt32(scaleRowStride)), offset: 0, index: 6)
+        encoder.setBuffer(arena.make(UInt32(layout.blockSize)), offset: 0, index: 7)
+        encoder.setBuffer(arena.make(layout == .nvfp4), offset: 0, index: 8)
+        encoder.setBuffer(arena.make(outerScale), offset: 0, index: 9)
+        encoder.setBuffer(arena.make(weightOffset), offset: 0, index: 10)
+        encoder.setBuffer(arena.make(scaleOffset), offset: 0, index: 11)
+        encoder.setThreadgroupMemoryLength(32 * MemoryLayout<Float>.stride, index: 0)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: rows, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
+        )
+    }
+
+    /// The routing indices as integers, which the host needs to address a bank.
+    func readBackIndices(_ buffer: MTLBuffer, count: Int) -> [Int] {
+        Array(UnsafeBufferPointer(
+            start: buffer.contents().bindMemory(to: UInt32.self, capacity: count), count: count
+        )).map(Int.init)
     }
 }
