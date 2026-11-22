@@ -92,9 +92,16 @@ nonisolated public enum Inkling2ForwardError: Error, Equatable, CustomStringConv
 
 nonisolated public struct Inkling2ForwardOptions: Sendable, Equatable {
     public var activationProfile: Inkling2ActivationProfile
+    /// Positions the sequence may hold, or nil for the checkpoint's declared
+    /// maximum. A full-attention visit keeps every position's K/V, so this is
+    /// what turns a KV BUDGET (see `Inkling2MemoryPlan`) into a refusal by name
+    /// instead of a process that grows until it is killed. A ring visit is not
+    /// affected: it holds at most its window.
+    public var maxPositions: Int?
 
-    public init(activationProfile: Inkling2ActivationProfile = .hfReference) {
+    public init(activationProfile: Inkling2ActivationProfile = .hfReference, maxPositions: Int? = nil) {
         self.activationProfile = activationProfile
+        self.maxPositions = maxPositions
     }
 }
 
@@ -142,7 +149,8 @@ nonisolated public final class Inkling2CPUForward {
             window: config.slidingWindowSize,
             kvWidth: kvWidth,
             hidden: config.hiddenSize,
-            historyDepth: max(0, config.convKernelSize - 1)
+            historyDepth: max(0, config.convKernelSize - 1),
+            maxPositions: options.maxPositions ?? config.maxPositionEmbeddings
         )
     }
 
@@ -666,6 +674,16 @@ nonisolated public final class Inkling2CPUForward {
         }
         onInternal?(visitIndexForDebug, "v_norm", value)
 
+        // A full-attention visit keeps every position's K/V, so the KV budget is
+        // enforced here, where a row would be added: one position past it is a
+        // refusal by name, not a process that keeps growing.
+        if state.isAtCapacity {
+            throw Inkling2ForwardError.unsupported(
+                "position \(position) is past the KV budget: this sequence holds "
+                    + "\(state.committedPositions) positions and the plan provisions "
+                    + "\(state.maxRows ?? 0). Start a new conversation or raise the context budget."
+            )
+        }
         _ = state.append(key: key, value: value)
 
         // Relative bias: R from the pre-attention hidden, banked by backward

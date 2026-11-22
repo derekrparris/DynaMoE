@@ -332,7 +332,7 @@ public final class CompletionEngine: @unchecked Sendable {
     /// the resident sequence away and re-prefill the whole conversation. It is
     /// the HOST graph (no Metal), so it holds no device memory beyond the shard
     /// buffers the app already mapped.
-    private var cachedInklingForward: (path: String, forward: Inkling2CPUForward)?
+    private var cachedInklingForward: (path: String, contextLength: Int, forward: Inkling2CPUForward)?
 
     /// Encoded image spans, keyed by `snapshot path | image sha256`.
     ///
@@ -636,25 +636,45 @@ public final class CompletionEngine: @unchecked Sendable {
                 )
             }
 
+            // The KV cache is the authority, not the checkpoint's 1M
+            // declaration: a full-attention visit keeps every position's K/V,
+            // so the rows this turn may hold come from the memory budget and
+            // the plan's own per-position price. Without it a long conversation
+            // grows the process until it is killed; with it the forward refuses
+            // by name, one position past the budget.
+            let catalog = Inkling2WeightCatalog(
+                mainFile: loadedSummary.tensors.map { Inkling2TensorRef(metadata: $0) },
+                layerCount: inklingConfig.numHiddenLayers
+            )
+            let memoryPlan = Inkling2MemoryPlan.make(
+                config: inklingConfig, catalog: catalog, contextLength: inklingConfig.maxPositionEmbeddings
+            )
+            let contextLength = memoryPlan.affordableContextLength(
+                budgetGB: request.memory.budgetMode.targetMaxRssGB
+            )
+
             // Build once per checkpoint and keep it: a fresh forward per turn
             // would drop the resident sequence and re-prefill the conversation.
+            // Keyed by the context it was provisioned for, like the DeepSeek
+            // runtime, because a turn that needs more rows needs a bigger cache.
             var forward: Inkling2CPUForward?
             stateLock.lock()
-            if let cached = cachedInklingForward, cached.path == snapshotDir.path {
+            if let cached = cachedInklingForward,
+               cached.path == snapshotDir.path, cached.contextLength >= contextLength {
                 forward = cached.forward
             }
             stateLock.unlock()
             if forward == nil {
-                let catalog = Inkling2WeightCatalog(
-                    mainFile: loadedSummary.tensors.map { Inkling2TensorRef(metadata: $0) },
-                    layerCount: inklingConfig.numHiddenLayers
-                )
                 let source = Inkling2SnapshotWeights(
                     config: inklingConfig, catalog: catalog, shardBuffers: loadedShards
                 )
-                let built = try Inkling2CPUForward(config: inklingConfig, weights: source)
+                let built = try Inkling2CPUForward(
+                    config: inklingConfig,
+                    weights: source,
+                    options: Inkling2ForwardOptions(maxPositions: contextLength)
+                )
                 stateLock.lock()
-                cachedInklingForward = (path: snapshotDir.path, forward: built)
+                cachedInklingForward = (path: snapshotDir.path, contextLength: contextLength, forward: built)
                 stateLock.unlock()
                 forward = built
             }
@@ -692,7 +712,7 @@ public final class CompletionEngine: @unchecked Sendable {
                 promptTokenCount: request.promptTokenIds.count,
                 // The host forward keeps every cache value in FP32.
                 effectiveKVPrecision: .fp32,
-                provisionedSequenceLength: forward.positionLimit
+                provisionedSequenceLength: contextLength
             )
 
             let engineSelf = self

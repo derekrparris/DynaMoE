@@ -32,6 +32,9 @@ nonisolated public struct Inkling2MemoryPlan: Sendable, Equatable {
     /// (INT8) storage, 4 for FP32. The precision enum lives outside this type
     /// because it is internal to the app module.
     public let kvElementBytes: Int
+    /// K+V bytes one token costs across every full-attention visit: the
+    /// growing part of the cache, which is what a context budget is spent on.
+    public let bytesPerPosition: Int
     /// Growing full-attention caches: eight visits x K+V x head_dim x kv heads.
     public let fullAttentionCacheBytes: Int
     /// Bounded rings: forty visits x K+V x head_dim x kv heads x window.
@@ -76,6 +79,22 @@ nonisolated public struct Inkling2MemoryPlan: Sendable, Equatable {
         let slots = (budget - fixed) / Double(bytesPerExpertSlot)
         guard slots.isFinite, slots >= 1 else { return 1 }
         return Int(min(slots, 65_536))
+    }
+
+    /// Positions the KV cache may hold under `budgetGB`, i.e. the cap the
+    /// forward is built with so a long conversation refuses by name instead of
+    /// growing until the process is killed.
+    ///
+    /// Only the growing part is priced against the budget: the rings are
+    /// bounded by the window, so they are a fixed term, exactly as
+    /// `KVCacheProvisioning` treats a sliding ring. One position costs one
+    /// record per full-attention VISIT (from the schedule, since a full layer
+    /// in the loop core appears once per pass).
+    public func affordableContextLength(budgetGB: Double) -> Int {
+        guard bytesPerPosition > 0, budgetGB.isFinite else { return contextLength }
+        let budget = max(0.0, budgetGB * 1_073_741_824) - Double(localRingBytes)
+        guard budget > 0 else { return 1 }
+        return max(1, min(contextLength, Int(budget / Double(bytesPerPosition))))
     }
 
     /// One-line load-log summary.
@@ -169,6 +188,7 @@ nonisolated public struct Inkling2MemoryPlan: Sendable, Equatable {
         return Inkling2MemoryPlan(
             contextLength: context,
             kvElementBytes: max(1, kvElementBytes),
+            bytesPerPosition: fullVisitCount * recordPerToken,
             fullAttentionCacheBytes: full,
             localRingBytes: rings,
             convolutionStateBytes: convolution,

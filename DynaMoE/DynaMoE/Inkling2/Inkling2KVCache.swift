@@ -47,11 +47,24 @@ nonisolated public final class Inkling2VisitState {
     public private(set) var windowStart = 0
     public private(set) var convolutionHistory: [[[Float]]]
 
-    public init(isFullAttention: Bool, window: Int, stateWidths: [Int], historyDepth: Int) {
+    /// Rows this visit may hold, or nil for no cap. A full-attention visit
+    /// keeps every position, so this is the KV budget's cap on it; a ring visit
+    /// drops from the front and never reaches it.
+    public let maxRows: Int?
+
+    public init(isFullAttention: Bool, window: Int, stateWidths: [Int], historyDepth: Int, maxRows: Int? = nil) {
         self.isFullAttention = isFullAttention
         self.window = max(1, window)
         self.historyDepth = max(0, historyDepth)
+        self.maxRows = maxRows
         self.convolutionHistory = stateWidths.map { _ in [] }
+    }
+
+    /// Whether one more row would exceed the cap, which the forward turns into
+    /// a refusal by name rather than a process growing until it is killed.
+    public var isAtCapacity: Bool {
+        guard let maxRows else { return false }
+        return committedPositions >= maxRows
     }
 
     /// Appends one position's K/V and returns the absolute range of rows the
@@ -128,14 +141,30 @@ nonisolated public final class Inkling2SequenceState {
     /// a caller asks to keep them (a message read needs the previous pass's).
     public let plan: [Inkling2VisitPlan]
 
-    public init(plan: [Inkling2VisitPlan], window: Int, kvWidth: Int, hidden: Int, historyDepth: Int) {
+    /// Positions the sequence may hold. A full-attention visit keeps every
+    /// position's K/V, so this is the KV budget's per-visit row cap; a ring
+    /// visit never reaches it because it holds at most its window.
+    public let maxPositions: Int
+
+    public init(
+        plan: [Inkling2VisitPlan],
+        window: Int,
+        kvWidth: Int,
+        hidden: Int,
+        historyDepth: Int,
+        maxPositions: Int
+    ) {
+        self.maxPositions = max(1, maxPositions)
         self.plan = plan
         self.visits = plan.map { visit in
             Inkling2VisitState(
                 isFullAttention: visit.isFullAttention,
                 window: window,
                 stateWidths: [kvWidth, kvWidth, hidden, hidden],
-                historyDepth: historyDepth
+                historyDepth: historyDepth,
+                // Only a full-attention visit grows without bound; a ring is
+                // capped at its window and must not be refused at the budget.
+                maxRows: visit.isFullAttention ? maxPositions : nil
             )
         }
     }

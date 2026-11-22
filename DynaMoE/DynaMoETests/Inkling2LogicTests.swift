@@ -522,6 +522,29 @@ final class Inkling2LayerRuleTests: XCTestCase {
         XCTAssertEqual(Inkling2Math.finalLogitSoftcap([100, -3])[0], 29.9237390242, accuracy: 1e-5)
         XCTAssertEqual(Inkling2Math.finalLogitSoftcap([100, -3])[1], -2.9900398387, accuracy: 1e-5)
     }
+
+    /// The KV row cap is a budget, not a ring: a full-attention visit reports
+    /// capacity and stops growing, while a ring visit keeps dropping from the
+    /// front and must never be refused at the same number.
+    func testTheRowCapAppliesToFullAttentionOnly() {
+        let full = Inkling2VisitState(
+            isFullAttention: true, window: 2, stateWidths: [2, 2, 2, 2], historyDepth: 0, maxRows: 3
+        )
+        for position in 0..<3 {
+            XCTAssertFalse(full.isAtCapacity, "position \(position) is inside the cap")
+            _ = full.append(key: [1, 1], value: [1, 1])
+        }
+        XCTAssertTrue(full.isAtCapacity)
+        XCTAssertEqual(full.keys.count, 3, "a full visit keeps every row it took")
+
+        let ring = Inkling2VisitState(
+            isFullAttention: false, window: 2, stateWidths: [2, 2, 2, 2], historyDepth: 0, maxRows: nil
+        )
+        for _ in 0..<10 { _ = ring.append(key: [1, 1], value: [1, 1]) }
+        XCTAssertFalse(ring.isAtCapacity, "a ring is bounded by its window, never by the KV budget")
+        XCTAssertEqual(ring.keys.count, 2)
+        XCTAssertEqual(ring.windowStart, 8)
+    }
 }
 
 // MARK: - Query unpacking
@@ -1012,6 +1035,31 @@ final class Inkling2PublishedConfigTests: XCTestCase {
         // The naive 48-full-cache figure the table rules out.
         let naive = 48 * 1_048_576 * record
         XCTAssertEqual(Double(naive) / 1e9, 206.158, accuracy: 0.001)
+    }
+
+    /// The context a memory budget actually affords, which is what caps the
+    /// forward's KV cache. The rings are a fixed term (they never grow with the
+    /// context), so what a budget buys is the growing part, and the answer is
+    /// the plan's own per-position price rather than a second derivation.
+    func testTheAffordableContextFollowsFromTheBudget() throws {
+        let config = try published()
+        let plan = Inkling2MemoryPlan.make(config: config, catalog: nil, contextLength: 1_048_576)
+        // One position is 8 full visits x K+V x 2,048-byte record.
+        XCTAssertEqual(plan.bytesPerPosition, 8 * 2 * config.numKeyValueHeads * config.headDim * 2)
+        // A 16 GB budget: (16 GiB - 0.168 GB of rings) / 32,768 bytes per
+        // position is still past the checkpoint's 1M ceiling, so the ceiling
+        // wins -- and that is the point: the budget refuses at the ceiling.
+        XCTAssertEqual(plan.affordableContextLength(budgetGB: 16), 1_048_576)
+        // 1 GiB: (1 GiB - rings) / 32,768, floored at one position.
+        let oneGB = plan.affordableContextLength(budgetGB: 1)
+        XCTAssertEqual(oneGB, Int((Double(1) * 1_073_741_824 - Double(plan.localRingBytes)) / 32_768))
+        // A budget already smaller than the rings buys one position, not zero
+        // or a negative -- a cache of nothing cannot run a turn at all.
+        XCTAssertEqual(plan.affordableContextLength(budgetGB: 0.01), 1)
+        // And the plan is still asked at its own context: the answer never
+        // exceeds what the plan was built for.
+        let small = Inkling2MemoryPlan.make(config: config, catalog: nil, contextLength: 4_096)
+        XCTAssertLessThanOrEqual(small.affordableContextLength(budgetGB: 16), 4_096)
     }
 }
 
