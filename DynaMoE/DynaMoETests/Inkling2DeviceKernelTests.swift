@@ -1273,6 +1273,165 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         withExtendedLifetime(engine) {}
     }
 
+    // MARK: The server's text routes
+
+    /// Both API protocols answer a text turn for this family over real HTTP,
+    /// non-streaming and streaming, with the terminal frames the protocol
+    /// defines.
+    ///
+    /// The routes are shared with every other family, which is exactly why this
+    /// is checked here rather than assumed: the family supplies a forward and a
+    /// prompt formatter, and a route that reaches neither -- or that expects a
+    /// generic engine path this family refuses -- fails only on a real
+    /// checkpoint.
+    ///
+    /// Opt-in: a host turn is minutes, and four turns is most of an hour.
+    /// `touch /tmp/dynamoe_inkling2_server_routes` to run it.
+    func testBothProtocolsAnswerTextTurnsOverTheLocalServer() async throws {
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_server_routes"),
+            "opt-in server routes; touch /tmp/dynamoe_inkling2_server_routes to run"
+        )
+        let snapshot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(Inkling2PublishedTensorTests.snapshotRelativePath)
+        guard FileManager.default.fileExists(atPath: snapshot.path) else {
+            throw XCTSkip("Inkling 2 snapshot is not downloaded at \(snapshot.path)")
+        }
+        guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("No Metal GPU device") }
+        let tokenizer = try DynaMoeTokenizer(
+            tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+        )
+        let modelConfig = try XCTUnwrap(ModelConfig.load(from: snapshot))
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let indexed = try engine.getSummary()
+        let summary = try InferenceEngine.segmentShardsForMetal(
+            indexed, maxBufferLength: UInt64(device.maxBufferLength)
+        )
+        var buffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            let length = Int(shard.length)
+            guard length > 0, length <= Int(device.maxBufferLength),
+                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)),
+                  let buffer = device.makeBuffer(
+                      bytesNoCopy: pointer, length: length, options: .storageModeShared, deallocator: nil
+                  ) else { continue }
+            buffers[shard.index] = buffer
+        }
+        CompletionEngine.shared.configure(
+            summary: summary, modelConfig: modelConfig, tokenizer: tokenizer,
+            shardBuffers: buffers, activeLoadedModelPath: snapshot.path
+        )
+
+        let defaults = UserDefaults.standard
+        let saved = ["enabled": ServerController.enabledKey, "port": ServerController.portKey,
+                     "key": ServerController.apiKeyKey,
+                     "capture": ServerRequestLogRecorder.captureBodiesKey].map {
+            ($0.value, defaults.object(forKey: $0.value))
+        }
+        func restore() {
+            for (key, value) in saved {
+                if let value { defaults.set(value, forKey: key) } else { defaults.removeObject(forKey: key) }
+            }
+            ServerRequestLogRecorder.shared.useOverrideStore(nil)
+            CompletionEngine.shared.configure(
+                summary: nil, modelConfig: nil, tokenizer: nil,
+                shardBuffers: [:], activeLoadedModelPath: nil
+            )
+        }
+        let port = 8796
+        let store = ServerRequestLogStore.inMemory()
+        defaults.set(true, forKey: ServerController.enabledKey)
+        defaults.set(port, forKey: ServerController.portKey)
+        defaults.removeObject(forKey: ServerController.apiKeyKey)
+        defaults.set(true, forKey: ServerRequestLogRecorder.captureBodiesKey)
+        ServerRequestLogRecorder.shared.useOverrideStore(store)
+        if ServerController.shared.isRunning { await ServerController.shared.stop() }
+        ServerController.shared.start()
+        do {
+            let deadline = Date().addingTimeInterval(20)
+            var listening = false
+            while Date() < deadline {
+                if let (_, response) = try? await URLSession.shared.data(
+                    from: URL(string: "http://127.0.0.1:\(port)/health")!
+                ), (response as? HTTPURLResponse)?.statusCode == 200 {
+                    listening = true
+                    break
+                }
+                try await Task.sleep(nanoseconds: 100_000_000)
+            }
+            try XCTSkipUnless(listening, "the local server never answered /health on port \(port)")
+
+            // One non-streaming OpenAI turn.
+            let openAIBody = """
+            {"model":"any","max_tokens":2,"messages":[{"role":"user","content":"The capital of France is"}]}
+            """
+            var openAIRequest = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!)
+            openAIRequest.httpMethod = "POST"
+            openAIRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            openAIRequest.httpBody = Data(openAIBody.utf8)
+            openAIRequest.timeoutInterval = 900
+            let (openAIData, openAIResponse) = try await URLSession.shared.data(for: openAIRequest)
+            let openAIHTTP = try XCTUnwrap(openAIResponse as? HTTPURLResponse)
+            print("🔎 [inkling2 server] openai \(openAIHTTP.statusCode): \(String(decoding: openAIData.prefix(400), as: UTF8.self))")
+            XCTAssertEqual(openAIHTTP.statusCode, 200, "the OpenAI route must serve this family")
+            let openAIJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: openAIData) as? [String: Any])
+            XCTAssertEqual(openAIJSON["object"] as? String, "chat.completion")
+            let openAIChoice = try XCTUnwrap((openAIJSON["choices"] as? [[String: Any]])?.first)
+            XCTAssertNotNil(openAIChoice["finish_reason"] as? String)
+            XCTAssertNotNil((openAIJSON["usage"] as? [String: Any])?["prompt_tokens"])
+
+            // One streaming Anthropic turn: the frames must end at message_stop
+            // and the start frame must carry the prompt length.
+            let anthropicBody = """
+            {"model":"any","max_tokens":2,"stream":true,"messages":[{"role":"user","content":"The capital of France is"}]}
+            """
+            var anthropicRequest = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/messages")!)
+            anthropicRequest.httpMethod = "POST"
+            anthropicRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            anthropicRequest.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+            anthropicRequest.httpBody = Data(anthropicBody.utf8)
+            anthropicRequest.timeoutInterval = 900
+            let (anthropicData, anthropicResponse) = try await URLSession.shared.data(for: anthropicRequest)
+            let anthropicHTTP = try XCTUnwrap(anthropicResponse as? HTTPURLResponse)
+            let transcript = String(decoding: anthropicData, as: UTF8.self)
+            print("🔎 [inkling2 server] anthropic stream \(anthropicHTTP.statusCode): \(transcript.prefix(600))")
+            XCTAssertEqual(anthropicHTTP.statusCode, 200)
+            XCTAssertTrue(
+                (anthropicHTTP.value(forHTTPHeaderField: "Content-Type") ?? "").contains("text/event-stream")
+            )
+            // A frame is a block ended by a blank line; the terminal marker is
+            // the protocol's own, so it is asserted by NAME rather than by the
+            // stream merely ending.
+            let eventNames = transcript.components(separatedBy: "\n\n").compactMap { block -> String? in
+                block.split(separator: "\n").first { $0.hasPrefix("event:") }.map {
+                    String($0.dropFirst("event:".count)).trimmingCharacters(in: .whitespaces)
+                }
+            }
+            print("🔎 [inkling2 server] anthropic events: \(eventNames)")
+            XCTAssertTrue(eventNames.contains("message_start"), "no message_start frame")
+            XCTAssertTrue(eventNames.contains("message_stop"), "the stream never reached message_stop")
+            XCTAssertFalse(eventNames.contains("error"), "the stream carried an error frame")
+
+            let rows = try await {
+                let deadline = Date().addingTimeInterval(15)
+                while Date() < deadline {
+                    let rows = await store.fetch(limit: 50)
+                    if rows.count >= 2 { return rows }
+                    try await Task.sleep(nanoseconds: 50_000_000)
+                }
+                return await store.fetch(limit: 50)
+            }()
+            print("🔎 [inkling2 server] log rows: \(rows.map { "\($0.method) \($0.path) \($0.httpStatus) streaming=\($0.wasStreaming)" })")
+            XCTAssertEqual(Set(rows.map(\.path)), ["/v1/chat/completions", "/v1/messages"])
+        } catch {
+            await ServerController.shared.stop()
+            restore()
+            throw error
+        }
+        await ServerController.shared.stop()
+        restore()
+        withExtendedLifetime(engine) {}
+    }
     // MARK: The whole visit
 
     /// One complete visit on the device against the host's own `runVisit`, on
