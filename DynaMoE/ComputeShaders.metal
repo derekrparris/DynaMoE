@@ -14041,3 +14041,71 @@ kernel void inkling_expert_row_f32(
     float total = threadgroup_reduce_sum(localSum, shared, tid, tgSize);
     if (tid == 0) { outVector[row] = total; }
 }
+
+// Inkling 2's router selection: sigmoid every expert score, add the bias ONLY
+// to steer which experts are chosen, then renormalize the SELECTED raw scores
+// and scale. The bias never weights the output -- a softmax over the steered
+// values would, and that is the mistake this kernel exists to avoid.
+//
+// One threadgroup per position; a lane holds one expert. `topK <= 8` for the
+// published checkpoint, and a wider top-k keeps the same insertion sort.
+kernel void inkling_router_topk_f32(
+    device const float* scores [[buffer(0)]],
+    device const float* bias [[buffer(1)]],
+    device uint32_t* outIndices [[buffer(2)]],
+    device float* outWeights [[buffer(3)]],
+    constant uint32_t& numExperts [[buffer(4)]],
+    constant uint32_t& topK [[buffer(5)]],
+    constant float& routeScale [[buffer(6)]],
+    threadgroup float* shared [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgSize [[threads_per_threadgroup]],
+    uint position [[threadgroup_position_in_grid]]
+) {
+    device const float* rowScores = scores + ((uint64_t)position * numExperts);
+    device const float* rowBias = bias;
+    device uint32_t* indices = outIndices + ((uint64_t)position * topK);
+    device float* weights = outWeights + ((uint64_t)position * topK);
+
+    // Steered rank per expert, staged for the single-thread selection.
+    threadgroup float* rank = shared + 32;
+    if (tid < numExperts) {
+        rank[tid] = rowScores[tid] + (tid < numExperts ? rowBias[tid] : 0.0f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        uint k = min(topK, numExperts);
+        // Insertion sort over the steered ranks, best first. A tie goes to the
+        // LOWER expert id, which the host's sort guarantees and this loop must
+        // reproduce: `>` keeps the earlier (lower) id ahead on equality.
+        for (uint i = 0; i < k; i++) {
+            float bestRank = -INFINITY;
+            uint bestIndex = 0;
+            for (uint e = 0; e < numExperts; e++) {
+                bool taken = false;
+                for (uint j = 0; j < i; j++) { taken = taken || indices[j] == e; }
+                if (taken) { continue; }
+                if (rank[e] > bestRank) { bestRank = rank[e]; bestIndex = e; }
+            }
+            indices[i] = bestIndex;
+        }
+        // Weights: the SELECTED raw scores, renormalized and scaled.
+        float total = 0.0f;
+        for (uint i = 0; i < k; i++) { total += rowScores[indices[i]]; }
+        for (uint i = 0; i < k; i++) {
+            weights[i] = total > 0.0f ? rowScores[indices[i]] / total * routeScale : 0.0f;
+        }
+        // Ascending id order, which is what the host returns (`selected.sorted
+        // { $0.index < $1.index }`) and what a caller pairing an index with its
+        // weight relies on.
+        for (uint i = 0; i + 1 < k; i++) {
+            for (uint j = 0; j + 1 < k - i; j++) {
+                if (indices[j] > indices[j + 1]) {
+                    uint t = indices[j]; indices[j] = indices[j + 1]; indices[j + 1] = t;
+                    float w = weights[j]; weights[j] = weights[j + 1]; weights[j + 1] = w;
+                }
+            }
+        }
+    }
+}

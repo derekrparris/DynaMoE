@@ -431,6 +431,77 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         }
     }
 
+    // MARK: Routing
+
+    /// The router's selection and weighting against `Inkling2Math.route`.
+    ///
+    /// The fixture separates the bias's two possible roles. Expert 3 has the
+    /// largest raw score and a moderate negative bias: it is still selected,
+    /// so the bias cannot be dropping the true maximum, and its WEIGHT is the
+    /// raw score's share rather than the steered one's (a softmax over steered
+    /// values would give it a different number). Expert 5 has a small raw
+    /// score and a large positive bias, so it is selected although it ranks
+    /// low by score alone -- the bias does steer selection.
+    func testTheRouterMatchesTheHostRule() throws {
+        let (device, _, _) = try environment()
+        let numExperts = 8, topK = 3, positions = 2
+        let routeScale: Float = 2.5
+        let base: [Float] = [0.9, 0.5, 0.3, 1.2, 0.2, 0.25, 0.1, 0.05]
+        let bias: [Float] = [0.1, 0.1, 0.0, -0.4, 0.0, 0.9, 0.0, 0.0]
+        // A second position with a different order, so a kernel that ignored
+        // the position offset would fail.
+        let second: [Float] = [0.05, 0.1, 0.25, 0.2, 1.2, 0.3, 0.5, 0.9]
+        let scores = base + second
+
+        let scoresBuffer = try buffer(device, scores)
+        let biasBuffer = try buffer(device, bias)
+        let indicesBuffer = try buffer(device, [UInt32](repeating: 99, count: positions * topK))
+        let weightsBuffer = try buffer(device, [Float](repeating: 0, count: positions * topK))
+        let scalars = [UInt32(numExperts), UInt32(topK)]
+        let scalarBuffers = try scalars.map { try buffer(device, [$0]) }
+        let scaleBuffer = try buffer(device, [routeScale])
+        try run("inkling_router_topk_f32", threads: (positions, 1, 1), threadgroup: (64, 1, 1),
+                threadgroupMemory: (32 + numExperts) * MemoryLayout<Float>.stride,
+                byThreadgroup: true) { encoder in
+            encoder.setBuffer(scoresBuffer, offset: 0, index: 0)
+            encoder.setBuffer(biasBuffer, offset: 0, index: 1)
+            encoder.setBuffer(indicesBuffer, offset: 0, index: 2)
+            encoder.setBuffer(weightsBuffer, offset: 0, index: 3)
+            for (index, b) in scalarBuffers.enumerated() { encoder.setBuffer(b, offset: 0, index: 4 + index) }
+            encoder.setBuffer(scaleBuffer, offset: 0, index: 6)
+        }
+        let actualIndices = Array(UnsafeBufferPointer(
+            start: indicesBuffer.contents().bindMemory(to: UInt32.self, capacity: positions * topK),
+            count: positions * topK
+        )).map(Int.init)
+        let actualWeights = read(weightsBuffer, positions * topK)
+
+        for position in 0..<positions {
+            let row = Array(scores[(position * numExperts)..<((position + 1) * numExperts)])
+            let expected = Inkling2Math.route(scores: row, bias: bias, topK: topK, routeScale: routeScale)
+            XCTAssertEqual(
+                Array(actualIndices[(position * topK)..<((position + 1) * topK)]), expected.indices,
+                "position \(position) selection"
+            )
+            for slot in 0..<topK {
+                XCTAssertEqual(
+                    actualWeights[position * topK + slot], expected.weights[slot], accuracy: 1e-6,
+                    "position \(position) weight \(slot)"
+                )
+            }
+        }
+        // The fixture separates the bias's roles: the top raw score is not selected
+        // by rank alone, and the positively biased expert is.
+        let first = Inkling2Math.route(scores: base, bias: bias, topK: topK, routeScale: routeScale)
+        XCTAssertTrue(first.indices.contains(3), "the largest raw score stays selected despite a negative bias")
+        XCTAssertTrue(first.indices.contains(5), "the positively biased expert is selected despite a small score")
+        // The weights are the RAW scores' shares: steered ones would give
+        // expert 5 (bias +0.9) a much larger weight than expert 3.
+        let slot3 = try XCTUnwrap(first.indices.firstIndex(of: 3))
+        let slot5 = try XCTUnwrap(first.indices.firstIndex(of: 5))
+        XCTAssertGreaterThan(first.weights[slot3], first.weights[slot5])
+    }
+
     // MARK: The block read
 
     /// The block-attention residual read against the host rule, with TWO
