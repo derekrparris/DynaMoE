@@ -359,6 +359,7 @@ nonisolated public final class Inkling2MetalForward {
         "inkling_sigmoid_inplace_f32",
         "inkling_weighted_accumulate_f32",
         "inkling_short_conv_f32",
+        "inkling_dynamic_conv_f32",
         "inkling_message_gate_f32",
         "inkling_l2_clip_scale_f32",
         "inkling_l2_clip_f32",
@@ -663,6 +664,7 @@ nonisolated public final class Inkling2MetalForward {
         index: Int,
         values: MTLBuffer,
         valuesCount: Int,
+        dynamicInput: [Float],
         layer: Int,
         isFull: Bool,
         headDim: Int,
@@ -671,18 +673,32 @@ nonisolated public final class Inkling2MetalForward {
     ) throws {
         let kernelSize = config.convKernelSize
         let history = state.history(index)
-        // One weight per stream: K and V have their own, and the post-attention
-        // and post-MLP streams are DIFFERENT tensors too (`attn_sconv` and
-        // `mlp_sconv`) even though both are hidden-wide. Folding the last two
-        // onto one made the post-MLP convolution read the attention's taps.
+        // A full-attention layer's K/V convolutions are DYNAMIC: static taps
+        // plus per-head taps projected from the projection's input, normalized
+        // by `sqrt(2 * kernel + 1)`. The post-attention and post-MLP streams are
+        // always the static form. One weight per stream: K and V have their
+        // own, and the last two are DIFFERENT tensors (`attn_sconv` and
+        // `mlp_sconv`) even though both are hidden-wide -- folding them onto
+        // one made the post-MLP convolution read the attention's taps.
+        let isDynamic = isFull && (index == 0 || index == 1)
         let tapsRole: Inkling2TensorRole
         switch index {
-        case 0: tapsRole = .attnKSconvWeight
-        case 1: tapsRole = .attnVSconvWeight
+        case 0: tapsRole = isDynamic ? .attnKSconvStatic : .attnKSconvWeight
+        case 1: tapsRole = isDynamic ? .attnVSconvStatic : .attnVSconvWeight
         case 2: tapsRole = .attnSconv
         default: tapsRole = .mlpSconv
         }
         let taps = try hostMatrix(tapsRole, layer: layer)
+        // The dynamic taps come from a projection of the SAME input the K/V
+        // projection read, one `kernel`-wide vector per KV head.
+        var dynamicTaps: [Float] = []
+        if isDynamic {
+            let projection = try hostMatrix(
+                index == 0 ? .attnKSconvProj : .attnVSconvProj, layer: layer
+            )
+            let projected = try host.linear(projection, dynamicInput, rows: (valuesCount / headDim) * kernelSize)
+            dynamicTaps = projected
+        }
         // Staged through the ARENA, which owns every buffer a dispatch reads
         // until after the wait: a local buffer is freed when this function
         // returns, and the GPU may not have run the dispatch yet -- a
@@ -701,20 +717,34 @@ nonisolated public final class Inkling2MetalForward {
         let channels = arena.make(UInt32(valuesCount))
         let tapCount = arena.make(UInt32(kernelSize))
         let rows = arena.make(UInt32(historyRows))
-        encoder.setComputePipelineState(try pipeline("inkling_short_conv_f32"))
-        encoder.setBuffer(values, offset: 0, index: 0)
-        encoder.setBuffer(historyBuffer, offset: 0, index: 1)
-        encoder.setBuffer(tapsBuffer, offset: 0, index: 2)
-        encoder.setBuffer(output, offset: 0, index: 3)
-        encoder.setBuffer(channels, offset: 0, index: 4)
-        encoder.setBuffer(tapCount, offset: 0, index: 5)
-        encoder.setBuffer(rows, offset: 0, index: 6)
+        if isDynamic {
+            guard let dynamicBuffer = arena.make(staging: dynamicTaps) else {
+                throw Inkling2ForwardError.unsupported("could not stage the dynamic convolution taps")
+            }
+            encoder.setComputePipelineState(try pipeline("inkling_dynamic_conv_f32"))
+            encoder.setBuffer(values, offset: 0, index: 0)
+            encoder.setBuffer(historyBuffer, offset: 0, index: 1)
+            encoder.setBuffer(tapsBuffer, offset: 0, index: 2)
+            encoder.setBuffer(dynamicBuffer, offset: 0, index: 3)
+            encoder.setBuffer(output, offset: 0, index: 4)
+            encoder.setBuffer(channels, offset: 0, index: 5)
+            encoder.setBuffer(tapCount, offset: 0, index: 6)
+            encoder.setBuffer(rows, offset: 0, index: 7)
+            encoder.setBuffer(arena.make(UInt32(headDim)), offset: 0, index: 8)
+        } else {
+            encoder.setComputePipelineState(try pipeline("inkling_short_conv_f32"))
+            encoder.setBuffer(values, offset: 0, index: 0)
+            encoder.setBuffer(historyBuffer, offset: 0, index: 1)
+            encoder.setBuffer(tapsBuffer, offset: 0, index: 2)
+            encoder.setBuffer(output, offset: 0, index: 3)
+            encoder.setBuffer(channels, offset: 0, index: 4)
+            encoder.setBuffer(tapCount, offset: 0, index: 5)
+            encoder.setBuffer(rows, offset: 0, index: 6)
+        }
         encoder.dispatchThreads(
             MTLSize(width: valuesCount, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
         )
-        _ = isFull
-        _ = headDim
     }
 
     /// `output *= sigmoid(gate)`, elementwise.
@@ -807,7 +837,7 @@ nonisolated public final class Inkling2MetalForward {
         )
         try convolve(
             encoder: encoder, state: state, index: 0,
-            values: workspace.key, valuesCount: kvHeads * headDim,
+            values: workspace.key, valuesCount: kvHeads * headDim, dynamicInput: keyInput,
             layer: layer, isFull: isFull, headDim: headDim, output: workspace.convolvedKey, arena: arena
         )
         // The keys are clipped PLAINLY: the reference multiplies only the
@@ -829,7 +859,7 @@ nonisolated public final class Inkling2MetalForward {
         )
         try convolve(
             encoder: encoder, state: state, index: 1,
-            values: workspace.value, valuesCount: kvHeads * headDim,
+            values: workspace.value, valuesCount: kvHeads * headDim, dynamicInput: valueInput,
             layer: layer, isFull: isFull, headDim: headDim, output: workspace.convolvedValue, arena: arena
         )
         try headNorm(encoder: encoder, vector: workspace.convolvedValue, headDim: headDim, heads: kvHeads, arena: arena)
@@ -1086,6 +1116,7 @@ nonisolated public final class Inkling2MetalForward {
         try convolve(
             encoder: tailEncoder, state: state, index: 3,
             values: workspace.residualAccumulator, valuesCount: hiddenWidth,
+            dynamicInput: mlpInput,
             layer: layer, isFull: false, headDim: config.headDim,
             output: workspace.hidden, arena: tailArena
         )
@@ -1220,6 +1251,143 @@ nonisolated public final class Inkling2MetalForward {
             MTLSize(width: rows, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
         )
+    }
+
+    // MARK: The whole visit
+
+    /// One visit with both halves on the device: the host's own
+    /// `Inkling2CPUForward.runVisit` with `attentionHalf` and `mlpHalf` in place
+    /// of the two halves it calls.
+    ///
+    /// The SCHEDULE (the two block-read points, the boundary append, which
+    /// residual the mixture is added to, the message gates before the norms) is
+    /// transcribed from the host method line for line rather than re-derived:
+    /// it is the part the reference is subtle about, and it has exactly one
+    /// correct form. Everything this does NOT move -- the block reads, the
+    /// message gates, the input norms -- is the host's own code, called on the
+    /// same host graph object the device helper was built with.
+    ///
+    /// `position` is the absolute position, and the visit state it drives is
+    /// the sequence's own: after a visit it holds the KV row and the four
+    /// convolution histories the host would have left.
+    public func runVisit(
+        layer: Int,
+        pass: Int,
+        hidden initial: [Float],
+        blockStates: inout [[Float]],
+        messages: [[Float]]?,
+        position: Int,
+        workspace: Inkling2DeviceWorkspace
+    ) throws -> (output: [Float], attentionQueries: Int) {
+        let visitIndex = try host.visitIndex(layer: layer, pass: pass)
+        let state = host.states[visitIndex]
+        let isFull = !config.isLocalLayer(layer)
+        let blocks = config.nLayersPerAttnResBlock
+        let blockResidual = initial
+        let hidden = initial
+
+        // 1. The attention input read, and the message gates on its results.
+        var qRead = hidden
+        var kRead = hidden
+        var vRead = hidden
+        var attentionQueries = 0
+        if layer > 0 {
+            let packed = try weights.hostMatrix(.attnResAttnQuery, layer: layer - 1)
+            let queries = host.unpackRows(packed, count: isFull ? 3 : 1)
+            attentionQueries = queries.count
+            let reads = host.blockRead(blockStates: blockStates, partial: hidden, queries: queries)
+            qRead = reads[0]
+            kRead = isFull && reads.count > 1 ? reads[1] : reads[0]
+            vRead = isFull && reads.count > 2 ? reads[2] : reads[0]
+        }
+        var queryRead = qRead
+        var keyRead = kRead
+        var valueRead = vRead
+        if let messages, messages.count == 4 {
+            queryRead = try host.messageGate(role: .controllerAttnDown, layer: layer, current: queryRead, message: messages[0])
+            keyRead = try host.messageGate(role: .controllerKDown, layer: layer, current: keyRead, message: messages[1])
+            valueRead = try host.messageGate(role: .controllerVDown, layer: layer, current: valueRead, message: messages[2])
+        }
+        // 2. The three projection inputs, each normalized as the host does.
+        let queryInput: [Float]
+        let keyInput: [Float]
+        let valueInput: [Float]
+        if isFull {
+            queryInput = Inkling2Math.rmsNorm(
+                queryRead, gain: try weights.hostMatrix(.qInputNorm, layer: layer), eps: config.rmsNormEps
+            )
+            keyInput = Inkling2Math.rmsNorm(
+                keyRead, gain: try weights.hostMatrix(.kInputNorm, layer: layer), eps: config.rmsNormEps
+            )
+            valueInput = Inkling2Math.rmsNorm(
+                valueRead, gain: try weights.hostMatrix(.vInputNorm, layer: layer), eps: config.rmsNormEps
+            )
+        } else {
+            let gain = try weights.hostMatrix(.attnNorm, layer: layer)
+            queryInput = Inkling2Math.rmsNorm(queryRead, gain: gain, eps: config.rmsNormEps)
+            keyInput = Inkling2Math.rmsNorm(keyRead, gain: gain, eps: config.rmsNormEps)
+            valueInput = Inkling2Math.rmsNorm(valueRead, gain: gain, eps: config.rmsNormEps)
+        }
+
+        // 3. The attention half, on the device.
+        let attentionOutput = try attentionHalf(
+            layer: layer, state: state, queryInput: queryInput, keyInput: keyInput,
+            valueInput: valueInput, position: position, workspace: workspace
+        )
+        // 4. The post-attention convolution.
+        let postAttention = try shortConvolution(
+            encoderlessState: state, index: 2, values: attentionOutput, layer: layer, workspace: workspace
+        )
+
+        // 5. The residual: the boundary append is LOCAL to the MLP read.
+        var residual = postAttention
+        var mlpStack = blockStates
+        if layer % blocks == 0 {
+            mlpStack.append(blockResidual)
+        } else {
+            residual = zip(blockResidual, postAttention).map(+)
+        }
+        let mlpPacked = try weights.hostMatrix(.attnResMlpQuery, layer: layer)
+        var mlpHidden = host.blockRead(blockStates: mlpStack, partial: residual, queries: [mlpPacked])[0]
+        if let messages, messages.count == 4 {
+            mlpHidden = try host.messageGate(
+                role: .controllerMlpDown, layer: layer, current: mlpHidden, message: messages[3]
+            )
+        }
+        // 6. The MLP half, on the device (it returns residual + convolved mixture).
+        let output = try mlpHalf(
+            layer: layer, state: state, mlpInput: mlpHidden, residual: residual, workspace: workspace
+        )
+        return (output, attentionQueries)
+    }
+
+    /// The post-attention / post-MLP convolution: one dispatch, one commit, and
+    /// the history pushed after it.
+    func shortConvolution(
+        encoderlessState state: Inkling2VisitState, index: Int, values: [Float],
+        layer: Int, workspace: Inkling2DeviceWorkspace
+    ) throws -> [Float] {
+        let inputBuffer = try staging(workspace.projectionOutput, values)
+        let (commandBuffer, encoder) = try commandComponents()
+        let arena = Inkling2ScalarArena(device: device)
+        var encoded = false
+        defer {
+            if !encoded { encoder.endEncoding() }
+            arena.clear()
+        }
+        try convolve(
+            encoder: encoder, state: state, index: index,
+            values: inputBuffer, valuesCount: config.hiddenSize, dynamicInput: values,
+            layer: layer, isFull: false, headDim: config.headDim,
+            output: workspace.hidden, arena: arena
+        )
+        encoder.endEncoding()
+        encoded = true
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let error = commandBuffer.error { throw error }
+        state.pushConvolution(index, value: values)
+        return readBack(workspace.hidden, count: config.hiddenSize)
     }
 
     /// The routing indices as integers, which the host needs to address a bank.

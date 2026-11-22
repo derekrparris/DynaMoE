@@ -14243,3 +14243,39 @@ kernel void inkling_softcapped_swiglu_interleaved_f32(
     float activated = gated * (1.0f / (1.0f + exp(-gate)));
     outVector[gid] = activated * (tanh(up / upSoftcap) * upSoftcap);
 }
+
+// The DYNAMIC short convolution of a full-attention K/V stream, one thread per
+// channel: the static taps plus per-head taps projected from the projection's
+// input, over the same history the static form reads, normalized by
+// `sqrt(2 * kernel + 1)` instead of `sqrt(kernel + 1)`.
+//
+// `dynamic` is `[kvHeads][kernel]` and channel `c` belongs to head
+// `c / headDim`, so every channel of one head shares a tap vector.
+kernel void inkling_dynamic_conv_f32(
+    device const float* current [[buffer(0)]],
+    device const float* history [[buffer(1)]],
+    device const float* staticTaps [[buffer(2)]],
+    device const float* dynamicTaps [[buffer(3)]],
+    device float* outVector [[buffer(4)]],
+    constant uint32_t& channels [[buffer(5)]],
+    constant uint32_t& tapCount [[buffer(6)]],
+    constant uint32_t& historyRows [[buffer(7)]],
+    constant uint32_t& headDim [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= channels) { return; }
+    uint head = gid / headDim;
+    float x = current[gid];
+    float convolved = 0.0f;
+    for (uint tap = 0; tap < tapCount; tap++) {
+        uint age = tapCount - 1 - tap;
+        float source = 0.0f;
+        if (age == 0) {
+            source = x;
+        } else if (age - 1 < historyRows) {
+            source = history[(historyRows - 1 - (age - 1)) * channels + gid];
+        }
+        convolved += (staticTaps[gid * tapCount + tap] + dynamicTaps[head * tapCount + tap]) * source;
+    }
+    outVector[gid] = (convolved + x) / sqrt((float)(2 * tapCount + 1));
+}

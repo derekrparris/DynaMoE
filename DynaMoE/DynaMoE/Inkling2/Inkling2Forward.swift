@@ -136,6 +136,18 @@ nonisolated public final class Inkling2CPUForward {
     /// reference exposes as modules. Off in production; used to bisect a
     /// mismatch inside a layer instead of only at its output.
     public var onInternal: ((_ visitIndex: Int, _ name: String, _ value: [Float]) -> Void)?
+    /// Runs one visit in place of `runVisit`, or nil for the host graph.
+    ///
+    /// The loop SCHEDULE (block boundaries, the loop passes, the previous
+    /// pass's stack) is subtle enough that it must have one copy, so an
+    /// executor substitutes a VISIT rather than a token: `forwardHidden` keeps
+    /// deciding what to run, and this decides how. A substitution must leave the
+    /// visit state exactly where the host would -- the KV rows, the four
+    /// convolution histories -- or a later visit reads a different sequence.
+    public var visitRunner: ((
+        _ layer: Int, _ pass: Int, _ hidden: [Float], _ blockStates: inout [[Float]],
+        _ messages: [[Float]]?, _ position: Int
+    ) throws -> (output: [Float], attentionQueries: Int))?
 
     public init(
         config: Inkling2Config,
@@ -193,7 +205,7 @@ nonisolated public final class Inkling2CPUForward {
         let block = config.nLayersPerAttnResBlock
 
         for layer in 0..<coreStart {
-            let (output, _) = try runVisit(
+            let (output, _) = try runVisitOrSubstitute(
                 layer: layer, pass: 0, hidden: hidden, blockStates: &blockStates,
                 messages: nil, position: position
             )
@@ -209,7 +221,7 @@ nonisolated public final class Inkling2CPUForward {
         let preLoopBlockCount = blockStates.count
 
         for layer in coreStart..<coreEnd {
-            let (output, _) = try runVisit(
+            let (output, _) = try runVisitOrSubstitute(
                 layer: layer, pass: 0, hidden: hidden, blockStates: &blockStates,
                 messages: nil, position: position
             )
@@ -237,7 +249,7 @@ nonisolated public final class Inkling2CPUForward {
                     blockStates: previousBlocks, partial: previousHidden,
                     coreIndex: coreIndex, pass: pass
                 )
-                let (output, _) = try runVisit(
+                let (output, _) = try runVisitOrSubstitute(
                     layer: layer, pass: pass, hidden: hidden, blockStates: &blockStates,
                     messages: messages, position: position
                 )
@@ -247,7 +259,7 @@ nonisolated public final class Inkling2CPUForward {
         }
 
         for layer in coreEnd..<config.numHiddenLayers {
-            let (output, _) = try runVisit(
+            let (output, _) = try runVisitOrSubstitute(
                 layer: layer, pass: 0, hidden: hidden, blockStates: &blockStates,
                 messages: nil, position: position
             )
@@ -275,6 +287,24 @@ nonisolated public final class Inkling2CPUForward {
             logits[row] = total
         }
         return Inkling2Math.finalLogitSoftcap(logits, softcap: config.finalLogitSoftcapping)
+    }
+
+    /// One visit, through the installed executor when there is one.
+    func runVisitOrSubstitute(
+        layer: Int,
+        pass: Int,
+        hidden: [Float],
+        blockStates: inout [[Float]],
+        messages: [[Float]]?,
+        position: Int
+    ) throws -> (output: [Float], attentionQueries: Int) {
+        if let visitRunner {
+            return try visitRunner(layer, pass, hidden, &blockStates, messages, position)
+        }
+        return try runVisit(
+            layer: layer, pass: pass, hidden: hidden, blockStates: &blockStates,
+            messages: messages, position: position
+        )
     }
 
     /// One visit. Returns its output and the block-read query count, which the

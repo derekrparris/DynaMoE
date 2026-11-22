@@ -970,8 +970,8 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         try runStage("k conv") { encoder, arena in
             try metal.convolve(
                 encoder: encoder, state: state, index: 0,
-                values: workspace.key, valuesCount: kvHeads * headDim,
-                layer: layer, isFull: false, headDim: headDim, output: workspace.key, arena: arena
+                values: workspace.key, valuesCount: kvHeads * headDim, dynamicInput: keyInput,
+                layer: layer, isFull: false, headDim: headDim, output: workspace.convolvedKey, arena: arena
             )
         }
         try runStage("wv") { encoder, arena in
@@ -985,8 +985,8 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         try runStage("v conv") { encoder, arena in
             try metal.convolve(
                 encoder: encoder, state: state, index: 1,
-                values: workspace.value, valuesCount: kvHeads * headDim,
-                layer: layer, isFull: false, headDim: headDim, output: workspace.value, arena: arena
+                values: workspace.value, valuesCount: kvHeads * headDim, dynamicInput: valueInput,
+                layer: layer, isFull: false, headDim: headDim, output: workspace.convolvedValue, arena: arena
             )
         }
         try runStage("v norm") { encoder, arena in
@@ -1271,5 +1271,79 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         ]
         print("🔎 [inkling2 device] mlp stages: " + stageRows.joined(separator: " "))
         withExtendedLifetime(engine) {}
+    }
+
+    // MARK: The whole visit
+
+    /// One complete visit on the device against the host's own `runVisit`, on
+    /// the real checkpoint: every stage of a visit in its real order, through
+    /// the loop's own schedule.
+    ///
+    /// Two host forwards over the same weights, because both sides mutate the
+    /// visit's KV rows and convolution histories.
+    func testTheDeviceVisitMatchesTheHostGraph() throws {
+        let snapshot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(Inkling2PublishedTensorTests.snapshotRelativePath)
+        guard FileManager.default.fileExists(atPath: snapshot.path) else {
+            throw XCTSkip("Inkling 2 snapshot is not downloaded at \(snapshot.path)")
+        }
+        let (device, library, queue) = try environment()
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let summary = try engine.getSummary()
+        let config = try Inkling2Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let catalog = Inkling2WeightCatalog(
+            mainFile: summary.tensors.map { Inkling2TensorRef(metadata: $0) },
+            layerCount: config.numHiddenLayers
+        )
+        var shardBuffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            guard shard.length > 0,
+                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)) else { continue }
+            if let buffer = device.makeBuffer(
+                bytesNoCopy: pointer, length: Int(shard.length), options: .storageModeShared, deallocator: nil
+            ) { shardBuffers[shard.index] = buffer }
+        }
+        let source = Inkling2SnapshotWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
+        let oracle = try Inkling2CPUForward(config: config, weights: source)
+        let reference = try Inkling2CPUForward(config: config, weights: source)
+        let deviceWeights = Inkling2DeviceWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
+        let metal = try Inkling2MetalForward(
+            device: device, library: library, queue: queue, weights: deviceWeights, host: reference
+        )
+        let workspace = try Inkling2DeviceWorkspace(device: device, config: config)
+
+        let tokenizer = try DynaMoeTokenizer(
+            tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+        )
+        let ids = try tokenizer.encode(text: "Hi there")
+        for (position, id) in ids.enumerated() {
+            _ = try oracle.forwardToken(token: UInt32(id), position: position)
+            _ = try reference.forwardToken(token: UInt32(id), position: position)
+        }
+        let position = ids.count
+        // Layer 0 is a sliding layer, so the visit runs the shared-norm branch.
+        let layer = 0
+        let input = values(config.hiddenSize, seed: 71)
+        // The stack the visit reads: the block read is over these plus the partial.
+        var oracleStack = [values(config.hiddenSize, seed: 72)]
+        var deviceStack = oracleStack
+
+        let expected = try oracle.runVisit(
+            layer: layer, pass: 0, hidden: input, blockStates: &oracleStack,
+            messages: nil, position: position
+        )
+        let actual = try metal.runVisit(
+            layer: layer, pass: 0, hidden: input, blockStates: &deviceStack,
+            messages: nil, position: position, workspace: workspace
+        )
+
+        let scale = expected.output.reduce(Float(0)) { max($0, abs($1)) }
+        let worst = zip(actual.output, expected.output).reduce(Float(0)) { max($0, abs($1.0 - $1.1)) }
+        print("🔎 [inkling2 device] whole visit: \(worst / scale) relative")
+        XCTAssertEqual(actual.attentionQueries, expected.attentionQueries)
+        XCTAssertEqual(deviceStack.count, oracleStack.count)
+        XCTAssertLessThanOrEqual(worst / scale, 3e-3, "the device visit against the host graph")
     }
 }
