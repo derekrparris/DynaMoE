@@ -208,4 +208,134 @@ nonisolated public final class Inkling2MetalForward {
         }
         return pipeline
     }
+
+    // MARK: Small constants
+
+    /// A `constant` argument, as the buffer the shader binds.
+    ///
+    /// The caller keeps the returned buffers alive until the command buffer is
+    /// committed: a dispatch's arguments are read when the GPU runs it, not
+    /// when it is encoded, so a temporary freed at the end of the encoding
+    /// scope would be read after it was gone.
+    private func scalar<T>(_ value: T) -> MTLBuffer? {
+        var copy = value
+        return device.makeBuffer(
+            bytes: &copy, length: MemoryLayout<T>.stride, options: .storageModeShared
+        )
+    }
+
+    /// `y = W x` for a BF16 weight, dispatched through the wide-grid block form.
+    ///
+    /// The host's `linear` is FP32 over a dequantized matrix; the device reads
+    /// the checkpoint's BF16 bytes, which is the same number widened, so the
+    /// only difference is the accumulation order.
+    func gemm(
+        encoder: MTLComputeCommandEncoder,
+        role: Inkling2TensorRole,
+        layer: Int?,
+        input: MTLBuffer,
+        inputOffset: Int,
+        output: MTLBuffer,
+        outputOffset: Int,
+        rows: Int,
+        columns: Int,
+        kernel: String
+    ) throws {
+        let (weightBuffer, weightOffset) = try weights.tensor(role, layer: layer)
+        let offset = scalar(UInt64(weightOffset))
+        let inDim = scalar(UInt32(columns))
+        let outDim = scalar(UInt32(rows))
+        let zero: UInt32 = 0
+        let inputStride = scalar(zero)
+        let outputStride = scalar(zero)
+        encoder.setComputePipelineState(try pipeline(kernel))
+        encoder.setBuffer(weightBuffer, offset: 0, index: 0)
+        encoder.setBuffer(input, offset: inputOffset, index: 1)
+        encoder.setBuffer(output, offset: outputOffset, index: 2)
+        encoder.setBuffer(offset, offset: 0, index: 3)
+        encoder.setBuffer(inDim, offset: 0, index: 4)
+        encoder.setBuffer(outDim, offset: 0, index: 5)
+        encoder.setBuffer(inputStride, offset: 0, index: 6)
+        encoder.setBuffer(outputStride, offset: 0, index: 7)
+        encoder.setThreadgroupMemoryLength(32 * MemoryLayout<Float>.stride, index: 0)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: rows, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
+        )
+    }
+
+    /// The block read: `softmax(q . rmsnorm(row) / sqrt(width)) . rmsnorm(row)`
+    /// over the stack plus the partial, one threadgroup per query.
+    func blockRead(
+        encoder: MTLComputeCommandEncoder,
+        stack: MTLBuffer,
+        stackRows: Int,
+        partial: MTLBuffer,
+        partialOffset: Int,
+        queries: MTLBuffer,
+        queryCount: Int,
+        output: MTLBuffer,
+        outputOffset: Int
+    ) throws {
+        let width = config.hiddenSize
+        let stackRowsValue = scalar(UInt32(stackRows))
+        let widthValue = scalar(UInt32(width))
+        encoder.setComputePipelineState(try pipeline("inkling_block_read_f32"))
+        encoder.setBuffer(stack, offset: 0, index: 0)
+        encoder.setBuffer(partial, offset: partialOffset, index: 1)
+        encoder.setBuffer(queries, offset: 0, index: 2)
+        encoder.setBuffer(output, offset: outputOffset, index: 3)
+        encoder.setBuffer(stackRowsValue, offset: 0, index: 4)
+        encoder.setBuffer(widthValue, offset: 0, index: 5)
+        encoder.setThreadgroupMemoryLength(
+            (32 + 64 + 64) * MemoryLayout<Float>.stride, index: 0
+        )
+        encoder.dispatchThreadgroups(
+            MTLSize(width: queryCount, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
+        )
+    }
+
+    /// The attention kernel over one visit's staged KV rows.
+    func attention(
+        encoder: MTLComputeCommandEncoder,
+        workspace: Inkling2DeviceWorkspace,
+        state: Inkling2VisitState,
+        rows: Int,
+        position: Int,
+        relative: MTLBuffer,
+        bank: MTLBuffer,
+        sink: MTLBuffer,
+        output: MTLBuffer
+    ) throws {
+        let isFull = state.isFullAttention
+        let heads = isFull ? config.numAttentionHeads : config.swaNumAttentionHeads
+        let kvHeads = isFull ? config.numKeyValueHeads : config.swaNumKeyValueHeads
+        let headDim = isFull ? config.headDim : config.swaHeadDim
+        let kvWidth = kvHeads * headDim
+        let values: [UInt32] = [
+            UInt32(heads), UInt32(heads / kvHeads), UInt32(headDim), UInt32(kvWidth),
+            UInt32(rows), UInt32(state.windowStart), UInt32(position),
+            UInt32(config.dRel), UInt32(isFull ? config.relExtent : config.slidingWindowSize)
+        ]
+        encoder.setComputePipelineState(try pipeline("inkling_attention_f32"))
+        encoder.setBuffer(workspace.query, offset: 0, index: 0)
+        encoder.setBuffer(workspace.stagedKeys, offset: 0, index: 1)
+        encoder.setBuffer(workspace.stagedValues, offset: 0, index: 2)
+        encoder.setBuffer(relative, offset: 0, index: 3)
+        encoder.setBuffer(bank, offset: 0, index: 4)
+        encoder.setBuffer(sink, offset: 0, index: 5)
+        encoder.setBuffer(output, offset: 0, index: 6)
+        for (index, value) in values.enumerated() {
+            guard let buffer = scalar(value) else { continue }
+            encoder.setBuffer(buffer, offset: 0, index: 7 + index)
+        }
+        encoder.setThreadgroupMemoryLength(
+            (32 + rows) * MemoryLayout<Float>.stride, index: 0
+        )
+        encoder.dispatchThreadgroups(
+            MTLSize(width: heads, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+    }
 }
