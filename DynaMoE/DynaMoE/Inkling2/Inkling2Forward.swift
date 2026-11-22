@@ -187,6 +187,9 @@ nonisolated public final class Inkling2CPUForward {
             hidden, gain: try weights.matrix(.embeddingNorm, layer: nil), eps: config.rmsNormEps
         )
         let logits = try forwardHidden(hidden, position: position)
+        // Recorded AFTER the forward, so a visit that threw leaves the history
+        // matching the KV it actually committed -- and so a resume can prove
+        // which tokens the cache holds rather than assume a matching prefix.
         sequence.record(token: row)
         return logits
     }

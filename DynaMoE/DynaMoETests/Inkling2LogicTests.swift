@@ -1576,6 +1576,128 @@ final class Inkling2HostForwardTests: XCTestCase {
         return try Inkling2CPUForward(config: config, weights: source)
     }
 
+    /// A follow-up turn that resumes its prefix must answer exactly what a
+    /// fresh full prefill of the same prompt answers -- the Phase 3 gate, and
+    /// the only thing that makes reuse safe rather than merely faster.
+    ///
+    /// The prompt is the first turn's own prompt extended by what it generated,
+    /// which is the shape a real conversation produces: the executor holds the
+    /// prompt plus the forwarded continuation, and the next prompt starts with
+    /// both.
+    func testAFollowUpTurnResumesItsPrefixAndMatchesAFreshPrefill() throws {
+        let forward = try makeForward()
+        let tokenizer = try DynaMoeTokenizer(
+            tokenizerPath: try snapshot().appendingPathComponent("tokenizer.json").path
+        )
+        let ids = try tokenizer.encode(text: "Hi there").map { Int($0) }
+        let settings = Inkling2TurnRunner.Settings(
+            temperature: 0, topP: 1, minP: 0, topK: 1, maxTokens: 2,
+            eosTokenIds: [UInt32(clamping: forward.config.eosTokenID)]
+        )
+        func sample(_ logits: [Float], _ soFar: [UInt32]) -> UInt32 {
+            var scratch = logits
+            return scratch.withUnsafeMutableBufferPointer { buffer in
+                InferenceEngine.sampleNextToken(
+                    logits: buffer.baseAddress!, vocabSize: buffer.count,
+                    contextTokens: soFar, temperature: 0, topP: 1, minP: 0, topK: 1,
+                    repetitionPenalty: 1, presencePenalty: 0,
+                    eosTokenIds: settings.eosTokenIds
+                )
+            }
+        }
+
+        // Turn one: nothing resident, so the whole prompt prefills.
+        forward.reset()
+        let first = try Inkling2TurnRunner.run(
+            forward: forward, promptTokenIds: ids, settings: settings,
+            sample: sample, decode: { $0.map(String.init).joined() }
+        )
+        XCTAssertGreaterThan(first.storedPromptTokens, 0)
+
+        // The continuation the turn generated and FORWARDED is what the cache
+        // holds past the prompt; a sampled-but-unforwarded token is not there.
+        let followUp = ids + first.generatedTokenIds.dropLast().map(Int.init)
+
+
+        // Turn two: the same executor, so it may resume.
+        let resumed = try Inkling2TurnRunner.run(
+            forward: forward, promptTokenIds: followUp, prefixTokens: followUp.count - 1,
+            settings: settings, sample: sample, decode: { $0.map(String.init).joined() }
+        )
+        XCTAssertGreaterThan(resumed.prefixTokensReused, 0, "the follow-up must resume a prefix")
+
+        // The control: a fresh executor prefills the whole prompt.
+        let freshForward = try makeForward()
+        let fresh = try Inkling2TurnRunner.run(
+            forward: freshForward, promptTokenIds: followUp, settings: settings,
+            sample: sample, decode: { $0.map(String.init).joined() }
+        )
+        XCTAssertEqual(fresh.prefixTokensReused, 0)
+        XCTAssertEqual(
+            resumed.generatedTokenIds, fresh.generatedTokenIds,
+            "a resumed turn must answer what a full prefill answers"
+        )
+    }
+
+    /// A cancelled turn leaves the cache holding exactly its committed prefix,
+    /// and a resumed turn from that point answers what a fresh prefill answers.
+    ///
+    /// The cancellation lands during PREFILL, so the interesting number is
+    /// `storedPromptTokens` -- the positions actually forwarded -- rather than
+    /// the prompt length the turn was given.
+    func testACancelledTurnResumesExactlyItsCommittedPrefix() throws {
+        let forward = try makeForward()
+        let tokenizer = try DynaMoeTokenizer(
+            tokenizerPath: try snapshot().appendingPathComponent("tokenizer.json").path
+        )
+        let ids = try tokenizer.encode(text: "Hi there").map { Int($0) }
+        let settings = Inkling2TurnRunner.Settings(
+            temperature: 0, topP: 1, minP: 0, topK: 1, maxTokens: 2,
+            eosTokenIds: [UInt32(clamping: forward.config.eosTokenID)]
+        )
+        func sample(_ logits: [Float], _ soFar: [UInt32]) -> UInt32 {
+            var scratch = logits
+            return scratch.withUnsafeMutableBufferPointer { buffer in
+                InferenceEngine.sampleNextToken(
+                    logits: buffer.baseAddress!, vocabSize: buffer.count,
+                    contextTokens: soFar, temperature: 0, topP: 1, minP: 0, topK: 1,
+                    repetitionPenalty: 1, presencePenalty: 0,
+                    eosTokenIds: settings.eosTokenIds
+                )
+            }
+        }
+
+        // Cancelled after the first prompt position has run.
+        forward.reset()
+        var checks = 0
+        let cancelled = try Inkling2TurnRunner.run(
+            forward: forward, promptTokenIds: ids, settings: settings,
+            sample: sample, decode: { $0.map(String.init).joined() },
+            isCancelled: { checks += 1; return checks > 1 }
+        )
+        XCTAssertTrue(cancelled.cancelled)
+        XCTAssertEqual(cancelled.storedPromptTokens, 1, "one position ran before the cancel")
+        XCTAssertEqual(forward.sequence.tokenHistory, Array(ids.prefix(1)))
+        XCTAssertTrue(forward.sequence.isConsistent, "a cancelled turn leaves the visits agreeing")
+
+        // Resumed from exactly that prefix on the same executor.
+        let resumed = try Inkling2TurnRunner.run(
+            forward: forward, promptTokenIds: ids, prefixTokens: cancelled.storedPromptTokens,
+            settings: settings, sample: sample, decode: { $0.map(String.init).joined() }
+        )
+        XCTAssertEqual(resumed.prefixTokensReused, cancelled.storedPromptTokens)
+
+        let freshForward = try makeForward()
+        let fresh = try Inkling2TurnRunner.run(
+            forward: freshForward, promptTokenIds: ids, settings: settings,
+            sample: sample, decode: { $0.map(String.init).joined() }
+        )
+        XCTAssertEqual(
+            resumed.generatedTokenIds, fresh.generatedTokenIds,
+            "a turn resumed from a cancelled one must answer what a full prefill answers"
+        )
+    }
+
     /// A visit runner is a SUBSTITUTION, not a hook beside the work: the loop
     /// must run the installed one for every visit of a token and must produce
     /// the same logits when it simply delegates to the host graph.

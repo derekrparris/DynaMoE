@@ -96,6 +96,14 @@ extension Inkling2CPUForward: Inkling2PositionForward {
 
     public var storedPositions: Int { states.first?.committedPositions ?? 0 }
 
+    /// What the cache provably holds: the sequence's own token history against
+    /// the prompt, capped by the proposal and by the committed positions. A
+    /// session key or a matching id prefix is not evidence -- two conversations
+    /// can share one -- so the history is the authority.
+    public func reusablePrefix(proposedPrefix: Int, promptTokenIds: [Int]) -> Int {
+        sequence.reusablePrefix(proposedPrefix: proposedPrefix, promptTokenIds: promptTokenIds)
+    }
+
     public func forwardToken(_ token: Int, position: Int) throws -> [Float] {
         try forwardToken(token: UInt32(token), position: position)
     }
@@ -193,17 +201,20 @@ nonisolated public enum Inkling2TurnRunner {
         guard promptTokenIds.count <= limit else {
             throw Inkling2TurnError.promptTooLong(promptTokens: promptTokenIds.count, limit: limit)
         }
-        let reusable = max(0, min(prefixTokens, promptTokenIds.count - 1))
-        if reusable > 0 {
-            _ = forward.reusablePrefix(proposedPrefix: reusable, promptTokenIds: promptTokenIds)
-        } else {
-            forward.reset()
-        }
+        // The proposal is advisory: the executor knows what it actually holds,
+        // and a resumed prefix that disagreed with the cache would mix two
+        // sequences with no error anywhere. So it decides, and the prefill
+        // starts at ITS answer.
+        let proposed = max(0, min(prefixTokens, promptTokenIds.count - 1))
+        let reusable = proposed > 0
+            ? forward.reusablePrefix(proposedPrefix: proposed, promptTokenIds: promptTokenIds)
+            : 0
+        if reusable == 0 { forward.reset() }
 
-        // Prefill: every prompt position runs; the last one's logits are the
-        // first draw's.
+        // Prefill: every prompt position from the reused prefix runs; the last
+        // one's logits are the first draw's.
         var logits: [Float] = []
-        for (position, token) in promptTokenIds.enumerated() {
+        for (position, token) in promptTokenIds.enumerated() where position >= reusable {
             if isCancelled() {
                 return Output(
                     generatedTokenIds: [], text: "", finishReason: .stopped,
