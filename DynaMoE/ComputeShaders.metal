@@ -13955,3 +13955,89 @@ kernel void inkling_attention_f32(
         out[d] = accumulator;
     }
 }
+
+// E2M1 (FP4) decode of one nibble, and BF16 rounding, both matching
+// Inkling2Element.decodeE2M1 / roundToBF16 exactly -- the host rule the expert
+// kernel is checked against rounds each dequantized product to BF16 before it
+// meets the activation, because Transformers dequantizes to BF16.
+inline float inkling_e2m1(uint nibble) {
+    uint code = nibble & 0xF;
+    float sign = (code & 0x8) != 0 ? -1.0f : 1.0f;
+    uint exponent = (code >> 1) & 0x3;
+    uint mantissa = code & 0x1;
+    float magnitude;
+    if (exponent == 0) {
+        magnitude = (float)mantissa * 0.5f;
+    } else {
+        magnitude = (1.0f + (float)mantissa * 0.5f) * exp2((float)(exponent - 1));
+    }
+    return sign * magnitude;
+}
+
+inline float inkling_round_bf16(float value) {
+    if (!isfinite(value)) { return value; }
+    uint bits = as_type<uint>(value);
+    uint lsb = (bits >> 16) & 1;
+    bits += 0x7FFF + lsb;
+    bits &= 0xFFFF0000;
+    return as_type<float>(bits);
+}
+
+inline float inkling_e4m3(uint byte) {
+    float sign = (byte & 0x80) != 0 ? -1.0f : 1.0f;
+    uint exponent = (byte >> 3) & 0xF;
+    uint mantissa = byte & 0x7;
+    if (exponent == 0xF && mantissa == 0x7) { return NAN; }
+    float magnitude;
+    if (exponent == 0) {
+        magnitude = (float)mantissa * exp2(-9.0f);
+    } else {
+        magnitude = (1.0f + (float)mantissa / 8.0f) * exp2((float)exponent - 7.0f);
+    }
+    return sign * magnitude;
+}
+
+// One output row of an expert projection: `sum_c bf16(dequant(w[c]) * scale) *
+// x[c]`, block-scaled. One threadgroup per output row; the lanes split the
+// columns.
+//
+// `layoutIsNVFP4` selects the packing (two values per byte, 16-value blocks)
+// against MXFP8 (one byte per value, 32-value blocks with E8M0 scales). The
+// outer scale (`amax / denominator`) is folded into the block scale for NVFP4,
+// exactly as the host does.
+kernel void inkling_expert_row_f32(
+    device const uchar* weight [[buffer(0)]],
+    device const uchar* scales [[buffer(1)]],
+    device const float* input [[buffer(2)]],
+    device float* outVector [[buffer(3)]],
+    constant uint32_t& logicalColumns [[buffer(4)]],
+    constant uint32_t& weightRowStride [[buffer(5)]],
+    constant uint32_t& scaleRowStride [[buffer(6)]],
+    constant uint32_t& blockSize [[buffer(7)]],
+    constant bool& layoutIsNVFP4 [[buffer(8)]],
+    constant float& outerScale [[buffer(9)]],
+    threadgroup float* shared [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgSize [[threads_per_threadgroup]],
+    uint row [[threadgroup_position_in_grid]]
+) {
+    uint weightBase = row * weightRowStride;
+    uint scaleBase = row * scaleRowStride;
+    float localSum = 0.0f;
+    for (uint column = tid; column < logicalColumns; column += tgSize) {
+        uint block = column / blockSize;
+        float scale = layoutIsNVFP4 ? inkling_e4m3(scales[scaleBase + block]) * outerScale
+                                    : exp2((float)scales[scaleBase + block] - 127.0f);
+        float value;
+        if (layoutIsNVFP4) {
+            uchar byte = weight[weightBase + column / 2];
+            uint nibble = column % 2 == 0 ? (byte & 0xF) : (byte >> 4);
+            value = inkling_e2m1(nibble) * scale;
+        } else {
+            value = inkling_e4m3(weight[weightBase + column]) * scale;
+        }
+        localSum += inkling_round_bf16(value) * input[column];
+    }
+    float total = threadgroup_reduce_sum(localSum, shared, tid, tgSize);
+    if (tid == 0) { outVector[row] = total; }
+}

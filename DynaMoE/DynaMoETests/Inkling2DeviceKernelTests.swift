@@ -350,6 +350,87 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         XCTAssertLessThan(position - (windowStart + Int(keyRows) - 1), 0)
     }
 
+    // MARK: Experts
+
+    /// The block-scaled expert row against `Inkling2PackedExpertMatrix.project`,
+    /// the host rule the mixture uses, for BOTH layouts.
+    ///
+    /// The NVFP4 case is the one that matters: nothing on the device reads that
+    /// packing yet, and its quirks (two values per byte, low nibble first, 16
+    /// blocks, an outer amax scale, a BF16 rounding of each product) are each a
+    /// way to be quietly wrong. The column count is odd-block aware (a partial
+    /// last block) and the row stride is wider than the logical row, so a
+    /// stride bug cannot hide.
+    func testTheExpertRowMatchesTheHostRule() throws {
+        let (device, _, _) = try environment()
+        for layout in [Inkling2ExpertQuantLayout.nvfp4, .mxfp8] {
+            let rows = 2, logicalColumns = 40
+            let blockSize = layout.blockSize
+            let valuesPerByte = layout == .nvfp4 ? 2 : 1
+            let packedColumns = (logicalColumns + valuesPerByte - 1) / valuesPerByte
+            let weightRowStride = packedColumns + 3       // padded: a stride bug must fail
+            let scaleColumns = (logicalColumns + blockSize - 1) / blockSize
+            let scaleRowStride = scaleColumns + 1
+            let amax: Float = 3.5, denominator: Float = 4.0
+
+            // Bytes whose exponents stay finite, so a decoded value is a number.
+            var weight = [UInt8](repeating: 0, count: rows * weightRowStride)
+            for index in 0..<weight.count {
+                weight[index] = UInt8(0x21 + (index &* 13) % 0x5C)
+            }
+            var scales = [UInt8](repeating: 0, count: rows * scaleRowStride)
+            for index in 0..<scales.count {
+                // E4M3 near 2^0 for NVFP4; E8M0 (a biased exponent) for MXFP8.
+                scales[index] = layout == .nvfp4 ? UInt8(118 + index % 9) : UInt8(124 + index % 5)
+            }
+            let input = values(logicalColumns, seed: 31)
+
+            let matrix = Inkling2PackedExpertMatrix(
+                layout: layout, weight: weight, weightRowStride: weightRowStride,
+                scales: scales, scaleRowStride: scaleRowStride,
+                rows: rows, logicalColumns: logicalColumns,
+                expertAmax: amax, outerScaleDenominator: denominator
+            )
+            let expected = (0..<rows).map { matrix.project(row: $0, input: input) }
+
+            let weightBuffer = try XCTUnwrap(device.makeBuffer(
+                bytes: weight, length: weight.count, options: .storageModeShared))
+            let scaleBuffer = try XCTUnwrap(device.makeBuffer(
+                bytes: scales, length: scales.count, options: .storageModeShared))
+            let inputBuffer = try buffer(device, input)
+            let outputBuffer = try buffer(device, [Float](repeating: 0, count: rows))
+            let scalars: [UInt32] = [
+                UInt32(logicalColumns), UInt32(weightRowStride), UInt32(scaleRowStride), UInt32(blockSize)
+            ]
+            let scalarBuffers = try scalars.enumerated().map { index, value in
+                try buffer(device, [value])
+            }
+            let layoutBuffer = try XCTUnwrap(device.makeBuffer(
+                bytes: [layout == .nvfp4], length: 1, options: .storageModeShared))
+            let outerScale = layout.requiresAmaxDenominator ? amax / denominator : 1
+            let outerBuffer = try buffer(device, [outerScale])
+
+            try run("inkling_expert_row_f32", threads: (rows, 1, 1), threadgroup: (64, 1, 1),
+                    threadgroupMemory: 32 * MemoryLayout<Float>.stride, byThreadgroup: true) { encoder in
+                encoder.setBuffer(weightBuffer, offset: 0, index: 0)
+                encoder.setBuffer(scaleBuffer, offset: 0, index: 1)
+                encoder.setBuffer(inputBuffer, offset: 0, index: 2)
+                encoder.setBuffer(outputBuffer, offset: 0, index: 3)
+                for (index, b) in scalarBuffers.enumerated() { encoder.setBuffer(b, offset: 0, index: 4 + index) }
+                encoder.setBuffer(layoutBuffer, offset: 0, index: 8)
+                encoder.setBuffer(outerBuffer, offset: 0, index: 9)
+            }
+            let actual = read(outputBuffer, rows)
+            for row in 0..<rows {
+                XCTAssertEqual(
+                    actual[row], expected[row],
+                    accuracy: max(1e-4, abs(expected[row]) * 1e-3),
+                    "\(layout) row \(row)"
+                )
+            }
+        }
+    }
+
     // MARK: The block read
 
     /// The block-attention residual read against the host rule, with TWO
