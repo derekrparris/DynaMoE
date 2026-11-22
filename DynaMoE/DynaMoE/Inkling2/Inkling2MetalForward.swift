@@ -125,6 +125,8 @@ nonisolated public final class Inkling2DeviceWorkspace {
     public let relativeStates: MTLBuffer
     public let sinkLogits: MTLBuffer
     public let bank: MTLBuffer
+    /// The attention's per-row scores, for a parity check of the stage inside.
+    public let scoreDump: MTLBuffer
 
     public init(device: MTLDevice, config: Inkling2Config) throws {
         let hiddenBytes = config.hiddenSize * MemoryLayout<Float>.stride
@@ -163,6 +165,7 @@ nonisolated public final class Inkling2DeviceWorkspace {
             config.dRel * max(config.relExtent, config.slidingWindowSize) * MemoryLayout<Float>.stride,
             "relative bank"
         )
+        scoreDump = try make(config.maxPositionEmbeddings * MemoryLayout<Float>.stride, "score dump")
     }
 
     /// Copies one visit's retained key and value rows into the staging buffers.
@@ -641,7 +644,8 @@ nonisolated public final class Inkling2MetalForward {
         keyInput: [Float],
         valueInput: [Float],
         position: Int,
-        workspace: Inkling2DeviceWorkspace
+        workspace: Inkling2DeviceWorkspace,
+        dumpsAttentionScores: Bool = false
     ) throws -> [Float] {
         let isFull = !config.isLocalLayer(layer)
         let heads = isFull ? config.numAttentionHeads : config.swaNumAttentionHeads
@@ -721,6 +725,15 @@ nonisolated public final class Inkling2MetalForward {
         )
         try headNorm(encoder: encoder, vector: workspace.value, headDim: headDim, heads: kvHeads, arena: arena)
 
+        // The position attends over ITSELF, so its own K/V joins the cache
+        // before the bias is computed -- the host's `attention` appends at
+        // exactly this point. Without it the device attends over one row fewer
+        // than the host and the sequence never grows.
+        _ = state.append(
+            key: readBack(workspace.key, count: kvHeads * headDim),
+            value: readBack(workspace.value, count: kvHeads * headDim)
+        )
+
         // The relative states and the sink logits are small host-side
         // projections; the kernel only needs their results, and computing them
         // on the host keeps this stage's device part to what it is for.
@@ -737,7 +750,8 @@ nonisolated public final class Inkling2MetalForward {
         try attention(
             encoder: encoder, workspace: workspace, state: state, rows: rows,
             position: position, relative: relativeBuffer, bank: bankBuffer,
-            sink: sinkBuffer, output: workspace.attentionOutput, arena: arena
+            sink: sinkBuffer, output: workspace.attentionOutput, arena: arena,
+            dumpsScores: dumpsAttentionScores
         )
 
         // The output gate, then the grouped output projection.
@@ -779,7 +793,8 @@ nonisolated public final class Inkling2MetalForward {
         bank: MTLBuffer,
         sink: MTLBuffer,
         output: MTLBuffer,
-        arena: Inkling2ScalarArena
+        arena: Inkling2ScalarArena,
+        dumpsScores: Bool = false
     ) throws {
         let isFull = state.isFullAttention
         let heads = isFull ? config.numAttentionHeads : config.swaNumAttentionHeads
@@ -802,6 +817,12 @@ nonisolated public final class Inkling2MetalForward {
         for (index, value) in values.enumerated() {
             encoder.setBuffer(arena.make(value), offset: 0, index: 7 + index)
         }
+        // An optional score dump, into the CALLER's workspace buffer: the host
+        // captures `scores_head0`, and comparing them is what separates the bias
+        // from the softmax from the value fold. It has to outlive this call for
+        // the caller to read it, so it cannot be the arena's.
+        encoder.setBuffer(workspace.scoreDump, offset: 0, index: 16)
+        encoder.setBuffer(arena.make(dumpsScores), offset: 0, index: 17)
         encoder.setThreadgroupMemoryLength(
             (32 + rows) * MemoryLayout<Float>.stride, index: 0
         )

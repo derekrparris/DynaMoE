@@ -13909,6 +13909,8 @@ kernel void inkling_attention_f32(
     constant uint32_t& position [[buffer(13)]],
     constant uint32_t& dRel [[buffer(14)]],
     constant uint32_t& extent [[buffer(15)]],
+    device float* scoreDump [[buffer(16)]],
+    constant bool& dumpsScores [[buffer(17)]],
     threadgroup float* shared [[threadgroup(0)]],
     uint tid [[thread_position_in_threadgroup]],
     uint tgSize [[threads_per_threadgroup]],
@@ -13938,7 +13940,11 @@ kernel void inkling_attention_f32(
             for (uint r = 0; r < dRel; r++) { bias += rel[r] * bank[r * extent + (uint)distance]; }
         }
         float score = dot * scaling + bias;
-        if (tid == 0) { scores[row] = score; }
+        // The store must not race the NEXT row's reduction: the helper's last
+        // barrier protects its own read, not a write that happens after it.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) { scores[row] = score; if (dumpsScores) { scoreDump[row] = score; } }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         localMax = max(localMax, score);
     }
     float maximum = max(localMax, sinkLogits[head]);
