@@ -1691,6 +1691,85 @@ final class Inkling2HostForwardTests: XCTestCase {
             "the turn did not continue in the assistant role: \(text.debugDescription)"
         )
     }
+
+    /// The Phase 2 gate the logit comparison cannot answer: greedy ids on
+    /// several separated prompts must be the reference's. A per-element
+    /// tolerance can pass while an argmax flips; this is the check that the
+    /// graph's DECISIONS agree.
+    ///
+    /// The reference is the pinned Transformers implementation in BF16, run by
+    /// `/tmp/inkling_greedy_ref.py` (its output is `/tmp/inkling2_greedy_ref.json`),
+    /// with the prompt rendered exactly as the app renders it -- the same
+    /// `Inkling2Prompt` call and effort 0 -- so the ids being compared start
+    /// from the same place.
+    func testGreedyContinuationsMatchTheReference() throws {
+        let path = "/tmp/inkling2_greedy_ref.json"
+        guard FileManager.default.fileExists(atPath: path),
+              let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let cases = root["cases"] as? [[String: Any]] else {
+            throw XCTSkip("no reference continuations at \(path): run /tmp/inkling_greedy_ref.py")
+        }
+        let forward = try makeForward()
+        let tokenizer = try DynaMoeTokenizer(
+            tokenizerPath: try snapshot().appendingPathComponent("tokenizer.json").path
+        )
+        for entry in cases {
+            let prompt = try XCTUnwrap(entry["prompt"] as? String)
+            let expected = try XCTUnwrap(entry["continuation"] as? [Int])
+            let promptIds = try XCTUnwrap(entry["ids"] as? [Int])
+
+            // The dump's ids are the reference tokenizer's; ours has to produce
+            // the same prompt for the comparison to be about the graph.
+            let rendered = try Inkling2Prompt().render(turns: [.user([.text(prompt)])], effort: 0)
+            let ids = try tokenizer.encode(text: rendered).map { Int($0) }
+            XCTAssertEqual(
+                ids, promptIds,
+                "the prompt tokenizes differently from the reference's for \(prompt.debugDescription)"
+            )
+
+            forward.reset()
+            let settings = Inkling2TurnRunner.Settings(
+                temperature: 0, topP: 1, minP: 0, topK: 1,
+                maxTokens: max(1, expected.count),
+                eosTokenIds: [UInt32(clamping: forward.config.eosTokenID)]
+            )
+            let output = try Inkling2TurnRunner.run(
+                forward: forward,
+                promptTokenIds: ids,
+                settings: settings,
+                sample: { logits, _ in
+                    var scratch = logits
+                    return scratch.withUnsafeMutableBufferPointer { buffer in
+                        InferenceEngine.sampleNextToken(
+                            logits: buffer.baseAddress!, vocabSize: buffer.count,
+                            contextTokens: [], temperature: 0, topP: 1, minP: 0, topK: 1,
+                            repetitionPenalty: 1, presencePenalty: 0,
+                            eosTokenIds: settings.eosTokenIds
+                        )
+                    }
+                },
+                decode: { ids in (try? tokenizer.decode(ids: ids)) ?? "" }
+            )
+            let actual = output.generatedTokenIds.map { Int($0) }
+            let referenceText = entry["text"] as? String ?? ""
+            print(
+                "🔎 [inkling2 greedy] \(prompt.debugDescription): mine \(actual) "
+                    + "vs reference \(expected) \(referenceText.debugDescription)"
+            )
+            // The first position is the one that must agree: after a divergence,
+            // every later id is conditioned on a different prefix, so comparing
+            // the rest says nothing new. Report the first mismatch by position.
+            let shared = min(actual.count, expected.count)
+            var agreed = 0
+            while agreed < shared, actual[agreed] == expected[agreed] { agreed += 1 }
+            XCTAssertEqual(
+                agreed, shared,
+                "\(prompt.debugDescription) diverges at position \(agreed): "
+                    + "mine \(Array(actual.prefix(agreed + 1))) vs reference \(Array(expected.prefix(agreed + 1)))"
+            )
+        }
+    }
 }
 
 // MARK: - Turn loop
