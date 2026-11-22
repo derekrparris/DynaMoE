@@ -122,6 +122,106 @@ nonisolated public enum Inkling2Effort: Sendable, Equatable {
     }
 }
 
+// MARK: - Tool declarations
+
+/// One tool the model may call, as the template's `tool_declare` message
+/// carries it.
+///
+/// The template accepts either a bare function or an OpenAI-style wrapper and
+/// normalizes both to the same four keys, so this is the normalized form: what
+/// a caller has is a name, a description and a JSON-schema parameter object.
+nonisolated public struct Inkling2ToolDeclaration: Sendable, Equatable {
+    public let name: String
+    public let description: String
+    /// The parameters as a JSON schema object, already in JSON-value form.
+    public let parameters: [String: MCPJSONValue]
+    /// `function` unless the caller says otherwise; the template defaults it.
+    public let type: String
+
+    public init(
+        name: String,
+        description: String = "",
+        parameters: [String: MCPJSONValue] = [:],
+        type: String = "function"
+    ) {
+        self.name = name
+        self.description = description
+        self.parameters = parameters
+        self.type = type
+    }
+
+    /// From the app's own tool definition, whose parameters are `AnyCodable`.
+    public init(_ definition: ToolDefinition) {
+        self.name = definition.function.name
+        self.description = definition.function.description
+        self.parameters = definition.function.parameters.mapValues {
+            MCPJSONValue(any: $0.value)
+        }
+        self.type = definition.type
+    }
+}
+
+// MARK: - JSON as the template writes it
+
+/// The subset of JSON the template's `tojson` produces, byte for byte.
+///
+/// `tojson` in jinja2 is `json.dumps` with `sort_keys=True` and the caller's
+/// separators, and markupsafe's wrapper does NOT escape non-ASCII -- so an
+/// accented character stays literal while a newline becomes `\n`. Keys sort by
+/// codepoint (Python's string comparison), which for valid UTF-8 is byte order.
+nonisolated enum Inkling2TemplateJSON {
+    /// Codepoint order, which is what Python's `sorted` on `str` does.
+    static func keyOrder(_ left: String, _ right: String) -> Bool {
+        left.unicodeScalars.lexicographicallyPrecedes(right.unicodeScalars) { a, b in
+            a.value < b.value
+        }
+    }
+
+    /// Compact JSON: `(",", ":")` separators, object keys sorted.
+    static func compact(_ value: MCPJSONValue) -> String {
+        switch value {
+        case .null: return "null"
+        case .bool(let flag): return flag ? "true" : "false"
+        case .int(let number): return String(number)
+        // Python prints a float with `repr`, the shortest round-trip form.
+        // Swift's description is also shortest round-trip; they differ only in
+        // exponent spelling, which no template value in this family reaches.
+        case .double(let number): return String(describing: number)
+        case .string(let text): return quoted(text)
+        case .array(let items): return "[" + items.map(compact).joined(separator: ",") + "]"
+        case .object(let fields):
+            let keys = fields.keys.sorted(by: keyOrder)
+            return "{" + keys.map { quoted($0) + ":" + compact(fields[$0] ?? .null) }
+                .joined(separator: ",") + "}"
+        }
+    }
+
+    /// Python's string escaping with `ensure_ascii=False`: quote, backslash, the
+    /// five short control escapes, `\u00XX` for the rest below 0x20, and every
+    /// other scalar literal.
+    static func quoted(_ text: String) -> String {
+        var output = "\""
+        for scalar in text.unicodeScalars {
+            switch scalar {
+            case "\"": output += "\\\""
+            case "\\": output += "\\\\"
+            case "\n": output += "\\n"
+            case "\r": output += "\\r"
+            case "\t": output += "\\t"
+            case "\u{08}": output += "\\b"
+            case "\u{0C}": output += "\\f"
+            default:
+                if scalar.value < 0x20 {
+                    output += String(format: "\\u%04x", scalar.value)
+                } else {
+                    output.unicodeScalars.append(scalar)
+                }
+            }
+        }
+        return output + "\""
+    }
+}
+
 // MARK: - Errors
 
 nonisolated public enum Inkling2PromptError: Error, Equatable, CustomStringConvertible {
@@ -156,11 +256,34 @@ nonisolated public enum Inkling2ContentPart: Sendable, Equatable {
     public static func parts(from content: String) -> [Inkling2ContentPart] { [.text(content)] }
 }
 
+/// One tool call in a conversation turn: the name and its already-parsed
+/// arguments.
+///
+/// The template refuses a JSON STRING of arguments ("canonicalize upstream"),
+/// so the arguments here are a mapping by construction -- a caller holding the
+/// model's raw JSON parses it first, and an unparseable call never becomes one
+/// of these (which is what keeps a truncated call from being executed).
+nonisolated public struct Inkling2ToolCall: Sendable, Equatable {
+    public let name: String
+    /// The template iterates this with `dictsort`, so insertion order is not
+    /// meaningful; `sortedKeys` at encode time is what the golden compares.
+    public let arguments: [String: MCPJSONValue]
+
+    public init(name: String, arguments: [String: MCPJSONValue]) {
+        self.name = name
+        self.arguments = arguments
+    }
+}
+
 /// One conversation turn, in the shape the template consumes.
 nonisolated public enum Inkling2Turn: Sendable, Equatable {
     case system(String)
     case user([Inkling2ContentPart])
-    case assistant(reasoning: String?, content: String?)
+    /// An assistant turn. `calls` are rendered after the content blocks, one
+    /// `message_model` block each, and the turn's end-of-sampling marker comes
+    /// after all of them -- so a call-only turn is one or more call blocks and
+    /// then the marker, exactly as the template writes it.
+    case assistant(reasoning: String?, content: String?, calls: [Inkling2ToolCall] = [])
     /// A tool RESULT. The template writes the tool's name straight after the
     /// role marker, so the name is part of the turn.
     case tool(name: String, content: [Inkling2ContentPart])
@@ -186,12 +309,16 @@ nonisolated public struct Inkling2Prompt: Sendable {
         self.markers = markers
     }
 
-    /// Renders a conversation exactly as the checkpoint's template does for the
-    /// text path. `effort` is the numeric reasoning effort; nil means the
-    /// template's default (0.9).
-    public func render(turns: [Inkling2Turn], effort: Float? = nil) throws -> String {
+    /// Renders a conversation exactly as the checkpoint's template does.
+    /// `effort` is the numeric reasoning effort; nil means the template's
+    /// default (0.9). `tools` are declarations, rendered as the template's
+    /// `tool_declare` system message at the HEAD of the prompt.
+    public func render(
+        turns: [Inkling2Turn], effort: Float? = nil, tools: [Inkling2ToolDeclaration] = []
+    ) throws -> String {
         let resolvedEffort = try Inkling2Effort.validate(effort ?? Inkling2Effort.defaultValue)
         var output = ""
+        if !tools.isEmpty { output += try toolDeclarationLine(tools) }
         var effortEmitted = false
         for turn in turns {
             if !effortEmitted && turn.role != "system" {
@@ -206,6 +333,31 @@ nonisolated public struct Inkling2Prompt: Sendable {
             output += try effortLine(resolvedEffort)
         }
         return output
+    }
+
+    /// The tool declarations as the template writes them: one system message
+    /// whose text begins `tool_declare`, then the specs as compact JSON with
+    /// sorted keys.
+    ///
+    /// Each spec is `{description, name, parameters, type}` with the template's
+    /// defaults -- an absent description is `""` and absent parameters are `{}`
+    /// -- and `type` falls back to `function` only when the declaration has no
+    /// type. The ordering is `sort_keys=true`, i.e. byte order of the keys, at
+    /// every level.
+    public func toolDeclarationLine(_ tools: [Inkling2ToolDeclaration]) throws -> String {
+        let specs: [MCPJSONValue] = tools.map { tool in
+            let parameters = tool.parameters.isEmpty
+                ? MCPJSONValue.object([:])
+                : MCPJSONValue.object(tool.parameters)
+            return .object([
+                "description": .string(tool.description),
+                "name": .string(tool.name),
+                "parameters": parameters,
+                "type": .string(tool.type.isEmpty ? "function" : tool.type)
+            ])
+        }
+        let json = Inkling2TemplateJSON.compact(.array(specs))
+        return markers.system + "tool_declare" + markers.contentXML + json + markers.endMessage
     }
 
     /// The effort line as its own system message.
@@ -231,15 +383,32 @@ nonisolated public struct Inkling2Prompt: Sendable {
             let body = try render(parts: parts, role: "user")
             return markers.user + body
 
-        case .assistant(let reasoning, let content):
+        case .assistant(let reasoning, let content, let calls):
             var output = ""
             if let reasoning, !reasoning.isEmpty {
                 output += markers.model + markers.contentThinking + reasoning + markers.endMessage
             }
             // An assistant turn with only reasoning or tool calls has no text
             // block, matching the template's condition.
-            if let content, (!content.isEmpty || reasoning == nil) {
+            if let content, (!content.isEmpty || (reasoning == nil && calls.isEmpty)) {
                 output += markers.model + markers.contentText + content + markers.endMessage
+            }
+            // One call block per call, each opening its own model message with
+            // the tool's name. The arguments are re-encoded rather than
+            // echoed: the template renders `{"name": <json>, "args": {<sorted
+            // key>: <json>}}`, so a caller's own formatting never survives.
+            for call in calls {
+                let name = Inkling2TemplateJSON.compact(.string(call.name))
+                var fields: [String] = []
+                for key in call.arguments.keys.sorted(by: Inkling2TemplateJSON.keyOrder) {
+                    fields.append(
+                        Inkling2TemplateJSON.compact(.string(key)) + ":"
+                            + Inkling2TemplateJSON.compact(call.arguments[key] ?? .null)
+                    )
+                }
+                output += markers.model + call.name + markers.contentInvokeToolJSON
+                    + "{\"name\":" + name + ",\"args\":{" + fields.joined(separator: ",") + "}}"
+                    + markers.endMessage
             }
             output += markers.contentModelEndSampling
             return output

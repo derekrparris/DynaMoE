@@ -851,6 +851,225 @@ final class Inkling2PromptTests: XCTestCase {
     }
 }
 
+// MARK: - Tool path
+
+/// The tool half of the prompt dialect, against goldens rendered by the
+/// checkpoint's own template (`Tools/inkling2_tool_goldens.py`), plus the call
+/// parsing and freeze rules the template does not decide.
+final class Inkling2ToolPromptTests: XCTestCase {
+
+    static let goldenPath = "/tmp/inkling2_tool_goldens.json"
+
+    private func goldens() throws -> [String: Any] {
+        guard FileManager.default.fileExists(atPath: Self.goldenPath),
+              let data = try? Data(contentsOf: URL(fileURLWithPath: Self.goldenPath)),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw XCTSkip("no tool goldens at \(Self.goldenPath): run Tools/inkling2_tool_goldens.py in the reference environment")
+        }
+        return root
+    }
+
+    private func expected(_ root: [String: Any], _ name: String) throws -> String {
+        let entry = try XCTUnwrap(root[name] as? [String: Any], name)
+        return try XCTUnwrap(entry["rendered"] as? String, name)
+    }
+
+    /// A declaration renders as the template's `tool_declare` system message,
+    /// with compact sorted JSON and the template's defaults for absent fields.
+    func testToolDeclarationsMatchTheTemplate() throws {
+        let root = try goldens()
+        let prompt = Inkling2Prompt()
+        let declared = Inkling2ToolDeclaration(
+            name: "read_file",
+            description: "Read a file from disk.",
+            parameters: [
+                "type": .string("object"),
+                "properties": .object([
+                    "path": .object(["type": .string("string")]),
+                    "limit": .object(["type": .string("integer")])
+                ]),
+                "required": .array([.string("path")])
+            ]
+        )
+        XCTAssertEqual(
+            try prompt.render(turns: [.user([.text("hi")])], effort: 0.9, tools: [declared]),
+            try expected(root, "declarationOnly")
+        )
+        // An absent description and absent parameters are still emitted, as ""
+        // and {} -- the template writes every key.
+        let bare = Inkling2ToolDeclaration(name: "no_args_tool")
+        XCTAssertEqual(
+            try prompt.render(turns: [.user([.text("hi")])], effort: 0.9, tools: [declared, bare]),
+            try expected(root, "declarationDefaults")
+        )
+    }
+
+    /// A call turn: nested arguments, escapes, several calls, and reasoning
+    /// before the call -- each is a separate way for the block to be wrong.
+    func testToolCallTurnsMatchTheTemplate() throws {
+        let root = try goldens()
+        let prompt = Inkling2Prompt()
+        let nested = Inkling2ToolCall(
+            name: "read_file",
+            arguments: [
+                "path": .string("a \"quoted\"/file.txt"),
+                "options": .object([
+                    "limit": .int(3),
+                    "strict": .bool(true),
+                    "tags": .array([.string("x"), .string("y")])
+                ]),
+                "note": .string("line\nbreak \u{e9}\u{4e2d}")
+            ]
+        )
+        let turns: [Inkling2Turn] = [
+            .user([.text("read it")]),
+            .assistant(reasoning: nil, content: nil, calls: [nested])
+        ]
+        let rendered = try prompt.render(turns: turns, effort: 0.2, tools: [
+            Inkling2ToolDeclaration(name: "read_file", description: "Read a file from disk.",
+                                    parameters: ["type": .string("object")])
+        ])
+        // The declaration's parameters differ from the golden's, so compare
+        // only from the effort line on: the call is the half under test here.
+        let golden = try expected(root, "callWithNestedArguments")
+        let mineTail = try XCTUnwrap(rendered.range(of: "<|message_system|><|content_text|>Thinking"))
+        let goldenTail = try XCTUnwrap(golden.range(of: "<|message_system|><|content_text|>Thinking"))
+        XCTAssertEqual(String(rendered[mineTail.lowerBound...]), String(golden[goldenTail.lowerBound...]))
+
+        // Two calls in one turn, with a text block before them.
+        let both: [Inkling2Turn] = [
+            .user([.text("read both")]),
+            .assistant(reasoning: nil, content: "I'll read both.", calls: [
+                Inkling2ToolCall(name: "read_file", arguments: ["path": .string("a.txt")]),
+                Inkling2ToolCall(name: "read_file", arguments: ["path": .string("b.txt")])
+            ])
+        ]
+        let bothGolden = try expected(root, "twoCallsInOneTurn")
+        let bothMine = try prompt.render(turns: both, effort: 0.9)
+        let bothStart = try XCTUnwrap(bothMine.range(of: "<|message_user|>"))
+        let bothGoldenStart = try XCTUnwrap(bothGolden.range(of: "<|message_user|>"))
+        XCTAssertEqual(String(bothMine[bothStart.lowerBound...]), String(bothGolden[bothGoldenStart.lowerBound...]))
+
+        // Reasoning, then a call: two model messages, and the end-of-sampling
+        // marker once.
+        let reasoningTurn: [Inkling2Turn] = [
+            .user([.text("read it")]),
+            .assistant(reasoning: "I should read the file.", content: nil, calls: [
+                Inkling2ToolCall(name: "read_file", arguments: ["path": .string("a.txt")])
+            ])
+        ]
+        let reasoningGolden = try expected(root, "reasoningThenCall")
+        let reasoningMine = try prompt.render(turns: reasoningTurn, effort: 0.7)
+        let reasoningStart = try XCTUnwrap(reasoningMine.range(of: "<|message_user|>"))
+        let reasoningGoldenStart = try XCTUnwrap(reasoningGolden.range(of: "<|message_user|>"))
+        XCTAssertEqual(
+            String(reasoningMine[reasoningStart.lowerBound...]),
+            String(reasoningGolden[reasoningGoldenStart.lowerBound...])
+        )
+    }
+
+    /// A tool result names its tool after the role marker, which is what the
+    /// template does and what the model was trained to read.
+    func testToolResultsMatchTheTemplate() throws {
+        let root = try goldens()
+        let prompt = Inkling2Prompt()
+        let turns: [Inkling2Turn] = [
+            .user([.text("read it")]),
+            .assistant(reasoning: nil, content: nil, calls: [
+                Inkling2ToolCall(name: "read_file", arguments: ["path": .string("a.txt")])
+            ]),
+            .tool(name: "read_file", content: [.text("file contents")]),
+            .user([.text("summarize")])
+        ]
+        let rendered = try prompt.render(turns: turns, effort: 0.9)
+        let golden = try expected(root, "callThenNamedResult")
+        let mineStart = try XCTUnwrap(rendered.range(of: "<|message_user|>"))
+        let goldenStart = try XCTUnwrap(golden.range(of: "<|message_user|>"))
+        XCTAssertEqual(String(rendered[mineStart.lowerBound...]), String(golden[goldenStart.lowerBound...]))
+    }
+
+    // MARK: Calls as the model writes them
+
+    private let markers = Inkling2PromptMarkers.familyDefault
+
+    private func callText(name: String, args: String) -> String {
+        markers.model + name + markers.contentInvokeToolJSON
+            + "{\"name\":\"\(name)\",\"args\":\(args)}" + markers.endMessage
+    }
+
+    func testACompleteCallParses() throws {
+        let text = "Reading. " + callText(name: "read_file", args: "{\"path\":\"a.txt\"}")
+        let calls = Inkling2ToolDialect.callBlocks(in: text, markers: markers)
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(calls[0].name, "read_file")
+        XCTAssertEqual(calls[0].arguments["path"] as? String, "a.txt")
+    }
+
+    /// The freeze rule: only a COMPLETE call freezes, and the invoke marker
+    /// alone does not (ordinary text also ends with `end_message`).
+    func testOnlyACompleteCallFreezes() throws {
+        XCTAssertFalse(Inkling2ToolDialect.shouldFreeze("plain text", markers: markers))
+        XCTAssertFalse(
+            Inkling2ToolDialect.shouldFreeze(
+                markers.model + "read_file" + markers.contentInvokeToolJSON + "{\"name\":",
+                markers: markers
+            ),
+            "a half-written payload must not freeze"
+        )
+        XCTAssertTrue(
+            Inkling2ToolDialect.shouldFreeze(
+                callText(name: "read_file", args: "{\"path\":\"a.txt\"}"), markers: markers
+            )
+        )
+    }
+
+    /// A truncated call is never executed, and it is not silently deleted
+    /// either: the bytes stay in the text.
+    func testATruncatedCallIsLeftAsText() throws {
+        let truncated = markers.model + "read_file" + markers.contentInvokeToolJSON
+            + "{\"name\":\"read_file\",\"args\":{\"path\":\"a"
+        let calls = Inkling2ToolDialect.callBlocks(in: truncated, markers: markers)
+        XCTAssertTrue(calls.isEmpty)
+        XCTAssertEqual(Inkling2ToolDialect.canonicalized(truncated, markers: markers), truncated)
+        // A payload that closes but does not parse is just as unusable.
+        let malformed = markers.model + "read_file" + markers.contentInvokeToolJSON
+            + "{\"name\":\"read_file\",\"args\":" + markers.endMessage
+        XCTAssertTrue(Inkling2ToolDialect.callBlocks(in: malformed, markers: markers).isEmpty)
+    }
+
+    /// The name in the payload must agree with the name in the block: the
+    /// template writes both from one value, so a disagreement is a corrupted
+    /// call, not one to guess at.
+    func testACallWhoseNamesDisagreeIsRefused() throws {
+        let text = markers.model + "read_file" + markers.contentInvokeToolJSON
+            + "{\"name\":\"shell_run\",\"args\":{}}" + markers.endMessage
+        XCTAssertTrue(Inkling2ToolDialect.callBlocks(in: text, markers: markers).isEmpty)
+    }
+
+    /// Canonicalization keeps the prose around the calls and turns each call
+    /// into the block the shared parser reads.
+    func testCanonicalizationKeepsTheProseAndRewritesTheCalls() throws {
+        let text = "before " + callText(name: "read_file", args: "{\"path\":\"a.txt\"}")
+            + " between " + callText(name: "shell_run", args: "{\"command\":\"ls\"}")
+            + " after"
+        let canonical = Inkling2ToolDialect.canonicalized(text, markers: markers)
+        XCTAssertTrue(canonical.hasPrefix("before <tool_call><function=read_file>"))
+        XCTAssertTrue(canonical.contains(" between <tool_call><function=shell_run>"))
+        XCTAssertTrue(canonical.hasSuffix(" after"))
+        let parsed = StreamingToolParser.shared.parseStreamingToolCalls(from: canonical, format: .qwenXML)
+        XCTAssertEqual(parsed.calls.map(\.name), ["read_file", "shell_run"])
+        XCTAssertEqual(parsed.calls[0].arguments["path"] as? String, "a.txt")
+    }
+
+    /// The result turn is the family's own tool message.
+    func testAResultTurnIsTheFamilysToolMessage() throws {
+        XCTAssertEqual(
+            Inkling2ToolDialect.resultTurn(name: "read_file", payload: "contents", markers: markers),
+            markers.tool + "read_file" + markers.contentText + "contents" + markers.endMessage
+        )
+    }
+}
+
 // MARK: - Published config
 
 /// Facts about the REAL checkpoint's `config.json`, embedded verbatim so the
