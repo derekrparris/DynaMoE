@@ -1084,9 +1084,20 @@ final class Inkling2PublishedConfigTests: XCTestCase {
         // One position is 8 full visits x K+V x 2,048-byte record.
         XCTAssertEqual(plan.bytesPerPosition, 8 * 2 * config.numKeyValueHeads * config.headDim * 2)
         // A 16 GB budget: (16 GiB - 0.168 GB of rings) / 32,768 bytes per
-        // position is still past the checkpoint's 1M ceiling, so the ceiling
-        // wins -- and that is the point: the budget refuses at the ceiling.
-        XCTAssertEqual(plan.affordableContextLength(budgetGB: 16), 1_048_576)
+        // position is ~519k positions, i.e. INSIDE the checkpoint's 1M ceiling.
+        // The budget is the authority here, not the declaration: an earlier
+        // version of this case asserted the ceiling won at 16 GB, which was
+        // wrong by the same arithmetic (and the loaded checkpoint's weights are
+        // not counted in it either, so the real budget is smaller still).
+        let sixteenGB = plan.affordableContextLength(budgetGB: 16)
+        XCTAssertEqual(
+            sixteenGB,
+            Int((Double(16) * 1_073_741_824 - Double(plan.localRingBytes)) / 32_768)
+        )
+        XCTAssertLessThan(sixteenGB, 1_048_576)
+        // Above the ceiling the declaration does win, because the plan has no
+        // geometry past it.
+        XCTAssertEqual(plan.affordableContextLength(budgetGB: 64), 1_048_576)
         // 1 GiB: (1 GiB - rings) / 32,768, floored at one position.
         let oneGB = plan.affordableContextLength(budgetGB: 1)
         XCTAssertEqual(oneGB, Int((Double(1) * 1_073_741_824 - Double(plan.localRingBytes)) / 32_768))
