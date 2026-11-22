@@ -35,8 +35,13 @@ HIDDEN, LAYERS, HEADS, KV, HEAD_DIM = 64, 12, 4, 2, 16
 D_REL, REL_EXTENT, WINDOW = 16, 1024, 1024
 EXPERTS, TOP_K, INTER, GATE_RANK = 2, 1, 32, 2
 VOCAB, UNPADDED = 128, 120
-BLOCK, CORE_START, CORE_END, PASSES = 6, 6, 12, 3
-FULL_LAYERS = {5, 11}
+# The block is 3 so the loop core (6 layers) holds TWO block boundaries per
+# pass: with one, the loop's `previous_block_states` slice is always empty and a
+# rule about it cannot be tested.
+BLOCK, CORE_START, CORE_END, PASSES = 3, 6, 12, 3
+# One full layer per block, so each block mixes the two attention kinds, and
+# both kinds appear inside the loop core (7, 9) and outside it (1, 4).
+FULL_LAYERS = {1, 4, 7, 9}
 
 rng = np.random.default_rng(20261121)
 
@@ -230,6 +235,10 @@ write_json("config.json", {
         "qk_l2_clip_threshold": 22.627416997969522, "rel_l2_clip_threshold": 8.0,
         "sconv_kernel_size": 4, "final_logit_softcapping": 30.0,
         "n_layers_per_attn_res_block": BLOCK, "attn_res_normalize_values": True,
+        # Written EXPLICITLY: the reference otherwise derives its own default
+        # (every sixth layer full), which silently disagrees with FULL_LAYERS and
+        # loads the full layers' weights into the wrong modules.
+        "layer_types": ["hybrid" if layer in FULL_LAYERS else "hybrid_sliding" for layer in range(LAYERS)],
         "n_routed_experts": EXPERTS, "num_experts_per_tok": TOP_K, "n_shared_experts": 0,
         "intermediate_size": INTER, "mlp_gate_softcap": 4.0, "mlp_up_softcap": 25.0,
         "route_scale": 8.0, "use_gate_bias": True,

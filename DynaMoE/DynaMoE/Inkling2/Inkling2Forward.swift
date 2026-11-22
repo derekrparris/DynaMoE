@@ -108,7 +108,7 @@ nonisolated public final class Inkling2CPUForward {
     /// The visit `runVisit` is currently executing, so the attention and mixture
     /// helpers can label their captures without threading it through.
     private var visitIndexForDebug = 0
-    private var positionForDebug = 0
+    private var currentPosition = 0
     /// Every visit's KV and convolution state, plus the token history.
     public let sequence: Inkling2SequenceState
     /// One state bundle per visit, indexed by `cacheSlot`.
@@ -172,7 +172,7 @@ nonisolated public final class Inkling2CPUForward {
     /// The 48-visit schedule over one position's embedding, then the final
     /// residual read, norm, unembedding and softcap.
     public func forwardHidden(_ embedding: [Float], position: Int) throws -> [Float] {
-        positionForDebug = position
+        currentPosition = position
         var hidden = embedding
         // The attention-residual stack: one entry per append, as the reference
         // builds it (a boundary layer contributes its input twice).
@@ -186,9 +186,11 @@ nonisolated public final class Inkling2CPUForward {
                 layer: layer, pass: 0, hidden: hidden, blockStates: &blockStates,
                 messages: nil, position: position
             )
-            // The loop appends the layer's OUTPUT at a boundary, after assigning it:
-            // the layer's own append was its INPUT, local to the MLP read.
-            if layer % block == 0 { blockStates.append(output) }
+            // The loop appends the layer's INPUT at a boundary, BEFORE assigning
+            // its output: `if decoder_layer.is_block_boundary: block_states =
+            // cat(...); hidden_states = new_hidden_states`. The layer's own
+            // append inside the MLP read is local and never reaches the caller.
+            if layer % block == 0 { blockStates.append(hidden) }
             hidden = output
         }
         let preLoopHidden = hidden
@@ -200,12 +202,16 @@ nonisolated public final class Inkling2CPUForward {
                 layer: layer, pass: 0, hidden: hidden, blockStates: &blockStates,
                 messages: nil, position: position
             )
-            if layer % block == 0 { blockStates.append(output) }
+            if layer % block == 0 { blockStates.append(hidden) }
             hidden = output
         }
 
         onInternal?(0, "endOfPassOne@\(position)", Array(hidden.prefix(4)))
         for pass in 1..<config.numPasses {
+            // Both are read from the PREVIOUS pass's leftovers, so they are
+            // recomputed at the top of every pass, not once before the loop:
+            // `previous_block_states = block_states[..., num_pre_loop_blocks + 1:, :]`
+            // and `previous_hidden_states = hidden_states`, both before the reset.
             let previousBlocks = Array(blockStates.dropFirst(preLoopBlockCount + 1))
             if pass == 1, let onInternal {
                 onInternal(0, "loop_stackCount", [Float(blockStates.count), Float(preLoopBlockCount), Float(previousBlocks.count)])
@@ -223,7 +229,7 @@ nonisolated public final class Inkling2CPUForward {
                     layer: layer, pass: pass, hidden: hidden, blockStates: &blockStates,
                     messages: messages, position: position
                 )
-                if layer % block == 0 { blockStates.append(output) }
+                if layer % block == 0 { blockStates.append(hidden) }
                 hidden = output
             }
         }
@@ -233,7 +239,7 @@ nonisolated public final class Inkling2CPUForward {
                 layer: layer, pass: 0, hidden: hidden, blockStates: &blockStates,
                 messages: nil, position: position
             )
-            if layer % block == 0 { blockStates.append(output) }
+            if layer % block == 0 { blockStates.append(hidden) }
             hidden = output
         }
 
@@ -301,24 +307,37 @@ nonisolated public final class Inkling2CPUForward {
         hidden = qRead
         onInternal?(visitIndex, "attn_input", hidden)
 
-        // The three projections' inputs, each normalized differently.
-        var queryInput: [Float]
-        var keyInput: [Float]
-        var valueInput: [Float]
-        if isFull {
-            queryInput = Inkling2Math.rmsNorm(qRead, gain: try weights.matrix(.qInputNorm, layer: layer), eps: config.rmsNormEps)
-            keyInput = Inkling2Math.rmsNorm(kRead, gain: try weights.matrix(.kInputNorm, layer: layer), eps: config.rmsNormEps)
-            valueInput = Inkling2Math.rmsNorm(vRead, gain: try weights.matrix(.vInputNorm, layer: layer), eps: config.rmsNormEps)
-        } else {
-            queryInput = Inkling2Math.rmsNorm(hidden, gain: try weights.matrix(.attnNorm, layer: layer), eps: config.rmsNormEps)
-            keyInput = queryInput
-            valueInput = queryInput
+        // The message gates act on the block-read result, BEFORE the input
+        // norms: the reference writes `self.input_layernorm(self.q_message_gate(
+        // query_hidden_states, query_message))`, so a gate applied after the norm
+        // sees different inputs.
+        var queryRead = qRead
+        var keyRead = kRead
+        var valueRead = vRead
+        if let messages, messages.count == 4 {
+            queryRead = try messageGate(role: .controllerAttnDown, layer: layer, current: queryRead, message: messages[0])
+            keyRead = try messageGate(role: .controllerKDown, layer: layer, current: keyRead, message: messages[1])
+            valueRead = try messageGate(role: .controllerVDown, layer: layer, current: valueRead, message: messages[2])
         }
 
-        if let messages, messages.count == 4 {
-            queryInput = try messageGate(role: .controllerAttnDown, layer: layer, current: queryInput, message: messages[0])
-            keyInput = try messageGate(role: .controllerKDown, layer: layer, current: keyInput, message: messages[1])
-            valueInput = try messageGate(role: .controllerVDown, layer: layer, current: valueInput, message: messages[2])
+        // The three projections' inputs, each normalized differently.
+        let queryInput: [Float]
+        let keyInput: [Float]
+        let valueInput: [Float]
+        if isFull {
+            queryInput = Inkling2Math.rmsNorm(queryRead, gain: try weights.matrix(.qInputNorm, layer: layer), eps: config.rmsNormEps)
+            keyInput = Inkling2Math.rmsNorm(keyRead, gain: try weights.matrix(.kInputNorm, layer: layer), eps: config.rmsNormEps)
+            valueInput = Inkling2Math.rmsNorm(valueRead, gain: try weights.matrix(.vInputNorm, layer: layer), eps: config.rmsNormEps)
+        } else {
+            // One shared norm on a sliding layer, but applied to each gated value
+            // SEPARATELY: the reference writes three `self.input_layernorm(...)`
+            // calls, and with messages the three gates make the three inputs
+            // different. Sharing one result was invisible without messages and
+            // wrong with them.
+            let gain = try weights.matrix(.attnNorm, layer: layer)
+            queryInput = Inkling2Math.rmsNorm(queryRead, gain: gain, eps: config.rmsNormEps)
+            keyInput = Inkling2Math.rmsNorm(keyRead, gain: gain, eps: config.rmsNormEps)
+            valueInput = Inkling2Math.rmsNorm(valueRead, gain: gain, eps: config.rmsNormEps)
         }
 
         let attentionOutput = try attention(
@@ -361,11 +380,6 @@ nonisolated public final class Inkling2CPUForward {
         mixture = try shortConvolution(layer: layer, state: state, index: 3, values: mixture)
         onInternal?(visitIndex, "postMlpConv", mixture)
         onInternal?(visitIndex, "residual", residual)
-        if visitIndex == 7, positionForDebug == 3 {
-            print("L7@3 stack norms", mlpStack.map { $0.reduce(0) { $0 + $1 * $1 }.squareRoot() },
-                  "partial norm", residual.reduce(0) { $0 + $1 * $1 }.squareRoot(),
-                  "mlpInput norm", mlpHidden.reduce(0) { $0 + $1 * $1 }.squareRoot())
-        }
         let output = zip(residual, mixture).map(+)
         if visitIndex == 0 {
             onInternal?(visitIndex, "add_residual", Array(residual.prefix(4)))
@@ -374,16 +388,6 @@ nonisolated public final class Inkling2CPUForward {
         }
         onVisitComplete?(visitIndex, layer, pass, output)
         return (output, attentionQueries)
-    }
-
-    /// The visit a core layer's first pass (or any pass) occupies, for the
-    /// diagnostic labels: pass two's first core layer is the plan's entry after
-    /// the pre-loop layers and pass one.
-    func visitIndexOfCoreLayer(_ coreIndex: Int) -> Int {
-        // The first cross-pass read happens in pass two, so the label is the
-        // first-pass visit plus one pass of core visits.
-        let firstPass = plan.first { $0.physicalLayer == config.loopCoreStart + coreIndex && $0.pass == 2 }
-        return firstPass?.visit ?? 0
     }
 
     public func isCore(_ layer: Int) -> Bool {
@@ -487,11 +491,13 @@ nonisolated public final class Inkling2CPUForward {
         let read = blockRead(blockStates: blockStates, partial: partial, queries: queries)
         if coreIndex == 0, let onInternal {
             // A read happens once per core layer per pass PER POSITION, so the
-            // label carries the position: a bare name kept position 0's value
-            // while every other capture held the last position's.
-            onInternal(visitIndexOfCoreLayer(coreIndex), "message0@\(positionForDebug)", read[0])
-            onInternal(visitIndexOfCoreLayer(coreIndex), "message0_stackCount@\(positionForDebug)", [Float(blockStates.count)])
-            onInternal(visitIndexOfCoreLayer(coreIndex), "message0_partial@\(positionForDebug)", Array(partial.prefix(4)))
+            // label carries the position and the VISIT: naming the read by the
+            // core layer alone made pass 1's and pass 2's reads share a key,
+            // and the later one silently overwrote the earlier.
+            let visit = visitIndexForDebug
+            onInternal(visit, "message0@\(currentPosition)", read[0])
+            onInternal(visit, "message0_stackCount@\(currentPosition)", [Float(blockStates.count)])
+            onInternal(visit, "message0_partial@\(currentPosition)", Array(partial.prefix(4)))
         }
         return read
     }
@@ -794,11 +800,6 @@ nonisolated public final class Inkling2CPUForward {
                     gate: gate[index], up: up[index],
                     gateSoftcap: config.mlpGateSoftcap, upSoftcap: config.mlpUpSoftcap
                 )
-            }
-            if visitIndexForDebug == 7 && slot == 0 {
-                print("L7 mixtureInput norm", hidden.reduce(0) { $0 + $1 * $1 }.squareRoot(),
-                      "gate[:3]", gate.prefix(3), "up[:3]", up.prefix(3),
-                      "act[:3]", activated.prefix(3))
             }
             if slot == 0 {
                 onInternal?(visitIndexForDebug, "expert0_gate", Array(gate.prefix(4)))

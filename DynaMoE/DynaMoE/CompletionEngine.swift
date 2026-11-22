@@ -326,6 +326,14 @@ public final class CompletionEngine: @unchecked Sendable {
     /// larger.
     private var cachedDeepSeekRuntime: (path: String, contextLength: Int, runtime: DeepSeekV41Runtime)?
 
+    /// The Inkling 2 host forward, kept between turns for the same reason as the
+    /// DeepSeek runtime: building it walks the catalog and allocates every
+    /// visit's KV and convolution state, and a fresh one per turn would throw
+    /// the resident sequence away and re-prefill the whole conversation. It is
+    /// the HOST graph (no Metal), so it holds no device memory beyond the shard
+    /// buffers the app already mapped.
+    private var cachedInklingForward: (path: String, forward: Inkling2CPUForward)?
+
     /// Encoded image spans, keyed by `snapshot path | image sha256`.
     ///
     /// A chat turn re-renders the whole conversation, so a picture that stays in
@@ -586,18 +594,346 @@ public final class CompletionEngine: @unchecked Sendable {
         }
         // Inkling 2 is detected natively but its 48-visit loop, relative-position
         // attention, block attention residuals and cross-pass message gates are
-        // served by a dedicated runtime (see `Inkling2/`). Refuse here rather
-        // than letting the generic decode loop run over tensors it cannot bind:
-        // that path would emit plausible text from the wrong graph. Phase 1
-        // lands the identity, catalog, memory plan and prompt; the turn engine
-        // arrives in Phase 2, so this is the one entry point that must never
-        // fall through in the meantime.
+        // served by a dedicated runtime (see `Inkling2/`). The generic decode
+        // loop cannot bind these tensors and would emit plausible text from the
+        // wrong graph, so this family never falls through to it.
+        //
+        // The runtime is the HOST forward: the Metal graph for this family is
+        // not written yet, and a host turn is slow but correct. It is kept
+        // between turns (like the DeepSeek runtime) because its per-visit KV
+        // state is what a follow-up reuses.
         if let config = modelConfig, config.isInkling2Model {
+            let path = activeLoadedModelPath
+            let loadedSummary = summary
+            let loadedShards = shardBuffers
             stateLock.unlock()
-            throw CompletionLaunchError.engineNotReady(
-                "⚠️ Inkling 2 Mini is recognized, but its turn engine is not wired yet: this build has "
-                    + "its config, tensor catalog, memory plan and prompt renderer only. The generic "
-                    + "decode path cannot run this architecture."
+
+            guard let snapshotDir = path.map({ URL(fileURLWithPath: $0) }) else {
+                throw CompletionLaunchError.engineNotReady(
+                    "⚠️ Inkling 2 Mini is loaded but its snapshot directory is unknown."
+                )
+            }
+            let inklingConfig: Inkling2Config
+            do {
+                inklingConfig = try Inkling2Config.decode(
+                    contentsOf: snapshotDir.appendingPathComponent("config.json")
+                )
+            } catch {
+                throw CompletionLaunchError.engineNotReady(
+                    "⚠️ Inkling 2 Mini config.json could not be decoded: \(error)"
+                )
+            }
+            // No tower is wired for this family, and dropping pixels in silence
+            // would answer about a picture the model never saw.
+            if !request.images.isEmpty {
+                throw CompletionLaunchError.engineNotReady(
+                    "⚠️ Inkling 2 Mini has no image path in this build, so an attached image cannot be seen."
+                )
+            }
+            guard !request.promptTokenIds.isEmpty else {
+                throw CompletionLaunchError.engineNotReady(
+                    "⚠️ Prompt tokenization produced 0 tokens."
+                )
+            }
+
+            // Build once per checkpoint and keep it: a fresh forward per turn
+            // would drop the resident sequence and re-prefill the conversation.
+            var forward: Inkling2CPUForward?
+            stateLock.lock()
+            if let cached = cachedInklingForward, cached.path == snapshotDir.path {
+                forward = cached.forward
+            }
+            stateLock.unlock()
+            if forward == nil {
+                let catalog = Inkling2WeightCatalog(
+                    mainFile: loadedSummary.tensors.map { Inkling2TensorRef(metadata: $0) },
+                    layerCount: inklingConfig.numHiddenLayers
+                )
+                let source = Inkling2SnapshotWeights(
+                    config: inklingConfig, catalog: catalog, shardBuffers: loadedShards
+                )
+                let built = try Inkling2CPUForward(config: inklingConfig, weights: source)
+                stateLock.lock()
+                cachedInklingForward = (path: snapshotDir.path, forward: built)
+                stateLock.unlock()
+                forward = built
+            }
+            guard let forward else {
+                throw CompletionLaunchError.engineNotReady(
+                    "⚠️ Inkling 2 Mini's forward could not be built."
+                )
+            }
+
+            // Same ordering as the DeepSeek branch: grammar token, then the id.
+            let inklingGrammarToken = GrammarConstrainedSampler.shared.beginGeneration()
+            stateLock.lock()
+            guard held.commit() else {
+                stateLock.unlock()
+                throw CompletionLaunchError.engineNotReady(
+                    "❌ This turn's reservation on the generation slot was given back before it could start. Try again in a moment."
+                )
+            }
+            let myGenerationId = held.ticket
+            currentGenerationId = myGenerationId
+            endedGenerationId = 0
+            activeTurnCancelled = false
+            activeTurnPriority = request.turnPriority
+            stateLock.unlock()
+
+            let reusablePrefix = forward.reusablePrefix(
+                proposedPrefix: PrefixCacheManager.shared.findCommonPrefix(
+                    promptTokenIds: request.promptTokenIds,
+                    sessionId: request.sessionId
+                ),
+                promptTokenIds: request.promptTokenIds.map { Int($0) }
+            )
+            let prep = TurnPrepInfo(
+                prefixTokensReused: reusablePrefix,
+                promptTokenCount: request.promptTokenIds.count,
+                // The host forward keeps every cache value in FP32.
+                effectiveKVPrecision: .fp32,
+                provisionedSequenceLength: forward.positionLimit
+            )
+
+            let engineSelf = self
+            let inklingTokenizer = tokenizer
+            let inklingSampling = request.sampling
+            let inklingPromptIds = request.promptTokenIds.map { Int($0) }
+            let inklingPrompt = request.formattedPrompt
+            let inklingStopSequences = request.stopSequences
+            let inklingSessionId = request.sessionId
+            let inklingAsOfDate = request.asOfDate
+            let inklingEos: [UInt32] = [UInt32(clamping: inklingConfig.eosTokenID)]
+            let inklingRunAgentTools = request.agentToolsEnabled && !request.forceSynthesis
+            // The grammar mask's marker vocabulary is Qwen's, so it is NOT
+            // installed for this family (the DeepSeek branch records the same
+            // reason). A tool freeze has nothing to key on yet: the Inkling tool
+            // dialect is Phase 4, so an agent turn here ends on EOS or the cap.
+            let inklingGrammarMaskActive = false
+            let (stream, continuation) = AsyncStream.makeStream(
+                of: CompletionEvent.self, bufferingPolicy: .unbounded
+            )
+            let handleTask = Task.detached(priority: .userInitiated) {
+                func emit(_ event: CompletionEvent) { continuation.yield(event) }
+                let isCurrentGeneration = { (id: UInt64) in
+                    engineSelf.isCurrentGenerationUnchecked(id)
+                }
+                engineSelf.turnDidBegin(myGenerationId)
+                defer {
+                    engineSelf.turnDidEnd(id: myGenerationId)
+                    continuation.finish()
+                }
+                emit(.started)
+
+                let startTime = CFAbsoluteTimeGetCurrent()
+                var lastFrameTime = 0.0
+                let prefillStartedAt = CFAbsoluteTimeGetCurrent()
+                var lastPrefillEmit = 0.0
+                let prefillPositions = max(0, inklingPromptIds.count - reusablePrefix)
+                if prefillPositions > 0 {
+                    emit(.prefillProgress(
+                        status: "Prefilling 0/\(prefillPositions)…",
+                        speed: nil,
+                        rssGB: WorkingSetManager.shared.effectiveResidentMemoryGB
+                    ))
+                }
+                let settings = Inkling2TurnRunner.Settings(
+                    temperature: inklingSampling.temperature,
+                    topP: inklingSampling.topP,
+                    minP: inklingSampling.minP,
+                    topK: inklingSampling.topK,
+                    repetitionPenalty: inklingSampling.repetitionPenalty,
+                    presencePenalty: inklingSampling.presencePenalty,
+                    maxTokens: inklingSampling.maxTokens,
+                    eosTokenIds: inklingEos,
+                    stopSequences: inklingStopSequences
+                )
+                do {
+                    let output = try Inkling2TurnRunner.run(
+                        forward: forward,
+                        promptTokenIds: inklingPromptIds,
+                        prefixTokens: reusablePrefix,
+                        settings: settings,
+                        sample: { logits, generated in
+                            var scratch = logits
+                            return scratch.withUnsafeMutableBufferPointer { buffer in
+                                InferenceEngine.sampleNextToken(
+                                    logits: buffer.baseAddress!,
+                                    vocabSize: buffer.count,
+                                    contextTokens: inklingPromptIds.map { UInt32($0) } + generated,
+                                    temperature: inklingSampling.temperature,
+                                    topP: inklingSampling.topP,
+                                    minP: inklingSampling.minP,
+                                    topK: inklingSampling.topK,
+                                    repetitionPenalty: inklingSampling.repetitionPenalty,
+                                    presencePenalty: inklingSampling.presencePenalty,
+                                    frequencyPenalty: inklingSampling.frequencyPenalty,
+                                    logitBias: inklingSampling.logitBias,
+                                    eosTokenIds: inklingEos
+                                )
+                            }
+                        },
+                        constrain: { logits, emittedText in
+                            guard inklingGrammarMaskActive else { return }
+                            logits.withUnsafeMutableBufferPointer { buffer in
+                                guard let base = buffer.baseAddress else { return }
+                                GrammarConstrainedSampler.shared.updateStateAndApplyLogitMask(
+                                    emittedText: emittedText,
+                                    logits: base,
+                                    vocabSize: buffer.count,
+                                    tokenDecoder: { try? inklingTokenizer.decode(ids: [$0]) },
+                                    enforceStructuralTagContinuation: true,
+                                    token: inklingGrammarToken
+                                )
+                            }
+                        },
+                        decode: { ids in
+                            (try? inklingTokenizer.decode(ids: ids)) ?? ""
+                        },
+                        onPrefill: { done, total in
+                            let now = CFAbsoluteTimeGetCurrent()
+                            let isFinal = done >= total
+                            guard done == 0 || isFinal || now - lastPrefillEmit >= 0.25
+                            else { return }
+                            lastPrefillEmit = now
+                            let elapsed = now - prefillStartedAt
+                            let rate: Double? = done > 0 && elapsed > 0.05
+                                ? Double(done) / elapsed
+                                : nil
+                            if isFinal, let rate { PrefillThroughput.note(tokensPerSecond: rate) }
+                            var text = "Prefilling \(done)/\(total)"
+                            if reusablePrefix > 0 { text += " (+\(reusablePrefix) resident)" }
+                            if let rate {
+                                text += rate >= 10
+                                    ? String(format: " • %.0f pos/s", rate)
+                                    : String(format: " • %.1f pos/s", rate)
+                            }
+                            emit(.prefillProgress(
+                                status: text + "…", speed: rate,
+                                rssGB: WorkingSetManager.shared.effectiveResidentMemoryGB
+                            ))
+                            if isFinal {
+                                emit(.prefillProgress(status: nil, speed: nil, rssGB: nil))
+                            }
+                        },
+                        onText: { text, tokens in
+                            let now = CFAbsoluteTimeGetCurrent()
+                            let elapsed = now - startTime
+                            guard tokens == 1 || now - lastFrameTime >= 0.016 || tokens % 4 == 0
+                            else { return }
+                            lastFrameTime = now
+                            let split = TurnTextSplitter.splitThinkingAndResponse(
+                                raw: text,
+                                promptRequestsThinking: TurnTextSplitter.promptRequestsThinking(
+                                    inklingPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                                )
+                            )
+                            let thinking = split.thinkClose || split.thinkOpen ? split.think : ""
+                            emit(.frame(CompletionFrame(
+                                rawText: text,
+                                thinkingText: thinking,
+                                responseText: split.resp,
+                                isActivelyThinking: split.thinkOpen && !split.thinkClose,
+                                tokensGenerated: tokens,
+                                elapsedMs: elapsed * 1000,
+                                tokensPerSecond: elapsed > 0 ? Double(tokens) / elapsed : 0,
+                                timeToFirstTokenSeconds: nil,
+                                thinkingDurationSeconds: nil,
+                                jetSpecActive: false,
+                                jetSpecMeanTau: 0,
+                                jetSpecDraftAccepted: 0,
+                                jetSpecDraftProposed: 0,
+                                residentMemoryGB: WorkingSetManager.shared.effectiveResidentMemoryGB,
+                                residentExpertCount: 0,
+                                totalExpertCount: 0,
+                                cacheHitRatePercent: 0,
+                                prefetchEfficiencyPercent: 0,
+                                pagingLatencyMs: 0
+                            )))
+                        },
+                        isCancelled: {
+                            Task.isCancelled || !isCurrentGeneration(myGenerationId)
+                        }
+                    )
+                    emit(.prefillProgress(status: nil, speed: nil, rssGB: nil))
+                    PrefixCacheManager.shared.recordTurn(
+                        promptTokenIds: inklingPromptIds.prefix(output.storedPromptTokens).map { UInt32($0) },
+                        generatedTokenIds: output.generatedTokenIds,
+                        sessionId: inklingSessionId,
+                        asOfDate: inklingAsOfDate
+                    )
+
+                    if output.cancelled || Task.isCancelled || !isCurrentGeneration(myGenerationId) {
+                        emit(.failedTurn(TurnFailure(
+                            kind: .cancelled,
+                            message: "⏹ Generation stopped by user.",
+                            cancelled: true,
+                            tokensGenerated: output.tokensGenerated,
+                            clearStreamingPlaceholders: false
+                        )))
+                        return
+                    }
+
+                    let split = TurnTextSplitter.splitThinkingAndResponse(
+                        raw: output.text,
+                        promptRequestsThinking: TurnTextSplitter.promptRequestsThinking(
+                            inklingPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                        )
+                    )
+                    // Tool calls are Phase 4 for this family: no dialect is
+                    // installed, so nothing is parsed out of the text and an
+                    // agent turn ends on EOS or the cap.
+                    let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
+                    emit(.finished(TurnResult(
+                        finishReason: output.finishReason,
+                        formattedPrompt: inklingPrompt,
+                        promptTokenIds: inklingPromptIds.map { UInt32($0) },
+                        generatedTokenIds: output.generatedTokenIds,
+                        rawDecodedText: output.text,
+                        thinkingText: split.thinkClose || split.thinkOpen ? split.think : "",
+                        responseText: split.resp,
+                        tokensGenerated: output.tokensGenerated,
+                        elapsedMs: elapsedMs,
+                        tokensPerSecond: output.tokensGenerated > 0 && elapsedMs > 0
+                            ? Double(output.tokensGenerated) / (elapsedMs / 1000) : 0,
+                        timeToFirstTokenSeconds: nil,
+                        thinkingDurationSeconds: nil,
+                        jetSpecActive: false,
+                        jetSpecMeanTau: 0,
+                        jetSpecDraftAccepted: 0,
+                        jetSpecDraftProposed: 0,
+                        residentMemoryGB: WorkingSetManager.shared.effectiveResidentMemoryGB,
+                        residentExpertCount: 0,
+                        totalExpertCount: 0,
+                        cacheHitRatePercent: 0,
+                        prefetchEfficiencyPercent: 0,
+                        pagingLatencyMs: 0,
+                        prefixTokensReused: output.prefixTokensReused,
+                        parsedToolCalls: [],
+                        actionableCallIndices: [],
+                        gestureSkipNotices: [:],
+                        brokenFragments: [],
+                        matchedStopSequence: output.matchedStopSequence
+                    )))
+                } catch {
+                    emit(.prefillProgress(status: nil, speed: nil, rssGB: nil))
+                    emit(.failedTurn(TurnFailure(
+                        kind: .forwardPassFailed,
+                        message: "❌ Inkling 2 turn failed: \(error)",
+                        cancelled: Task.isCancelled,
+                        tokensGenerated: 0
+                    )))
+                }
+            }
+            stateLock.lock()
+            if currentGenerationId == myGenerationId && endedGenerationId != myGenerationId {
+                currentGenerationTask = handleTask
+            }
+            stateLock.unlock()
+            return CompletionLaunch(
+                prep: prep,
+                handle: CompletionTurnHandle(generationId: myGenerationId, task: handleTask),
+                stream: stream
             )
         }
         // DeepSeek V4.1 is detected natively but its forward pass is served by a
@@ -12050,6 +12386,9 @@ if layer.attnGateProjTensor != nil,
         // nothing while costing tens of megabytes.
         let retired = cachedDeepSeekRuntime
         cachedDeepSeekRuntime = nil
+        // The Inkling forward goes with them: its weights are the loaded shards,
+        // and its per-visit state belongs to the sequence it was building.
+        cachedInklingForward = nil
         cachedImageSpans.removeAll()
         stateLock.unlock()
         // The prefill rate belongs to the checkpoint that measured it. A spawn

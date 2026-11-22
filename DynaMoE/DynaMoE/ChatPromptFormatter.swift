@@ -40,7 +40,25 @@ public enum ChatPromptFormatter {
 
         let isLing = (modelConfig?.isLingModel == true)
         let formattedPrompt: String
-        if modelConfig?.isDeepSeekV41Model == true {
+        if modelConfig?.isInkling2Model == true {
+            // Inkling 2: role markers plus typed content blocks, and an effort
+            // line as its own system message. The template has no assistant
+            // prefix -- generation begins after the last message's end marker --
+            // so `thinkingEnabled` moves the EFFORT value, not a suffix.
+            if prompt.contains(Inkling2PromptMarkers.familyDefault.user) {
+                formattedPrompt = prompt
+            } else {
+                var turns: [Inkling2Turn] = []
+                if !cleanSystem.isEmpty { turns.append(.system(cleanSystem)) }
+                turns.append(.user([.text(prompt)]))
+                formattedPrompt = (try? Inkling2Prompt().render(
+                    turns: turns,
+                    effort: Self.inkling2Effort(
+                        thinkingEnabled: thinkingEnabled, thinkingEffort: thinkingEffort
+                    )
+                )) ?? prompt
+            }
+        } else if modelConfig?.isDeepSeekV41Model == true {
             // DeepSeek V4.1: fullwidth-bar role markers, and an effort budget
             // rendered inside the system turn rather than a named thinking level.
             if isAlreadyDeepSeekTemplated(prompt, markers: promptDialect.markers) {
@@ -268,6 +286,18 @@ public enum ChatPromptFormatter {
     static let emptyReasoningSuffix =
         TurnTextSplitter.canonicalReasoningOpenTag + "\n\n" + TurnTextSplitter.canonicalReasoningCloseTag + "\n\n"
 
+    /// The Inkling 2 effort line's value. Thinking OFF renders 0.0 (`none`)
+    /// rather than the template's 0.9 default: a turn that asked for no
+    /// reasoning must not be handed the checkpoint's default effort, which is
+    /// the template's fallback only when the caller passes nothing at all.
+    static func inkling2Effort(thinkingEnabled: Bool, thinkingEffort: ThinkingEffort?) -> Float {
+        guard thinkingEnabled else { return 0 }
+        switch thinkingEffort ?? .high {
+        case .low: return Inkling2Effort.value(for: "low") ?? 0.2
+        case .high: return Inkling2Effort.value(for: "high") ?? 0.9
+        }
+    }
+
     /// Whether a *historical* assistant turn is rendered with its reasoning block
     /// open.
     ///
@@ -375,6 +405,43 @@ public enum ChatPromptFormatter {
         promptDialect: DeepSeekV41PromptDialect = DeepSeekV41PromptDialect()
     ) -> String {
         guard !turns.isEmpty else { return "" }
+
+        if modelConfig?.isInkling2Model == true {
+            // The checkpoint's template renders roles and typed blocks and has
+            // no assistant prefix, so the last turn is whatever the caller put
+            // there -- a completed assistant turn replays with its
+            // end-sampling marker, and generation starts right after it.
+            let splitter = TurnTextSplitter.self
+            var rendered: [Inkling2Turn] = []
+            if !cleanSystem.isEmpty { rendered.append(.system(cleanSystem)) }
+            for turn in turns {
+                switch turn.kind {
+                case .toolResult(let name):
+                    rendered.append(.tool(name: name, content: [.text(turn.text)]))
+                case .text:
+                    guard turn.role == .assistant else {
+                        rendered.append(.user([.text(turn.text)]))
+                        continue
+                    }
+                    let text = turn.text
+                    let reasoning: String?
+                    let content: String
+                    if splitter.containsReasoningClose(text) {
+                        let split = splitter.splitThinkingAndResponse(raw: text, promptRequestsThinking: true)
+                        reasoning = split.think.isEmpty ? nil : split.think
+                        content = split.resp
+                    } else {
+                        reasoning = nil
+                        content = text
+                    }
+                    rendered.append(.assistant(reasoning: reasoning, content: content))
+                }
+            }
+            return (try? Inkling2Prompt().render(
+                turns: rendered,
+                effort: inkling2Effort(thinkingEnabled: thinkingEnabled, thinkingEffort: thinkingEffort)
+            )) ?? ""
+        }
 
         if modelConfig?.isDeepSeekV41Model == true {
             // A completed assistant turn is rendered from its own content: the

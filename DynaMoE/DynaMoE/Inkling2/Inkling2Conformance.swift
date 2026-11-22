@@ -23,12 +23,15 @@ import Foundation
 
 /// Whether the family can serve a turn.
 ///
-/// Phase 1 lands identity, the catalog, the memory plan and the prompt
-/// renderer; the forward pass is Phase 2, so this is FALSE until a text turn
-/// actually runs. Discovery reads it to put an honest caveat on the model row,
-/// and the thinking-level flag reads it for the same reason DeepSeek's does.
+/// TRUE for TEXT turns: the host graph runs the published checkpoint through
+/// `Inkling2TurnRunner`, which `CompletionEngine.launchTurn` calls, and
+/// `testAPublishedPromptCompletesATurnThroughTheRuntime` runs exactly that.
+/// What is still missing is named here rather than hidden behind the flag: no
+/// image path (the vision tower is not wired into this family's turns), no
+/// device (Metal) graph, no speculative verify, and no tool dialect -- so an
+/// agent turn ends on EOS or the cap instead of freezing on a call.
 nonisolated public enum Inkling2Availability {
-    public static let isRuntimeAvailable = false
+    public static let isRuntimeAvailable = true
 }
 
 nonisolated public enum Inkling2Conformance {
