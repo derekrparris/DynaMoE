@@ -187,6 +187,55 @@ nonisolated public final class Inkling2DeviceWorkspace {
     }
 }
 
+// MARK: - Scalar arguments
+
+/// Keeps every `constant` argument buffer alive for as long as a command buffer
+/// may read it.
+///
+/// A dispatch reads its arguments when the GPU RUNS it, not when the host
+/// encodes it, so a scalar freed at the end of the helper that made it is a
+/// use-after-free -- and the GPU reports that as an address fault, not as a
+/// wrong number. Per-helper arrays were tried and every new helper forgot one;
+/// one arena owned by the caller of the whole sequence cannot.
+nonisolated public final class Inkling2ScalarArena {
+    private let device: MTLDevice
+    private var buffers: [MTLBuffer] = []
+
+    public init(device: MTLDevice) { self.device = device }
+
+    /// A copy of `value` as a buffer, retained until the arena dies.
+    public func make<T>(_ value: T) -> MTLBuffer? {
+        var copy = value
+        guard let buffer = device.makeBuffer(
+            bytes: &copy, length: MemoryLayout<T>.stride, options: .storageModeShared
+        ) else { return nil }
+        buffers.append(buffer)
+        return buffer
+    }
+
+    /// A staged copy of a host array (weights, history, anything a kernel reads
+    /// that is not already in a workspace buffer), retained until the arena is
+    /// cleared. The same lifetime rule as `make`: a buffer the GPU reads must
+    /// outlive the commit.
+    public func make<Element>(staging values: [Element]) -> MTLBuffer? {
+        // A zero-length `makeBuffer(bytes:)` is not allowed, and an empty
+        // history reads no row, so one zeroed element is a safe stand-in.
+        let padded = values.isEmpty
+            ? [Element](repeating: unsafeBitCast(0, to: Element.self), count: 1)
+            : values
+        let length = padded.count * MemoryLayout<Element>.stride
+        return padded.withUnsafeBytes { raw in
+            guard let buffer = device.makeBuffer(bytes: raw.baseAddress!, length: length,
+                                                options: .storageModeShared) else { return nil }
+            buffers.append(buffer)
+            return buffer
+        }
+    }
+
+    /// Drops the retained buffers: call once the command buffer has completed.
+    public func clear() { buffers.removeAll() }
+}
+
 // MARK: - The device forward
 
 /// One visit's device path. It owns the pipelines and the workspace; the turn
@@ -212,6 +261,7 @@ nonisolated public final class Inkling2MetalForward {
         "inkling_short_conv_f32",
         "inkling_message_gate_f32",
         "inkling_l2_clip_scale_f32",
+        "inkling_l2_clip_f32",
         "inkling_gate_multiply_f32",
         "inkling_block_read_f32",
         "inkling_attention_f32",
@@ -282,15 +332,21 @@ nonisolated public final class Inkling2MetalForward {
         outputOffset: Int,
         rows: Int,
         columns: Int,
-        kernel: String
+        positions: Int = 1,
+        arena: Inkling2ScalarArena
     ) throws {
+        // The BLOCK form reads eight positions unconditionally, so it is only
+        // valid when the input really holds eight rows -- dispatching it for one
+        // position reads seven rows past the buffer, which the GPU reports as an
+        // address fault. A walk therefore takes the one-thread-per-row form.
+        let kernel = positions >= 8 ? "bf16_gemv_rows8" : "bf16_gemv"
         let (weightBuffer, weightOffset) = try weights.tensor(role, layer: layer)
-        let offset = scalar(UInt64(weightOffset))
-        let inDim = scalar(UInt32(columns))
-        let outDim = scalar(UInt32(rows))
+        let offset = arena.make(UInt64(weightOffset))
+        let inDim = arena.make(UInt32(columns))
+        let outDim = arena.make(UInt32(rows))
         let zero: UInt32 = 0
-        let inputStride = scalar(zero)
-        let outputStride = scalar(zero)
+        let inputStride = arena.make(zero)
+        let outputStride = arena.make(zero)
         encoder.setComputePipelineState(try pipeline(kernel))
         encoder.setBuffer(weightBuffer, offset: 0, index: 0)
         encoder.setBuffer(input, offset: inputOffset, index: 1)
@@ -300,11 +356,18 @@ nonisolated public final class Inkling2MetalForward {
         encoder.setBuffer(outDim, offset: 0, index: 5)
         encoder.setBuffer(inputStride, offset: 0, index: 6)
         encoder.setBuffer(outputStride, offset: 0, index: 7)
-        encoder.setThreadgroupMemoryLength(32 * MemoryLayout<Float>.stride, index: 0)
-        encoder.dispatchThreadgroups(
-            MTLSize(width: rows, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
-        )
+        if kernel == "bf16_gemv_rows8" {
+            encoder.setThreadgroupMemoryLength(32 * MemoryLayout<Float>.stride, index: 0)
+            encoder.dispatchThreadgroups(
+                MTLSize(width: rows, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
+            )
+        } else {
+            encoder.dispatchThreads(
+                MTLSize(width: rows, height: positions, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: min(rows, 128), height: 1, depth: 1)
+            )
+        }
     }
 
     /// The block read: `softmax(q . rmsnorm(row) / sqrt(width)) . rmsnorm(row)`
@@ -318,11 +381,12 @@ nonisolated public final class Inkling2MetalForward {
         queries: MTLBuffer,
         queryCount: Int,
         output: MTLBuffer,
-        outputOffset: Int
+        outputOffset: Int,
+        arena: Inkling2ScalarArena
     ) throws {
         let width = config.hiddenSize
-        let stackRowsValue = scalar(UInt32(stackRows))
-        let widthValue = scalar(UInt32(width))
+        let stackRowsValue = arena.make(UInt32(stackRows))
+        let widthValue = arena.make(UInt32(width))
         encoder.setComputePipelineState(try pipeline("inkling_block_read_f32"))
         encoder.setBuffer(stack, offset: 0, index: 0)
         encoder.setBuffer(partial, offset: partialOffset, index: 1)
@@ -349,24 +413,47 @@ nonisolated public final class Inkling2MetalForward {
         headDim: Int,
         heads: Int,
         threshold: Float,
-        tau: Float
-    ) throws -> [MTLBuffer?] {
-        let headDimValue = scalar(UInt32(headDim))
-        let thresholdValue = scalar(threshold)
-        let tauValue = scalar(tau)
+        tau: Float,
+        arena: Inkling2ScalarArena
+    ) throws {
+        let headDimValue = arena.make(UInt32(headDim))
+        let scaleOffsetValue = arena.make(UInt64(scaleOffset))
+        let thresholdValue = arena.make(threshold)
+        let tauValue = arena.make(tau)
         encoder.setComputePipelineState(try pipeline("inkling_l2_clip_scale_f32"))
         encoder.setBuffer(vector, offset: vectorOffset, index: 0)
-        encoder.setBuffer(scale, offset: scaleOffset, index: 1)
-        encoder.setBuffer(headDimValue, offset: 0, index: 2)
-        encoder.setBuffer(thresholdValue, offset: 0, index: 3)
-        encoder.setBuffer(tauValue, offset: 0, index: 4)
+        // The scale's buffer at offset ZERO plus its byte offset as a constant:
+        // a tensor's offset inside a shard is not buffer-aligned.
+        encoder.setBuffer(scale, offset: 0, index: 1)
+        encoder.setBuffer(scaleOffsetValue, offset: 0, index: 2)
+        encoder.setBuffer(headDimValue, offset: 0, index: 3)
+        encoder.setBuffer(thresholdValue, offset: 0, index: 4)
+        encoder.setBuffer(tauValue, offset: 0, index: 5)
         encoder.setThreadgroupMemoryLength(32 * MemoryLayout<Float>.stride, index: 0)
         encoder.dispatchThreadgroups(
             MTLSize(width: heads, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
         )
-        // The caller keeps these alive until the commit.
-        return [headDimValue, thresholdValue, tauValue]
+    }
+
+    /// The plain per-head L2 clip (no learned scale), which is the key path.
+    func l2ClipPlain(
+        encoder: MTLComputeCommandEncoder,
+        vector: MTLBuffer,
+        headDim: Int,
+        heads: Int,
+        threshold: Float,
+        arena: Inkling2ScalarArena
+    ) throws {
+        encoder.setComputePipelineState(try pipeline("inkling_l2_clip_f32"))
+        encoder.setBuffer(vector, offset: 0, index: 0)
+        encoder.setBuffer(arena.make(UInt32(headDim)), offset: 0, index: 1)
+        encoder.setBuffer(arena.make(threshold), offset: 0, index: 2)
+        encoder.setThreadgroupMemoryLength(32 * MemoryLayout<Float>.stride, index: 0)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: heads, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
+        )
     }
 
     /// One head's unweighted norm in place, which the value projection needs.
@@ -374,11 +461,15 @@ nonisolated public final class Inkling2MetalForward {
         encoder: MTLComputeCommandEncoder,
         vector: MTLBuffer,
         headDim: Int,
-        heads: Int
-    ) throws -> [MTLBuffer?] {
-        let headDimValue = scalar(UInt32(headDim))
-        let epsValue = scalar(config.rmsNormEps)
+        heads: Int,
+        arena: Inkling2ScalarArena
+    ) throws {
+        let headDimValue = arena.make(UInt32(headDim))
+        let epsValue = arena.make(config.rmsNormEps)
         encoder.setComputePipelineState(try pipeline("inkling_rmsnorm_no_gain_f32"))
+        // In place: the kernel reads a row fully into its reduction before its
+        // write loop touches it, and each threadgroup owns one head's row, so
+        // no group reads another's.
         encoder.setBuffer(vector, offset: 0, index: 0)
         encoder.setBuffer(vector, offset: 0, index: 1)
         encoder.setBuffer(headDimValue, offset: 0, index: 2)
@@ -390,7 +481,6 @@ nonisolated public final class Inkling2MetalForward {
             MTLSize(width: heads, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
         )
-        return [headDimValue, epsValue]
     }
 
     // MARK: Staging and host-side pieces
@@ -465,35 +555,39 @@ nonisolated public final class Inkling2MetalForward {
     /// over the same visit leave it in the same place.
     func convolve(
         encoder: MTLComputeCommandEncoder,
-        workspace: Inkling2DeviceWorkspace,
         state: Inkling2VisitState,
         index: Int,
         values: MTLBuffer,
         valuesCount: Int,
         layer: Int,
         isFull: Bool,
-        kvHeads: Int,
         headDim: Int,
-        dynamicInput: MTLBuffer,
-        hidden: Int,
-        output: MTLBuffer
-    ) throws -> [MTLBuffer?] {
+        output: MTLBuffer,
+        arena: Inkling2ScalarArena
+    ) throws {
         let kernelSize = config.convKernelSize
         let history = state.history(index)
-        let taps = try hostMatrix(index == 0 || index == 1
-            ? (isFull ? .attnKSconvStatic : .attnKSconvWeight)
-            : .attnSconv, layer: layer)
-        // The stored conv1d order is oldest-first; the kernel takes it as stored.
-        let tapsBuffer = try staging(workspace.bank, taps)
+        // The K/V convolutions have their own weights; index 2/3 are the
+        // post-attention and post-MLP streams, which share the hidden-width one.
+        let taps = try hostMatrix(index == 0 ? .attnKSconvWeight : (index == 1 ? .attnVSconvWeight : .attnSconv), layer: layer)
+        // Staged through the ARENA, which owns every buffer a dispatch reads
+        // until after the wait: a local buffer is freed when this function
+        // returns, and the GPU may not have run the dispatch yet -- a
+        // use-after-free it reports as an address fault.
+        guard let tapsBuffer = arena.make(staging: taps) else {
+            throw Inkling2ForwardError.unsupported("could not stage the convolution taps")
+        }
         let historyRows = history.count
         var flatHistory = [Float](repeating: 0, count: historyRows * valuesCount)
         for row in 0..<historyRows {
             for channel in 0..<valuesCount { flatHistory[row * valuesCount + channel] = history[row][channel] }
         }
-        let historyBuffer = try staging(workspace.relativeStates, flatHistory)
-        let channels = scalar(UInt32(valuesCount))
-        let tapCount = scalar(UInt32(kernelSize))
-        let rows = scalar(UInt32(historyRows))
+        guard let historyBuffer = arena.make(staging: flatHistory) else {
+            throw Inkling2ForwardError.unsupported("could not stage the convolution history")
+        }
+        let channels = arena.make(UInt32(valuesCount))
+        let tapCount = arena.make(UInt32(kernelSize))
+        let rows = arena.make(UInt32(historyRows))
         encoder.setComputePipelineState(try pipeline("inkling_short_conv_f32"))
         encoder.setBuffer(values, offset: 0, index: 0)
         encoder.setBuffer(historyBuffer, offset: 0, index: 1)
@@ -506,42 +600,19 @@ nonisolated public final class Inkling2MetalForward {
             MTLSize(width: valuesCount, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
         )
-        // The dynamic form's extra per-head taps are a host-side projection at
-        // this stage: the kernel covers the static part exactly, and the
-        // dynamic term is added by the host rule below when it is non-zero.
-        if isFull {
-            let projected = try host.linear(
-                try hostMatrix(.attnKSconvProj, layer: layer),
-                readBack(dynamicInput, count: hidden),
-                rows: kvHeads * kernelSize
-            )
-            if projected.contains(where: { $0 != 0 }) {
-                let current = readBack(values, count: valuesCount)
-                let out = readBack(output, count: valuesCount)
-                var corrected = out
-                for channel in 0..<valuesCount {
-                    let head = channel / max(1, headDim)
-                    let channelHistory = history.map { $0[channel] }
-                    let staticWeights = (0..<kernelSize).map { taps[$0 * valuesCount + channel] }
-                    let dynamicWeights = (0..<kernelSize).map { projected[head * kernelSize + $0] }
-                    corrected[channel] = Inkling2Math.dynamicShortConvolution(
-                        current: current[channel], history: channelHistory,
-                        staticWeights: staticWeights, dynamicWeights: dynamicWeights
-                    )
-                }
-                let pointer = output.contents().bindMemory(to: Float.self, capacity: valuesCount)
-                for channel in 0..<valuesCount { pointer[channel] = corrected[channel] }
-            }
-        }
+        // The state stays the authority even on a device pass, so the next
+        // convolution (host or device) sees the same history either way.
         state.pushConvolution(index, value: readBack(values, count: valuesCount))
-        _ = workspace
-        _ = taps
-        return [channels, tapCount, rows, tapsBuffer, historyBuffer]
+        _ = isFull
+        _ = headDim
     }
 
     /// `output *= sigmoid(gate)`, elementwise.
-    func gateMultiply(encoder: MTLComputeCommandEncoder, output: MTLBuffer, gate: MTLBuffer, count: Int) throws {
-        let countValue = scalar(UInt32(count))
+    func gateMultiply(
+        encoder: MTLComputeCommandEncoder, output: MTLBuffer, gate: MTLBuffer,
+        count: Int, arena: Inkling2ScalarArena
+    ) throws {
+        let countValue = arena.make(UInt32(count))
         encoder.setComputePipelineState(try pipeline("inkling_gate_multiply_f32"))
         encoder.setBuffer(output, offset: 0, index: 0)
         encoder.setBuffer(gate, offset: 0, index: 1)
@@ -550,7 +621,6 @@ nonisolated public final class Inkling2MetalForward {
             MTLSize(width: count, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
         )
-        withExtendedLifetime(countValue) {}
     }
 
     // MARK: The attention half
@@ -585,22 +655,33 @@ nonisolated public final class Inkling2MetalForward {
         let valueInputBuffer = try staging(workspace.valueInput, valueInput)
 
         let (commandBuffer, encoder) = try commandComponents()
+        // Every dispatch's scalar argument lives in the arena until the command
+        // buffer has completed: the GPU reads them when it runs the work.
+        let arena = Inkling2ScalarArena(device: device)
+        defer { arena.clear() }
+        // Every early throw below must still close the encoder: Metal asserts on
+        // release, and that assertion is a process abort rather than an error a
+        // caller can read (the same rule the vision kernels recorded).
+        var encoded = false
+        defer { if !encoded { encoder.endEncoding() } }
 
         // Q: project, then scale + L2 clip (+ log scale on a full layer).
         try gemm(
             encoder: encoder, role: .attnWqDu, layer: layer,
             input: queryInputBuffer, inputOffset: 0,
             output: workspace.query, outputOffset: 0,
-            rows: heads * headDim, columns: hidden, kernel: "bf16_gemv_rows8"
+            rows: heads * headDim, columns: hidden,
+            arena: arena
         )
         let qScale = try weights.tensor(.attnQL2ClipScale, layer: layer)
         let tau = isFull
             ? Inkling2Math.logScale(position: position, alpha: config.logScalingAlpha, floor: config.logScalingNFloor)
             : 1
-        let qKeep = try l2Clip(
+        try l2Clip(
             encoder: encoder, vector: workspace.query, vectorOffset: 0,
             scale: qScale.buffer, scaleOffset: Int(qScale.offset),
-            headDim: headDim, heads: heads, threshold: config.qkL2ClipThreshold, tau: tau
+            headDim: headDim, heads: heads, threshold: config.qkL2ClipThreshold, tau: tau,
+            arena: arena
         )
 
         // K: project, convolve, L2 clip.
@@ -608,21 +689,21 @@ nonisolated public final class Inkling2MetalForward {
             encoder: encoder, role: .attnWkDv, layer: layer,
             input: keyInputBuffer, inputOffset: 0,
             output: workspace.key, outputOffset: 0,
-            rows: kvHeads * headDim, columns: hidden, kernel: "bf16_gemv_rows8"
+            rows: kvHeads * headDim, columns: hidden,
+            arena: arena
         )
-        let keyConv = try convolve(
-            encoder: encoder, workspace: workspace, state: state, index: 0,
+        try convolve(
+            encoder: encoder, state: state, index: 0,
             values: workspace.key, valuesCount: kvHeads * headDim,
-            layer: layer, isFull: isFull, kvHeads: kvHeads, headDim: headDim,
-            dynamicInput: keyInputBuffer, hidden: hidden, output: workspace.key
+            layer: layer, isFull: isFull, headDim: headDim, output: workspace.key, arena: arena
         )
-        // One shared clip scale for q and k: the checkpoint publishes only
-        // `attn.q_l2_clip.scale`, and the host applies it to both.
-        let kScale = try weights.tensor(.attnQL2ClipScale, layer: layer)
-        let kKeep = try l2Clip(
-            encoder: encoder, vector: workspace.key, vectorOffset: 0,
-            scale: kScale.buffer, scaleOffset: Int(kScale.offset),
-            headDim: headDim, heads: kvHeads, threshold: config.qkL2ClipThreshold, tau: 1
+        // The keys are clipped PLAINLY: the reference multiplies only the
+        // queries by `q_l2_clip.scale`, so passing that scale here made K 0.47
+        // off while Q was exact.
+        try l2ClipPlain(
+            encoder: encoder, vector: workspace.key,
+            headDim: headDim, heads: kvHeads, threshold: config.qkL2ClipThreshold,
+            arena: arena
         )
 
         // V: project, convolve, unweighted per-head norm.
@@ -630,17 +711,15 @@ nonisolated public final class Inkling2MetalForward {
             encoder: encoder, role: .attnWvDv, layer: layer,
             input: valueInputBuffer, inputOffset: 0,
             output: workspace.value, outputOffset: 0,
-            rows: kvHeads * headDim, columns: hidden, kernel: "bf16_gemv_rows8"
+            rows: kvHeads * headDim, columns: hidden,
+            arena: arena
         )
-        let valueConv = try convolve(
-            encoder: encoder, workspace: workspace, state: state, index: 1,
+        try convolve(
+            encoder: encoder, state: state, index: 1,
             values: workspace.value, valuesCount: kvHeads * headDim,
-            layer: layer, isFull: isFull, kvHeads: kvHeads, headDim: headDim,
-            dynamicInput: valueInputBuffer, hidden: hidden, output: workspace.value
+            layer: layer, isFull: isFull, headDim: headDim, output: workspace.value, arena: arena
         )
-        let vKeep = try headNorm(
-            encoder: encoder, vector: workspace.value, headDim: headDim, heads: kvHeads
-        )
+        try headNorm(encoder: encoder, vector: workspace.value, headDim: headDim, heads: kvHeads, arena: arena)
 
         // The relative states and the sink logits are small host-side
         // projections; the kernel only needs their results, and computing them
@@ -649,10 +728,8 @@ nonisolated public final class Inkling2MetalForward {
         let sink = try sinkLogits(layer: layer, queryInput: queryInput)
         let relativeBuffer = try staging(workspace.relativeStates, relative)
         let sinkBuffer = try staging(workspace.sinkLogits, sink)
-        let bank = try weights.tensor(.attnRelLogitsProj, layer: layer)
         let bankValues = try hostMatrix(.attnRelLogitsProj, layer: layer)
         let bankBuffer = try staging(workspace.bank, bankValues)
-        _ = bank
 
         // The KV rows this position attends over, staged.
         let rows = workspace.stage(state)
@@ -660,7 +737,7 @@ nonisolated public final class Inkling2MetalForward {
         try attention(
             encoder: encoder, workspace: workspace, state: state, rows: rows,
             position: position, relative: relativeBuffer, bank: bankBuffer,
-            sink: sinkBuffer, output: workspace.attentionOutput
+            sink: sinkBuffer, output: workspace.attentionOutput, arena: arena
         )
 
         // The output gate, then the grouped output projection.
@@ -668,27 +745,26 @@ nonisolated public final class Inkling2MetalForward {
             encoder: encoder, role: .attnGate, layer: layer,
             input: queryInputBuffer, inputOffset: 0,
             output: workspace.gate, outputOffset: 0,
-            rows: heads * headDim, columns: hidden, kernel: "bf16_gemv_rows8"
+            rows: heads * headDim, columns: hidden,
+            arena: arena
         )
-        try gateMultiply(encoder: encoder, output: workspace.attentionOutput,
-                         gate: workspace.gate, count: heads * headDim)
+        try gateMultiply(
+            encoder: encoder, output: workspace.attentionOutput,
+            gate: workspace.gate, count: heads * headDim, arena: arena
+        )
         try gemm(
             encoder: encoder, role: .attnWoUd, layer: layer,
             input: workspace.attentionOutput, inputOffset: 0,
             output: workspace.projectionOutput, outputOffset: 0,
-            rows: hidden, columns: heads * headDim, kernel: "bf16_gemv_rows8"
+            rows: hidden, columns: heads * headDim,
+            arena: arena
         )
 
         encoder.endEncoding()
+        encoded = true
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
         if let error = commandBuffer.error { throw error }
-        // Keep every scalar buffer alive past the commit.
-        withExtendedLifetime(qKeep) {}
-        withExtendedLifetime(kKeep) {}
-        withExtendedLifetime(vKeep) {}
-        withExtendedLifetime(keyConv) {}
-        withExtendedLifetime(valueConv) {}
         return readBack(workspace.projectionOutput, count: hidden)
     }
 
@@ -702,7 +778,8 @@ nonisolated public final class Inkling2MetalForward {
         relative: MTLBuffer,
         bank: MTLBuffer,
         sink: MTLBuffer,
-        output: MTLBuffer
+        output: MTLBuffer,
+        arena: Inkling2ScalarArena
     ) throws {
         let isFull = state.isFullAttention
         let heads = isFull ? config.numAttentionHeads : config.swaNumAttentionHeads
@@ -723,8 +800,7 @@ nonisolated public final class Inkling2MetalForward {
         encoder.setBuffer(sink, offset: 0, index: 5)
         encoder.setBuffer(output, offset: 0, index: 6)
         for (index, value) in values.enumerated() {
-            guard let buffer = scalar(value) else { continue }
-            encoder.setBuffer(buffer, offset: 0, index: 7 + index)
+            encoder.setBuffer(arena.make(value), offset: 0, index: 7 + index)
         }
         encoder.setThreadgroupMemoryLength(
             (32 + rows) * MemoryLayout<Float>.stride, index: 0

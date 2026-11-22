@@ -14117,18 +14117,22 @@ kernel void inkling_router_topk_f32(
 // One threadgroup per head; the lanes split the head dimension.
 kernel void inkling_l2_clip_scale_f32(
     device float* vector [[buffer(0)]],
-    device const float* scale [[buffer(1)]],
-    constant uint32_t& headDim [[buffer(2)]],
-    constant float& threshold [[buffer(3)]],
-    constant float& tau [[buffer(4)]],
+    device const uchar* scaleBytes [[buffer(1)]],
+    constant uint64_t& scaleOffset [[buffer(2)]],
+    constant uint32_t& headDim [[buffer(3)]],
+    constant float& threshold [[buffer(4)]],
+    constant float& tau [[buffer(5)]],
     threadgroup float* shared [[threadgroup(0)]],
     uint tid [[thread_position_in_threadgroup]],
     uint tgSize [[threads_per_threadgroup]],
     uint head [[threadgroup_position_in_grid]]
 ) {
     device float* row = vector + ((uint64_t)head * headDim);
-    device const float* headScale = scale + ((uint64_t)head * headDim);
-    for (uint d = tid; d < headDim; d += tgSize) { row[d] *= headScale[d]; }
+    // The scale is BF16 in the shard and its byte offset is NOT buffer-aligned
+    // (160 mod 256 here), so it is read through the offset rather than bound at
+    // it: `setBuffer(offset:)` requires a 256-byte multiple and faults otherwise.
+    device const uchar* headScaleBytes = scaleBytes + scaleOffset + ((uint64_t)head * headDim * 2);
+    for (uint d = tid; d < headDim; d += tgSize) { row[d] *= read_bf16_unaligned(headScaleBytes + (uint64_t)d * 2); }
     float localSum = 0.0f;
     for (uint d = tid; d < headDim; d += tgSize) { localSum += row[d] * row[d]; }
     float norm = sqrt(threadgroup_reduce_sum(localSum, shared, tid, tgSize));
@@ -14145,4 +14149,25 @@ kernel void inkling_gate_multiply_f32(
 ) {
     if (gid >= count) { return; }
     output[gid] *= 1.0f / (1.0f + exp(-gate[gid]));
+}
+
+// A per-head L2 clip with NO learned scale, which is Inkling 2's key path: the
+// reference multiplies only the queries by `q_l2_clip.scale` and clips the keys
+// plainly. Its own kernel rather than a flag, because the scale-free form binds
+// no scale buffer at all -- a sentinel offset still has to name one.
+kernel void inkling_l2_clip_f32(
+    device float* vector [[buffer(0)]],
+    constant uint32_t& headDim [[buffer(1)]],
+    constant float& threshold [[buffer(2)]],
+    threadgroup float* shared [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgSize [[threads_per_threadgroup]],
+    uint head [[threadgroup_position_in_grid]]
+) {
+    device float* row = vector + ((uint64_t)head * headDim);
+    float localSum = 0.0f;
+    for (uint d = tid; d < headDim; d += tgSize) { localSum += row[d] * row[d]; }
+    float norm = sqrt(threadgroup_reduce_sum(localSum, shared, tid, tgSize));
+    float factor = min(threshold / (norm + 1e-6f), 1.0f);
+    for (uint d = tid; d < headDim; d += tgSize) { row[d] *= factor; }
 }

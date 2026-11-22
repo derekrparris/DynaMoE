@@ -615,15 +615,17 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         )
         let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
         let encoder = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
+        let arena = Inkling2ScalarArena(device: device)
         try metal.attention(
             encoder: encoder, workspace: workspace, state: state, rows: rows,
             position: position, relative: relativeBuffer, bank: bankBuffer,
-            sink: sinkBuffer, output: outputBuffer
+            sink: sinkBuffer, output: outputBuffer, arena: arena
         )
         encoder.endEncoding()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
         if let error = commandBuffer.error { throw error }
+        arena.clear()
 
         let deviceOutput = read(outputBuffer, config.numAttentionHeads * config.headDim)
         let headDim = config.headDim
@@ -651,6 +653,375 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         print("🔎 [inkling2 device] attention per head: \(perHead.joined(separator: " "))")
         print("🔎 [inkling2 device] attention: worst head \(worstHead) at \(worstError) relative over \(rows) row(s)")
         XCTAssertLessThanOrEqual(worstError, 1e-4, "head \(worstHead) of the device attention against the host graph")
+        withExtendedLifetime(engine) {}
+    }
+
+    /// The whole attention half against the host's `attention`, on the real
+    /// checkpoint: after this the half is checked stage by stage rather than
+    /// only at its kernel.
+    ///
+    /// Two host forwards over the same weights, because both sides MUTATE the
+    /// visit's convolution history: one is the oracle, the other is the
+    /// device driver's reference for its small host-side pieces. Sharing one
+    /// would make the second side read a history the first had already pushed.
+    func testTheDeviceAttentionHalfMatchesTheHost() throws {
+        let snapshot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(Inkling2PublishedTensorTests.snapshotRelativePath)
+        guard FileManager.default.fileExists(atPath: snapshot.path) else {
+            throw XCTSkip("Inkling 2 snapshot is not downloaded at \(snapshot.path)")
+        }
+        let (device, library, queue) = try environment()
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let summary = try engine.getSummary()
+        let config = try Inkling2Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let catalog = Inkling2WeightCatalog(
+            mainFile: summary.tensors.map { Inkling2TensorRef(metadata: $0) },
+            layerCount: config.numHiddenLayers
+        )
+        var shardBuffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            guard shard.length > 0,
+                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)) else { continue }
+            if let buffer = device.makeBuffer(
+                bytesNoCopy: pointer, length: Int(shard.length), options: .storageModeShared, deallocator: nil
+            ) { shardBuffers[shard.index] = buffer }
+        }
+        let source = Inkling2SnapshotWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
+        let oracle = try Inkling2CPUForward(config: config, weights: source)
+        let reference = try Inkling2CPUForward(config: config, weights: source)
+        let deviceWeights = Inkling2DeviceWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
+        let metal = try Inkling2MetalForward(
+            device: device, library: library, queue: queue, weights: deviceWeights, host: reference
+        )
+        let workspace = try Inkling2DeviceWorkspace(device: device, config: config)
+
+        let tokenizer = try DynaMoeTokenizer(
+            tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+        )
+        let ids = try tokenizer.encode(text: "Hi there")
+        for (position, id) in ids.enumerated() {
+            _ = try oracle.forwardToken(token: UInt32(id), position: position)
+            _ = try reference.forwardToken(token: UInt32(id), position: position)
+        }
+        let position = ids.count
+        let layer = 0
+        let queryInput = values(config.hiddenSize, seed: 51)
+        let keyInput = values(config.hiddenSize, seed: 52)
+        let valueInput = values(config.hiddenSize, seed: 53)
+
+        // The host's own intermediate stages, by name: a mismatch then names the
+        // stage instead of only the half's output.
+        var oracleStages: [String: [Float]] = [:]
+        oracle.onInternal = { _, name, value in oracleStages[name] = value }
+        let expected = try oracle.attention(
+            layer: layer, state: oracle.states[0], queryInput: queryInput,
+            keyInput: keyInput, valueInput: valueInput, position: position
+        )
+        // The K projection and convolution on their own, so a mismatch in
+        // `k_norm` is attributed to one of the two rather than to the clip:
+        // the same buffers the half uses, one command buffer each.
+        let probeState = Inkling2VisitState(
+            isFullAttention: false, window: config.slidingWindowSize,
+            stateWidths: [config.swaNumKeyValueHeads * config.swaHeadDim,
+                          config.swaNumKeyValueHeads * config.swaHeadDim,
+                          config.hiddenSize, config.hiddenSize],
+            historyDepth: config.convKernelSize - 1
+        )
+        // Same row count and the same convolution history the half starts
+        // from, so the probe's convolution is comparable; a copy, because the
+        // convolution pushes to this history and the half must not see that.
+        let sourceState = reference.states[0]
+        for row in 0..<sourceState.committedPositions {
+            _ = probeState.append(key: sourceState.keys[row], value: sourceState.values[row])
+        }
+        for index in 0..<4 {
+            for entry in sourceState.history(index) { probeState.pushConvolution(index, value: entry) }
+        }
+        func isolatedK() throws -> (linear: [Float], convolved: [Float]) {
+            let queryInputBuffer = try metal.staging(workspace.keyInput, keyInput)
+            _ = queryInputBuffer
+            let interrupt = try XCTUnwrap(queue.makeCommandBuffer())
+            let encoder = try XCTUnwrap(interrupt.makeComputeCommandEncoder())
+            let arena = Inkling2ScalarArena(device: device)
+            try metal.gemm(
+                encoder: encoder, role: .attnWkDv, layer: layer,
+                input: workspace.keyInput, inputOffset: 0, output: workspace.key, outputOffset: 0,
+                rows: config.swaNumKeyValueHeads * config.swaHeadDim, columns: config.hiddenSize,
+                arena: arena
+            )
+            encoder.endEncoding()
+            interrupt.commit()
+            interrupt.waitUntilCompleted()
+            let linear = metal.readBack(
+                workspace.key, count: config.swaNumKeyValueHeads * config.swaHeadDim
+            )
+            let second = try XCTUnwrap(queue.makeCommandBuffer())
+            let encoder2 = try XCTUnwrap(second.makeComputeCommandEncoder())
+            // A state of its own: the convolution pushes history, and the half
+            // below must start from the history the host's capture did.
+            try metal.convolve(
+                encoder: encoder2, state: probeState, index: 0,
+                values: workspace.key, valuesCount: config.swaNumKeyValueHeads * config.swaHeadDim,
+                layer: layer, isFull: false, headDim: config.swaHeadDim, output: workspace.key,
+                arena: arena
+            )
+            encoder2.endEncoding()
+            second.commit()
+            second.waitUntilCompleted()
+            arena.clear()
+            return (linear, metal.readBack(
+                workspace.key, count: config.swaNumKeyValueHeads * config.swaHeadDim
+            ))
+        }
+        // The host's matching pair, from its own captures (a fresh state so the
+        // convolution history is the one the half started from).
+        let kPair = try isolatedK()
+        func rel(_ mine: [Float], _ ref: [Float]) -> Float {
+            guard !ref.isEmpty, mine.count == ref.count else { return .infinity }
+            let s = ref.reduce(Float(0)) { max($0, abs($1)) }
+            return zip(mine, ref).reduce(Float(0)) { max($0, abs($1.0 - $1.1)) } / max(s, 1e-9)
+        }
+        print("🔎 [inkling2 device] k path: linear \(rel(kPair.linear, oracleStages["k_linear"] ?? []))"
+            + " convolved \(rel(kPair.convolved, oracleStages["k_sconv"] ?? []))")
+        // The clip alone, on the same convolved vector: what is left after the
+        // two stages above are exact.
+        let clipBuffer = try XCTUnwrap(device.makeBuffer(
+            bytes: kPair.convolved, length: kPair.convolved.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        ))
+        let clipCommand = try XCTUnwrap(queue.makeCommandBuffer())
+        let clipEncoder = try XCTUnwrap(clipCommand.makeComputeCommandEncoder())
+        let clipArena = Inkling2ScalarArena(device: device)
+        let clipScale = try deviceWeights.tensor(.attnQL2ClipScale, layer: layer)
+        try metal.l2Clip(
+            encoder: clipEncoder, vector: clipBuffer, vectorOffset: 0,
+            scale: clipScale.buffer, scaleOffset: Int(clipScale.offset),
+            headDim: config.swaHeadDim, heads: config.swaNumKeyValueHeads,
+            threshold: config.qkL2ClipThreshold, tau: 1, arena: clipArena
+        )
+        clipEncoder.endEncoding()
+        clipCommand.commit()
+        clipCommand.waitUntilCompleted()
+        clipArena.clear()
+        let clipped = Array(UnsafeBufferPointer(
+            start: clipBuffer.contents().bindMemory(to: Float.self, capacity: kPair.convolved.count),
+            count: kPair.convolved.count
+        ))
+        // The host rule applied to the same input, to separate "the kernel is
+        // wrong" from "the host's k_norm is not this value".
+        let hostScale = try source.matrix(.attnQL2ClipScale, layer: layer)
+        var hostClipped = kPair.convolved
+        for head in 0..<config.swaNumKeyValueHeads {
+            let range = (head * config.swaHeadDim)..<((head + 1) * config.swaHeadDim)
+            var slice = Array(hostClipped[range])
+            for d in 0..<config.swaHeadDim { slice[d] *= hostScale[head * config.swaHeadDim + d] }
+            slice = Inkling2Math.l2Clip(slice, threshold: config.qkL2ClipThreshold)
+            for d in 0..<config.swaHeadDim { hostClipped[head * config.swaHeadDim + d] = slice[d] }
+        }
+        print("🔎 [inkling2 device] k clip: kernel-vs-host-rule \(rel(clipped, hostClipped))"
+            + " host-rule-vs-reference \(rel(hostClipped, oracleStages["k_norm"] ?? []))")
+
+        // The device half's own stages, read back from the workspace after it runs.
+        let actual = try metal.attentionHalf(
+            layer: layer, state: reference.states[0], queryInput: queryInput,
+            keyInput: keyInput, valueInput: valueInput, position: position, workspace: workspace
+        )
+        let scale = expected.reduce(Float(0)) { max($0, abs($1)) }
+        let worst = zip(actual, expected).reduce(Float(0)) { max($0, abs($1.0 - $1.1)) }
+        print("🔎 [inkling2 device] attention half: \(worst / scale) relative")
+        // Which stage diverges: each device workspace buffer against the host's
+        // capture of the same named value.
+        func stageError(_ name: String, _ mine: [Float], _ reference: [Float]) -> String {
+            guard !reference.isEmpty else { return "\(name): no reference" }
+            let stageScale = reference.reduce(Float(0)) { max($0, abs($1)) }
+            let delta = zip(mine, reference).reduce(Float(0)) { max($0, abs($1.0 - $1.1)) }
+            return String(format: "%@:%.2e", name, stageScale > 0 ? delta / stageScale : delta)
+        }
+        let stageRows: [String] = [
+            stageError("q_norm", metal.readBack(workspace.query, count: config.swaNumAttentionHeads * config.swaHeadDim),
+                       oracleStages["q_norm"] ?? []),
+            stageError("k_norm", metal.readBack(workspace.key, count: config.swaNumKeyValueHeads * config.swaHeadDim),
+                       oracleStages["k_norm"] ?? []),
+            stageError("v_norm", metal.readBack(workspace.value, count: config.swaNumKeyValueHeads * config.swaHeadDim),
+                       oracleStages["v_norm"] ?? []),
+            stageError("relative", metal.readBack(workspace.relativeStates, count: config.swaNumAttentionHeads * config.dRel),
+                       oracleStages["relative_states"] ?? []),
+            stageError("sink", metal.readBack(workspace.sinkLogits, count: config.swaNumAttentionHeads),
+                       oracleStages["sink"] ?? []),
+            stageError("attn_raw", metal.readBack(workspace.attentionOutput, count: config.swaNumAttentionHeads * config.swaHeadDim),
+                       oracleStages["attn_raw"] ?? [])
+        ]
+        print("🔎 [inkling2 device] stages: " + stageRows.joined(separator: " "))
+        XCTAssertLessThanOrEqual(worst / scale, 2e-3, "the device attention half against the host")
+        withExtendedLifetime(engine) {}
+    }
+
+    /// Bisects a GPU fault by running the attention half's stages ONE COMMAND
+    /// BUFFER AT A TIME on a fabricated state, so the stage that faults is the
+    /// one that was running when the error came back -- an asynchronous fault in
+    /// one buffer names nothing.
+    ///
+    /// It also covers a class the parity case cannot: every stage must run
+    /// without an out-of-bounds bind at the checkpoint's real tensor offsets,
+    /// which are NOT 256-byte aligned (that is what a first cut got wrong).
+    func testEveryAttentionStageRunsWithoutAFault() throws {
+        let snapshot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(Inkling2PublishedTensorTests.snapshotRelativePath)
+        guard FileManager.default.fileExists(atPath: snapshot.path) else {
+            throw XCTSkip("Inkling 2 snapshot is not downloaded at \(snapshot.path)")
+        }
+        let (device, library, queue) = try environment()
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let summary = try engine.getSummary()
+        let config = try Inkling2Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let catalog = Inkling2WeightCatalog(
+            mainFile: summary.tensors.map { Inkling2TensorRef(metadata: $0) },
+            layerCount: config.numHiddenLayers
+        )
+        var shardBuffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            guard shard.length > 0,
+                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)) else { continue }
+            if let buffer = device.makeBuffer(
+                bytesNoCopy: pointer, length: Int(shard.length), options: .storageModeShared, deallocator: nil
+            ) { shardBuffers[shard.index] = buffer }
+        }
+        let source = Inkling2SnapshotWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
+        let host = try Inkling2CPUForward(config: config, weights: source)
+        let deviceWeights = Inkling2DeviceWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
+        let metal = try Inkling2MetalForward(
+            device: device, library: library, queue: queue, weights: deviceWeights, host: host
+        )
+        let workspace = try Inkling2DeviceWorkspace(device: device, config: config)
+
+        // A fabricated state: three rows of KV, no host forward needed.
+        let layer = 0
+        let heads = config.swaNumAttentionHeads
+        let kvHeads = config.swaNumKeyValueHeads
+        let headDim = config.swaHeadDim
+        let state = Inkling2VisitState(
+            isFullAttention: false, window: config.slidingWindowSize,
+            stateWidths: [kvHeads * headDim, kvHeads * headDim, config.hiddenSize, config.hiddenSize],
+            historyDepth: config.convKernelSize - 1
+        )
+        for row in 0..<3 {
+            _ = state.append(
+                key: values(kvHeads * headDim, seed: 60 + row),
+                value: values(kvHeads * headDim, seed: 70 + row)
+            )
+        }
+
+        // ONE buffer per stage, so an asynchronous fault names the stage that
+        // was running. The arena outlives each commit for the same reason the
+        // driver's does: a dispatch reads its scalar arguments when the GPU runs
+        // it, and a freed one is an address fault.
+        func runStage(_ name: String, _ encode: (MTLComputeCommandEncoder, Inkling2ScalarArena) throws -> Void) throws {
+            let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+            let encoder = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
+            let arena = Inkling2ScalarArena(device: device)
+            do {
+                try encode(encoder, arena)
+            } catch {
+                encoder.endEncoding()
+                XCTFail("stage '\(name)' threw while encoding: \(error)")
+                return
+            }
+            encoder.endEncoding()
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            XCTAssertNil(commandBuffer.error, "stage '\(name)' faulted: \(String(describing: commandBuffer.error))")
+            arena.clear()
+        }
+
+        let queryInput = values(config.hiddenSize, seed: 41)
+        let keyInput = values(config.hiddenSize, seed: 42)
+        let valueInput = values(config.hiddenSize, seed: 43)
+        func staging(_ buffer: MTLBuffer, _ input: [Float]) -> MTLBuffer {
+            let pointer = buffer.contents().bindMemory(to: Float.self, capacity: input.count)
+            for index in input.indices { pointer[index] = input[index] }
+            return buffer
+        }
+        let queryInputBuffer = try staging(workspace.queryInput, queryInput)
+        let keyInputBuffer = try staging(workspace.keyInput, keyInput)
+        let valueInputBuffer = try staging(workspace.valueInput, valueInput)
+
+        try runStage("wq") { encoder, arena in
+            try metal.gemm(
+                encoder: encoder, role: .attnWqDu, layer: layer,
+                input: queryInputBuffer, inputOffset: 0, output: workspace.query, outputOffset: 0,
+                rows: heads * headDim, columns: config.hiddenSize,
+                arena: arena
+            )
+        }
+        try runStage("q clip") { encoder, arena in
+            let scale = try deviceWeights.tensor(.attnQL2ClipScale, layer: layer)
+            try metal.l2Clip(
+                encoder: encoder, vector: workspace.query, vectorOffset: 0,
+                scale: scale.buffer, scaleOffset: Int(scale.offset),
+                headDim: headDim, heads: heads, threshold: config.qkL2ClipThreshold, tau: 1,
+                arena: arena
+            )
+        }
+        try runStage("wk") { encoder, arena in
+            try metal.gemm(
+                encoder: encoder, role: .attnWkDv, layer: layer,
+                input: keyInputBuffer, inputOffset: 0, output: workspace.key, outputOffset: 0,
+                rows: kvHeads * headDim, columns: config.hiddenSize,
+                arena: arena
+            )
+        }
+        try runStage("k conv") { encoder, arena in
+            try metal.convolve(
+                encoder: encoder, state: state, index: 0,
+                values: workspace.key, valuesCount: kvHeads * headDim,
+                layer: layer, isFull: false, headDim: headDim, output: workspace.key, arena: arena
+            )
+        }
+        try runStage("wv") { encoder, arena in
+            try metal.gemm(
+                encoder: encoder, role: .attnWvDv, layer: layer,
+                input: valueInputBuffer, inputOffset: 0, output: workspace.value, outputOffset: 0,
+                rows: kvHeads * headDim, columns: config.hiddenSize,
+                arena: arena
+            )
+        }
+        try runStage("v conv") { encoder, arena in
+            try metal.convolve(
+                encoder: encoder, state: state, index: 1,
+                values: workspace.value, valuesCount: kvHeads * headDim,
+                layer: layer, isFull: false, headDim: headDim, output: workspace.value, arena: arena
+            )
+        }
+        try runStage("v norm") { encoder, arena in
+            try metal.headNorm(
+                encoder: encoder, vector: workspace.value, headDim: headDim, heads: kvHeads, arena: arena
+            )
+        }
+        try runStage("attention") { encoder, arena in
+            let relative = try staging(
+                workspace.relativeStates, [Float](repeating: 0.01, count: heads * config.dRel)
+            )
+            let bank = try staging(
+                workspace.bank, [Float](repeating: 0.02, count: config.dRel * config.slidingWindowSize)
+            )
+            let sink = try staging(workspace.sinkLogits, [Float](repeating: 0.5, count: heads))
+            let rows = workspace.stage(state)
+            try metal.attention(
+                encoder: encoder, workspace: workspace, state: state, rows: rows,
+                position: 3, relative: relative, bank: bank, sink: sink,
+                output: workspace.attentionOutput, arena: arena
+            )
+        }
+        try runStage("gate") { encoder, arena in
+            try metal.gateMultiply(
+                encoder: encoder, output: workspace.attentionOutput,
+                gate: workspace.gate, count: heads * headDim, arena: arena
+            )
+        }
         withExtendedLifetime(engine) {}
     }
 
