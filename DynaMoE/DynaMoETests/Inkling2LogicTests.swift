@@ -1576,8 +1576,10 @@ final class Inkling2HostForwardTests: XCTestCase {
         var ringIndex = 0
         forward.onInternal = { visit, name, value in
             // Keyed by visit: a name alone is overwritten by every later visit,
-            // which once made layer 23's value look like layer 0's.
-            if visit == 0 { internals[name] = value }
+            // which once made layer 23's value look like layer 0's. `bias_head0`
+            // is kept for EVERY visit because the reference dump has it per
+            // visit and it is the value the relative-bias gate is checked with.
+            if visit == 0 || name == "bias_head0" { internals["\(visit):\(name)"] = value }
         }
         forward.onVisitComplete = { _, _, _, output in
             if actualVisits.count >= 48 {
@@ -1646,6 +1648,65 @@ final class Inkling2HostForwardTests: XCTestCase {
                 XCTFail("visit \(slot) (layer \(plan.physicalLayer) pass \(plan.pass)) is \(error) relative from the reference")
                 return
             }
+        }
+
+        // The relative-position bias, head by head-0 row, against the
+        // reference's OWN captured bias (`/tmp/dump_bias.py`, written in FP32).
+        // It is the one intermediate both sides can name exactly, and it is
+        // what the `relativeBias` gate is closed on: the bank mix, the distance
+        // gather and the out-of-extent zeroing all show up in this vector, and
+        // a wrong L2 clip or log scale would not.
+        let biasPath = "/tmp/inkling2_bias_ref.json"
+        if FileManager.default.fileExists(atPath: biasPath),
+           let biasData = try? Data(contentsOf: URL(fileURLWithPath: biasPath)),
+           let biasRoot = try? JSONSerialization.jsonObject(with: biasData) as? [String: Any],
+           let biasVisits = biasRoot["visits"] as? [[String: Any]] {
+            var referenceBiasByVisit: [Int: [Float]] = [:]
+            var seenPerLayerBias: [Int: Int] = [:]
+            for entry in biasVisits {
+                let layer = entry["physicalLayer"] as? Int ?? -1
+                let pass = seenPerLayerBias[layer, default: 0]
+                seenPerLayerBias[layer] = pass + 1
+                // The hook captured `output[-1]`, so the entry is
+                // `[heads][query][key]`; this forward records head 0 at the LAST
+                // query row, i.e. `bias[0][last]`, every key row.
+                // JSONSerialization gives nested `[Any]` of NSNumber, so each
+                // level is bridged explicitly: a direct `as? [[[NSNumber]]]`
+                // cast fails and the entry would be skipped in silence, which
+                // reads exactly like a mismatch downstream.
+                func floats(_ value: Any?) -> [Float] {
+                    (value as? [Any])?.compactMap { ($0 as? NSNumber)?.floatValue } ?? []
+                }
+                let heads = (entry["bias"] as? [Any]) ?? []
+                guard let head0 = heads.first as? [Any], let lastQuery = head0.last else { continue }
+                referenceBiasByVisit[try forward.visitIndex(layer: layer, pass: pass)] = floats(lastQuery)
+            }
+            var checked = 0
+            var worst: Float = 0
+            for (slot, plan) in forward.plan.enumerated() {
+                guard let reference = referenceBiasByVisit[plan.cacheSlot],
+                      let mine = internals["\(slot):bias_head0"] else { continue }
+                XCTAssertEqual(mine.count, reference.count, "visit \(slot) bias row count")
+                for row in 0..<min(mine.count, reference.count) {
+                    let scale = max(abs(reference[row]), 1)
+                    let error = abs(mine[row] - reference[row]) / scale
+                    worst = max(worst, error)
+                    // 5e-2, measured: the worst row is 4.8e-2, in a post-loop
+                    // layer whose residual is ~265, i.e. the same accumulated
+                    // BF16 rounding the visits show. The bar is a shape check
+                    // (a wrong bank mix or a wrong mask is a unit error, not
+                    // percent), and the relative error is printed so a drift
+                    // upward is visible before it fails.
+                    XCTAssertLessThanOrEqual(
+                        error, 5e-2,
+                        "visit \(slot) (layer \(plan.physicalLayer) pass \(plan.pass)) bias row \(row): "
+                            + "\(mine[row]) against \(reference[row])"
+                    )
+                }
+                checked += 1
+            }
+            print("🔎 [inkling2 real] relative bias: \(checked) visit(s), worst \(worst) relative")
+            XCTAssertGreaterThan(checked, 0, "no visit's bias was comparable")
         }
 
         // The logits, in the shape a BF16 reference can actually support.

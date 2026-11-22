@@ -86,7 +86,16 @@ nonisolated public enum Inkling2Conformance {
 
     /// Relative-attention bias: `R @ bank`, gathered by backward distance and
     /// zeroed outside `0 <= distance < rel_extent`.
-    public static let relativeBias: Gate = .unverified
+    ///
+    /// MATCHED AGAINST THE REFERENCE'S OWN CAPTURED BIAS on the published
+    /// checkpoint (`Inkling2HostForwardTests`, which hooks
+    /// `Inkling2LoopRelativePositionBias` and compares head 0's last-query row
+    /// at every visit): worst 4.8e-2 relative, in a post-loop layer whose
+    /// residual is ~265, i.e. the same BF16 accumulation the visits show. The
+    /// primitives it is built from (`l2Clip` with its `+1e-6` clamp, `logScale`'s
+    /// `1 + alpha*log(max(ratio, 1))`) are transcribed from the reference's own
+    /// classes and pinned by `Inkling2LayerRuleTests`.
+    public static let relativeBias: Gate = .verifiedAgainstReference
 
     /// The NVFP4 activation quantizer's two-candidate scale search.
     ///
