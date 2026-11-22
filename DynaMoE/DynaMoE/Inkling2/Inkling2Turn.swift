@@ -183,10 +183,14 @@ nonisolated public enum Inkling2TurnRunner {
     ///   - onPrefill: `(positions done, total)`.
     ///   - onText: `(text, tokens generated)` at most once per token.
     ///   - isCancelled: consulted before every position and every draw.
+    ///   - prefillChunk: positions per chunk for the progress report and the
+    ///     cancellation check. It never changes WHAT runs -- a position is a
+    ///     position -- so it is a scheduling knob, and 1 is the walk.
     static func run(
         forward: any Inkling2PositionForward,
         promptTokenIds: [Int],
         prefixTokens: Int = 0,
+        prefillChunk: Int = 8,
         settings: Settings,
         sample: ([Float], [UInt32]) -> UInt32,
         constrain: (inout [Float], String) -> Void = { _, _ in },
@@ -213,8 +217,20 @@ nonisolated public enum Inkling2TurnRunner {
 
         // Prefill: every prompt position from the reused prefix runs; the last
         // one's logits are the first draw's.
+        //
+        // In CHUNKS, which is a scheduling unit and not a batching one: each
+        // position still runs through the executor's own forward, so the answer
+        // is identical to the walk's (a real batched pass would be a different
+        // arithmetic order and needs its own parity case). What a chunk buys is
+        // the two things a walk cannot give a caller: a progress report per
+        // chunk rather than per position, and a cancellation point between
+        // chunks -- and the commit rule, since a cancelled chunk stops at a
+        // position boundary with every position before it committed.
         var logits: [Float] = []
-        for (position, token) in promptTokenIds.enumerated() where position >= reusable {
+        let chunk = max(1, prefillChunk)
+        var position = reusable
+        while position < promptTokenIds.count {
+            let end = min(position + chunk, promptTokenIds.count)
             if isCancelled() {
                 return Output(
                     generatedTokenIds: [], text: "", finishReason: .stopped,
@@ -223,12 +239,15 @@ nonisolated public enum Inkling2TurnRunner {
                     storedPromptTokens: forward.storedPositions, cancelled: true
                 )
             }
-            do {
-                logits = try forward.forwardToken(token, position: position)
-            } catch {
-                throw Inkling2TurnError.prefillFailed(position: position, underlying: "\(error)")
+            for index in position..<end {
+                do {
+                    logits = try forward.forwardToken(promptTokenIds[index], position: index)
+                } catch {
+                    throw Inkling2TurnError.prefillFailed(position: index, underlying: "\(error)")
+                }
             }
-            onPrefill(position + 1, promptTokenIds.count)
+            position = end
+            onPrefill(position, promptTokenIds.count)
         }
 
         var generated: [UInt32] = []

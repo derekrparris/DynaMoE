@@ -2210,6 +2210,61 @@ final class Inkling2TurnTests: XCTestCase {
         UInt32(logits.indices.max { logits[$0] < logits[$1] } ?? 0)
     }
 
+    /// A chunk size is a scheduling knob: every size must forward the same
+    /// positions in the same order and produce the same answer, and the
+    /// progress report must arrive once per chunk rather than once per
+    /// position.
+    func testAChunkSizeNeverChangesWhatRuns() throws {
+        var logits = [Float](repeating: 0, count: 16)
+        logits[5] = 10
+        let prompt = [1, 2, 3, 4, 5, 6, 7]
+        var baseline: (tokens: [UInt32], forwarded: [Int], reports: [Int])?
+        for chunk in [1, 2, 3, 7, 64] {
+            let forward = ScriptedInklingForward(logits: [logits])
+            var reports: [Int] = []
+            let output = try Inkling2TurnRunner.run(
+                forward: forward, promptTokenIds: prompt, prefillChunk: chunk,
+                settings: settings(maxTokens: 3),
+                sample: greedy, decode: { $0.map(String.init).joined() },
+                onPrefill: { done, _ in reports.append(done) }
+            )
+            if let baseline {
+                XCTAssertEqual(output.generatedTokenIds, baseline.tokens, "chunk \(chunk)")
+                XCTAssertEqual(forward.forwarded, baseline.forwarded, "chunk \(chunk)")
+            } else {
+                baseline = (output.generatedTokenIds, forward.forwarded, reports)
+            }
+            // One report per chunk, each at a chunk boundary, the last at the
+            // prompt's end.
+            XCTAssertEqual(reports.last, prompt.count, "chunk \(chunk)")
+            XCTAssertEqual(reports.count, (prompt.count + min(chunk, prompt.count) - 1) / min(chunk, prompt.count))
+            XCTAssertEqual(reports, reports.sorted(), "reports must be monotone")
+        }
+    }
+
+    /// A cancel between chunks leaves exactly the positions before the chunk
+    /// boundary committed, and a resumed turn from there answers what a full
+    /// prefill answers.
+    func testACancelBetweenChunksResumesExactlyThere() throws {
+        var logits = [Float](repeating: 0, count: 16)
+        logits[5] = 10
+        let prompt = [1, 2, 3, 4, 5, 6, 7]
+        let forward = ScriptedInklingForward(logits: [logits])
+        // Cancelled after the second chunk's report: two chunks of three is
+        // six positions committed, one short of the prompt.
+        var reports = 0
+        let cancelled = try Inkling2TurnRunner.run(
+            forward: forward, promptTokenIds: prompt, prefillChunk: 3,
+            settings: settings(maxTokens: 3),
+            sample: greedy, decode: { $0.map(String.init).joined() },
+            onPrefill: { _, _ in reports += 1 },
+            isCancelled: { reports >= 2 }
+        )
+        XCTAssertTrue(cancelled.cancelled)
+        XCTAssertEqual(cancelled.storedPromptTokens, 6)
+        XCTAssertEqual(forward.forwarded, Array(prompt.prefix(6)))
+    }
+
     func testATurnStopsAtEos() throws {
         // Logits favour id 9 (EOS) at every position.
         var logits = [Float](repeating: 0, count: 16)
