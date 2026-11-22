@@ -2482,6 +2482,54 @@ final class Inkling2SyntheticForwardTests: XCTestCase {
         }
     }
 
+    /// Commit-only-after-success: a position whose forward THROWS leaves the
+    /// sequence exactly where it was, in every visit and in the token history.
+    ///
+    /// It is the property a resume depends on -- `storedPromptTokens` is the
+    /// pinned prefix, so a position counted but not committed (or the reverse)
+    /// makes the next turn splice two sequences. The forward here is the real
+    /// host graph on the fixture, with the KV budget zeroed after a few
+    /// positions: the refusal is the forward's own, not a stub's.
+    func testAFailedPositionCommitsNothing() throws {
+        let directory = try fixture()
+        let (summary, config) = try fixtureSummary(directory)
+        let catalog = Inkling2WeightCatalog(
+            mainFile: summary.tensors.map { Inkling2TensorRef(metadata: $0) },
+            layerCount: config.numHiddenLayers
+        )
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let weightsPath = directory.appendingPathComponent("model-00001-of-00001.safetensors")
+        let handle = try FileHandle(forReadingFrom: weightsPath)
+        defer { try? handle.close() }
+        let fileLength = try XCTUnwrap(try FileManager.default.attributesOfItem(
+            atPath: weightsPath.path
+        )[.size] as? NSNumber).intValue
+        let mapped = try XCTUnwrap(mmap(nil, fileLength, PROT_READ, MAP_PRIVATE, handle.fileDescriptor, 0))
+        XCTAssertNotEqual(mapped, MAP_FAILED)
+        let buffer = try XCTUnwrap(device.makeBuffer(
+            bytesNoCopy: mapped, length: fileLength, options: .storageModeShared, deallocator: nil
+        ))
+        let source = Inkling2SnapshotWeights(config: config, catalog: catalog, shardBuffers: [0: buffer])
+        // Enough rows for two positions and not a third.
+        let forward = try Inkling2CPUForward(
+            config: config, weights: source, options: Inkling2ForwardOptions(maxPositions: 2)
+        )
+        let token = UInt32(1)
+        _ = try forward.forwardToken(token: token, position: 0)
+        _ = try forward.forwardToken(token: token, position: 1)
+        let before = forward.states.map(\.committedPositions)
+        let historyBefore = forward.sequence.tokenHistory
+
+        XCTAssertThrowsError(try forward.forwardToken(token: token, position: 2)) { error in
+            // The refusal must NAME the budget, not surface as a shape error
+            // from some inner kernel.
+            XCTAssertTrue("\(error)".contains("KV budget"), "\(error)")
+        }
+        XCTAssertEqual(forward.states.map(\.committedPositions), before, "a refused position committed a row")
+        XCTAssertEqual(forward.sequence.tokenHistory, historyBefore, "a refused position entered the history")
+        XCTAssertTrue(forward.sequence.isConsistent)
+    }
+
     func testTheFixtureCatalogIsExhaustiveAndStrict() throws {
         let directory = try fixture()
         let (summary, config) = try fixtureSummary(directory)

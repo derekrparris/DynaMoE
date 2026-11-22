@@ -185,6 +185,22 @@ nonisolated public final class Inkling2SequenceState {
         tokenHistory.append(token)
     }
 
+    /// Refuses a position the KV budget cannot hold, before anything is
+    /// written. A full-attention visit keeps every position, so the tightest
+    /// one decides; ring visits are capped at their window and never refuse.
+    public func checkCapacity(position: Int) throws {
+        for (slot, visit) in visits.enumerated() where visit.isFullAttention {
+            if visit.isAtCapacity {
+                throw Inkling2ForwardError.unsupported(
+                    "position \(position) is past the KV budget: this sequence holds "
+                        + "\(visit.committedPositions) positions and the plan provisions "
+                        + "\(visit.maxRows ?? 0) (visit \(slot)). Start a new conversation or "
+                        + "raise the context budget."
+                )
+            }
+        }
+    }
+
     /// How much of `promptTokenIds` is provably resident: the longest common
     /// prefix of the history and the prompt, capped at what the caller
     /// proposed and by the committed count. Leaving the last position out is

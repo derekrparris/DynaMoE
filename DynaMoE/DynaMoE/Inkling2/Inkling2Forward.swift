@@ -199,6 +199,12 @@ nonisolated public final class Inkling2CPUForward {
     /// The 48-visit schedule over one position's embedding, then the final
     /// residual read, norm, unembedding and softcap.
     public func forwardHidden(_ embedding: [Float], position: Int) throws -> [Float] {
+        // The KV budget is checked ONCE, before any visit runs. The per-visit
+        // check inside `attention` is still the backstop, but a refusal there
+        // fires after the visits that already ran have appended their rows --
+        // leaving the sequence half-committed, which is a state no resume can
+        // detect and none may trust. Refusing here commits nothing.
+        try sequence.checkCapacity(position: position)
         currentPosition = position
         var hidden = embedding
         // The attention-residual stack: one entry per append, as the reference

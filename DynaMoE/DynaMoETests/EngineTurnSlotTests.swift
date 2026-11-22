@@ -141,6 +141,35 @@ final class EngineTurnSlotTests: XCTestCase {
         XCTAssertNil(engine.reserveTurnSlot(), "and nobody else may claim it")
     }
 
+    /// A model swap waits for a turn that is only PREPARING, not just one that is
+    /// running: `awaitIdle` reads `isActive`, and a claim is occupancy.
+    ///
+    /// The wait is what a swap's `awaitGenerationTeardown` depends on -- it
+    /// replaces the shard buffers `configure` holds, and a preparing turn has
+    /// already captured them but not yet registered its task, so a wait on the
+    /// task alone would see a free engine and swap underneath it.
+    func testAModelSwapWaitsForATurnThatIsOnlyPreparing() async throws {
+        let engine = CompletionEngine.shared
+        XCTAssertFalse(engine.isActive, "the slot must be free at the start of the case")
+
+        let claim = try XCTUnwrap(engine.reserveTurnSlot())
+        let released = expectation(description: "the claim was released after the wait began")
+        let releaseTask = Task {
+            try await Task.sleep(nanoseconds: 150_000_000)
+            claim.release()
+            released.fulfill()
+        }
+        let started = Date()
+        await engine.awaitIdle()
+        let waited = Date().timeIntervalSince(started)
+        try await releaseTask.value
+        await fulfillment(of: [released], timeout: 1)
+        // It cannot have returned before the claim was given back: a swap in
+        // that window would have replaced the buffers of a turn mid-preparation.
+        XCTAssertGreaterThanOrEqual(waited, 0.14, "awaitIdle returned while a claim was still held")
+        XCTAssertFalse(engine.isActive)
+    }
+
     /// The window this closes: the queue has decided the slot is free and is
     /// preparing a turn. A chat turn arriving now must be told, immediately and
     /// truthfully, rather than launching into a slot the queue is about to take.

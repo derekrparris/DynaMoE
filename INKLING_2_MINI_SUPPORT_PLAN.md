@@ -350,6 +350,15 @@ Five defects the stage-by-stage comparison found and no end-to-end number would 
 
 ### Phase 3: Stateful prefill, prefix reuse, and text server integration
 
+**Recorded 2026-11-22: IN PROGRESS. Four of the five exit gates are pinned; chunked prefill is the one still open.**
+
+- **A resumed follow-up equals a fresh prefill** (`testAFollowUpTurnResumesItsPrefixAndMatchesAFreshPrefill`): the same prompt prefilled in full and resumed from the executor's own prefix generate the same ids. Getting there needed three fixes, all found by that test: the turn runner asked the executor how much was resident and then discarded the answer (re-forwarding the prompt on top of an existing cache, which appends a second copy of the prefix to every visit's KV); the host forward never recorded a forwarded token, so the sequence history -- the only evidence a resume may trust -- was always empty; and the host forward never implemented `reusablePrefix`, so the conservative default answered zero even with the history in place.
+- **A cancelled turn resumes exactly its committed prefix** (`testACancelledTurnResumesExactlyItsCommittedPrefix`): cancelled during prefill, the cache holds exactly the forwarded positions, every visit agrees, and a resumed turn from there answers what a fresh prefill answers.
+- **Commit-only-after-success** (`testAFailedPositionCommitsNothing`, on the synthetic fixture): a position the KV budget refuses leaves every visit's count and the token history untouched. The first run of that test FAILED -- the budget was checked per visit, so visit 0 had appended its row before visit 1 refused -- and the check now runs once, before the visit loop.
+- **A model swap waits for preparation** (`testAModelSwapWaitsForATurnThatIsOnlyPreparing`): `awaitIdle` does not return while a turn holds the slot claim without a registered task, which is the whole of a turn's preparation.
+- **Both server routes** (`testBothProtocolsAnswerTextTurnsOverTheLocalServer`, opt-in): see the Phase 2 device record; an OpenAI chat completion and a streamed Anthropic message both answer for this family, with `message_stop` and no error frame.
+- OPEN: chunked prefill. A prompt prefills position by position on both executors, which is correct and slow; the plan's bounded chunk scheduling is not written.
+
 **Work**
 
 1. Implement bounded chunk scheduling through all 48 visits, chronological local rings, growing global caches, progress callbacks, and commit-only-after-success semantics.
