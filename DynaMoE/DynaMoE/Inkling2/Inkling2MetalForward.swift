@@ -33,10 +33,19 @@ import Metal
 /// shard index, so a weight is `(buffer, offset)` and never a copy. A role that
 /// is missing, or whose shard is not mapped, is an error that names it -- the
 /// host weight source fails closed the same way.
-nonisolated public struct Inkling2DeviceWeights {
+nonisolated public final class Inkling2DeviceWeights {
     public let config: Inkling2Config
     public let catalog: Inkling2WeightCatalog
     private let shardBuffers: [UInt32: MTLBuffer]
+    /// Dequantized FP32 matrices, keyed by role and layer.
+    ///
+    /// The small vectors this graph needs as VALUES (the relative bank, the
+    /// convolution taps, the clip scales) are read from the shards on the host,
+    /// and a visit asks for the same ones on every position: without this, one
+    /// turn re-decoded them 48 times per token. Guarded because the executor
+    /// runs on a turn's own task while another turn can be preparing.
+    private let cacheLock = NSLock()
+    private var matrixCache: [String: [Float]] = [:]
 
     public init(config: Inkling2Config, catalog: Inkling2WeightCatalog, shardBuffers: [UInt32: MTLBuffer]) {
         self.config = config
@@ -76,9 +85,20 @@ nonisolated public struct Inkling2DeviceWeights {
     /// scales), never for a stage the port exists to move -- those read the
     /// stored bytes directly.
     public func hostMatrix(_ role: Inkling2TensorRole, layer: Int? = nil) throws -> [Float] {
-        try Inkling2SnapshotWeights(
+        let key = "\(role.rawValue)|\(layer.map(String.init) ?? "-")"
+        cacheLock.lock()
+        if let cached = matrixCache[key] {
+            cacheLock.unlock()
+            return cached
+        }
+        cacheLock.unlock()
+        let matrix = try Inkling2SnapshotWeights(
             config: config, catalog: catalog, shardBuffers: shardBuffers
         ).matrix(role, layer: layer)
+        cacheLock.lock()
+        matrixCache[key] = matrix
+        cacheLock.unlock()
+        return matrix
     }
 
     public func dtype(_ role: Inkling2TensorRole, layer: Int? = nil) throws -> String {
