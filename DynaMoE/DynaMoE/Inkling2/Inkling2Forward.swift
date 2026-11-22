@@ -115,6 +115,9 @@ nonisolated public final class Inkling2CPUForward {
     /// The visit `runVisit` is currently executing, so the attention and mixture
     /// helpers can label their captures without threading it through.
     private var visitIndexForDebug = 0
+    /// The loop pass `runVisit` is executing, for the captures that must name
+    /// the LAST pass (the reference's message dump is the final pass's).
+    private var passForDebug = 0
     private var currentPosition = 0
     /// Every visit's KV and convolution state, plus the token history.
     public let sequence: Inkling2SequenceState
@@ -231,7 +234,8 @@ nonisolated public final class Inkling2CPUForward {
             for layer in coreStart..<coreEnd {
                 let coreIndex = layer - coreStart
                 let messages = try messageInput(
-                    blockStates: previousBlocks, partial: previousHidden, coreIndex: coreIndex
+                    blockStates: previousBlocks, partial: previousHidden,
+                    coreIndex: coreIndex, pass: pass
                 )
                 let (output, _) = try runVisit(
                     layer: layer, pass: pass, hidden: hidden, blockStates: &blockStates,
@@ -290,6 +294,7 @@ nonisolated public final class Inkling2CPUForward {
     ) throws -> (output: [Float], attentionQueries: Int) {
         let visitIndex = try visitIndex(layer: layer, pass: pass)
         visitIndexForDebug = visitIndex
+        passForDebug = pass
         let state = states[visitIndex]
         let isFull = !config.isLocalLayer(layer)
         let block = config.nLayersPerAttnResBlock
@@ -487,7 +492,12 @@ nonisolated public final class Inkling2CPUForward {
 
     /// Four messages for one core layer, from the previous pass's stack slice
     /// plus its final hidden state.
-    public func messageInput(blockStates: [[Float]], partial: [Float], coreIndex: Int) throws -> [[Float]] {
+    /// `pass` is the loop's own 0-based counter, passed IN rather than read from
+    /// `passForDebug`: this runs before `runVisit`, so the field still holds the
+    /// PREVIOUS visit's pass and a capture keyed on it is tagged one pass late.
+    public func messageInput(
+        blockStates: [[Float]], partial: [Float], coreIndex: Int, pass: Int
+    ) throws -> [[Float]] {
         let unpacking = Inkling2QueryUnpacking.CrossPassQueryRows(coreLayer: coreIndex)
         let main = try weights.matrix(.crossPassQuery, layer: nil)
         let kv = try weights.matrix(.crossPassKVQuery, layer: nil)
@@ -497,15 +507,37 @@ nonisolated public final class Inkling2CPUForward {
             return Array(source[(row * width)..<((row + 1) * width)])
         }
         let read = blockRead(blockStates: blockStates, partial: partial, queries: queries)
-        if coreIndex == 0, let onInternal {
+        if let onInternal {
             // A read happens once per core layer per pass PER POSITION, so the
-            // label carries the position and the VISIT: naming the read by the
+            // label carries the position and the PASS: naming the read by the
             // core layer alone made pass 1's and pass 2's reads share a key,
             // and the later one silently overwrote the earlier.
-            let visit = visitIndexForDebug
-            onInternal(visit, "message0@\(currentPosition)", read[0])
-            onInternal(visit, "message0_stackCount@\(currentPosition)", [Float(blockStates.count)])
-            onInternal(visit, "message0_partial@\(currentPosition)", Array(partial.prefix(4)))
+            //
+            // The visit index is deliberately NOT in the key: this runs before
+            // `runVisit`, so `visitIndexForDebug` still holds the PREVIOUS
+            // visit's index and a visit-keyed capture is filed one visit late.
+            // The key names the layer, the channel and the pass, which is what
+            // a read is.
+            let visit = 0
+            if coreIndex == 0 {
+                onInternal(visit, "message0@\(currentPosition)", read[0])
+                onInternal(visit, "message0_stackCount@\(currentPosition)", [Float(blockStates.count)])
+                onInternal(visit, "message0_partial@\(currentPosition)", Array(partial.prefix(4)))
+            }
+            // Every channel of every core layer, on the LAST pass: the
+            // reference's `messages` dump is the final pass's four reads per
+            // core layer, in layer order, so this is the only pass whose
+            // values can be compared with it (an earlier pass reads a shorter
+            // stack). Keyed by layer and channel, not by visit.
+            //
+            // `passForDebug` is the LOOP's counter (0-based); the plan's `pass`
+            // is 1-based for core layers, which is why the two numbers do not
+            // match and must not be used interchangeably.
+            if config.numPasses > 1 {
+                for channel in read.indices {
+                    onInternal(visit, "message\(coreIndex)_\(channel)_p\(pass)", read[channel])
+                }
+            }
         }
         return read
     }

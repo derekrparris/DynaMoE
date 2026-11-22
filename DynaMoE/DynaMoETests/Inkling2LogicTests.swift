@@ -1579,7 +1579,12 @@ final class Inkling2HostForwardTests: XCTestCase {
             // which once made layer 23's value look like layer 0's. `bias_head0`
             // is kept for EVERY visit because the reference dump has it per
             // visit and it is the value the relative-bias gate is checked with.
-            if visit == 0 || name == "bias_head0" { internals["\(visit):\(name)"] = value }
+            // `bias_head0` and the final pass's per-channel messages are the
+            // values a reference dump names exactly, so they are kept for every
+            // visit; everything else is kept for visit 0 only.
+            if visit == 0 || name == "bias_head0" || name.hasPrefix("message") {
+                internals["\(visit):\(name)"] = value
+            }
         }
         forward.onVisitComplete = { _, _, _, output in
             if actualVisits.count >= 48 {
@@ -1707,6 +1712,45 @@ final class Inkling2HostForwardTests: XCTestCase {
             }
             print("🔎 [inkling2 real] relative bias: \(checked) visit(s), worst \(worst) relative")
             XCTAssertGreaterThan(checked, 0, "no visit's bias was comparable")
+        }
+
+        // The cross-pass messages, which is what the `middleCycle` gate is
+        // about: the reference's `messages` dump is, per core layer, its four
+        // reads (query, key, value, mlp) on the LAST pass, in layer order.
+        // Comparing them checks more than the row unpacking -- the stack slice,
+        // the partial state and the read itself all feed these numbers -- so a
+        // mismatch names a channel rather than a "cycle".
+        let referenceMessages = (dumped["messages"] as? [Any]) ?? []
+        if !referenceMessages.isEmpty {
+            // The dump is PASS-MAJOR: the core reads messages on every pass but
+            // the first, so entry `i` is core layer `i % coreCount` of loop pass
+            // `1 + i / coreCount` (12 layers x 2 passes = 24 entries here).
+            let coreCount = forward.config.loopCoreEnd - forward.config.loopCoreStart
+            XCTAssertEqual(referenceMessages.count, coreCount * (forward.config.numPasses - 1))
+            var compared = 0
+            var worstMessage: Float = 0
+            for (index, entry) in referenceMessages.enumerated() {
+                guard let channels = entry as? [Any] else { continue }
+                let layer = index % coreCount
+                let pass = 1 + index / coreCount
+                for (channel, raw) in channels.enumerated() {
+                    let reference = (raw as? [Any])?.compactMap { ($0 as? NSNumber)?.floatValue } ?? []
+                    // Not visit-keyed: the read happens before its visit runs,
+                    // so the key names the layer, channel and pass.
+                    guard let mine = internals["0:message\(layer)_\(channel)_p\(pass)"] else {
+                        XCTFail("no capture for core layer \(layer) message \(channel) pass \(pass)")
+                        return
+                    }
+                    let scale = reference.reduce(Float(0)) { max($0, abs($1)) }
+                    let error = zip(mine, reference).reduce(Float(0)) { max($0, abs($1.0 - $1.1)) }
+                    worstMessage = max(worstMessage, scale > 0 ? error / scale : error)
+                    compared += 1
+                }
+            }
+            print("🔎 [inkling2 real] messages: \(compared) compared, worst \(worstMessage) relative")
+            // 5e-2, the same accumulated-rounding bar the visits carry.
+            XCTAssertLessThanOrEqual(worstMessage, 5e-2, "the cross-pass message read")
+            XCTAssertEqual(compared, referenceMessages.count * 4)
         }
 
         // The logits, in the shape a BF16 reference can actually support.

@@ -68,12 +68,17 @@ nonisolated public enum Inkling2Conformance {
     /// The four logical cross-pass queries and how the checkpoint's two
     /// 24-row tensors unpack into them.
     ///
-    /// READ FROM THE REFERENCE MODULE STRUCTURE: `middle_cycle_cross_pass_queries`
-    /// rows `2i`/`2i+1` are core layer `i`'s Q and MLP queries, and the `_kv_`
-    /// tensor's same rows are its K and V. The plan requires this pinned by a
-    /// golden before any turn runs, and Phase 1 has no reference run to pin it
-    /// with, so it stays open here rather than being asserted from a guess.
-    public static let middleCycle: Gate = .unverified
+    /// `middle_cycle_cross_pass_queries` rows `2i`/`2i+1` are core layer `i`'s Q
+    /// and MLP queries, and the `_kv_` tensor's same rows are its K and V.
+    ///
+    /// MATCHED AGAINST THE REFERENCE'S OWN MESSAGE DUMPS on the published
+    /// checkpoint: all four channels of all 12 core layers on both
+    /// message-carrying passes, 96 values, worst 1.6e-2 relative
+    /// (`Inkling2HostForwardTests`). That comparison covers the row unpacking
+    /// and everything that feeds the read -- the previous pass's stack slice,
+    /// the partial state and the attention over them -- so a swapped row or a
+    /// wrong slice could not agree.
+    public static let middleCycle: Gate = .verifiedAgainstReference
 
     /// The short convolutions' normalization constants.
     ///
