@@ -13657,3 +13657,225 @@ kernel void gqa_attention_prefill_standard_fp8(
     float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
     *(device float4*)(attnOutBuffer + qBase + dimBase) = acc4 * invL;
 }
+
+// ============================================================================
+// Inkling 2 Mini (inkling_* prefix)
+//
+// The device graph's kernels, each checked against the host reference graph
+// (Inkling2Forward.swift / Inkling2Primitives.swift) rather than against a
+// second GPU implementation: the host graph is what matches the checkpoint's
+// own Transformers reference, so a kernel that agrees with it agrees with the
+// model. Every buffer is FP32 unless its name says otherwise, which is what
+// the reference keeps in FP32 (convolutions, gates, routing, residual reads).
+// ============================================================================
+
+// A weighted RMS norm: `x * rsqrt(mean(x^2) + eps) * gain`, one threadgroup per
+// row, the gain read as plain floats.
+kernel void inkling_rmsnorm_f32(
+    device const float* inVector [[buffer(0)]],
+    device const float* gain [[buffer(1)]],
+    device float* outVector [[buffer(2)]],
+    constant uint32_t& dim [[buffer(3)]],
+    constant float& eps [[buffer(4)]],
+    threadgroup float* sharedWarpSums [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgSize [[threads_per_threadgroup]],
+    uint tgIdx [[threadgroup_position_in_grid]]
+) {
+    device const float* inRow = inVector + ((uint64_t)tgIdx * dim);
+    device float* outRow = outVector + ((uint64_t)tgIdx * dim);
+    float localSum = 0.0f;
+    for (uint i = tid; i < dim; i += tgSize) {
+        float v = inRow[i];
+        localSum += v * v;
+    }
+    float totalSum = threadgroup_reduce_sum(localSum, sharedWarpSums, tid, tgSize);
+    float invRms = rsqrt(totalSum / (float)dim + eps);
+    for (uint i = tid; i < dim; i += tgSize) {
+        outRow[i] = inRow[i] * invRms * gain[i];
+    }
+}
+
+// An UNWEIGHTED RMS norm, which the block read applies to every stack entry
+// before scoring it.
+kernel void inkling_rmsnorm_no_gain_f32(
+    device const float* inVector [[buffer(0)]],
+    device float* outVector [[buffer(1)]],
+    constant uint32_t& dim [[buffer(2)]],
+    constant float& eps [[buffer(3)]],
+    threadgroup float* sharedWarpSums [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgSize [[threads_per_threadgroup]],
+    uint tgIdx [[threadgroup_position_in_grid]]
+) {
+    device const float* inRow = inVector + ((uint64_t)tgIdx * dim);
+    device float* outRow = outVector + ((uint64_t)tgIdx * dim);
+    float localSum = 0.0f;
+    for (uint i = tid; i < dim; i += tgSize) {
+        float v = inRow[i];
+        localSum += v * v;
+    }
+    float totalSum = threadgroup_reduce_sum(localSum, sharedWarpSums, tid, tgSize);
+    float invRms = rsqrt(totalSum / (float)dim + eps);
+    for (uint i = tid; i < dim; i += tgSize) {
+        outRow[i] = inRow[i] * invRms;
+    }
+}
+
+// The softcapped SwiGLU: `softcap(sigmoid(g) * g, gateCap) * softcap(u, upCap)`
+// with `softcap(x, c) = tanh(x / c) * c`. One thread per element, gate and up
+// adjacent in the gate-up buffer's own layout (row `i` = gate, row `i + inter`
+// = up), so the caller passes the two base offsets.
+kernel void inkling_softcapped_swiglu_f32(
+    device const float* gateUp [[buffer(0)]],
+    device float* outVector [[buffer(1)]],
+    constant uint32_t& intermediate [[buffer(2)]],
+    constant float& gateSoftcap [[buffer(3)]],
+    constant float& upSoftcap [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= intermediate) { return; }
+    float gate = gateUp[gid];
+    float up = gateUp[intermediate + gid];
+    float gated = tanh(gate / gateSoftcap) * gateSoftcap;
+    float activated = gated * (1.0f / (1.0f + exp(-gate)));
+    outVector[gid] = activated * (tanh(up / upSoftcap) * upSoftcap);
+}
+
+// The short convolution's static form for one channel:
+// `(sum_k taps[k] * x[t - k] + x[t]) / sqrt(kernel + 1)`, taps in STORED conv1d
+// order (oldest first), rows of history oldest first. One thread per channel.
+kernel void inkling_short_conv_f32(
+    device const float* current [[buffer(0)]],
+    device const float* history [[buffer(1)]],
+    device const float* taps [[buffer(2)]],
+    device float* outVector [[buffer(3)]],
+    constant uint32_t& channels [[buffer(4)]],
+    constant uint32_t& tapCount [[buffer(5)]],
+    constant uint32_t& historyRows [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= channels) { return; }
+    // `kernel` is MSL's own qualifier, so the tap count is named `tapCount`
+    // here: a parameter called `kernel` made every declaration after it
+    // unparseable.
+    float x = current[gid];
+    float convolved = 0.0f;
+    for (uint tap = 0; tap < tapCount; tap++) {
+        uint age = tapCount - 1 - tap;
+        float source = 0.0f;
+        if (age == 0) {
+            source = x;
+        } else if (age - 1 < historyRows) {
+            source = history[(historyRows - 1 - (age - 1)) * channels + gid];
+        }
+        convolved += taps[gid * tapCount + tap] * source;
+    }
+    outVector[gid] = (convolved + x) / sqrt((float)(tapCount + 1));
+}
+
+// The message gate: `(1 - tanh(forget)) * current + tanh(gain) * message`.
+kernel void inkling_message_gate_f32(
+    device const float* current [[buffer(0)]],
+    device const float* message [[buffer(1)]],
+    device const float* forget [[buffer(2)]],
+    device const float* gain [[buffer(3)]],
+    device float* outVector [[buffer(4)]],
+    constant uint32_t& width [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= width) { return; }
+    float keep = 1.0f - tanh(forget[gid]);
+    outVector[gid] = keep * current[gid] + tanh(gain[gid]) * message[gid];
+}
+
+// One stack row's scaled score for a query: `q . rmsnorm(row) * rsqrt(width)`.
+// A device function rather than a local one, because MSL has no nested
+// functions, and shared by the block read below and any other stage that needs
+// the same score.
+inline float inkling_row_score(
+    device const float* source,
+    device const float* query,
+    threadgroup float* shared,
+    uint width,
+    uint tid,
+    uint tgSize
+) {
+    float squareSum = 0.0f;
+    for (uint i = tid; i < width; i += tgSize) { squareSum += source[i] * source[i]; }
+    float total = threadgroup_reduce_sum(squareSum, shared, tid, tgSize);
+    float invRms = rsqrt(total / (float)width + 1e-6f);
+    float localDot = 0.0f;
+    for (uint i = tid; i < width; i += tgSize) { localDot += query[i] * source[i] * invRms; }
+    return threadgroup_reduce_sum(localDot, shared, tid, tgSize) * rsqrt((float)width);
+}
+
+// The block-attention residual read, one threadgroup per query:
+// `softmax(q . rmsnorm(row) / sqrt(width)) . rmsnorm(row)` over every stack row
+// plus the current partial. `stackRows` is the stack's own count; the partial
+// is row `stackRows`.
+//
+// Three passes, each row costing two reductions (its norm, then its dot): the
+// max, the denominator, then the weighted sum. Recomputing the norm per pass
+// is deliberate -- staging ~50 normalized rows of 2,304 floats would need
+// 460 KB of threadgroup memory, which the device does not have.
+kernel void inkling_block_read_f32(
+    device const float* stack [[buffer(0)]],
+    device const float* partial [[buffer(1)]],
+    device const float* queries [[buffer(2)]],
+    device float* outVector [[buffer(3)]],
+    constant uint32_t& stackRows [[buffer(4)]],
+    constant uint32_t& width [[buffer(5)]],
+    threadgroup float* sharedWarpSums [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgSize [[threads_per_threadgroup]],
+    uint queryIndex [[threadgroup_position_in_grid]]
+) {
+    uint rows = stackRows + 1;
+    device const float* query = queries + ((uint64_t)queryIndex * width);
+    device float* out = outVector + ((uint64_t)queryIndex * width);
+
+    // Every row's score and weight, computed ONCE and held per thread: each
+    // score is two threadgroup reductions, so recomputing one inside the
+    // element loop below would interleave reductions from different lanes'
+    // iterations and read a shared buffer mid-reduction. `rows` is the
+    // attention-residual stack, tens of entries, so a per-thread array is cheap.
+    threadgroup float* weights = sharedWarpSums + 32;
+    threadgroup float* inverses = sharedWarpSums + 32 + 64;
+
+    float localMax = -INFINITY;
+    for (uint row = 0; row < rows; row++) {
+        device const float* source = row < stackRows ? stack + ((uint64_t)row * width) : partial;
+        float squareSum = 0.0f;
+        for (uint i = tid; i < width; i += tgSize) { squareSum += source[i] * source[i]; }
+        float total = threadgroup_reduce_sum(squareSum, sharedWarpSums, tid, tgSize);
+        float invRms = rsqrt(total / (float)width + 1e-6f);
+        if (tid == 0) { inverses[row] = invRms; }
+        float localDot = 0.0f;
+        for (uint i = tid; i < width; i += tgSize) { localDot += query[i] * source[i] * invRms; }
+        float score = threadgroup_reduce_sum(localDot, sharedWarpSums, tid, tgSize) * rsqrt((float)width);
+        localMax = max(localMax, score);
+    }
+    float maximum = localMax;
+    float denominator = 0.0f;
+    for (uint row = 0; row < rows; row++) {
+        device const float* source = row < stackRows ? stack + ((uint64_t)row * width) : partial;
+        float localDot = 0.0f;
+        for (uint i = tid; i < width; i += tgSize) { localDot += query[i] * source[i] * inverses[row]; }
+        float score = threadgroup_reduce_sum(localDot, sharedWarpSums, tid, tgSize) * rsqrt((float)width);
+        float weight = exp(score - maximum);
+        if (tid == 0) { weights[row] = weight; }
+        denominator += weight;
+    }
+    // `maximum` and the denominator are identical on every lane (each score is
+    // reduced, and the sum over rows is complete per lane), so no third
+    // reduction is needed -- one would multiply it by the threadgroup size.
+    for (uint i = tid; i < width; i += tgSize) {
+        float accumulator = 0.0f;
+        for (uint row = 0; row < rows; row++) {
+            device const float* source = row < stackRows ? stack + ((uint64_t)row * width) : partial;
+            accumulator += (weights[row] / denominator) * source[i] * inverses[row];
+        }
+        out[i] = accumulator;
+    }
+}
