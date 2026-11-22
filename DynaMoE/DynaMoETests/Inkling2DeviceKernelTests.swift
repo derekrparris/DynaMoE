@@ -502,6 +502,158 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         XCTAssertGreaterThan(first.weights[slot3], first.weights[slot5])
     }
 
+    // MARK: Device against the host graph
+
+    /// One real checkpoint's attention stage, on the device and through the
+    /// host graph, compared elementwise.
+    ///
+    /// The host forward is the oracle (it is what matches the checkpoint's
+    /// Transformers reference) and it records its own intermediate values
+    /// through `onInternal`, so the comparison does not re-derive any input:
+    /// the same query, key, value, relative vector and sink the host used are
+    /// staged from the host's captures. The device reads the same zero-copy
+    /// shard bytes for the weights.
+    ///
+    /// Layer 0 is a SLIDING layer (the shared-norm branch); it is the first
+    /// visit, whose state holds the whole short prompt.
+    func testTheDeviceAttentionMatchesTheHostGraph() throws {
+        let snapshot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(Inkling2PublishedTensorTests.snapshotRelativePath)
+        guard FileManager.default.fileExists(atPath: snapshot.path) else {
+            throw XCTSkip("Inkling 2 snapshot is not downloaded at \(snapshot.path)")
+        }
+        let (device, library, queue) = try environment()
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let summary = try engine.getSummary()
+        let config = try Inkling2Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let catalog = Inkling2WeightCatalog(
+            mainFile: summary.tensors.map { Inkling2TensorRef(metadata: $0) },
+            layerCount: config.numHiddenLayers
+        )
+        var shardBuffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            guard shard.length > 0,
+                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)) else { continue }
+            if let buffer = device.makeBuffer(
+                bytesNoCopy: pointer, length: Int(shard.length), options: .storageModeShared, deallocator: nil
+            ) { shardBuffers[shard.index] = buffer }
+        }
+        let hostSource = Inkling2SnapshotWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
+        let host = try Inkling2CPUForward(config: config, weights: hostSource)
+        let deviceWeights = Inkling2DeviceWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
+        let metal = try Inkling2MetalForward(
+            device: device, library: library, queue: queue, weights: deviceWeights
+        )
+        let workspace = try Inkling2DeviceWorkspace(device: device, config: config)
+
+        let tokenizer = try DynaMoeTokenizer(
+            tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+        )
+        // Two tokens: the cache only needs to HOLD rows for the attention to
+        // read them, and every extra position costs a host forward.
+        let ids = try tokenizer.encode(text: "Hi there")
+        for (position, id) in ids.enumerated() {
+            _ = try host.forwardToken(token: UInt32(id), position: position)
+        }
+        let position = ids.count
+        let layer = 0
+        let state = host.states[0]
+
+        // The host's own values for this stage, captured as it computes them.
+        var hostScores: [Float] = []
+        var hostWeights: [Float] = []
+        var hostRaw: [Float] = []
+        var hostQuery: [Float] = []
+        var hostRelative: [Float] = []
+        var hostSink: [Float] = []
+        host.onInternal = { _, name, value in
+            switch name {
+            case "scores_head0": hostScores = value
+            case "weights_head0": hostWeights = value
+            case "attn_raw": hostRaw = value
+            case "q_norm": hostQuery = value
+            // The POST-clip vector, which is what the kernel's bias mixes: the
+            // raw projection (`rel_linear`) is a different value.
+            case "relative_states": hostRelative = value
+            case "sink": hostSink = value
+            default: break
+            }
+        }
+        let queryInput = values(config.hiddenSize, seed: 41)
+        let keyInput = values(config.hiddenSize, seed: 42)
+        let valueInput = values(config.hiddenSize, seed: 43)
+        let hostOutput = try host.attention(
+            layer: layer, state: state, queryInput: queryInput,
+            keyInput: keyInput, valueInput: valueInput, position: position
+        )
+        // The gate is applied after the capture, so `attn_raw` is the attention
+        // kernel's own output -- exactly what the device kernel produces.
+        XCTAssertEqual(hostRaw.count, config.numAttentionHeads * config.headDim)
+        XCTAssertEqual(hostScores.count, state.keys.count)
+        XCTAssertFalse(hostQuery.isEmpty)
+
+        // The device: the same state staged, and the host's own captured
+        // inputs (query, post-clip relative vector, sink) plus the same weights.
+        let rows = workspace.stage(state)
+        XCTAssertEqual(rows, state.keys.count)
+
+        // The query goes into the WORKSPACE, which is the buffer the attention
+        // helper binds -- a separate buffer here would never be read, and the
+        // kernel would run on a zeroed vector (which is what a first cut did).
+        let queryPointer = workspace.query.contents().bindMemory(
+            to: Float.self, capacity: hostQuery.count
+        )
+        for index in hostQuery.indices { queryPointer[index] = hostQuery[index] }
+        let relativeBuffer = try buffer(device, hostRelative)
+        let sinkBuffer = try buffer(device, hostSink)
+        let bank = try hostSource.matrix(.attnRelLogitsProj, layer: layer)
+        let bankBuffer = try buffer(device, bank)
+        let outputBuffer = try buffer(
+            device, [Float](repeating: 0, count: config.numAttentionHeads * config.headDim)
+        )
+        let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+        let encoder = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
+        try metal.attention(
+            encoder: encoder, workspace: workspace, state: state, rows: rows,
+            position: position, relative: relativeBuffer, bank: bankBuffer,
+            sink: sinkBuffer, output: outputBuffer
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let error = commandBuffer.error { throw error }
+
+        let deviceOutput = read(outputBuffer, config.numAttentionHeads * config.headDim)
+        let headDim = config.headDim
+        // Per head: a wrong KV-head mapping is right on head 0 and wrong from
+        // the first head that shares a different KV head, so an aggregate
+        // number would not say which.
+        var worstHead = 0
+        var worstError: Float = 0
+        for head in 0..<config.numAttentionHeads {
+            let range = (head * headDim)..<((head + 1) * headDim)
+            let scale = hostRaw[range].reduce(Float(0)) { max($0, abs($1)) }
+            let delta = zip(deviceOutput[range], hostRaw[range]).reduce(Float(0)) { max($0, abs($1.0 - $1.1)) }
+            let error = scale > 0 ? delta / scale : delta
+            if error > worstError { worstError = error; worstHead = head }
+        }
+        // Every head, not only the worst: a wrong KV-head mapping is exact on
+        // the first head of each group and wrong on the rest, which a single
+        // worst-head number cannot distinguish from a smooth numeric drift.
+        let perHead: [String] = (0..<config.numAttentionHeads).map { head in
+            let range = (head * headDim)..<((head + 1) * headDim)
+            let scale = hostRaw[range].reduce(Float(0)) { max($0, abs($1)) }
+            let delta = zip(deviceOutput[range], hostRaw[range]).reduce(Float(0)) { max($0, abs($1.0 - $1.1)) }
+            return String(format: "%d:%.1e", head, scale > 0 ? delta / scale : delta)
+        }
+        print("🔎 [inkling2 device] attention per head: \(perHead.joined(separator: " "))")
+        print("🔎 [inkling2 device] attention: worst head \(worstHead) at \(worstError) relative over \(rows) row(s)")
+        XCTAssertLessThanOrEqual(worstError, 1e-4, "head \(worstHead) of the device attention against the host graph")
+        withExtendedLifetime(engine) {}
+    }
+
     // MARK: The block read
 
     /// The block-attention residual read against the host rule, with TWO

@@ -740,6 +740,11 @@ nonisolated public final class Inkling2CPUForward {
             }
             for dimension in 0..<config.dRel { relative[head * config.dRel + dimension] = slice[dimension] }
         }
+        // The kernel's own input: captured AFTER the learned scale, the L2 clip
+        // and (on a full layer) the log scale, because `rel_linear` above is
+        // only the raw projection and a device comparison needs the value the
+        // bias is actually mixed from.
+        onInternal?(visitIndexForDebug, "relative_states", relative)
         let bank = try weights.matrix(.attnRelLogitsProj, layer: layer)   // [d_rel][extent]
 
         let sinkProjection = try weights.matrix(.attnSinkProj, layer: layer)  // [heads][hidden]
