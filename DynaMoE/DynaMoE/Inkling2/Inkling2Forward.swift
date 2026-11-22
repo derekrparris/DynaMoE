@@ -257,6 +257,11 @@ nonisolated public final class Inkling2CPUForward {
 
         let outputQuery = try weights.matrix(.attnResOutputQuery, layer: nil)
         hidden = blockRead(blockStates: blockStates, partial: hidden, queries: [outputQuery])[0]
+        // The read over the WHOLE stack, which is what makes it the check on the
+        // stack's contents and order: one wrong entry, one entry too many, or a
+        // boundary layer appended after its output instead of before all move
+        // this vector and nothing else that is named.
+        onInternal?(0, "finalRead", hidden)
         hidden = Inkling2Math.rmsNorm(
             hidden, gain: try weights.matrix(.finalNorm, layer: nil), eps: config.rmsNormEps
         )

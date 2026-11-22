@@ -439,6 +439,43 @@ final class Inkling2LayerRuleTests: XCTestCase {
         )
     }
 
+    /// The same convolution written the way the reference writes it: a
+    /// per-channel `F.conv1d` (cross-correlation, left padded, so the STORED
+    /// weight's first tap is the OLDEST) followed by `(conv + x) / sqrt(k + 1)`.
+    ///
+    /// This is what pins the reversal the forward does at its call site. A
+    /// mirror that reused the primitive's backward-distance order would agree
+    /// with a forward that forgot to reverse, i.e. it would check nothing.
+    func testTheStaticConvolutionMatchesTheReferencesStoredOrder() {
+        let kernel = 4
+        let stored: [Float] = [0.1, -0.2, 0.3, -0.4]   // conv1d order: oldest tap first
+        let history: [Float] = [0.5, -1.0, 2.0]        // oldest first, newest last
+        let current: Float = 1.5
+        // The reference's window, left padded: [.., x[t-3], x[t-2], x[t-1], x[t]].
+        let window = history + [current]
+        var convolved: Float = 0
+        for tap in 0..<kernel {
+            // conv1d pairs stored[k] with the (kernel - 1 - k)-th newest value.
+            let age = kernel - 1 - tap
+            let source = age < window.count ? window[window.count - 1 - age] : 0
+            convolved += stored[tap] * source
+        }
+        let expected = (convolved + current) / Float(kernel + 1).squareRoot()
+
+        // The forward reverses the stored taps once and calls the primitive.
+        let reversed = (0..<kernel).map { stored[kernel - 1 - $0] }
+        XCTAssertEqual(
+            Inkling2Math.staticShortConvolution(current: current, history: history, weights: reversed),
+            expected, accuracy: 1e-6
+        )
+        // And the stored order UNREVERSED is a different number, so the two
+        // cannot be confused: this is what a missing reversal would produce.
+        XCTAssertNotEqual(
+            Inkling2Math.staticShortConvolution(current: current, history: history, weights: stored),
+            expected, accuracy: 1e-3
+        )
+    }
+
     func testDynamicShortConvolutionMatchesTheMirror() {
         let staticWeights: [Float] = [0.05, 0.1, -0.15, 0.2]
         let dynamicWeights: [Float] = [0.01, -0.02, 0.03, -0.04]
@@ -1753,6 +1790,27 @@ final class Inkling2HostForwardTests: XCTestCase {
             XCTAssertEqual(compared, referenceMessages.count * 4)
         }
 
+        // The final read over the whole stack, against the reference's own
+        // `attnResOutputQuery` output: the one named value that depends on the
+        // stack's contents AND order, so it is the check the `blockResidual`
+        // gate closes on.
+        let referenceFinalRead = (dumped["finalRead"] as? [NSNumber])?.map(\.floatValue) ?? []
+        if !referenceFinalRead.isEmpty {
+            let finalRead = try XCTUnwrap(
+                // Captured under visit 0 like every other named intermediate of
+                // the last position (the read happens after the last visit, so
+                // a visit-numbered key would fall outside the plan).
+                internals["0:finalRead"], "the final read was not captured"
+            )
+            XCTAssertEqual(finalRead.count, referenceFinalRead.count)
+            let scale = referenceFinalRead.reduce(Float(0)) { max($0, abs($1)) }
+            let worst = zip(finalRead, referenceFinalRead).reduce(Float(0)) { max($0, abs($1.0 - $1.1)) }
+            let error = scale > 0 ? worst / scale : worst
+            print("🔎 [inkling2 real] final read: \(error) relative")
+            // 5e-2, the same accumulated-rounding bar the visits carry.
+            XCTAssertLessThanOrEqual(error, 5e-2, "the final block read over the stack")
+        }
+
         // The logits, in the shape a BF16 reference can actually support.
         //
         // The plan's elementwise bar (5e-4 + 5e-4 * |reference|) is not
@@ -2353,11 +2411,18 @@ final class Inkling2SyntheticForwardTests: XCTestCase {
         }
         var lastPositionInternals: [String: [Float]] = [:]
         var internals: [String: [Float]] = [:]
+        var postAttentionIndex = 0
         forward.onPostAttention = { (visit: Int, value: [Float]) in
             record(visit, "postAttnConv", value)
-            // The final position's capture is the last write, which is what the
-            // reference dump holds.
-            if visit == 0 { postAttention = [value] }
+            // The golden holds EVERY visit's post-attention convolution for the
+            // final position, so this is a ring of one position's visits too --
+            // keeping only visit 0 compared one entry out of twenty-four.
+            if postAttention.count < visitsPerPosition {
+                postAttention.append(value)
+            } else {
+                postAttention[postAttentionIndex] = value
+            }
+            postAttentionIndex = (postAttentionIndex + 1) % visitsPerPosition
         }
         forward.onInternal = { (visit: Int, name: String, value: [Float]) in
             // ONE closure: a second assignment would overwrite the first, which
@@ -2400,12 +2465,27 @@ final class Inkling2SyntheticForwardTests: XCTestCase {
                 return
             }
         }
+        XCTAssertEqual(postAttention.count, goldenAttention.count)
         for index in 0..<min(postAttention.count, goldenAttention.count) {
             let error = rel(postAttention[index], goldenAttention[index])
             if error > 2e-2 {
                 XCTFail("visit \(index) post-attention is \(error) relative from the reference")
                 return
             }
+        }
+        // The final read over the whole stack: the reference's own
+        // `attnResOutputQuery` output. Its length is the stack's length plus
+        // one, so this is also the check that the stack has the right NUMBER of
+        // entries (a boundary layer appended twice in the wrong place still
+        // changes this vector's values, but a missed append changes its sum).
+        if let goldenFinalRead = golden["finalRead"] as? [NSNumber] {
+            let mineFinalRead = try XCTUnwrap(
+                lastPositionInternals["0.finalRead"],
+                "the final read was not captured"
+            )
+            let finalReadError = rel(mineFinalRead, goldenFinalRead)
+            print("🔎 [inkling2 fixture] final read: \(finalReadError) relative")
+            XCTAssertLessThanOrEqual(finalReadError, 2e-2, "the final block read over the stack")
         }
         let expected = try XCTUnwrap(golden["logits"] as? [NSNumber])
         let worst = rel(logits, expected)

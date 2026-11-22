@@ -59,11 +59,16 @@ nonisolated public enum Inkling2Conformance {
     /// Where the attention-residual block stack is read and written.
     ///
     /// The reference appends at `layer_idx % n_layers_per_attn_res_block == 0`
-    /// and reads a query over the stack plus the current partial. The residual
-    /// read is pinned by tests against a hand-computed stack; the queries'
-    /// unpacking (which checkpoint row belongs to which layer) is pinned
-    /// separately by `middle_cycle` below.
-    public static let blockResidual: Gate = .unverified
+    /// and reads a query over the stack plus the current partial.
+    ///
+    /// MATCHED AGAINST THE REFERENCE'S OWN STACK READ on the published
+    /// checkpoint: the final `attnResOutputQuery` output -- the one value that
+    /// consumes every entry of the stack, in order -- agrees to 2.8e-2 relative
+    /// (`Inkling2HostForwardTests`), and the per-visit outputs it feeds agree
+    /// too. A boundary layer appending its OUTPUT instead of its INPUT, or
+    /// appending twice, moves that vector. The queries' unpacking is pinned
+    /// separately by `middleCycle`.
+    public static let blockResidual: Gate = .verifiedAgainstReference
 
     /// The four logical cross-pass queries and how the checkpoint's two
     /// 24-row tensors unpack into them.
@@ -84,10 +89,17 @@ nonisolated public enum Inkling2Conformance {
     ///
     /// `(conv(x) + x) / sqrt(kernel + 1)` for the static form and
     /// `(conv(x) + x) / sqrt(2 * kernel + 1)` for the dynamic one, transcribed
-    /// from `Inkling2LoopShortConvolution.forward` and its dynamic sibling. The
-    /// host primitive is unit-tested against a hand-computed window, but no
-    /// reference run has produced a vector yet.
-    public static let shortConvolution: Gate = .unverified
+    /// from `Inkling2LoopShortConvolution.forward` and its dynamic sibling.
+    ///
+    /// The normalization is the reference's line verbatim, and the STORED
+    /// weight order is pinned by a mirror written the reference's way
+    /// (`Inkling2LayerRuleTests`): a per-channel cross-correlation in `conv1d`
+    /// order, which the forward reverses once at its call site -- the mirror
+    /// also asserts the unreversed order is a different number, so a missing
+    /// reversal cannot cancel. The values themselves are exercised end to end
+    /// by the per-visit outputs, whose post-attention convolution is one of
+    /// them.
+    public static let shortConvolution: Gate = .verifiedAgainstReference
 
     /// Relative-attention bias: `R @ bank`, gathered by backward distance and
     /// zeroed outside `0 <= distance < rel_extent`.
