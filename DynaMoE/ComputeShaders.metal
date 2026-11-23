@@ -14267,15 +14267,20 @@ kernel void inkling_dynamic_conv_f32(
     uint head = gid / headDim;
     float x = current[gid];
     float convolved = 0.0f;
-    for (uint tap = 0; tap < tapCount; tap++) {
-        uint age = tapCount - 1 - tap;
+    // BOTH tap sets are LAG-indexed, unlike `conv1d.weight`'s oldest-first
+    // order: `static_weight` is [kernel][channels] with index 0 the current
+    // token, and `weight_proj`'s rows are [head][lag]. Reading the static taps
+    // channel-major (the static kernel's layout) transposed them, and pairing
+    // tap 0 with the oldest lag reversed them -- on full layers only, which is
+    // why every local layer matched the host and the first full one did not.
+    for (uint lag = 0; lag < tapCount; lag++) {
         float source = 0.0f;
-        if (age == 0) {
+        if (lag == 0) {
             source = x;
-        } else if (age - 1 < historyRows) {
-            source = history[(historyRows - 1 - (age - 1)) * channels + gid];
+        } else if (lag - 1 < historyRows) {
+            source = history[(historyRows - lag) * channels + gid];
         }
-        convolved += (staticTaps[gid * tapCount + tap] + dynamicTaps[head * tapCount + tap]) * source;
+        convolved += (staticTaps[lag * channels + gid] + dynamicTaps[head * tapCount + lag]) * source;
     }
     outVector[gid] = (convolved + x) / sqrt((float)(2 * tapCount + 1));
 }
