@@ -17,19 +17,21 @@ I'm not great at keeping this readme up to date on all the latest and greatest c
 This project was undertaken purely for the joy of exploration by someone who is not a software engineer. Just someone who is enjoying learning with the help of AI.
 
 The following AI models have been used to code DynaMoE:
-* Gemini 3.6 Thinking, 3.7 Flash and 3.8 Flash
+* Gemini 3.6 Thinking, 3.7 Flash and 3.8 Flash, 4 Hydrogen, Neon and Carbon
 * Ling 3.0 Flash Fin Free (Opencode)
 * GLM 5.3
 * GLM 5.3 Flash
 * Big Pickle (Opencode)
 * Deepseek V4.1 Flash
-* Kimi K3
+* Kimi K3 & 3.1
+* SubQ Savant 1.4
 
 Special thanks and acknowledgement to the open-source projects, dependencies, and research that inspired this architecture and power it today:
 * **JetSpec** (Hao AI Lab / UC San Diego — [arXiv:2606.18394](https://arxiv.org/html/2606.18394v2)): Causal parallel tree drafting and tree-causal attention verification for breakthrough speculative decoding throughput.
 * **Flash-MoE** (https://github.com/danveloper/flash-moe) by Dan Woods: Pioneering work on MoE expert repackaging format and contiguous binary layer storage layout (`packed_experts/layer_XX.bin`). DynaMoE builds upon Flash-MoE's expert restructuring concepts to enable high-throughput asynchronous POSIX `pread` file streaming directly into shared Metal GPU buffers.
 * **Colibri** (https://github.com/JustVugg/colibri): Pioneering work on high-speed off-disk model execution.
 * **Hummingbird** (https://github.com/hummingbird-project/hummingbird): The Swift server framework that backs DynaMoE's local inference server, exposing the loaded model over OpenAI- and Anthropic-compatible APIs.
+* **Crush** (https://github.com/charmbracelet/crush): The majority of DynaMoE development has been done in Crush. Love Charm!
 
 ---
 
