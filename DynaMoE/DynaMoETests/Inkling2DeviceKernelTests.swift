@@ -2384,4 +2384,123 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         XCTAssertEqual(deviceArm.ids, hostArm.ids, "the device visit runner changed the answer")
         withExtendedLifetime(engine) {}
     }
+
+    /// A complete tool call through the APP's engine: agent tools enabled, the
+    /// checkpoint loaded the way the app loads it, and the `TurnResult` the
+    /// harness reads carrying one actionable call.
+    ///
+    /// The runner-level gate proves the graph and the dialect. This proves the
+    /// engine's half of the same contract: the device visit runner installed
+    /// inside the turn task, the freeze hook keyed on the family's own block
+    /// (`inklingRunAgentTools`), canonicalization into the shared parser, and
+    /// the parsed call landing in `TurnResult.parsedToolCalls`. The tool is not
+    /// EXECUTED here -- execution, approval and the result turn are the
+    /// harness's shared path, and the continuation after a result is asserted
+    /// on the runner by `testATurnAnswersAfterAToolResultOnThePublishedCheckpoint`.
+    ///
+    /// Default when the checkpoint is present: the device path makes it ~20 s.
+    func testAnAgentTurnFreezesACompleteCallThroughTheEngine() async throws {
+        let snapshot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(Inkling2PublishedTensorTests.snapshotRelativePath)
+        guard FileManager.default.fileExists(atPath: snapshot.path) else {
+            throw XCTSkip("Inkling 2 snapshot is not downloaded at \(snapshot.path)")
+        }
+        guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("No Metal GPU device") }
+        let tokenizer = try DynaMoeTokenizer(
+            tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+        )
+        let modelConfig = try XCTUnwrap(ModelConfig.load(from: snapshot))
+        XCTAssertTrue(modelConfig.isInkling2Model)
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let indexed = try engine.getSummary()
+        let summary = try InferenceEngine.segmentShardsForMetal(
+            indexed, maxBufferLength: UInt64(device.maxBufferLength)
+        )
+        var buffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            let length = Int(shard.length)
+            guard length > 0, length <= Int(device.maxBufferLength),
+                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)),
+                  let buffer = device.makeBuffer(
+                      bytesNoCopy: pointer, length: length, options: .storageModeShared, deallocator: nil
+                  ) else { continue }
+            buffers[shard.index] = buffer
+        }
+        CompletionEngine.shared.configure(
+            summary: summary, modelConfig: modelConfig, tokenizer: tokenizer,
+            shardBuffers: buffers, activeLoadedModelPath: snapshot.path
+        )
+        // The DEVICE arm: a host turn is minutes, and the host graph's own
+        // fidelity is pinned elsewhere. A developer's seam value is restored.
+        let defaults = UserDefaults.standard
+        let seam = "dynamoe_inkling2_device_off"
+        let savedSeam = defaults.object(forKey: seam)
+        defaults.set(false, forKey: seam)
+        defer {
+            CompletionEngine.shared.configure(
+                summary: nil, modelConfig: nil, tokenizer: nil,
+                shardBuffers: [:], activeLoadedModelPath: nil
+            )
+            if let savedSeam { defaults.set(savedSeam, forKey: seam) }
+            else { defaults.removeObject(forKey: seam) }
+        }
+
+        let tools = [Inkling2ToolDeclaration(
+            name: "read_file",
+            description: "Read a file from disk and return its contents.",
+            parameters: [
+                "type": .string("object"),
+                "properties": .object(["path": .object(["type": .string("string")])]),
+                "required": .array([.string("path")])
+            ]
+        )]
+        let prompt = try Inkling2Prompt().render(
+            turns: [
+                .system("You are a helpful assistant."),
+                .user([.text("Call read_file now with path /tmp/notes.txt, then tell me what it says.")])
+            ],
+            effort: 0, tools: tools
+        )
+        let promptIds = try tokenizer.encode(text: prompt)
+        let request = CompletionTurnRequest(
+            promptTokenIds: promptIds,
+            formattedPrompt: prompt,
+            sessionId: nil,
+            sampling: TurnSampling(
+                temperature: 0, topP: 1, minP: 0, topK: 1,
+                repetitionPenalty: 1, maxTokens: 384
+            ),
+            memory: TurnMemorySettings(
+                executionMode: .residentRAM, budgetMode: .unrestricted, kvPrecision: .fp32
+            ),
+            agentToolsEnabled: true,
+            thinkingEnabled: false,
+            agentStep: 0,
+            forceSynthesis: false,
+            isSplicedContinuation: false,
+            stopSequences: [],
+            asOfDate: nil,
+            images: []
+        )
+        var result: TurnResult?
+        for await event in try CompletionEngine.shared.launchTurn(request).stream {
+            switch event {
+            case .finished(let turn):
+                result = turn
+            case .failedTurn(let failure):
+                XCTFail("the agent turn failed: \(failure.message)")
+            default:
+                break
+            }
+        }
+        let turn = try XCTUnwrap(result, "the turn emitted no result")
+        print("🔎 [inkling2 engine] agent turn: \(turn.finishReason.rawValue) after \(turn.tokensGenerated) token(s), \(turn.parsedToolCalls.count) call(s)")
+        print("🔎 [inkling2 engine] call: \(turn.parsedToolCalls.first.map { "\($0.name) \($0.rawArguments)" } ?? "none")")
+        XCTAssertEqual(turn.finishReason, .toolFreeze, "the engine must stop on the completed call")
+        XCTAssertEqual(turn.parsedToolCalls.count, 1, "one actionable call")
+        let call = try XCTUnwrap(turn.parsedToolCalls.first)
+        XCTAssertEqual(call.name, "read_file")
+        XCTAssertEqual(call.arguments["path"] as? String, "/tmp/notes.txt")
+        withExtendedLifetime(engine) {}
+    }
 }
