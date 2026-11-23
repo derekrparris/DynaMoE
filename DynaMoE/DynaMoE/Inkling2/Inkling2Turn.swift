@@ -182,7 +182,8 @@ nonisolated public enum Inkling2TurnRunner {
     ///   - decode: decodes the generated sequence so far.
     ///   - onPrefill: `(positions done, total)`.
     ///   - onText: `(text, tokens generated)` at most once per token.
-    ///   - isCancelled: consulted before every position and every draw.
+    ///   - isCancelled: consulted before every prefill CHUNK and every draw
+    ///     (`prefillChunk` is what makes a position a cancellation point).
     ///   - prefillChunk: positions per chunk for the progress report and the
     ///     cancellation check. It never changes WHAT runs -- a position is a
     ///     position -- so it is a scheduling knob, and 1 is the walk.

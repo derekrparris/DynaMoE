@@ -1925,7 +1925,13 @@ final class Inkling2HostForwardTests: XCTestCase {
         forward.reset()
         var checks = 0
         let cancelled = try Inkling2TurnRunner.run(
-            forward: forward, promptTokenIds: ids, settings: settings,
+            forward: forward, promptTokenIds: ids,
+            // ONE position per chunk: the runner consults `isCancelled` between
+            // chunks, so with the default chunk a two-token prompt forwards
+            // both positions before the second check can land. The chunk size
+            // changes when the cancel is seen, never what a position computes.
+            prefillChunk: 1,
+            settings: settings,
             sample: sample, decode: { $0.map(String.init).joined() },
             isCancelled: { checks += 1; return checks > 1 }
         )
