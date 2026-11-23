@@ -83,30 +83,35 @@ nonisolated public enum Inkling2ToolDialect {
         var calls: [(name: String, arguments: [String: Any], raw: String)] = []
         var cursor = text.startIndex
         while let open = text.range(of: markers.model, range: cursor..<text.endIndex) {
-            guard let invoke = text.range(
-                of: markers.contentInvokeToolJSON, range: open.upperBound..<text.endIndex
-            ) else { return calls }
-            let name = text[open.upperBound..<invoke.lowerBound]
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            // ONE message block at a time: `<|message_model|> ... <|end_message|>`.
+            // Searching for the invoke marker ACROSS blocks read a reasoning
+            // turn's opener as the call's, so "reason, then call" -- the shape
+            // this model actually emits -- produced a name of the whole
+            // reasoning turn, no call, and therefore no freeze.
             guard let close = text.range(
-                of: markers.endMessage, range: invoke.upperBound..<text.endIndex
+                of: markers.endMessage, range: open.upperBound..<text.endIndex
             ) else {
                 // Still being written: the next delta re-parses it.
                 return calls
             }
-            let payload = String(text[invoke.upperBound..<close.lowerBound])
-            if !name.isEmpty,
-               let data = payload.data(using: .utf8),
-               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let declared = object[nameKey] as? String,
-               declared == name,
-               let arguments = object[argumentsKey] as? [String: Any] {
-                calls.append((
-                    name: name, arguments: arguments,
-                    raw: String(text[open.lowerBound..<close.upperBound])
-                ))
+            let body = text[open.upperBound..<close.lowerBound]
+            if let invoke = body.range(of: markers.contentInvokeToolJSON) {
+                let name = body[body.startIndex..<invoke.lowerBound]
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let payload = String(body[invoke.upperBound...])
+                if !name.isEmpty,
+                   let data = payload.data(using: .utf8),
+                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let declared = object[nameKey] as? String,
+                   declared == name,
+                   let arguments = object[argumentsKey] as? [String: Any] {
+                    calls.append((
+                        name: name, arguments: arguments,
+                        raw: String(text[open.lowerBound..<close.upperBound])
+                    ))
+                }
             }
-            // Not a valid call: keep scanning after it, and leave the bytes.
+            // Not a call block: keep scanning after it, and leave the bytes.
             cursor = close.upperBound
         }
         return calls
