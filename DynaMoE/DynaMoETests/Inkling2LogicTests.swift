@@ -1005,6 +1005,30 @@ final class Inkling2ToolPromptTests: XCTestCase {
         XCTAssertEqual(calls[0].arguments["path"] as? String, "a.txt")
     }
 
+    /// The shape the published checkpoint actually emits: a REASONING block,
+    /// then the call block.
+    ///
+    /// The scan must take ONE message block at a time. Searching for the invoke
+    /// marker across the whole text read the reasoning turn's opener as the
+    /// call's, gave it a name made of the reasoning sentence, found no call --
+    /// and so never froze, which let the model narrate past a call it had
+    /// already completed.
+    func testACallAfterAReasoningBlockFreezes() throws {
+        let reasoning = markers.model + markers.contentThinking + "I should read it."
+            + markers.endMessage
+        let text = reasoning + callText(name: "read_file", args: "{\"path\":\"a.txt\"}")
+        let calls = Inkling2ToolDialect.callBlocks(in: text, markers: markers)
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(calls[0].name, "read_file")
+        XCTAssertEqual(calls[0].arguments["path"] as? String, "a.txt")
+        XCTAssertTrue(Inkling2ToolDialect.shouldFreeze(text, markers: markers))
+        // The reasoning block is prose to the caller, and the call still
+        // canonicalizes into the block the shared parser reads.
+        let canonical = Inkling2ToolDialect.canonicalized(text, markers: markers)
+        XCTAssertTrue(canonical.hasPrefix(reasoning))
+        XCTAssertTrue(canonical.contains("<tool_call><function=read_file>"))
+    }
+
     /// The freeze rule: only a COMPLETE call freezes, and the invoke marker
     /// alone does not (ordinary text also ends with `end_message`).
     func testOnlyACompleteCallFreezes() throws {
