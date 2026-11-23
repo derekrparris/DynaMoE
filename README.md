@@ -35,7 +35,9 @@ Special thanks and acknowledgement to the open-source projects, dependencies, an
 
 ## Supported Architectures & Models
 
-**To date, all development and validation has been done on a 2021 Macbook Pro with an M1 Pro CPU, 16 GB RAM and 512 GB SSD.**
+**All development and validation up to the 26.7 release was been done on a 2021 Macbook Pro with an M1 Pro CPU, 16 GB RAM and 512 GB SSD.**
+
+**Starting with the 26.8 release, development and testing has been done on a Mac Studio M5 Max with 128 GB of RAM.**
 
 DynaMoE supports sparse Mixture-of-Experts, hybrid recurrent SSM/attention architectures, and dense autoregressive transformers with automatic model topology detection.
 
@@ -43,7 +45,7 @@ DynaMoE supports sparse Mixture-of-Experts, hybrid recurrent SSM/attention archi
 
 On macOS 26 or later with Apple Intelligence enabled, Apple's built-in **on-device Foundation Model** is also selectable as a zero-install chat backend (plain chat; agent tools, JetSpec, thinking blocks, and KV-cache prefixing are local-weights features that do not apply). It appears in the chat model picker under **System Models**, and it summarizes `/compact` manual conversation compaction for local conversations; a cloud conversation is summarized by the provider model already answering it, so that command needs no Apple Intelligence. Either way a rolling general summary plus a detailed recap of the most recent work replace the evicted history, stay visible in an expandable summary card at the top of the chat, and ride into every later prompt. Cloud turns also compact automatically as they approach the model's recorded context window. The system model is a chat-only backend: the local inference server (below) always serves the locally loaded weights.
 
-**The following models have been tested and should run well in DynaMoE:**
+**The following models have been tested and should run well locally in DynaMoE:**
 
 * **deepseek-ai/DeepSeek-V4.1-Flash-1017** Deepseek is here and it's spectacular!
 * **Nanbeige/Nanbeige4.3-33B**
@@ -54,8 +56,6 @@ On macOS 26 or later with Apple Intelligence enabled, Apple's built-in **on-devi
 * **XHToken/Spark-X2.5-4B** - a note on Spark - it uses an interesting hybrid attention architecture with one full attention layer and three sliding-window attention layers. Prefill takes a LONG time on my M1 Pro Macbook, but it has a native 1 million token context. So if you're willing to run it on some interesting longer horizon tasks during downtime, results can be interesting. Fun small model to play with.
 * **Nanbeige/Nanbeige4.3-33B** - a 33B dense `LlamaForCausalLM` (66 GB BF16, 52 layers of 7168 hidden, 56/8 query/key-value heads, native 524,288-token context) tuned for agentic tool use. It needs a large-Unified-Memory Mac to hold in Full RAM; on a smaller machine raise the KV cache to FP8 before driving it past ~100k tokens. Its **Quantize to Q4 / Q8** action (Models → ⋯) rewrites the weights into one contiguous quantized blob next to the snapshot: 66 GB becomes ~34 GB at Q8 and ~22 GB at Q4, which is what decode throughput tracks, and a Q4 repack of the published checkpoint still answers its published turn, with the same opening tokens as the full-precision run. DynaMoE renders its own chat template (`<|im_start|>` framing, a ` thinking` channel, `<tool_response>` tool turns) and its `qwen3_coder` XML tool calls. Its checkpoint declares `model_type: llama`, so the app identifies it from the checkpoint's shape (a 166,912-row vocabulary) rather than from its name.
 * **XHToken/Spark-X2.6-4B** - the same hybrid attention family as X2.5, with a graded reasoning template. The Thinking dropdown offers **High**, **Low**, and **Off** instead of a plain on/off switch; the choice is stored per conversation and rendered into the system prompt as `reasoning_effort`. Expect the same long prefill on an M1 Pro and the same 1 million token context.
-
-**Note:** I don't currently have enough disk space to fully repack Qwen3.8 Flash Next to test streaming optimizations. If anyone has the room to test speeds with full repacking, please do let me know. I will be able to conduct further tests once I get a new computer :)
 
 ---
 
@@ -267,20 +267,9 @@ DynaMoE/
 
 ---
 
-## Project Status - Check Issues to see what's in the hopper
-
-- [x] Add auto-update capability (Sparkle)
-- [x] MoE streaming bottleneck resolution (speed increase of over 500% compared to previous streaming speed)
-- [x] Support Apple Foundation Models
-- [x] Use Apple Foundation Model (AFM) to compact conversations
-- [x] Serve the loaded model over OpenAI- and Anthropic-compatible APIs, with streaming, tool calling, reasoning, and prefix reuse across stateless turns
-- [ ] UI/UX refinement
-
----
-
 ## Getting Started
 
-If you're interested in building and running the app in your own development environment:
+I try my best to keep the main branch stable, reflecting the most up-to-date deploy-ready iteration of the app at any given time. You will occasionally see new functionality and bug fixes merged to main before I decide to create a release. If you're interested in building and running the app in your own development environment:
 
 ### Prerequisites
 * macOS 26+ (Apple Intelligence enabled for the on-device Apple system model and for `/compact` on local conversations; a cloud conversation compacts with its own provider model)
