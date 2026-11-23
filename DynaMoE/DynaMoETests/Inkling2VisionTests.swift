@@ -179,6 +179,59 @@ final class Inkling2VisionTests: XCTestCase {
         XCTAssertEqual(values, [-2, 1], "rotate_pairwise is (-x2, x1)")
     }
 
+    // MARK: Pixels
+
+    func testThePicturePadsToWholeCellsBeforeItNormalizes() throws {
+        // 41 x 81 pixels: two cell columns (the second one 39 pixels of padding)
+        // and three cell rows (the third one 39 rows of padding).
+        let width = 41
+        let height = 81
+        var rgb = [UInt8](repeating: 0, count: width * height * 3)
+        for index in rgb.indices { rgb[index] = UInt8(index % 256) }
+        let pixels = Inkling2ImagePixels.RGB(rgb: rgb, width: width, height: height)
+        let cells = try Inkling2ImagePixels.cells(pixels)
+        XCTAssertEqual(cells.cellRows, 3)
+        XCTAssertEqual(cells.cellColumns, 2)
+        XCTAssertEqual(cells.languagePositions, 6, "the cells are what the prompt pays for")
+        XCTAssertEqual(cells.values.count, 6 * 40 * 40 * 3)
+
+        // A real pixel normalizes as (x / 255 - 0.5) / 0.5.
+        let expected = (Float(rgb[0]) / 255 - 0.5) / 0.5
+        XCTAssertEqual(cells.values[0], expected, accuracy: 1e-6)
+
+        // A padded one is the processor's -1.0 written on the 0-255 scale BEFORE
+        // the rescale, so it lands just below -1 rather than at 0.
+        // Cell (2, 0), row 1, column 0: source row 81 is past the picture.
+        let cell = (2 * 2 + 0) * 40 * 40 * 3 + (1 * 40 + 0) * 3
+        XCTAssertEqual(cells.values[cell], (Float(-1) / 255 - 0.5) / 0.5, accuracy: 1e-6)
+        XCTAssertLessThan(cells.values[cell], -1)
+
+        // Cell index 1 (row 0, column 1), row 0, column 2: source column 42 is
+        // past the picture.
+        let padded = ((1 * 40 + 0) * 40 + 2) * 3
+        XCTAssertEqual(cells.values[padded], (Float(-1) / 255 - 0.5) / 0.5, accuracy: 1e-6)
+    }
+
+    func testTransparencyCompositesOntoTheCheckerboard() {
+        // A fully transparent pixel shows the processor's checkerboard: 204 in an
+        // even 8-pixel cell, 153 in an odd one.
+        var rgba = [UInt8](repeating: 0, count: 10 * 10 * 4)
+        rgba[(0 * 10 + 0) * 4 + 3] = 0
+        rgba[(9 * 10 + 0) * 4 + 3] = 0
+        // One opaque pixel passes its own colour through.
+        let opaque = (0 * 10 + 5) * 4
+        rgba[opaque] = 10
+        rgba[opaque + 1] = 20
+        rgba[opaque + 2] = 30
+        rgba[opaque + 3] = 255
+        let rgb = Inkling2ImagePixels.composite(rgba: rgba, width: 10, height: 10)
+        XCTAssertEqual(rgb.rgb[0], 204, "row 0 / column 0 is an even checker cell")
+        XCTAssertEqual(rgb.rgb[(9 * 10 + 0) * 3], 153, "row 9 is an odd checker row")
+        XCTAssertEqual(rgb.rgb[(0 * 10 + 5) * 3], 10)
+        XCTAssertEqual(rgb.rgb[(0 * 10 + 5) * 3 + 1], 20)
+        XCTAssertEqual(rgb.rgb[(0 * 10 + 5) * 3 + 2], 30)
+    }
+
     // MARK: The tower
 
     func testTheTowerMatchesTheReferenceStageByStage() throws {
