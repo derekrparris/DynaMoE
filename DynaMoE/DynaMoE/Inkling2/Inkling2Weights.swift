@@ -493,23 +493,35 @@ nonisolated public struct Inkling2WeightCatalog: Sendable {
 
     public func tensor(
         _ role: Inkling2TensorRole,
-        scope: Inkling2TensorScope = .text,
+        scope: Inkling2TensorScope? = nil,
         layer: Int? = nil
     ) -> Inkling2TensorRef? {
-        index[Self.key(role, scope: scope, layer: layer)]?.ref
+        index[Self.key(role, scope: scope ?? Self.defaultScope(role), layer: layer)]?.ref
+    }
+
+    /// Which scope a role lives in when the caller does not say. Vision and
+    /// draft roles only ever exist in their own scope, and a lookup that named
+    /// no scope defaulted to `.text` found nothing -- which is how
+    /// `visionPatchEmbedding` came back missing from a checkpoint that has it.
+    public static func defaultScope(_ role: Inkling2TensorRole) -> Inkling2TensorScope {
+        if role.isVision { return .vision }
+        if role.isDraft { return .sidecar }
+        return .text
     }
 
     public static func key(
         _ role: Inkling2TensorRole,
-        scope: Inkling2TensorScope = .text,
+        scope: Inkling2TensorScope? = nil,
         layer: Int? = nil
     ) -> String {
-        "\(scope.rawValue)|\(role.rawValue)|\(layer.map(String.init) ?? "-")"
+        let resolved = scope ?? defaultScope(role)
+        return "\(resolved.rawValue)|\(role.rawValue)|\(layer.map(String.init) ?? "-")"
     }
 
     /// Slots of one role, ascending by layer, for the "which layers have this" checks.
-    public func layers(of role: Inkling2TensorRole, scope: Inkling2TensorScope = .text) -> [Int] {
-        Set(slots.filter { $0.role == role && $0.scope == scope }.compactMap(\.layer)).sorted()
+    public func layers(of role: Inkling2TensorRole, scope: Inkling2TensorScope? = nil) -> [Int] {
+        let resolved = scope ?? Self.defaultScope(role)
+        return Set(slots.filter { $0.role == role && $0.scope == resolved }.compactMap(\.layer)).sorted()
     }
 
     /// Bytes of every tensor that is not an expert bank, i.e. what a dense pin
