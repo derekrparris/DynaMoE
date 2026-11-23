@@ -159,6 +159,39 @@ nonisolated public struct Inkling2ToolDeclaration: Sendable, Equatable {
         }
         self.type = definition.type
     }
+
+    /// From an OpenAI-route tool: the schema arrives as raw JSON text, which is
+    /// re-parsed here so the template's `tojson` sees the client's own object
+    /// rather than a string containing it.
+    init(_ tool: OpenAIChatRequest.Tool) {
+        let parameters: [String: MCPJSONValue]
+        if let data = tool.function.parametersData,
+           let parsed = MCPJSONValue(data: data),
+           case .object(let fields) = parsed {
+            parameters = fields
+        } else {
+            parameters = [:]
+        }
+        self.init(
+            name: tool.function.name,
+            description: tool.function.description ?? "",
+            parameters: parameters,
+            type: tool.type ?? "function"
+        )
+    }
+
+    /// From an Anthropic-route tool, whose input schema is the same raw JSON.
+    init(_ tool: AnthropicMessagesRequest.Tool) {
+        let parameters: [String: MCPJSONValue]
+        if let data = tool.inputSchemaData,
+           let parsed = MCPJSONValue(data: data),
+           case .object(let fields) = parsed {
+            parameters = fields
+        } else {
+            parameters = [:]
+        }
+        self.init(name: tool.name, description: tool.description ?? "", parameters: parameters)
+    }
 }
 
 // MARK: - JSON as the template writes it

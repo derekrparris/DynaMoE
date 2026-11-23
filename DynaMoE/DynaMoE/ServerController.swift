@@ -1551,6 +1551,10 @@ final class ServerController: ObservableObject {
         var thinkingEffort: ThinkingEffort?
         var hasTools: Bool
         var toolDeclaration: String?
+        /// The same client tools in the shape a template-declared family
+        /// renders (Inkling 2's `tool_declare` message). Empty for every other
+        /// family, whose declaration travels in the system prompt instead.
+        var inklingTools: [Inkling2ToolDeclaration] = []
         var maskSchemas: [GrammarToolSchema]
         var sessionId: UUID
         /// Images attached to specific turns, keyed by that turn's index in
@@ -1744,9 +1748,16 @@ final class ServerController: ObservableObject {
             currentDate: renderedAsOfDate
         ).trimmingCharacters(in: .whitespacesAndNewlines)
 
-        if inputs.hasTools, let declaration = inputs.toolDeclaration {
+        // A template-declared family (Inkling 2) carries its tools as the
+        // checkpoint's own declaration message, rendered by the template, so
+        // the generic tagged-form paragraph is withheld there: it teaches a call
+        // shape this model was not post-trained to emit. Every other family
+        // keeps it in the system prompt, where it has always lived.
+        let declaresToolsInTemplate = engine.promptModelConfig?.isInkling2Model == true
+        if inputs.hasTools, !declaresToolsInTemplate, let declaration = inputs.toolDeclaration {
             cleanSystem = cleanSystem.isEmpty ? declaration : cleanSystem + "\n\n" + declaration
         }
+        let inklingTools = declaresToolsInTemplate ? inputs.inklingTools : []
 
         let thinkingEnabled = info.supportsThinking && inputs.thinkingRequested
         let thinkingEffort = Self.resolvedThinkingEffort(
@@ -1806,7 +1817,8 @@ final class ServerController: ObservableObject {
                 modelSupportsThinking: info.supportsThinking,
                 modelConfig: engine.promptModelConfig,
                 thinkingEffort: thinkingEffort,
-                promptDialect: engine.promptDialect
+                promptDialect: engine.promptDialect,
+                inklingTools: inklingTools
             )
         } else {
             formattedPrompt = ChatPromptFormatter.formatConversation(
@@ -1816,7 +1828,8 @@ final class ServerController: ObservableObject {
                 modelSupportsThinking: info.supportsThinking,
                 modelConfig: engine.promptModelConfig,
                 thinkingEffort: thinkingEffort,
-                promptDialect: engine.promptDialect
+                promptDialect: engine.promptDialect,
+                inklingTools: inklingTools
             )
         }
 
@@ -1999,6 +2012,7 @@ final class ServerController: ObservableObject {
             thinkingEffort: thinkingEffort,
             hasTools: hasTools,
             toolDeclaration: hasTools ? OpenAIAdapter.toolDeclarationText(apiRequest.tools ?? []) : nil,
+            inklingTools: hasTools ? (apiRequest.tools ?? []).map { Inkling2ToolDeclaration($0) } : [],
             maskSchemas: hasTools ? (apiRequest.tools ?? []).filter { ($0.type ?? "function") == "function" }.map {
                 GrammarToolSchema(name: $0.function.name, schemaJSON: $0.function.parametersData)
             } : [],
@@ -2098,6 +2112,7 @@ final class ServerController: ObservableObject {
             thinkingEffort: thinkingEffort,
             hasTools: hasTools,
             toolDeclaration: hasTools ? AnthropicAdapter.toolDeclarationText(apiRequest.tools ?? []) : nil,
+            inklingTools: hasTools ? (apiRequest.tools ?? []).map { Inkling2ToolDeclaration($0) } : [],
             maskSchemas: hasTools ? (apiRequest.tools ?? []).map {
                 GrammarToolSchema(name: $0.name, schemaJSON: $0.inputSchemaData)
             } : [],

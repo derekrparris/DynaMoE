@@ -607,4 +607,68 @@ final class ChatPromptFormatterConversationTests: XCTestCase {
         )
         XCTAssertEqual(actual, expected)
     }
+
+    // MARK: - Inkling 2 tool declarations
+
+    /// The Inkling 2 template declares tools as its own `tool_declare` system
+    /// message, so the declarations have to reach `Inkling2Prompt` rather than
+    /// being flattened into the system text: a server tool turn used to render
+    /// with no declaration at all, and the model was asked to call a tool it
+    /// had never been told about.
+    ///
+    /// The expected string is the template's own shape, asserted structurally
+    /// (role marker, `tool_declare`, the content marker, and the spec keys)
+    /// rather than as a golden, because the golden path needs the reference
+    /// environment. `Inkling2ToolPromptTests` pins the exact bytes.
+    func testInkling2ToolDeclarationsReachTheTemplate() throws {
+        let inkling = try config("inkling2_loop")
+        let declared = Inkling2ToolDeclaration(
+            name: "read_file",
+            description: "Read a file from disk.",
+            parameters: ["type": .string("object")]
+        )
+        let prompt = ChatPromptFormatter.formatPrompt(
+            prompt: "hi",
+            cleanSystem: system,
+            thinkingEnabled: false,
+            modelSupportsThinking: true,
+            modelConfig: inkling,
+            inklingTools: [declared]
+        )
+        XCTAssertTrue(
+            prompt.hasPrefix(Inkling2PromptMarkers.familyDefault.system + "tool_declare"),
+            "the declaration must be the template's first system message: \(prompt.debugDescription)"
+        )
+        XCTAssertTrue(prompt.contains("\"name\":\"read_file\""))
+        XCTAssertTrue(prompt.contains("\"parameters\":{\"type\":\"object\"}"))
+        // No tools means no declaration message, and the system prompt is
+        // otherwise unchanged.
+        let plain = ChatPromptFormatter.formatPrompt(
+            prompt: "hi",
+            cleanSystem: system,
+            thinkingEnabled: false,
+            modelSupportsThinking: true,
+            modelConfig: inkling
+        )
+        XCTAssertFalse(plain.contains("tool_declare"))
+        XCTAssertTrue(plain.hasPrefix(Inkling2PromptMarkers.familyDefault.system + Inkling2PromptMarkers.familyDefault.contentText))
+    }
+
+    /// The same declarations reach the history render, which is the path a
+    /// follow-up turn takes -- a live suffix and a rebuilt history must not
+    /// disagree about whether the tools were declared.
+    func testInkling2ToolDeclarationsReachTheHistoryRender() throws {
+        let inkling = try config("inkling2_loop")
+        let declared = Inkling2ToolDeclaration(name: "no_args_tool")
+        let prompt = ChatPromptFormatter.formatConversation(
+            turns: [.init(role: .user, text: "hi"), .init(role: .assistant, text: "hello")],
+            cleanSystem: system,
+            thinkingEnabled: false,
+            modelSupportsThinking: true,
+            modelConfig: inkling,
+            inklingTools: [declared]
+        )
+        XCTAssertTrue(prompt.hasPrefix(Inkling2PromptMarkers.familyDefault.system + "tool_declare"))
+        XCTAssertTrue(prompt.contains("\"description\":\"\""), "an absent description still renders as its default")
+    }
 }

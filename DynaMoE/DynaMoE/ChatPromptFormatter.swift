@@ -27,7 +27,8 @@ public enum ChatPromptFormatter {
         modelSupportsThinking: Bool,
         modelConfig: ModelConfig?,
         thinkingEffort: ThinkingEffort? = nil,
-        promptDialect: DeepSeekV41PromptDialect = DeepSeekV41PromptDialect()
+        promptDialect: DeepSeekV41PromptDialect = DeepSeekV41PromptDialect(),
+        inklingTools: [Inkling2ToolDeclaration] = []
     ) -> String {
         let thinkSuffix: String
         if thinkingEnabled {
@@ -55,7 +56,8 @@ public enum ChatPromptFormatter {
                     turns: turns,
                     effort: Self.inkling2Effort(
                         thinkingEnabled: thinkingEnabled, thinkingEffort: thinkingEffort
-                    )
+                    ),
+                    tools: inklingTools
                 )) ?? prompt
             }
         } else if modelConfig?.isDeepSeekV41Model == true {
@@ -402,7 +404,8 @@ public enum ChatPromptFormatter {
         modelSupportsThinking: Bool,
         modelConfig: ModelConfig?,
         thinkingEffort: ThinkingEffort? = nil,
-        promptDialect: DeepSeekV41PromptDialect = DeepSeekV41PromptDialect()
+        promptDialect: DeepSeekV41PromptDialect = DeepSeekV41PromptDialect(),
+        inklingTools: [Inkling2ToolDeclaration] = []
     ) -> String {
         guard !turns.isEmpty else { return "" }
 
@@ -439,7 +442,8 @@ public enum ChatPromptFormatter {
             }
             return (try? Inkling2Prompt().render(
                 turns: rendered,
-                effort: inkling2Effort(thinkingEnabled: thinkingEnabled, thinkingEffort: thinkingEffort)
+                effort: inkling2Effort(thinkingEnabled: thinkingEnabled, thinkingEffort: thinkingEffort),
+                tools: inklingTools
             )) ?? ""
         }
 
