@@ -148,6 +148,35 @@ nonisolated public enum Inkling2ToolDialect {
             + canonicalClose
     }
 
+    /// One call in the family's own block, for a stored turn whose raw call
+    /// text was lost (an edited turn, a reloaded session, a message carried over
+    /// from another dialect).
+    ///
+    /// The stored record's arguments are TEXT, so each value is parsed as JSON
+    /// when it parses and kept as a string otherwise -- the same rule the
+    /// template's `args` apply, since it refuses a string where it expects an
+    /// object but takes any JSON value inside one.
+    public static func renderCall(
+        name: String, arguments: [String: String], markers: Inkling2PromptMarkers = .familyDefault
+    ) -> String {
+        var fields: [String] = []
+        for key in arguments.keys.sorted() {
+            let raw = arguments[key] ?? ""
+            let value: MCPJSONValue
+            if let data = raw.data(using: .utf8), let parsed = MCPJSONValue(data: data) {
+                value = parsed
+            } else {
+                value = .string(raw)
+            }
+            fields.append(
+                Inkling2TemplateJSON.quoted(key) + ":" + Inkling2TemplateJSON.compact(value)
+            )
+        }
+        return markers.model + name + markers.contentInvokeToolJSON
+            + "{\"name\":" + Inkling2TemplateJSON.quoted(name) + ",\"args\":{" + fields.joined(separator: ",") + "}}"
+            + markers.endMessage
+    }
+
     // MARK: - Freezing
 
     /// True once a call block has closed, so generation stops before the model

@@ -5640,6 +5640,7 @@ public final class AgentHarness {
         isLingModel: Bool = false,
         isGemma4Model: Bool = false,
         isDeepSeekV41Model: Bool = false,
+        isInkling2Model: Bool = false,
         currentDate: Date = Date()
     ) -> String {
         var prompt = AgentHarness.formattedDateTimeContext(date: currentDate) + "\n\n"
@@ -5663,7 +5664,8 @@ public final class AgentHarness {
         prompt += Self.workerToolCallSyntaxSection(
             isLingModel: isLingModel,
             isGemma4Model: isGemma4Model,
-            isDeepSeekV41Model: isDeepSeekV41Model
+            isDeepSeekV41Model: isDeepSeekV41Model,
+            isInkling2Model: isInkling2Model
         )
         prompt += """
 
@@ -5702,10 +5704,14 @@ public final class AgentHarness {
     private static func workerToolCallSyntaxSection(
         isLingModel: Bool,
         isGemma4Model: Bool,
-        isDeepSeekV41Model: Bool
+        isDeepSeekV41Model: Bool,
+        isInkling2Model: Bool = false
     ) -> String {
         if isDeepSeekV41Model {
             return "\n\n" + DeepSeekV41ToolDialect.instructions() + "\n\n"
+        }
+        if isInkling2Model {
+            return "\n\n" + Inkling2ToolDialect.instructions() + "\n\n"
         }
         if isLingModel {
             return """
@@ -5813,7 +5819,7 @@ public final class AgentHarness {
         return prompt
     }
 
-    public func buildSystemPrompt(baseSystem: String, modelName: String? = nil, currentDate: Date = Date(), isLingModel: Bool = false, isGemma4Model: Bool = false, isDeepSeekV41Model: Bool = false, mode: AgentMode = .code) -> String {
+    public func buildSystemPrompt(baseSystem: String, modelName: String? = nil, currentDate: Date = Date(), isLingModel: Bool = false, isGemma4Model: Bool = false, isDeepSeekV41Model: Bool = false, isInkling2Model: Bool = false, mode: AgentMode = .code) -> String {
         var cleanBase = baseSystem.trimmingCharacters(in: .whitespacesAndNewlines)
         if cleanBase.isEmpty {
             cleanBase = "You are an expert AI software engineering and reasoning assistant with direct access to local macOS development tools."
@@ -5966,6 +5972,21 @@ public final class AgentHarness {
             - Distinguish official shipping hardware (vendor domains) from speculative rumors ("rumored", "leaked", "expected").
             - When `web_search` returns a result with is_official_domain: true, that result is verified. When ground_truth_notice is present, synthesize directly — do not loop or re-search.
             </IMPORTANT>
+            """
+        } else if isInkling2Model {
+            // The checkpoint's own template defines the call shape, so the
+            // instructions teach exactly that block rather than a generic one.
+            prompt += "\n\n" + Inkling2ToolDialect.instructions()
+            prompt += """
+
+
+            Web Research Grounding Rules:
+            - Live web data supersedes frozen pre-training memory. Never dismiss results as "hallucinated", "corrupted", or "parody" because names, specs, or prices are newer or unfamiliar.
+            - Official vendor domains (apple.com, developer.apple.com, github.com, etc.) returned by web_search/web_fetch are authentic ground truth. Synthesize directly without re-searching.
+            - NEVER invent URLs, article numbers, or chip generations. Only fetch URLs returned by web_search.
+
+            Tool Result Format & Reading Guidance:
+            Tool results arrive as text blocks after the tool's name, not as JSON, and may carry `--- content ---` sections, truncation markers and page hints. Read the content section as the actual file/page text; `next_start_line`/`continuation_hint` mean the result was paged, so call the tool again with that start line rather than assuming the document is broken.
             """
         } else if isDeepSeekV41Model {
             // The checkpoint's own call shape, measured from the published weights

@@ -4335,6 +4335,7 @@ struct ContentView: View {
                 isLingModel: modelConfig?.isLingModel == true,
                 isGemma4Model: modelConfig?.isGemma4Model == true,
                 isDeepSeekV41Model: modelConfig?.isDeepSeekV41Model == true,
+                isInkling2Model: modelConfig?.isInkling2Model == true,
                 mode: sessionMode
             )
         }
@@ -4605,6 +4606,70 @@ struct ContentView: View {
             } else {
                 promptString += "<|turn>model\n<|channel>thought\n<channel|>"
             }
+        } else if modelConfig?.isInkling2Model == true {
+            // The checkpoint's own turn structure, rebuilt from the stored
+            // session the same way the live continuation renders it: one
+            // `formatConversation` call, so a history replay and a live suffix
+            // cannot drift into two shapes (a tool result rendered differently
+            // from the one the model was trained on loses the prefix pin).
+            let markers = Inkling2PromptMarkers.familyDefault
+            func storedTurnText(_ raw: String, isAssistant: Bool) -> String {
+                var text = raw
+                    .replacingOccurrences(of: "<|im_start|>", with: "")
+                    .replacingOccurrences(of: "<|im_end|>", with: "")
+                    .replacingOccurrences(of: "<|endoftext|>", with: "")
+                    .replacingOccurrences(of: markers.endMessage, with: "")
+                    .replacingOccurrences(of: markers.contentModelEndSampling, with: "")
+                if isAssistant {
+                    text = text
+                        .replacingOccurrences(of: markers.model, with: "")
+                        .replacingOccurrences(of: markers.contentText, with: "")
+                        .replacingOccurrences(of: markers.contentThinking, with: "")
+                }
+                return text.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            var turns: [ChatPromptFormatter.ConversationTurn] = []
+            for msg in sessions[sessionIdx].messages.dropLast() {
+                let cleanMsg = storedTurnText(msg.content, isAssistant: msg.role == .assistant)
+                let hasTools = (msg.toolCalls != nil && !msg.toolCalls!.isEmpty)
+                let hasReasoning = !(msg.thinkingContent ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                guard !cleanMsg.isEmpty || hasReasoning || hasTools else { continue }
+                if msg.role == .user {
+                    turns.append(.init(role: .user, text: cleanMsg))
+                } else if msg.role == .assistant {
+                    var body = cleanMsg
+                    if hasReasoning {
+                        let think = msg.thinkingContent!.trimmingCharacters(in: .whitespacesAndNewlines)
+                        body = think + TurnTextSplitter.canonicalReasoningCloseTag + body
+                    }
+                    // A call the stored content no longer carries is rebuilt from
+                    // its record, in this family's own block.
+                    if let calls = msg.toolCalls, !calls.isEmpty,
+                       !cleanMsg.contains(markers.contentInvokeToolJSON) {
+                        for call in calls {
+                            let rendered = Inkling2ToolDialect.renderCall(
+                                name: call.name, arguments: call.arguments, markers: markers
+                            )
+                            body += (body.isEmpty ? "" : "\n") + rendered
+                        }
+                    }
+                    turns.append(.init(role: .assistant, text: body))
+                    for call in msg.toolCalls ?? [] {
+                        guard let output = call.output ?? call.error, !output.isEmpty else { continue }
+                        turns.append(.init(
+                            role: .user, text: output, kind: .toolResult(name: call.name)
+                        ))
+                    }
+                }
+            }
+            promptString = ChatPromptFormatter.formatConversation(
+                turns: turns,
+                cleanSystem: effectiveSystem,
+                thinkingEnabled: thinkingEnabled,
+                modelSupportsThinking: modelSupportsThinking,
+                modelConfig: modelConfig,
+                thinkingEffort: thinkingEffortLevel
+            )
         } else if isLing {
             let thinkingOption = thinkingEnabled ? "on" : "off"
             if !effectiveSystem.isEmpty {
@@ -8412,20 +8477,38 @@ struct ContentView: View {
                                 thinkingEnabled: thinkingEnabled,
                                 promptDialect: CompletionEngine.shared.promptDialect
                             )
+                        } else if modelConfig?.isInkling2Model == true {
+                            // The checkpoint's own tool message: the tool's name after the
+                            // role marker, then the payload as a text block. No assistant
+                            // prefix -- the template ends a prompt after the last message,
+                            // so generation begins right after the result's end marker.
+                            toolResponseTurn = allResponses.map { response in
+                                // The result JSON names its tool; the name is also
+                                // what the model saw in the call block, so a
+                                // result that lost it is named "tool" rather
+                                // than attributed to some other tool.
+                                let name = (try? JSONSerialization.jsonObject(
+                                    with: Data(response.utf8)
+                                ) as? [String: Any])?["tool"] as? String ?? "tool"
+                                return Inkling2ToolDialect.resultTurn(
+                                    name: name,
+                                    payload: AgentHarness.renderToolResultForModel(response)
+                                )
+                            }.joined()
                         } else {
                             toolResponseTurn = AgentHarness.shared.formatToolResponseTurn(
                                 responses: allResponses,
                                 includeThinkSuffix: thinkingEnabled
                             )
                         }
-                        let endTag = (modelConfig?.isGemma4Model == true) ? "<turn|>" : ((modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : ((modelConfig?.isDeepSeekV41Model == true) ? CompletionEngine.shared.promptDialect.markers.endOfSentence : "<|im_end|>")) )
+                        let endTag = (modelConfig?.isGemma4Model == true) ? "<turn|>" : ((modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : ((modelConfig?.isDeepSeekV41Model == true) ? CompletionEngine.shared.promptDialect.markers.endOfSentence : ((modelConfig?.isInkling2Model == true) ? Inkling2PromptMarkers.familyDefault.contentModelEndSampling : "<|im_end|>"))))
                         // Gemma keeps the tool call and its response in one model turn (no
                         // <turn|> between them), so the assistant text is not closed here and
                         // the response turn is appended with no separator. DeepSeek V4.1
                         // closes the call turn with its end-of-sentence marker and the result
                         // follows it directly, which is the shape the published probe used.
                         let assistantEndTag = isGemma4Continuation ? "" : endTag
-                        let continuationSeparator = (isGemma4Continuation || modelConfig?.isDeepSeekV41Model == true) ? "" : "\n"
+                        let continuationSeparator = (isGemma4Continuation || modelConfig?.isDeepSeekV41Model == true || modelConfig?.isInkling2Model == true) ? "" : "\n"
                         let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: assistantEndTag)
                         let staleNextPrompt = formattedPrompt + assistantTurnText + continuationSeparator + toolResponseTurn
                         // tools_load/tools_unload may have changed the registry THIS step;

@@ -95,7 +95,8 @@ final class AgentRunContext {
         baseSystem: String,
         isLingModel: Bool = false,
         isGemma4Model: Bool = false,
-        isDeepSeekV41Model: Bool = false
+        isDeepSeekV41Model: Bool = false,
+        isInkling2Model: Bool = false
     ) -> String {
         harness.buildWorkerSystemPrompt(
             baseSystem: baseSystem,
@@ -103,7 +104,8 @@ final class AgentRunContext {
             mode: mode,
             isLingModel: isLingModel,
             isGemma4Model: isGemma4Model,
-            isDeepSeekV41Model: isDeepSeekV41Model
+            isDeepSeekV41Model: isDeepSeekV41Model,
+            isInkling2Model: isInkling2Model
         )
     }
 

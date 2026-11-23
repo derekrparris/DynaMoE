@@ -780,9 +780,12 @@ public final class CompletionEngine: @unchecked Sendable {
             let inklingRunAgentTools = request.agentToolsEnabled && !request.forceSynthesis
             // The grammar mask's marker vocabulary is Qwen's, so it is NOT
             // installed for this family (the DeepSeek branch records the same
-            // reason). A tool freeze has nothing to key on yet: the Inkling tool
-            // dialect is Phase 4, so an agent turn here ends on EOS or the cap.
+            // reason): the checkpoint writes its own call block, and forcing a
+            // `<function=>` shape would fight what it was trained to emit. The
+            // freeze is keyed on that block instead, and argument validation
+            // still happens at execution.
             let inklingGrammarMaskActive = false
+            let inklingMarkers = Inkling2PromptMarkers.familyDefault
             let (stream, continuation) = AsyncStream.makeStream(
                 of: CompletionEvent.self, bufferingPolicy: .unbounded
             )
@@ -861,6 +864,10 @@ public final class CompletionEngine: @unchecked Sendable {
                                     token: inklingGrammarToken
                                 )
                             }
+                        },
+                        shouldFreeze: { text in
+                            guard inklingRunAgentTools else { return false }
+                            return Inkling2ToolDialect.shouldFreeze(text, markers: inklingMarkers)
                         },
                         decode: { ids in
                             (try? inklingTokenizer.decode(ids: ids)) ?? ""
@@ -955,9 +962,27 @@ public final class CompletionEngine: @unchecked Sendable {
                             inklingPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
                         )
                     )
-                    // Tool calls are Phase 4 for this family: no dialect is
-                    // installed, so nothing is parsed out of the text and an
-                    // agent turn ends on EOS or the cap.
+                    // Agent calls arrive in this checkpoint's own dialect
+                    // (a model message naming the tool, then its JSON). Rewriting
+                    // into the canonical block keeps the executor, HITL gating,
+                    // timeline and history on the one shared path every family
+                    // uses. An incomplete call is left as prose, and the freeze
+                    // above stops the turn at the first COMPLETE one.
+                    var inklingParsedCalls: [ParsedToolCall] = []
+                    var inklingGestureNotices: [Int: String] = [:]
+                    var inklingActionable: [Int] = []
+                    var inklingBroken: [String] = []
+                    if inklingRunAgentTools {
+                        let canonical = Inkling2ToolDialect.canonicalized(output.text, markers: inklingMarkers)
+                        let parsed = StreamingToolParser.shared.parseStreamingToolCalls(
+                            from: canonical, format: .qwenXML
+                        )
+                        let gestures = AgentHarness.splitGestureCalls(parsed.calls)
+                        inklingParsedCalls = parsed.calls
+                        inklingGestureNotices = gestures.skipNotices
+                        inklingActionable = gestures.actionableIndices
+                        inklingBroken = parsed.brokenFragments
+                    }
                     let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
                     emit(.finished(TurnResult(
                         finishReason: output.finishReason,
@@ -984,10 +1009,10 @@ public final class CompletionEngine: @unchecked Sendable {
                         prefetchEfficiencyPercent: 0,
                         pagingLatencyMs: 0,
                         prefixTokensReused: output.prefixTokensReused,
-                        parsedToolCalls: [],
-                        actionableCallIndices: [],
-                        gestureSkipNotices: [:],
-                        brokenFragments: [],
+                        parsedToolCalls: inklingParsedCalls,
+                        actionableCallIndices: inklingActionable,
+                        gestureSkipNotices: inklingGestureNotices,
+                        brokenFragments: inklingBroken,
                         matchedStopSequence: output.matchedStopSequence
                     )))
                 } catch {

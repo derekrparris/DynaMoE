@@ -814,7 +814,8 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
             mode: mode,
             isLingModel: config?.isLingModel == true,
             isGemma4Model: config?.isGemma4Model == true,
-            isDeepSeekV41Model: config?.isDeepSeekV41Model == true
+            isDeepSeekV41Model: config?.isDeepSeekV41Model == true,
+            isInkling2Model: config?.isInkling2Model == true
         )
     }
 }
