@@ -271,6 +271,57 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         }
     }
 
+    /// The DYNAMIC short convolution, which only full-attention layers run.
+    ///
+    /// Its two tap sets are indexed differently from the static kernel's, and
+    /// reading it as that kernel was the bug that left every local layer exact
+    /// and the first full one 5.6e-2 off: `static_weight` is `[kernel][channel]`
+    /// with index 0 the CURRENT token, and `weight_proj`'s rows are
+    /// `[head][lag]`. A channel-major read transposes the static taps and a
+    /// current-first pairing reverses both sets, so this fixture's per-channel
+    /// and per-tap values are distinct.
+    func testTheDynamicShortConvolutionMatchesTheHostRule() throws {
+        let (device, _, _) = try environment()
+        let headDim = 3, heads = 2, channels = headDim * heads
+        let tapCount = 4, historyRows = 3
+        let current = values(channels, seed: 31)
+        let history = values(historyRows * channels, seed: 32)
+        let staticTaps = values(tapCount * channels, seed: 33)
+        let dynamicTaps = values(heads * tapCount, seed: 34)
+        let currentBuffer = try buffer(device, current)
+        let historyBuffer = try buffer(device, history)
+        let staticBuffer = try buffer(device, staticTaps)
+        let dynamicBuffer = try buffer(device, dynamicTaps)
+        let outputBuffer = try buffer(device, [Float](repeating: 0, count: channels))
+        let channelsBuffer = try buffer(device, [UInt32(channels)])
+        let tapsCountBuffer = try buffer(device, [UInt32(tapCount)])
+        let historyRowsBuffer = try buffer(device, [UInt32(historyRows)])
+        let headDimBuffer = try buffer(device, [UInt32(headDim)])
+        try run("inkling_dynamic_conv_f32", threads: (channels, 1, 1), threadgroup: (32, 1, 1)) { encoder in
+            encoder.setBuffer(currentBuffer, offset: 0, index: 0)
+            encoder.setBuffer(historyBuffer, offset: 0, index: 1)
+            encoder.setBuffer(staticBuffer, offset: 0, index: 2)
+            encoder.setBuffer(dynamicBuffer, offset: 0, index: 3)
+            encoder.setBuffer(outputBuffer, offset: 0, index: 4)
+            encoder.setBuffer(channelsBuffer, offset: 0, index: 5)
+            encoder.setBuffer(tapsCountBuffer, offset: 0, index: 6)
+            encoder.setBuffer(historyRowsBuffer, offset: 0, index: 7)
+            encoder.setBuffer(headDimBuffer, offset: 0, index: 8)
+        }
+        let actual = read(outputBuffer, channels)
+        for channel in 0..<channels {
+            let head = channel / headDim
+            let channelHistory = (0..<historyRows).map { history[$0 * channels + channel] }
+            let expected = Inkling2Math.dynamicShortConvolution(
+                current: current[channel],
+                history: channelHistory,
+                staticWeights: (0..<tapCount).map { staticTaps[$0 * channels + channel] },
+                dynamicWeights: (0..<tapCount).map { dynamicTaps[head * tapCount + $0] }
+            )
+            XCTAssertEqual(actual[channel], expected, accuracy: 1e-6, "channel \(channel)")
+        }
+    }
+
     /// The message gate, at a width that is not a multiple of the threadgroup.
     func testTheMessageGateMatchesTheHostRule() throws {
         let (device, _, _) = try environment()
@@ -1363,6 +1414,10 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         )
         let promptIds = try tokenizer.encode(text: prompt).map { Int($0) }
         print("🔎 [inkling2 agent] prompt \(promptIds.count) token(s): \(prompt.debugDescription)")
+        // The reference prompt producer: `/tmp/inkling_tool_logits_ref.py` runs
+        // the pinned Transformers implementation over EXACTLY this text, and
+        // the per-position comparison is only meaningful while the two are the
+        // same bytes. Opt-in, because it returns before the model runs.
         if FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_prompt_only") {
             try prompt.write(toFile: "/tmp/inkling2_port_prompt.txt", atomically: true, encoding: .utf8)
             try promptIds.map(String.init).joined(separator: ",")
@@ -1390,33 +1445,34 @@ final class Inkling2DeviceKernelTests: XCTestCase {
             decode: decode
         )
         print("🔎 [inkling2 agent] call: \(call.finishReason.rawValue) \(call.text.debugDescription)")
-        // The pinned reference's first eight ids for this exact prompt (BF16,
+        // The pinned reference's first eight ids for this exact prompt (FP32,
         // greedy, `apply_chat_template` with the same tools and system block).
         // Comparing them is what separates "the graph diverges at this length"
         // from "the model deliberates longer here": the reference calls the tool
         // and these ids are its opening.
-        let referenceOpening: [UInt32] = [200001, 200008, 371, 150409, 159306, 149991, 149882, 151272]
+        //
+        // FP32 and not BF16: the reference's own BF16 run flips at index 4
+        // (`159306`) where its FP32 run keeps going (`171960`), so a bar taken
+        // from BF16 would fault this graph for the reference's rounding. The
+        // port matches the FP32 continuation for these eight ids and diverges
+        // after them; `Tools/inkling2_compare_logits.py` is what shows the
+        // per-position size of the remaining difference.
+        let referenceOpening: [UInt32] = [200001, 200008, 371, 150409, 171960, 149882, 151272, 150546]
         let opening = Array(call.generatedTokenIds.prefix(referenceOpening.count))
         print("🔎 [inkling2 agent] opening: \(opening)")
         print("🔎 [inkling2 agent] reference: \(referenceOpening)")
 
-        // The agent-continuation gate is recorded OPEN, not passed: the port
-        // agrees with the reference for the first four ids and then degrades
-        // into repetition, on this prompt and on a minimal one (a template
-        // declaration and one sentence), so the divergence is in the graph's
-        // numerical drift rather than in any prompt. The per-position case
-        // (`testTheHostRankingMatchesTheReferencePositionByPosition`) is what
-        // pins the size of that drift: logits within a few tenths on a ~20
-        // scale, inside the reference's own BF16 noise, yet enough to reorder
-        // near-ties and derail a long reasoning chain. Everything BELOW the call
-        // (the result turn's shape, the splice, the resume) is asserted from
-        // the frozen text this turn did produce, so a regression in the
-        // plumbing still fails here.
-        XCTAssertEqual(opening.prefix(4), referenceOpening.prefix(4), "the opening must track the reference")
+        // The gate: a complete call on the published checkpoint, frozen at its
+        // own block, whose arguments are the ones the question named, and a
+        // continuation after the result that carries the result's content.
+        // Both halves are asserted: the call alone proves the graph and the
+        // dialect, and the answer proves the result turn and the resume.
+        XCTAssertEqual(call.finishReason, .toolFreeze, "the call turn must freeze on its complete block")
+        XCTAssertEqual(opening, referenceOpening, "the opening must track the reference")
         let calls = Inkling2ToolDialect.callBlocks(in: call.text, markers: markers)
-        let firstCall = calls.first ?? (
-            name: "read_file", arguments: ["path": "/tmp/notes.txt"], raw: call.text
-        )
+        let firstCall = try XCTUnwrap(calls.first, "the frozen text carries no complete call")
+        XCTAssertEqual(firstCall.name, "read_file")
+        XCTAssertEqual(firstCall.arguments["path"] as? String, "/tmp/notes.txt")
 
         // The result the loop would hand back, rendered the way the harness does.
         let responseJSON = #"{"tool":"read_file","status":"success","result":{"path":"/tmp/notes.txt","content":"the answer is 42"}}"#
@@ -1431,7 +1487,11 @@ final class Inkling2DeviceKernelTests: XCTestCase {
             ? call.text : call.text + markers.contentModelEndSampling
         let continuation = prompt + callTurnText + resultTurn
         let continuationIds = try tokenizer.encode(text: continuation).map { Int($0) }
-        let endTagIds = try tokenizer.encode(text: markers.contentModelEndSampling).map { Int($0) }
+        // A turn that stopped at the end-sampling marker already carries it in
+        // `generatedTokenIds`; appending it again put a SECOND copy in the
+        // splice, which is what made the re-encode disagree at the end tag.
+        let endTagIds: [Int] = call.text.contains(markers.contentModelEndSampling)
+            ? [] : try tokenizer.encode(text: markers.contentModelEndSampling).map { Int($0) }
         let resultIds = try tokenizer.encode(text: resultTurn).map { Int($0) }
         let generatedIds: [Int] = call.generatedTokenIds.map { Int($0) }
         let splicedIds: [Int] = promptIds + generatedIds + endTagIds + resultIds
@@ -1475,10 +1535,13 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         print("🔎 [inkling2 agent] answer: \(answer.finishReason.rawValue) after \(answer.tokensGenerated) token(s)")
         print("🔎 [inkling2 agent] answer text: \(answer.text.debugDescription)")
         XCTAssertGreaterThan(answer.tokensGenerated, 0, "the continuation produced no token")
-        // The answer READING the result is the open half of the gate above: with
-        // the call turn already degraded, the continuation's content says
-        // nothing about the plumbing. It is printed rather than asserted, and
-        // the assertion returns when the call does.
+        // The result turn and the resume together: the answer can only carry
+        // this word if the spliced prompt resumed from the call's own cache and
+        // the tool result rendered as the template expects.
+        XCTAssertTrue(
+            answer.text.contains("42"),
+            "the answer after the tool result must carry the content it returned"
+        )
         withExtendedLifetime(engine) {}
     }
 
@@ -1494,12 +1557,29 @@ final class Inkling2DeviceKernelTests: XCTestCase {
     /// disagree, and that is the length a bisect needs.
     ///
     /// Opt-in with `/tmp/dynamoe_inkling2_agent_turn` (the dump) and the
-    /// reference JSON from `/tmp/inkling_tool_logits_ref.py`.
+    /// reference JSON from `INKLING_REF_DTYPE=float32 /tmp/inkling_tool_logits_ref.py`.
+    ///
+    /// FP32 is preferred and BF16 is the fallback: the reference disagrees with
+    /// itself between the two (its BF16 run flips an argmax at two positions
+    /// here), so a bar taken from BF16 faults this graph for the reference's
+    /// rounding. The FP32 dump is the yardstick; BF16 is only what an older
+    /// machine may have.
     func testTheHostRankingMatchesTheReferencePositionByPosition() throws {
+        // Opt-in: a host walk of the whole prompt is ~46 minutes, so this is a
+        // measurement rather than a gate. The DEVICE graph's per-position table
+        // (`testWhereTheDeviceContinuationLeavesTheReference`) is 100 seconds and
+        // is the one a turn's fidelity is judged on.
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_host_ranking"),
+            "opt-in host ranking; touch /tmp/dynamoe_inkling2_host_ranking to run"
+        )
         if FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_prompt_only") {
             throw XCTSkip("the agent case is in prompt-only mode")
         }
-        let referencePath = "/tmp/inkling2_tool_logits_ref.json"
+        let referencePath = ["/tmp/inkling2_tool_logits_ref_fp32.json", "/tmp/inkling2_tool_logits_ref.json"]
+            .first { FileManager.default.fileExists(atPath: $0) }
+            ?? "/tmp/inkling2_tool_logits_ref_fp32.json"
+        print("🔎 [inkling2 logits] reference: \(referencePath)")
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: referencePath)),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let promptIds = root["promptIds"] as? [Int],
@@ -1552,6 +1632,388 @@ final class Inkling2DeviceKernelTests: XCTestCase {
             }
             XCTAssertEqual(mine.first, expectedIds.first, "argmax at position \(position)")
             XCTAssertEqual(mineTop4, expectedTop4, "top-4 set at position \(position)")
+        }
+        withExtendedLifetime(engine) {}
+    }
+
+    // MARK: The shipped path's own logits
+
+    /// The DEVICE path's logits, position by position: the whole prompt, then
+    /// the reference's own greedy continuation, with the margin at the step this
+    /// port's run left it.
+    ///
+    /// The ranking case above measures the HOST graph, on the prompt only. A
+    /// turn runs `Inkling2MetalForward` over the prompt plus every token it has
+    /// generated, so "the continuation diverges at the ninth token" needs a
+    /// number no host table can give: the two distributions at that step. A
+    /// near tie is the model being sensitive, a clear flip is a stage bug, and
+    /// only the same input tells them apart.
+    ///
+    /// The reference is teacher-forced over exactly these ids
+    /// (`/tmp/inkling2_ref_tail.py`, which reproduces its own greedy run), so
+    /// every step up to the divergence is the reference's own path and only the
+    /// suffix after it is forced.
+    ///
+    /// Writes `/tmp/inkling2_port_device_rows.bin` (every position's full
+    /// logits, little-endian Float32, the input a stage bisect needs) beside
+    /// `/tmp/inkling2_port_device_rows.json`, and prints the table.
+    /// Opt-in with `/tmp/dynamoe_inkling2_tail`.
+    func testWhereTheDeviceContinuationLeavesTheReference() throws {
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_tail"),
+            "opt-in device divergence; touch /tmp/dynamoe_inkling2_tail to run"
+        )
+        let tailPath = ["/tmp/inkling2_tool_logits_tail_fp32.json", "/tmp/inkling2_tool_logits_tail.json"]
+            .first { FileManager.default.fileExists(atPath: $0) } ?? ""
+        guard let tailData = try? Data(contentsOf: URL(fileURLWithPath: tailPath)),
+              let tailRoot = try? JSONSerialization.jsonObject(with: tailData) as? [String: Any],
+              let promptIds = tailRoot["promptIds"] as? [Int],
+              let continuation = tailRoot["continuation"] as? [Int],
+              let tailPositions = tailRoot["positions"] as? [[String: Any]] else {
+            throw XCTSkip("no reference tail at \(tailPath): run /tmp/inkling2_ref_tail.py")
+        }
+        // The prompt's own table comes from the full-range dump when it exists:
+        // the tail file only carries the positions the continuation needs.
+        var reference: [Int: (ids: [Int], logits: [Double])] = [:]
+        func absorb(_ entries: [[String: Any]]) {
+            for entry in entries {
+                guard let position = entry["position"] as? Int,
+                      let ids = entry["ids"] as? [Int],
+                      let logits = entry["logits"] as? [Double] else { continue }
+                reference[position] = (ids, logits)
+            }
+        }
+        absorb(tailPositions)
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: "/tmp/inkling2_tool_logits_ref_fp32.json")),
+           let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let entries = root["positions"] as? [[String: Any]] {
+            absorb(entries)
+        }
+        print("🔎 [inkling2 device] reference: \(tailPath), \(reference.count) position(s)")
+        // The reference's full rows for the tail, so the cosine is over the whole
+        // vocabulary and not only over the eight ids both sides printed.
+        var fullReference: (first: Int, width: Int, rows: [Float])?
+        if let indexData = try? Data(contentsOf: URL(fileURLWithPath: "/tmp/inkling2_tool_logits_tail_fp32.index.json")),
+           let index = try? JSONSerialization.jsonObject(with: indexData) as? [String: Any],
+           let first = index["firstPosition"] as? Int,
+           let width = index["rowWidth"] as? Int,
+           let count = index["rowCount"] as? Int,
+           let bin = try? Data(contentsOf: URL(fileURLWithPath: "/tmp/inkling2_tool_logits_tail_fp32.bin")) {
+            let floats: [Float] = bin.withUnsafeBytes { raw in
+                (0..<(count * width)).map { raw.loadUnaligned(fromByteOffset: $0 * 4, as: Float.self) }
+            }
+            fullReference = (first, width, floats)
+        }
+
+        let snapshot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(Inkling2PublishedTensorTests.snapshotRelativePath)
+        guard FileManager.default.fileExists(atPath: snapshot.path) else {
+            throw XCTSkip("Inkling 2 snapshot is not downloaded at \(snapshot.path)")
+        }
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let summary = try engine.getSummary()
+        let config = try Inkling2Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let catalog = Inkling2WeightCatalog(
+            mainFile: summary.tensors.map { Inkling2TensorRef(metadata: $0) },
+            layerCount: config.numHiddenLayers
+        )
+        var shardBuffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            guard shard.length > 0,
+                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)) else { continue }
+            if let buffer = deviceBuffer(shard, pointer) { shardBuffers[shard.index] = buffer }
+        }
+        let source = Inkling2SnapshotWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
+        let forward = try Inkling2CPUForward(config: config, weights: source)
+        let (device, library, queue) = try environment()
+        let deviceWeights = Inkling2DeviceWeights(
+            config: config, catalog: catalog, shardBuffers: shardBuffers
+        )
+        let executor = try Inkling2MetalForward(
+            device: device, library: library, queue: queue, weights: deviceWeights, host: forward
+        )
+        let workspace = try Inkling2DeviceWorkspace(device: device, config: config, stagedPositions: 2_048)
+        forward.visitRunner = { layer, pass, hidden, blockStates, messages, position in
+            try executor.runVisit(
+                layer: layer, pass: pass, hidden: hidden, blockStates: &blockStates,
+                messages: messages, position: position, workspace: workspace
+            )
+        }
+        defer { forward.visitRunner = nil }
+
+        let inputIds = promptIds + continuation
+        var rows: [[Float]] = []
+        rows.reserveCapacity(inputIds.count)
+        let started = Date()
+        for (position, id) in inputIds.enumerated() {
+            rows.append(try forward.forwardToken(token: UInt32(id), position: position))
+        }
+        let elapsed = Date().timeIntervalSince(started)
+        print("🔎 [inkling2 device] walked \(inputIds.count) position(s) in \(round(elapsed * 10) / 10) s")
+
+        func ranking(_ values: [Float], _ count: Int) -> [Int] {
+            Array(values.indices.sorted { values[$0] > values[$1] }.prefix(count))
+        }
+        func cosine(_ a: [Float], _ b: ArraySlice<Float>) -> Double {
+            var dot = 0.0, left = 0.0, right = 0.0
+            for index in 0..<min(a.count, b.count) {
+                let value = Double(a[index])
+                let other = Double(b[b.startIndex + index])
+                dot += value * other
+                left += value * value
+                right += other * other
+            }
+            return dot / (left.squareRoot() * right.squareRoot())
+        }
+
+        // The prompt half: the same comparison the ranking case makes on the
+        // host, so the two paths' fidelity is one table apart.
+        var promptScored = 0, promptArgmax = 0, promptTop4 = 0
+        for position in 0..<min(promptIds.count, rows.count) {
+            guard let expected = reference[position] else { continue }
+            let mine = ranking(rows[position], 8)
+            promptScored += 1
+            if mine.first == expected.ids.first { promptArgmax += 1 }
+            if Set(mine.prefix(4)) == Set(expected.ids.prefix(4)) { promptTop4 += 1 }
+            guard mine.first != expected.ids.first || Set(mine.prefix(4)) != Set(expected.ids.prefix(4)) else {
+                continue
+            }
+            print("🔎 [inkling2 device] prompt \(position): mine \(mine.prefix(4)) ref \(expected.ids.prefix(4))")
+        }
+        print("🔎 [inkling2 device] prompt: argmax \(promptArgmax)/\(promptScored), top-4 \(promptTop4)/\(promptScored) against FP32")
+
+        // The continuation: every step's distribution, and the margin at the
+        // step the two paths part. This is the table the gate has been missing.
+        let promptCount = promptIds.count
+        var entries: [[String: Any]] = []
+        for step in 0..<continuation.count {
+            let position = promptCount + step
+            guard position < rows.count else { break }
+            let row = rows[position]
+            let mine = ranking(row, 8)
+            let following = step + 1 < continuation.count ? continuation[step + 1] : -1
+            var entry: [String: Any] = [
+                "position": position,
+                "step": step,
+                "inputId": continuation[step],
+                "following": following,
+                "ids": mine,
+                "logits": mine.map { Double(row[$0]) },
+            ]
+            if let expected = reference[position] {
+                entry["referenceIds"] = expected.ids
+                entry["referenceLogits"] = expected.logits
+            }
+            if let fullReference, position >= fullReference.first,
+               position < fullReference.first + fullReference.rows.count / max(1, fullReference.width) {
+                let offset = (position - fullReference.first) * fullReference.width
+                let slice = fullReference.rows[offset..<(offset + fullReference.width)]
+                entry["cosine"] = cosine(row, slice)
+            }
+            entries.append(entry)
+            let agrees: Bool? = reference[position].map { $0.ids.first == mine.first }
+            let detail: String
+            if let expected = reference[position] {
+                let margin = expected.logits[0] - expected.logits[1]
+                let rank = expected.ids.firstIndex(of: mine[0]).map { "#\($0 + 1)" } ?? "outside top-8"
+                detail = String(
+                    format: "ref %@ %.3f (margin %.3f), mine %@ %.3f (%@), next %d",
+                    String(describing: expected.ids[0]), expected.logits[0], margin,
+                    String(describing: mine[0]), row[mine[0]], rank, following
+                )
+            } else {
+                detail = "no reference row"
+            }
+            let verdict = agrees == true ? "agrees" : "DIFFERENT"
+            let cosineText = entry["cosine"].map { String(format: "%.6f", $0 as? Double ?? 0) } ?? "-"
+            print("🔎 [inkling2 device] step \(step) pos \(position) \(verdict): \(detail), cos \(cosineText)")
+        }
+
+        let flat = rows.flatMap { $0 }
+        try flat.withUnsafeBufferPointer { buffer in
+            try Data(buffer: buffer).write(to: URL(fileURLWithPath: "/tmp/inkling2_port_device_rows.bin"))
+        }
+        let dump: [String: Any] = [
+            "promptIds": promptIds,
+            "continuation": continuation,
+            "positionCount": rows.count,
+            "rowWidth": rows.first?.count ?? 0,
+            "reference": tailPath,
+            "seconds": elapsed,
+            "promptArgmaxAgreement": promptArgmax,
+            "promptTop4Agreement": promptTop4,
+            "promptScored": promptScored,
+            "positions": entries,
+        ]
+        try JSONSerialization.data(withJSONObject: dump, options: [.prettyPrinted])
+            .write(to: URL(fileURLWithPath: "/tmp/inkling2_port_device_rows.json"))
+        print("🔎 [inkling2 device] wrote \(rows.count) position(s) to /tmp/inkling2_port_device_rows.bin")
+        // Structural, so a truncated walk cannot read as a result: one row per
+        // input id at the checkpoint's own width, every value finite.
+        XCTAssertEqual(rows.count, inputIds.count, "a row per input position")
+        XCTAssertGreaterThan(rows.first?.count ?? 0, 0, "a non-empty vocabulary")
+        XCTAssertTrue(rows.allSatisfy { $0.allSatisfy(\.isFinite) }, "every logit finite")
+        withExtendedLifetime(engine) {}
+    }
+
+    // MARK: The whole device stack against the host
+
+    /// Visit by visit, the device executor's output against the host graph's,
+    /// on the real checkpoint at the real widths.
+    ///
+    /// `testTheDeviceVisitMatchesTheHostGraph` compares ONE visit, with a
+    /// synthetic hidden state and a one-entry stack, at a 3e-3 bar. A position
+    /// runs 48 visits over the same weights and its logits are the final read
+    /// over the whole stack, so a defect that only grows with the stack, with a
+    /// pass's messages, or with the visit index can stay invisible there while
+    /// the logits are already far from the host's. That is exactly what
+    /// happened: the dynamic K/V convolution of a FULL-attention layer read its
+    /// taps as the static one's channel-major, oldest-first layout, so visits
+    /// 0-4 (all local) agreed to 1e-6, the first full layer sat at 5.6e-2, and
+    /// the logits at position 0 were 2.3e-1 off the host until it was fixed.
+    ///
+    /// Position 0 covers every one of the 48 visits and is what the default run
+    /// takes; `/tmp/dynamoe_inkling2_visit_parity` adds position 1, which is the
+    /// only one that attends over a row of HISTORY. The bar is 1e-3 -- three
+    /// orders above the ~2e-6 this graph measures, and two below the defect it
+    /// exists to catch.
+    func testEveryVisitMatchesTheHostAtThePublishedWidths() throws {
+        let snapshot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(Inkling2PublishedTensorTests.snapshotRelativePath)
+        guard FileManager.default.fileExists(atPath: snapshot.path) else {
+            throw XCTSkip("Inkling 2 snapshot is not downloaded at \(snapshot.path)")
+        }
+        let tokenizer = try DynaMoeTokenizer(
+            tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+        )
+        // The agent gate's own prompt: the graph the turn runs, without the turn.
+        let tools = [Inkling2ToolDeclaration(
+            name: "read_file",
+            description: "Read a file from disk and return its contents.",
+            parameters: [
+                "type": .string("object"),
+                "properties": .object(["path": .object(["type": .string("string")])]),
+                "required": .array([.string("path")])
+            ]
+        )]
+        let prompt = try Inkling2Prompt().render(
+            turns: [
+                .system("You are a helpful assistant."),
+                .user([.text("Call read_file now with path /tmp/notes.txt, then tell me what it says.")])
+            ],
+            effort: 0, tools: tools
+        )
+        let promptIds = try tokenizer.encode(text: prompt).map { Int($0) }
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let summary = try engine.getSummary()
+        let config = try Inkling2Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let catalog = Inkling2WeightCatalog(
+            mainFile: summary.tensors.map { Inkling2TensorRef(metadata: $0) },
+            layerCount: config.numHiddenLayers
+        )
+        var shardBuffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            guard shard.length > 0,
+                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)) else { continue }
+            if let buffer = deviceBuffer(shard, pointer) { shardBuffers[shard.index] = buffer }
+        }
+        let source = Inkling2SnapshotWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
+        let host = try Inkling2CPUForward(config: config, weights: source)
+        // The device runs through the forward it is walking: `runVisit` reads
+        // `host.states` for the KV rows its kernels append to, so pointing it at
+        // a different forward would run the graph over a cache nobody wrote.
+        let deviceHost = try Inkling2CPUForward(config: config, weights: source)
+        let (device, library, queue) = try environment()
+        let deviceWeights = Inkling2DeviceWeights(
+            config: config, catalog: catalog, shardBuffers: shardBuffers
+        )
+        let metal = try Inkling2MetalForward(
+            device: device, library: library, queue: queue, weights: deviceWeights, host: deviceHost
+        )
+        let workspace = try Inkling2DeviceWorkspace(device: device, config: config, stagedPositions: 2_048)
+
+        var hostVisits: [Int: [Float]] = [:]
+        var hostOrder: [(index: Int, layer: Int, pass: Int)] = []
+        host.onVisitComplete = { index, layer, pass, output in
+            hostVisits[index] = output
+            hostOrder.append((index, layer, pass))
+        }
+        var deviceVisits: [Int: [Float]] = [:]
+
+        func worst(_ actual: [Float], _ expected: [Float]) -> (relative: Float, cosine: Double) {
+            guard actual.count == expected.count, !actual.isEmpty else { return (.infinity, 0) }
+            var scale: Float = 0, maximum: Float = 0, dot = 0.0, left = 0.0, right = 0.0
+            for index in 0..<actual.count {
+                scale = max(scale, abs(expected[index]))
+                maximum = max(maximum, abs(actual[index] - expected[index]))
+                let a = Double(actual[index]), b = Double(expected[index])
+                dot += a * b
+                left += a * a
+                right += b * b
+            }
+            return (scale > 0 ? maximum / scale : 0, dot / (left.squareRoot() * right.squareRoot()))
+        }
+
+        let extended = FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_visit_parity")
+        let positions = min(extended ? 2 : 1, promptIds.count)
+        for position in 0..<positions {
+            hostVisits.removeAll()
+            hostOrder.removeAll()
+            let hostLogits = try host.forwardToken(token: UInt32(promptIds[position]), position: position)
+
+            deviceVisits.removeAll()
+            deviceHost.visitRunner = { layer, pass, hidden, blockStates, messages, visitPosition in
+                let (output, queries) = try metal.runVisit(
+                    layer: layer, pass: pass, hidden: hidden, blockStates: &blockStates,
+                    messages: messages, position: visitPosition, workspace: workspace
+                )
+                if let index = try? deviceHost.visitIndex(layer: layer, pass: pass) {
+                    deviceVisits[index] = output
+                }
+                return (output, queries)
+            }
+            let deviceLogits = try deviceHost.forwardToken(token: UInt32(promptIds[position]), position: position)
+            deviceHost.visitRunner = nil
+
+            let logits = worst(deviceLogits, hostLogits)
+            print(String(
+                format: "🔎 [inkling2 parity] position %d logits: rel %.3e cos %.6f",
+                position, logits.relative, logits.cosine
+            ))
+            var firstBad: Int?
+            var worstVisit: (index: Int, relative: Float) = (-1, 0)
+            for entry in hostOrder {
+                guard let expected = hostVisits[entry.index], let actual = deviceVisits[entry.index] else {
+                    print("🔎 [inkling2 parity] visit \(entry.index) missing on one side")
+                    continue
+                }
+                let error = worst(actual, expected)
+                if error.relative > worstVisit.relative {
+                    worstVisit = (entry.index, error.relative)
+                }
+                if firstBad == nil && error.relative > 1e-2 {
+                    firstBad = entry.index
+                }
+                print(String(
+                    format: "🔎 [inkling2 parity] visit %2d layer %2d pass %d: rel %.3e cos %.6f",
+                    entry.index, entry.layer, entry.pass, error.relative, error.cosine
+                ))
+            }
+            print("🔎 [inkling2 parity] position \(position): first visit over 1e-2 = \(firstBad.map(String.init) ?? "none"), worst \(worstVisit.index) at \(worstVisit.relative)")
+            // Structural: every visit ran on both sides and the loop's own
+            // schedule is the same one -- a missing visit would otherwise read
+            // as "no visit over the bar".
+            XCTAssertEqual(deviceVisits.count, hostVisits.count, "every visit on both sides")
+            XCTAssertLessThanOrEqual(
+                logits.relative, 1e-3, "position \(position)'s logits against the host"
+            )
+            XCTAssertLessThanOrEqual(
+                worstVisit.relative, 1e-3, "visit \(worstVisit.index) at position \(position)"
+            )
         }
         withExtendedLifetime(engine) {}
     }
