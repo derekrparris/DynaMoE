@@ -815,14 +815,30 @@ final class Inkling2PromptTests: XCTestCase {
     }
 
     func testAnImageRendersAsThePlaceholderPairAndOnlyOnUserOrToolTurns() throws {
+        let grid = Inkling2ImageGrid(cellRows: 2, cellColumns: 3)
         XCTAssertEqual(
-            try prompt.render(turns: [.user([.image, .text("What is this?")])]),
+            try prompt.render(turns: [.user([.image(grid), .text("What is this?")])]),
             "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>"
                 + "<|message_user|><|content_image|><|unused_200054|><|end_message|>"
                 + "<|content_text|>What is this?<|end_message|>"
         )
-        XCTAssertThrowsError(try prompt.render(parts: [.image], role: "assistant")) { error in
+        XCTAssertThrowsError(try prompt.render(parts: [.image(grid)], role: "assistant")) { error in
             XCTAssertEqual(error as? Inkling2PromptError, .imageNotSupportedHere("assistant"))
+        }
+        // The template's placeholder is ONE token per image, not one per cell:
+        // the expansion to `languagePositions` markers happens after
+        // tokenization (`Inkling2ImagePrompt`), so the rendered prompt still
+        // matches the checkpoint's own template byte for byte.
+        let rendered = try prompt.render(turns: [.user([.image(grid)])])
+        let occurrences = rendered.components(separatedBy: prompt.markers.imagePlaceholder).count - 1
+        XCTAssertEqual(occurrences, 1)
+        XCTAssertEqual(grid.languagePositions, 6)
+        // A grid with no cells would expand to nothing and shift every later
+        // position, so the prompt refuses it by name.
+        XCTAssertThrowsError(
+            try prompt.render(parts: [.image(Inkling2ImageGrid(cellRows: 0, cellColumns: 2))], role: "user")
+        ) { error in
+            XCTAssertEqual(error as? Inkling2PromptError, .invalidImageGrid(rows: 0, columns: 2))
         }
         // No assistant prefix: generation starts right after the last turn.
         XCTAssertEqual(prompt.assistantPrefix, "")
@@ -2420,22 +2436,32 @@ private final class ScriptedInklingForward: Inkling2PositionForward {
     let positionLimit: Int
     private(set) var storedPositions = 0
     private(set) var forwarded: [Int] = []
+    private(set) var forwardedRows: [(position: Int, first: Float)] = []
+    private(set) var prefixProposals: [Int] = []
     private(set) var resets = 0
     /// Logits per forwarded position, cycled.
     var logits: [[Float]]
     var failAt: Int?
+    /// What `reusablePrefix` answers, capped by the proposal.
+    var prefixAnswer = 0
+    /// False makes `forwardRow` refuse, like an executor with no image seam.
+    var supportsRows = true
 
     init(positionLimit: Int = 64, logits: [[Float]]) {
         self.positionLimit = positionLimit
         self.logits = logits
     }
 
-    func reusablePrefix(proposedPrefix: Int, promptTokenIds: [Int]) -> Int { 0 }
+    func reusablePrefix(proposedPrefix: Int, promptTokenIds: [Int]) -> Int {
+        prefixProposals.append(proposedPrefix)
+        return min(prefixAnswer, proposedPrefix)
+    }
 
     func reset() {
         resets += 1
         storedPositions = 0
         forwarded.removeAll()
+        forwardedRows.removeAll()
     }
 
     func forwardToken(_ token: Int, position: Int) throws -> [Float] {
@@ -2444,7 +2470,16 @@ private final class ScriptedInklingForward: Inkling2PositionForward {
         }
         forwarded.append(token)
         storedPositions += 1
-        return logits[forwarded.count % logits.count]
+        return logits[storedPositions % logits.count]
+    }
+
+    func forwardRow(_ row: [Float], position: Int) throws -> [Float] {
+        guard supportsRows else {
+            throw Inkling2TurnError.imageRowsNotSupported(position: position)
+        }
+        forwardedRows.append((position, row.first ?? 0))
+        storedPositions += 1
+        return logits[storedPositions % logits.count]
     }
 }
 
@@ -2512,6 +2547,102 @@ final class Inkling2TurnTests: XCTestCase {
         XCTAssertTrue(cancelled.cancelled)
         XCTAssertEqual(cancelled.storedPromptTokens, 6)
         XCTAssertEqual(forward.forwarded, Array(prompt.prefix(6)))
+    }
+
+    /// A supplied row is forwarded where the prompt says, in prompt order, and
+    /// the positions the map does not name still go through the token
+    /// embedding. Getting this backwards would either embed a marker token the
+    /// checkpoint never trained as a row or skip text positions entirely.
+    func testImageRowsRunAtTheirOwnPositions() throws {
+        var logits = [Float](repeating: 0, count: 16)
+        logits[9] = 10
+        let forward = ScriptedInklingForward(logits: [logits])
+        let marker = 200054
+        let prompt = [1, marker, 2, marker, 3]
+        let output = try Inkling2TurnRunner.run(
+            forward: forward, promptTokenIds: prompt,
+            imageRows: [1: [0.25], 3: [0.75]],
+            settings: settings(maxTokens: 2),
+            sample: greedy, decode: { $0.map(String.init).joined() }
+        )
+        XCTAssertEqual(output.finishReason, .eos)
+        XCTAssertEqual(output.promptTokens, 5)
+        XCTAssertEqual(forward.forwarded, [1, 2, 3], "the markers never reach the embedding lookup")
+        XCTAssertEqual(forward.forwardedRows.map(\.position), [1, 3])
+        XCTAssertEqual(forward.forwardedRows.map(\.first), [0.25, 0.75])
+    }
+
+    /// Two pictures of the same size expand to IDENTICAL marker ids, so a
+    /// matching id prefix does not mean the cache holds the same rows: an
+    /// image-bearing prompt must never resume, and the executor must not even
+    /// be asked.
+    func testAnImagePromptNeverResumesAPrefix() throws {
+        var logits = [Float](repeating: 0, count: 16)
+        logits[9] = 10
+        let forward = ScriptedInklingForward(logits: [logits])
+        forward.prefixAnswer = 3
+        let marker = 200054
+        let output = try Inkling2TurnRunner.run(
+            forward: forward, promptTokenIds: [1, marker, 2],
+            imageRows: [1: [0.5]], prefixTokens: 2,
+            settings: settings(maxTokens: 2),
+            sample: greedy, decode: { $0.map(String.init).joined() }
+        )
+        XCTAssertEqual(output.prefixTokensReused, 0)
+        XCTAssertTrue(forward.prefixProposals.isEmpty, "an image prompt must not propose a resume")
+        XCTAssertEqual(forward.forwarded, [1, 2])
+        // The same proposal without rows DOES resume, which is what makes the
+        // rule above a rule about rows and not about prefix reuse in general.
+        let text = ScriptedInklingForward(logits: [logits])
+        text.prefixAnswer = 2
+        let resumed = try Inkling2TurnRunner.run(
+            forward: text, promptTokenIds: [1, 2, 3], prefixTokens: 2,
+            settings: settings(maxTokens: 2),
+            sample: greedy, decode: { $0.map(String.init).joined() }
+        )
+        XCTAssertEqual(resumed.prefixTokensReused, 2)
+        XCTAssertEqual(text.forwarded, [3])
+    }
+
+    func testAnImageRowOutsideThePromptIsRefused() throws {
+        var logits = [Float](repeating: 0, count: 16)
+        logits[5] = 10
+        let forward = ScriptedInklingForward(logits: [logits])
+        XCTAssertThrowsError(
+            try Inkling2TurnRunner.run(
+                forward: forward, promptTokenIds: [1, 2],
+                imageRows: [2: [0.5]],
+                settings: settings(maxTokens: 1),
+                sample: greedy, decode: { $0.map(String.init).joined() }
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? Inkling2TurnError,
+                .imageRowOutOfRange(position: 2, promptTokens: 2)
+            )
+        }
+        XCTAssertTrue(forward.forwarded.isEmpty)
+    }
+
+    func testAnExecutorWithNoImageSeamRefusesARowByName() throws {
+        var logits = [Float](repeating: 0, count: 16)
+        logits[5] = 10
+        let forward = ScriptedInklingForward(logits: [logits])
+        forward.supportsRows = false
+        XCTAssertThrowsError(
+            try Inkling2TurnRunner.run(
+                forward: forward, promptTokenIds: [1, 200054],
+                imageRows: [1: [0.5]],
+                settings: settings(maxTokens: 1),
+                sample: greedy, decode: { $0.map(String.init).joined() }
+            )
+        ) { error in
+            guard case .prefillFailed(let position, let underlying)? = error as? Inkling2TurnError else {
+                return XCTFail("unexpected error: \(error)")
+            }
+            XCTAssertEqual(position, 1)
+            XCTAssertTrue(underlying.contains("cannot forward a supplied embedding"), underlying)
+        }
     }
 
     func testATurnStopsAtEos() throws {

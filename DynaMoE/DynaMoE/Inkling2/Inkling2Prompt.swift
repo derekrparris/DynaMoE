@@ -261,6 +261,7 @@ nonisolated public enum Inkling2PromptError: Error, Equatable, CustomStringConve
     case effortOutOfRange(Float)
     case unknownRole(String)
     case imageNotSupportedHere(String)
+    case invalidImageGrid(rows: Int, columns: Int)
     case emptyToolName
 
     public var description: String {
@@ -271,6 +272,8 @@ nonisolated public enum Inkling2PromptError: Error, Equatable, CustomStringConve
             return "unknown message role: \(role)"
         case .imageNotSupportedHere(let role):
             return "image content is only supported for user and tool messages, not \(role)"
+        case .invalidImageGrid(let rows, let columns):
+            return "an image grid of \(rows)x\(columns) cells has no language positions"
         case .emptyToolName:
             return "a tool message must name the tool whose result it carries"
         }
@@ -283,8 +286,11 @@ nonisolated public enum Inkling2PromptError: Error, Equatable, CustomStringConve
 nonisolated public enum Inkling2ContentPart: Sendable, Equatable {
     case text(String)
     /// An attachment, which the template renders as
-    /// `<|content_image|><|unused_200054|>`; the tower runs later.
-    case image
+    /// `<|content_image|><|unused_200054|>`. The grid is what the marker
+    /// expands to after tokenization -- one marker per cell -- so it belongs to
+    /// the part rather than to a caller's side array; the tower's rows travel
+    /// in the turn plan (`Inkling2ImagePrompt`).
+    case image(Inkling2ImageGrid)
 
     public static func parts(from content: String) -> [Inkling2ContentPart] { [.text(content)] }
 }
@@ -462,14 +468,47 @@ nonisolated public struct Inkling2Prompt: Sendable {
             switch part {
             case .text(let text):
                 output += markers.contentText + text + markers.endMessage
-            case .image:
+            case .image(let grid):
                 guard role == "user" || role == "tool" else {
                     throw Inkling2PromptError.imageNotSupportedHere(role)
+                }
+                // The template writes one placeholder per image; the cell count
+                // is what it expands to after tokenization. A grid with no cells
+                // would expand to nothing, so it is refused by name here rather
+                // than shrinking the span the caller priced.
+                guard grid.isValid else {
+                    throw Inkling2PromptError.invalidImageGrid(
+                        rows: grid.cellRows, columns: grid.cellColumns
+                    )
                 }
                 output += markers.contentImage + markers.imagePlaceholder + markers.endMessage
             }
         }
         return output
+    }
+
+    /// Every attachment's grid in RENDER ORDER, which is the order the marker
+    /// tokens appear in after tokenization.
+    ///
+    /// A caller holding encoded spans builds them in this order, so a picture
+    /// cannot land on another picture's markers: `Inkling2ImagePrompt.expand`
+    /// consumes placeholders and spans left to right and refuses a count
+    /// mismatch, and this is what makes "left to right" the conversation's own
+    /// order rather than a caller's guess.
+    public static func imageGrids(in turns: [Inkling2Turn]) -> [Inkling2ImageGrid] {
+        func grids(in parts: [Inkling2ContentPart]) -> [Inkling2ImageGrid] {
+            parts.compactMap {
+                if case .image(let grid) = $0 { return grid }
+                return nil
+            }
+        }
+        return turns.flatMap { turn -> [Inkling2ImageGrid] in
+            switch turn {
+            case .system, .assistant: return []
+            case .user(let parts): return grids(in: parts)
+            case .tool(_, let parts): return grids(in: parts)
+            }
+        }
     }
 
     /// What a live turn appends after the prompt before the model writes: the

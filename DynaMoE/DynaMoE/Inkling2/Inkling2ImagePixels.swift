@@ -37,6 +37,29 @@ nonisolated public enum Inkling2ImagePixelsError: LocalizedError, Equatable {
     }
 }
 
+// MARK: - Grid
+
+/// The cell grid a picture occupies in the prompt: `ceil(height / 40)` by
+/// `ceil(width / 40)`.
+///
+/// It is the one number the prompt, the span arithmetic and the tower's layout
+/// have to agree on, so it is a type rather than a pair of ints. A grid with no
+/// cells is refused by the prompt and by the expansion rather than shrinking a
+/// picture's span to nothing, which would silently shift every later position.
+nonisolated public struct Inkling2ImageGrid: Sendable, Equatable {
+    public let cellRows: Int
+    public let cellColumns: Int
+
+    public init(cellRows: Int, cellColumns: Int) {
+        self.cellRows = cellRows
+        self.cellColumns = cellColumns
+    }
+
+    public var isValid: Bool { cellRows > 0 && cellColumns > 0 }
+    /// Language-token positions the picture costs, one per cell.
+    public var languagePositions: Int { cellRows * cellColumns }
+}
+
 nonisolated public enum Inkling2ImagePixels {
     /// One language-token cell, matching the image processor's fixed size.
     public static let cellSide = 40
@@ -67,7 +90,11 @@ nonisolated public enum Inkling2ImagePixels {
         public var cellRows: Int
         public var cellColumns: Int
 
-        public var languagePositions: Int { cellRows * cellColumns }
+        public var grid: Inkling2ImageGrid {
+            Inkling2ImageGrid(cellRows: cellRows, cellColumns: cellColumns)
+        }
+
+        public var languagePositions: Int { grid.languagePositions }
     }
 
     /// Decodes `data` (any format ImageIO reads) into upright RGB, applying EXIF

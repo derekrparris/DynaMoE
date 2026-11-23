@@ -39,6 +39,8 @@ nonisolated public enum Inkling2TurnError: Error, Equatable, CustomStringConvert
     case emptyPrompt
     case promptTooLong(promptTokens: Int, limit: Int)
     case prefillFailed(position: Int, underlying: String)
+    case imageRowOutOfRange(position: Int, promptTokens: Int)
+    case imageRowsNotSupported(position: Int)
 
     public var description: String {
         switch self {
@@ -49,6 +51,12 @@ nonisolated public enum Inkling2TurnError: Error, Equatable, CustomStringConvert
                 + "\(limit); raise the max-token budget or shorten the prompt."
         case .prefillFailed(let position, let underlying):
             return "❌ Inkling 2 prefill failed at position \(position): \(underlying)"
+        case .imageRowOutOfRange(let position, let promptTokens):
+            return "❌ Inkling 2 was given an image row for position \(position), but the prompt "
+                + "is \(promptTokens) tokens long."
+        case .imageRowsNotSupported(let position):
+            return "❌ Inkling 2 was given an image row for position \(position), but this "
+                + "executor cannot forward a supplied embedding."
         }
     }
 }
@@ -76,6 +84,15 @@ nonisolated public protocol Inkling2PositionForward: AnyObject {
     func reset()
     /// Appends one position and returns its logits.
     func forwardToken(_ token: Int, position: Int) throws -> [Float]
+    /// Appends one position whose residual row is SUPPLIED rather than looked
+    /// up: a vision tower's per-cell output.
+    ///
+    /// The reference scatters image rows into the token embeddings after the
+    /// embedding norm has been applied to the token rows, so an executor must
+    /// NOT normalize a supplied row. The default refuses by name, because an
+    /// executor that silently looked the marker token up instead would run a
+    /// different graph and answer about nothing.
+    func forwardRow(_ row: [Float], position: Int) throws -> [Float]
 }
 
 public extension Inkling2PositionForward {
@@ -83,6 +100,10 @@ public extension Inkling2PositionForward {
     /// A wrong resume mixes two sequences with no error anywhere, which is worse
     /// than re-prefilling.
     func reusablePrefix(proposedPrefix: Int, promptTokenIds: [Int]) -> Int { 0 }
+
+    func forwardRow(_ row: [Float], position: Int) throws -> [Float] {
+        throw Inkling2TurnError.imageRowsNotSupported(position: position)
+    }
 }
 
 // MARK: - The host forward as a position source
@@ -106,6 +127,21 @@ extension Inkling2CPUForward: Inkling2PositionForward {
 
     public func forwardToken(_ token: Int, position: Int) throws -> [Float] {
         try forwardToken(token: UInt32(token), position: position)
+    }
+
+    public func forwardRow(_ row: [Float], position: Int) throws -> [Float] {
+        guard row.count == config.hiddenSize else {
+            throw Inkling2ForwardError.shapeMismatch(
+                "an image row is \(row.count) wide, expected \(config.hiddenSize)"
+            )
+        }
+        let logits = try forwardHidden(row, position: position)
+        // Recorded with the marker id, which is what the prompt's token at this
+        // position IS. The history still cannot prove which PICTURE ran -- two
+        // same-sized pictures produce identical ids -- which is why an
+        // image-bearing turn never resumes a prefix (see `Inkling2TurnRunner`).
+        sequence.record(token: config.imageTokenID)
+        return logits
     }
 }
 
@@ -171,7 +207,10 @@ nonisolated public enum Inkling2TurnRunner {
     /// - Parameters:
     ///   - forward: the executor. Its cache is reset unless `prefixTokens` says
     ///     part of this prompt is resident.
-    ///   - promptTokenIds: the rendered prompt, already tokenized.
+    ///   - promptTokenIds: the rendered prompt, already tokenized and, for a
+    ///     picture, already EXPANDED (one marker per language cell).
+    ///   - imageRows: expanded prompt position -> the tower's residual row for
+    ///     it, empty for a text-only prompt.
     ///   - prefixTokens: leading prompt positions the cache already holds.
     ///   - settings: sampling and the turn's stop conditions.
     ///   - sample: draws one id from a position's logits, given the ids so far.
@@ -190,6 +229,7 @@ nonisolated public enum Inkling2TurnRunner {
     static func run(
         forward: any Inkling2PositionForward,
         promptTokenIds: [Int],
+        imageRows: [Int: [Float]] = [:],
         prefixTokens: Int = 0,
         prefillChunk: Int = 8,
         settings: Settings,
@@ -206,11 +246,21 @@ nonisolated public enum Inkling2TurnRunner {
         guard promptTokenIds.count <= limit else {
             throw Inkling2TurnError.promptTooLong(promptTokens: promptTokenIds.count, limit: limit)
         }
+        for position in imageRows.keys where position < 0 || position >= promptTokenIds.count {
+            throw Inkling2TurnError.imageRowOutOfRange(
+                position: position, promptTokens: promptTokenIds.count
+            )
+        }
         // The proposal is advisory: the executor knows what it actually holds,
         // and a resumed prefix that disagreed with the cache would mix two
         // sequences with no error anywhere. So it decides, and the prefill
         // starts at ITS answer.
-        let proposed = max(0, min(prefixTokens, promptTokenIds.count - 1))
+        //
+        // A supplied row is the one thing an id prefix cannot vouch for: two
+        // pictures of the same size expand to IDENTICAL marker ids, so a matching
+        // history says nothing about whose rows the cache holds. An
+        // image-bearing prompt therefore never resumes.
+        let proposed = imageRows.isEmpty ? max(0, min(prefixTokens, promptTokenIds.count - 1)) : 0
         let reusable = proposed > 0
             ? forward.reusablePrefix(proposedPrefix: proposed, promptTokenIds: promptTokenIds)
             : 0
@@ -242,7 +292,11 @@ nonisolated public enum Inkling2TurnRunner {
             }
             for index in position..<end {
                 do {
-                    logits = try forward.forwardToken(promptTokenIds[index], position: index)
+                    if let row = imageRows[index] {
+                        logits = try forward.forwardRow(row, position: index)
+                    } else {
+                        logits = try forward.forwardToken(promptTokenIds[index], position: index)
+                    }
                 } catch {
                     throw Inkling2TurnError.prefillFailed(position: index, underlying: "\(error)")
                 }

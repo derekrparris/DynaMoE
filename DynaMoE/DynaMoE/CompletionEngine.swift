@@ -339,6 +339,32 @@ public final class CompletionEngine: @unchecked Sendable {
     /// turn then runs wholly on the host.
     private var cachedInklingDevice: (path: String, contextLength: Int, executor: Inkling2MetalForward, workspace: Inkling2DeviceWorkspace)?
 
+    /// The Inkling 2 image tower, built on the first image turn and kept.
+    ///
+    /// Its init reads the checkpoint's ~400 vision tensors out of the shards and
+    /// decodes every one into an FP32 array, so a per-turn build would re-read
+    /// most of a gigabyte before the first cell was encoded. Retired with the
+    /// checkpoint, like the forward it shares its weight source with.
+    private var cachedInklingVision: (path: String, forward: Inkling2VisionForward)?
+    /// Encoded image spans for this family, keyed by `snapshot path | sha256`.
+    ///
+    /// The tower is the most expensive step of an image turn -- minutes on the
+    /// host graph -- and a conversation addresses the same few pictures over
+    /// and over, so a digest hit skips it. Bounded like the DeepSeek cache: the
+    /// rows are `textHiddenSize` floats per cell and a full cache of them is
+    /// megabytes.
+    private var cachedInklingImageSpans: [String: Inkling2ImagePrompt.ImageSpan] = [:]
+    private static let inklingImageSpanCacheLimit = 4
+
+    /// Why the last Inkling turn's Metal visit runner was or was not installed.
+    ///
+    /// A host fallback is CORRECT and catastrophically slower (minutes per
+    /// token against a fraction of a second), and the only other evidence is a
+    /// unified-log line. This makes it assertable: a test that expects the
+    /// device path reads it after `launchTurn` returns, and a developer with a
+    /// slow turn can see which of the four reasons applies.
+    private(set) var inklingDeviceHalfStatus = "not attempted"
+
     /// Encoded image spans, keyed by `snapshot path | image sha256`.
     ///
     /// A chat turn re-renders the whole conversation, so a picture that stays in
@@ -588,8 +614,10 @@ public final class CompletionEngine: @unchecked Sendable {
         // Only the DeepSeek V4.1 branch below reads pixels. Every other family
         // would take the generic loop, which never looks at `request.images`, so an
         // attachment there would be dropped in silence and the model would answer
-        // about a picture it never saw. Fail closed instead.
-        if let config = modelConfig, !config.isDeepSeekV41Model, !request.images.isEmpty {
+        // about a picture it never saw. Fail closed instead. The two families
+        // whose own branches DO read pixels are exempt.
+        if let config = modelConfig, !config.isDeepSeekV41Model,
+           !config.isInkling2Model, !request.images.isEmpty {
             stateLock.unlock()
             throw CompletionLaunchError.engineNotReady(
                 "❌ \(request.images.count == 1 ? "An image was" : "\(request.images.count) images were") "
@@ -628,12 +656,25 @@ public final class CompletionEngine: @unchecked Sendable {
                     "⚠️ Inkling 2 Mini config.json could not be decoded: \(error)"
                 )
             }
-            // No tower is wired for this family, and dropping pixels in silence
-            // would answer about a picture the model never saw.
+            // Pictures: the template writes ONE placeholder per attachment and
+            // this family's processor expands it to one marker per 40-pixel
+            // language cell, so the prompt the cache and the sampler see is the
+            // EXPANDED one. A checkpoint without a `vision_config` has no tower,
+            // and silently dropping pixels would answer about a picture the
+            // model never saw.
             if !request.images.isEmpty {
-                throw CompletionLaunchError.engineNotReady(
-                    "⚠️ Inkling 2 Mini has no image path in this build, so an attached image cannot be seen."
-                )
+                guard inklingConfig.vision != nil else {
+                    throw CompletionLaunchError.engineNotReady(
+                        "⚠️ Inkling 2 Mini's checkpoint publishes no vision_config, so an attached "
+                            + "image cannot be seen."
+                    )
+                }
+                for (index, image) in request.images.enumerated() where !image.isWellFormed {
+                    throw CompletionLaunchError.engineNotReady(
+                        "⚠️ Image \(index + 1) is \(image.width)x\(image.height) but carries "
+                            + "\(image.rgb.count) bytes, so its pixels cannot be bound."
+                    )
+                }
             }
             guard !request.promptTokenIds.isEmpty else {
                 throw CompletionLaunchError.engineNotReady(
@@ -658,6 +699,43 @@ public final class CompletionEngine: @unchecked Sendable {
                 budgetGB: request.memory.budgetMode.targetMaxRssGB
             )
 
+            // Price the image expansion BEFORE the tower runs: one placeholder
+            // per image becomes one marker per 40-pixel cell, and the tower is
+            // minutes on the host graph, so an impossible prompt must be
+            // refused now rather than after it. A continuation arrives already
+            // expanded and carries its spans, so its length is its own.
+            let carriedImageSpans = request.imageSpans
+            let imageGrids: [Inkling2ImageGrid] = request.images.map { image in
+                let cell = Inkling2VisionSpec.cellSize
+                return Inkling2ImageGrid(
+                    cellRows: max(1, (image.height + cell - 1) / cell),
+                    cellColumns: max(1, (image.width + cell - 1) / cell)
+                )
+            }
+            let pricedPromptTokens: Int
+            if carriedImageSpans.isEmpty {
+                let marker = UInt32(clamping: inklingConfig.imageTokenID)
+                let placeholders = request.promptTokenIds.reduce(0) { $0 + ($1 == marker ? 1 : 0) }
+                guard placeholders == request.images.count else {
+                    throw CompletionLaunchError.engineNotReady(
+                        "⚠️ Inkling 2's prompt has \(placeholders) image placeholder(s) but "
+                            + "\(request.images.count) image(s) were attached, so the pictures "
+                            + "have no place to go."
+                    )
+                }
+                pricedPromptTokens = request.promptTokenIds.count - placeholders
+                    + imageGrids.reduce(0) { $0 + $1.languagePositions }
+            } else {
+                pricedPromptTokens = request.promptTokenIds.count
+            }
+            guard pricedPromptTokens <= contextLength else {
+                throw CompletionLaunchError.engineNotReady(
+                    "⚠️ Inkling 2 needs \(pricedPromptTokens) positions for this prompt but its "
+                        + "cache was provisioned for \(contextLength); shorten the prompt or "
+                        + "the attachments."
+                )
+            }
+
             // Build once per checkpoint and keep it: a fresh forward per turn
             // would drop the resident sequence and re-prefill the conversation.
             // Keyed by the context it was provisioned for, like the DeepSeek
@@ -671,6 +749,7 @@ public final class CompletionEngine: @unchecked Sendable {
                 if let device = cachedInklingDevice,
                    device.path == snapshotDir.path, device.contextLength >= contextLength {
                     deviceHalf = (device.executor, device.workspace)
+                    inklingDeviceHalfStatus = "cached"
                 }
             }
             stateLock.unlock()
@@ -695,26 +774,192 @@ public final class CompletionEngine: @unchecked Sendable {
             }
             // The device half, built beside the host one. Its absence is not an
             // error: the host graph is a complete (slow) turn, and a machine
-            // without Metal still answers.
-            if deviceHalf == nil,
-               let device = MTLCreateSystemDefaultDevice(),
-               let queue = device.makeCommandQueue(),
-               let library = device.makeDefaultLibrary() {
-                let deviceWeights = Inkling2DeviceWeights(
-                    config: inklingConfig, catalog: catalog, shardBuffers: loadedShards
-                )
-                if let executor = try? Inkling2MetalForward(
-                    device: device, library: library, queue: queue, weights: deviceWeights, host: forward
-                ), let workspace = try? Inkling2DeviceWorkspace(
-                    device: device, config: inklingConfig, stagedPositions: contextLength
-                ) {
-                    stateLock.lock()
-                    cachedInklingDevice = (
-                        path: snapshotDir.path, contextLength: contextLength,
-                        executor: executor, workspace: workspace
+            // without Metal still answers. It is LOGGED, though -- a silent
+            // fallback costs this family more than an order of magnitude, so
+            // "why is a turn taking minutes" must have an answer in Console.app.
+            if deviceHalf == nil {
+                if let device = MTLCreateSystemDefaultDevice(),
+                   let queue = device.makeCommandQueue(),
+                   let library = device.makeDefaultLibrary() {
+                    let deviceWeights = Inkling2DeviceWeights(
+                        config: inklingConfig, catalog: catalog, shardBuffers: loadedShards
                     )
+                    do {
+                        let executor = try Inkling2MetalForward(
+                            device: device, library: library, queue: queue,
+                            weights: deviceWeights, host: forward
+                        )
+                        let workspace = try Inkling2DeviceWorkspace(
+                            device: device, config: inklingConfig, stagedPositions: contextLength
+                        )
+                        stateLock.lock()
+                        cachedInklingDevice = (
+                            path: snapshotDir.path, contextLength: contextLength,
+                            executor: executor, workspace: workspace
+                        )
+                        stateLock.unlock()
+                        deviceHalf = (executor, workspace)
+                        inklingDeviceHalfStatus = "built at \(contextLength) positions"
+                    } catch {
+                        inklingDeviceHalfStatus = "failed: \(error)"
+                        DiagLog.warning(
+                            "inkling2.device",
+                            "the Metal visit runner was not built, so this turn runs the host graph: \(error)"
+                        )
+                    }
+                } else {
+                    inklingDeviceHalfStatus = "no Metal device, queue or library"
+                    DiagLog.warning(
+                        "inkling2.device",
+                        "no Metal device, command queue or default library, so this turn runs the host graph"
+                    )
+                }
+            }
+
+            // Bind the pictures. The tower is built once per checkpoint and
+            // kept -- its init decodes every vision tensor into an FP32 array
+            // -- and a digest hit skips the encode entirely.
+            let inklingTurnPromptIds: [UInt32]
+            let inklingImageRows: [Int: [Float]]
+            let inklingTurnSpans: [TurnImageSpan]
+            if request.images.isEmpty && carriedImageSpans.isEmpty {
+                inklingTurnPromptIds = request.promptTokenIds
+                inklingImageRows = [:]
+                inklingTurnSpans = []
+            } else {
+                guard let spec = inklingConfig.vision else {
+                    throw CompletionLaunchError.engineNotReady(
+                        "⚠️ Inkling 2 Mini's checkpoint publishes no vision_config, so an attached "
+                            + "image cannot be seen."
+                    )
+                }
+                var vision: Inkling2VisionForward?
+                stateLock.lock()
+                if let cached = cachedInklingVision, cached.path == snapshotDir.path {
+                    vision = cached.forward
+                }
+                stateLock.unlock()
+                if vision == nil {
+                    let built = try Inkling2VisionForward(config: inklingConfig, weights: forward.weights)
+                    stateLock.lock()
+                    cachedInklingVision = (path: snapshotDir.path, forward: built)
                     stateLock.unlock()
-                    deviceHalf = (executor, workspace)
+                    vision = built
+                }
+                guard let vision else {
+                    throw CompletionLaunchError.engineNotReady(
+                        "⚠️ Inkling 2 Mini's vision tower could not be built, so the attached "
+                            + "image cannot be seen."
+                    )
+                }
+                var freshSpans: [String: Inkling2ImagePrompt.ImageSpan] = [:]
+                func encodeSpan(_ image: TurnImage) throws -> Inkling2ImagePrompt.ImageSpan {
+                    let key = image.sha256.isEmpty ? "" : "\(snapshotDir.path)|\(image.sha256)"
+                    if !key.isEmpty {
+                        stateLock.lock()
+                        let hit = cachedInklingImageSpans[key]
+                        stateLock.unlock()
+                        if let hit { return hit }
+                        if let hit = freshSpans[key] { return hit }
+                    }
+                    let pixels = Inkling2ImagePixels.RGB(
+                        rgb: image.rgb, width: image.width, height: image.height
+                    )
+                    let cells = try Inkling2ImagePixels.cells(pixels)
+                    let layout = Inkling2VisionLayout(
+                        cellRows: cells.cellRows, cellColumns: cells.cellColumns, spec: spec
+                    )
+                    let rows = try vision.encode(pixelValues: cells.values, layout: layout)
+                    let span = Inkling2ImagePrompt.ImageSpan(rows: rows, grid: cells.grid)
+                    if !key.isEmpty { freshSpans[key] = span }
+                    return span
+                }
+                if !carriedImageSpans.isEmpty, !request.images.isEmpty,
+                   carriedImageSpans.count != request.images.count {
+                    throw CompletionLaunchError.engineNotReady(
+                        "⚠️ This continuation carries \(carriedImageSpans.count) image span(s) but "
+                            + "\(request.images.count) image(s) were attached."
+                    )
+                }
+                if !carriedImageSpans.isEmpty {
+                    for (index, span) in carriedImageSpans.enumerated()
+                    where index < request.images.count
+                        && !span.sha256.isEmpty && !request.images[index].sha256.isEmpty
+                        && span.sha256 != request.images[index].sha256 {
+                        throw CompletionLaunchError.engineNotReady(
+                            "⚠️ Image \(index + 1) of this continuation is not the picture its "
+                                + "prompt was built with, so its rows cannot be reused."
+                        )
+                    }
+                }
+                var encoded: [Inkling2ImagePrompt.ImageSpan] = []
+                encoded.reserveCapacity(
+                    carriedImageSpans.isEmpty ? request.images.count : carriedImageSpans.count
+                )
+                if carriedImageSpans.isEmpty || !request.images.isEmpty {
+                    for image in request.images {
+                        encoded.append(try encodeSpan(image))
+                    }
+                } else {
+                    for (index, carried) in carriedImageSpans.enumerated() {
+                        let key = carried.sha256.isEmpty ? "" : "\(snapshotDir.path)|\(carried.sha256)"
+                        stateLock.lock()
+                        let hit = key.isEmpty ? nil : cachedInklingImageSpans[key]
+                        stateLock.unlock()
+                        guard let hit else {
+                            throw CompletionLaunchError.engineNotReady(
+                                "⚠️ This turn continues a prompt that already carries an image, "
+                                    + "but image \(index + 1)'s rows are no longer encoded and its "
+                                    + "pixels were not sent again, so they cannot be rebuilt."
+                            )
+                        }
+                        encoded.append(hit)
+                    }
+                }
+                if !freshSpans.isEmpty {
+                    stateLock.lock()
+                    for (key, span) in freshSpans { cachedInklingImageSpans[key] = span }
+                    if cachedInklingImageSpans.count > Self.inklingImageSpanCacheLimit {
+                        // Keep the most recent encodes: a conversation addresses the
+                        // same few pictures over and over, and an unbounded cache of
+                        // multi-megabyte row sets is a leak. Resetting to THIS turn's
+                        // encodes rather than to its last picture is what keeps a
+                        // multi-image turn's every span cached.
+                        cachedInklingImageSpans = freshSpans
+                    }
+                    stateLock.unlock()
+                }
+                if carriedImageSpans.isEmpty {
+                    let plan = try Inkling2ImagePrompt.expand(
+                        tokenIds: request.promptTokenIds,
+                        spans: encoded,
+                        imageTokenID: inklingConfig.imageTokenID,
+                        rowWidth: inklingConfig.hiddenSize
+                    )
+                    guard plan.promptTokens == pricedPromptTokens else {
+                        throw CompletionLaunchError.engineNotReady(
+                            "⚠️ Inkling 2's image expansion produced \(plan.promptTokens) prompt "
+                                + "tokens, but the cell grid priced \(pricedPromptTokens)."
+                        )
+                    }
+                    inklingTurnPromptIds = plan.tokenIds
+                    inklingImageRows = plan.rows
+                    inklingTurnSpans = zip(request.images, plan.spans).map { image, range in
+                        TurnImageSpan(
+                            sha256: image.sha256, width: image.width, height: image.height, range: range
+                        )
+                    }
+                } else {
+                    let plan = try Inkling2ImagePrompt.place(
+                        tokenIds: request.promptTokenIds,
+                        spans: encoded,
+                        at: carriedImageSpans.map(\.range),
+                        imageTokenID: inklingConfig.imageTokenID,
+                        rowWidth: inklingConfig.hiddenSize
+                    )
+                    inklingTurnPromptIds = plan.tokenIds
+                    inklingImageRows = plan.rows
+                    inklingTurnSpans = carriedImageSpans
                 }
             }
 
@@ -744,6 +989,9 @@ public final class CompletionEngine: @unchecked Sendable {
             // one test compare the two arms of the SAME process.
             let deviceHalfForTurn = UserDefaults.standard.bool(forKey: "dynamoe_inkling2_device_off")
                 ? nil : deviceHalf
+            if UserDefaults.standard.bool(forKey: "dynamoe_inkling2_device_off") {
+                inklingDeviceHalfStatus = "disabled by dynamoe_inkling2_device_off"
+            }
             let inklingVisitRunner: Inkling2CPUForward.VisitRunner? = deviceHalfForTurn.map { half in
                 { layer, pass, hidden, blockStates, messages, position in
                     try half.executor.runVisit(
@@ -753,16 +1001,24 @@ public final class CompletionEngine: @unchecked Sendable {
                 }
             }
 
-            let reusablePrefix = forward.reusablePrefix(
-                proposedPrefix: PrefixCacheManager.shared.findCommonPrefix(
-                    promptTokenIds: request.promptTokenIds,
-                    sessionId: request.sessionId
-                ),
-                promptTokenIds: request.promptTokenIds.map { Int($0) }
-            )
+            // A supplied image row is the one thing an id prefix cannot vouch
+            // for: two same-sized pictures expand to identical marker ids, so
+            // an image-bearing prompt never proposes a resume.
+            let reusablePrefix: Int
+            if inklingImageRows.isEmpty {
+                reusablePrefix = forward.reusablePrefix(
+                    proposedPrefix: PrefixCacheManager.shared.findCommonPrefix(
+                        promptTokenIds: inklingTurnPromptIds,
+                        sessionId: request.sessionId
+                    ),
+                    promptTokenIds: inklingTurnPromptIds.map { Int($0) }
+                )
+            } else {
+                reusablePrefix = 0
+            }
             let prep = TurnPrepInfo(
                 prefixTokensReused: reusablePrefix,
-                promptTokenCount: request.promptTokenIds.count,
+                promptTokenCount: inklingTurnPromptIds.count,
                 // The host forward keeps every cache value in FP32.
                 effectiveKVPrecision: .fp32,
                 provisionedSequenceLength: contextLength
@@ -771,7 +1027,7 @@ public final class CompletionEngine: @unchecked Sendable {
             let engineSelf = self
             let inklingTokenizer = tokenizer
             let inklingSampling = request.sampling
-            let inklingPromptIds = request.promptTokenIds.map { Int($0) }
+            let inklingPromptIds = inklingTurnPromptIds.map { Int($0) }
             let inklingPrompt = request.formattedPrompt
             let inklingStopSequences = request.stopSequences
             let inklingSessionId = request.sessionId
@@ -830,6 +1086,7 @@ public final class CompletionEngine: @unchecked Sendable {
                     let output = try Inkling2TurnRunner.run(
                         forward: forward,
                         promptTokenIds: inklingPromptIds,
+                        imageRows: inklingImageRows,
                         prefixTokens: reusablePrefix,
                         settings: settings,
                         sample: { logits, generated in
@@ -1013,7 +1270,8 @@ public final class CompletionEngine: @unchecked Sendable {
                         actionableCallIndices: inklingActionable,
                         gestureSkipNotices: inklingGestureNotices,
                         brokenFragments: inklingBroken,
-                        matchedStopSequence: output.matchedStopSequence
+                        matchedStopSequence: output.matchedStopSequence,
+                        imageSpans: inklingTurnSpans
                     )))
                 } catch {
                     emit(.prefillProgress(status: nil, speed: nil, rssGB: nil))
@@ -12491,6 +12749,8 @@ if layer.attnGateProjTensor != nil,
         // device half holds buffers over the same shards, so it goes too.
         cachedInklingForward = nil
         cachedInklingDevice = nil
+        cachedInklingVision = nil
+        cachedInklingImageSpans.removeAll()
         cachedImageSpans.removeAll()
         stateLock.unlock()
         // The prefill rate belongs to the checkpoint that measured it. A spawn

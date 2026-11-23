@@ -232,6 +232,537 @@ final class Inkling2VisionTests: XCTestCase {
         XCTAssertEqual(rgb.rgb[(0 * 10 + 5) * 3 + 2], 30)
     }
 
+    // MARK: The marker expansion
+
+    /// Row-major RGB sized so the processor's cell arithmetic is exercised
+    /// without an encoder: every byte is distinct, so a transposed or
+    /// off-by-one crop is visible in the cells rather than merely plausible.
+    private func picture(width: Int, height: Int) -> Inkling2ImagePixels.RGB {
+        var rgb = [UInt8](repeating: 0, count: width * height * 3)
+        for index in rgb.indices { rgb[index] = UInt8(index % 256) }
+        return Inkling2ImagePixels.RGB(rgb: rgb, width: width, height: height)
+    }
+
+    private func span(_ grid: Inkling2ImageGrid, rowWidth: Int = 4) -> Inkling2ImagePrompt.ImageSpan {
+        let rows = (0..<grid.languagePositions).map { cell -> [Float] in
+            var row = [Float](repeating: 0, count: rowWidth)
+            row[0] = Float(cell)
+            return row
+        }
+        return Inkling2ImagePrompt.ImageSpan(rows: rows, grid: grid)
+    }
+
+    func testOneAttachmentBecomesOneMarkerPerCell() throws {
+        // 41 x 81 pixels pad to 3 cell rows and 2 cell columns: six language
+        // positions, which is exactly what the prompt pays for.
+        let cells = try Inkling2ImagePixels.cells(picture(width: 41, height: 81))
+        XCTAssertEqual(cells.grid, Inkling2ImageGrid(cellRows: 3, cellColumns: 2))
+        XCTAssertEqual(cells.languagePositions, 6)
+
+        let marker: UInt32 = 200054
+        let plan = try Inkling2ImagePrompt.expand(
+            tokenIds: [11, marker, 12],
+            spans: [span(cells.grid)],
+            imageTokenID: Int(marker),
+            rowWidth: 4
+        )
+        XCTAssertEqual(plan.tokenIds, [11] + [UInt32](repeating: marker, count: 6) + [12])
+        XCTAssertEqual(plan.spans, [1..<7], "the span starts where the single placeholder was")
+        XCTAssertEqual(plan.rows.keys.sorted(), Array(1...6))
+        for position in 1...6 {
+            XCTAssertEqual(plan.rows[position]?.first, Float(position - 1), "cell order is preserved")
+        }
+        XCTAssertEqual(plan.promptTokens, 8)
+        XCTAssertEqual(plan.imagePositionCount, 6)
+
+        // A text-only prompt is returned untouched.
+        let text = try Inkling2ImagePrompt.expand(
+            tokenIds: [1, 2, 3], spans: [], imageTokenID: Int(marker), rowWidth: 4
+        )
+        XCTAssertEqual(text.tokenIds, [1, 2, 3])
+        XCTAssertTrue(text.rows.isEmpty)
+        XCTAssertTrue(text.spans.isEmpty)
+    }
+
+    func testTwoInterleavedImagesKeepContentOrder() throws {
+        let first = Inkling2ImageGrid(cellRows: 2, cellColumns: 1)
+        let second = Inkling2ImageGrid(cellRows: 1, cellColumns: 3)
+        let marker: UInt32 = 200054
+        // Content order: picture 0, text, picture 1, text. The two grids differ
+        // in size, so swapping their spans changes the output length.
+        let plan = try Inkling2ImagePrompt.expand(
+            tokenIds: [marker, 5, marker, 6],
+            spans: [span(first), span(second)],
+            imageTokenID: Int(marker),
+            rowWidth: 4
+        )
+        XCTAssertEqual(plan.tokenIds, [marker, marker, 5, marker, marker, marker, 6])
+        XCTAssertEqual(plan.spans, [0..<2, 3..<6])
+        // Each image's own encoded rows land on its own span.
+        XCTAssertEqual(plan.rows[0]?.first, 0)
+        XCTAssertEqual(plan.rows[1]?.first, 1)
+        XCTAssertEqual(plan.rows[3]?.first, 0)
+        XCTAssertEqual(plan.rows[5]?.first, 2)
+        XCTAssertEqual(plan.imagePositionCount, 5)
+    }
+
+    func testTheSpecPricesTheSameCellsThePixelsProduce() throws {
+        let config = try Inkling2Config.decode(
+            contentsOf: try snapshot().appendingPathComponent("config.json")
+        )
+        let spec = try XCTUnwrap(config.vision)
+        for (width, height) in [(1, 1), (40, 40), (39, 39), (41, 81), (120, 80), (4_096, 1)] {
+            let cells = try Inkling2ImagePixels.cells(picture(width: width, height: height))
+            XCTAssertEqual(cells.grid.cellRows, (height + 39) / 40, "\(width)x\(height)")
+            XCTAssertEqual(cells.grid.cellColumns, (width + 39) / 40, "\(width)x\(height)")
+            XCTAssertEqual(
+                cells.grid.languagePositions,
+                spec.languagePositions(width: width, height: height),
+                "the prompt's price and the pixel path must agree at \(width)x\(height)"
+            )
+        }
+        // The checkpoint publishes no `image_token_id`; the decoder falls back
+        // to the modular default, which is the tokenizer's own added token.
+        XCTAssertEqual(config.imageTokenID, 200054)
+    }
+
+    func testAPlaceholderCountThatDisagreesWithThePicturesIsRefused() {
+        let marker: UInt32 = 200054
+        let one = span(Inkling2ImageGrid(cellRows: 1, cellColumns: 1))
+        XCTAssertThrowsError(
+            try Inkling2ImagePrompt.expand(
+                tokenIds: [marker, marker], spans: [one], imageTokenID: Int(marker), rowWidth: 4
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? Inkling2ImagePromptError,
+                .placeholderCountMismatch(placeholders: 2, images: 1)
+            )
+        }
+        // The other direction matters as much: an image whose marker is absent
+        // would otherwise have nowhere to put its rows and be dropped.
+        XCTAssertThrowsError(
+            try Inkling2ImagePrompt.expand(
+                tokenIds: [1, 2], spans: [one], imageTokenID: Int(marker), rowWidth: 4
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? Inkling2ImagePromptError,
+                .placeholderCountMismatch(placeholders: 0, images: 1)
+            )
+        }
+    }
+
+    func testASpanThatDisagreesWithItsGridIsRefused() {
+        let marker: UInt32 = 200054
+        let grid = Inkling2ImageGrid(cellRows: 2, cellColumns: 2)
+        // Four cells, three rows: the span would leave one marker unbound.
+        let short = Inkling2ImagePrompt.ImageSpan(rows: [[0, 0], [1, 0], [2, 0]], grid: grid)
+        XCTAssertThrowsError(
+            try Inkling2ImagePrompt.expand(
+                tokenIds: [marker], spans: [short], imageTokenID: Int(marker), rowWidth: 4
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? Inkling2ImagePromptError,
+                .spanLengthMismatch(image: 0, expected: 4, actual: 3)
+            )
+        }
+        // A row that is not the text hidden size cannot become a residual row.
+        let ragged = Inkling2ImagePrompt.ImageSpan(rows: [[0], [1], [2], [0]], grid: grid)
+        XCTAssertThrowsError(
+            try Inkling2ImagePrompt.expand(
+                tokenIds: [marker], spans: [ragged], imageTokenID: Int(marker), rowWidth: 4
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? Inkling2ImagePromptError,
+                .rowWidthMismatch(image: 0, position: 0, expected: 4, actual: 1)
+            )
+        }
+        // A grid with no cells is refused rather than shrinking the span.
+        let empty = Inkling2ImagePrompt.ImageSpan(
+            rows: [], grid: Inkling2ImageGrid(cellRows: 0, cellColumns: 3)
+        )
+        XCTAssertThrowsError(
+            try Inkling2ImagePrompt.expand(
+                tokenIds: [marker], spans: [empty], imageTokenID: Int(marker), rowWidth: 4
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? Inkling2ImagePromptError,
+                .invalidGrid(image: 0, rows: 0, columns: 3)
+            )
+        }
+        // A marker id outside the token space is a config bug, not token 0.
+        XCTAssertThrowsError(
+            try Inkling2ImagePrompt.expand(
+                tokenIds: [marker], spans: [span(grid)], imageTokenID: -1, rowWidth: 4
+            )
+        ) { error in
+            XCTAssertEqual(error as? Inkling2ImagePromptError, .invalidImageTokenID(-1))
+        }
+    }
+
+    func testTheGridsAreCollectedInRenderOrder() throws {
+        let first = Inkling2ImageGrid(cellRows: 1, cellColumns: 2)
+        let second = Inkling2ImageGrid(cellRows: 3, cellColumns: 1)
+        let turns: [Inkling2Turn] = [
+            .system("s"),
+            .user([.text("before"), .image(first), .text("middle")]),
+            .assistant(reasoning: nil, content: "ok"),
+            .tool(name: "shot", content: [.image(second)])
+        ]
+        XCTAssertEqual(Inkling2Prompt.imageGrids(in: turns), [first, second])
+        XCTAssertEqual(
+            Inkling2Prompt.imageGrids(in: [.user([.image(first), .image(second)])]),
+            [first, second]
+        )
+    }
+
+    /// A continuation splices the expanded ids forward, so re-expanding would
+    /// read a span as many placeholders. `place` puts the same rows back at the
+    /// recorded positions instead, and the two entry points must agree on the
+    /// result.
+    func testACarriedSpanBindsTheRecordedRows() throws {
+        let marker: UInt32 = 200054
+        let first = Inkling2ImageGrid(cellRows: 2, cellColumns: 1)
+        let second = Inkling2ImageGrid(cellRows: 1, cellColumns: 2)
+        let spans = [span(first), span(second)]
+        let expanded = try Inkling2ImagePrompt.expand(
+            tokenIds: [7, marker, 8, marker, 9],
+            spans: spans,
+            imageTokenID: Int(marker),
+            rowWidth: 4
+        )
+        XCTAssertEqual(expanded.spans, [1..<3, 4..<6])
+        let placed = try Inkling2ImagePrompt.place(
+            tokenIds: expanded.tokenIds,
+            spans: spans,
+            at: expanded.spans,
+            imageTokenID: Int(marker),
+            rowWidth: 4
+        )
+        XCTAssertEqual(placed.tokenIds, expanded.tokenIds)
+        XCTAssertEqual(placed.rows, expanded.rows)
+        XCTAssertEqual(placed.spans, expanded.spans)
+        XCTAssertEqual(placed.imagePositionCount, 4)
+    }
+
+    func testACarriedSpanThatDoesNotMatchItsPromptIsRefused() {
+        let marker: UInt32 = 200054
+        let one = Inkling2ImagePrompt.ImageSpan(
+            rows: [[0, 0, 0, 0], [1, 0, 0, 0]], grid: Inkling2ImageGrid(cellRows: 2, cellColumns: 1)
+        )
+        // Position 1 holds an ordinary token where the span says a marker is.
+        XCTAssertThrowsError(
+            try Inkling2ImagePrompt.place(
+                tokenIds: [marker, 5, marker], spans: [one], at: [1..<3],
+                imageTokenID: Int(marker), rowWidth: 4
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? Inkling2ImagePromptError,
+                .spanTokenMismatch(image: 0, position: 1, expected: 200054, actual: 5)
+            )
+        }
+        // A range whose length disagrees with its grid: one marker would be
+        // bound twice or not at all.
+        XCTAssertThrowsError(
+            try Inkling2ImagePrompt.place(
+                tokenIds: [marker, marker, marker], spans: [one], at: [0..<3],
+                imageTokenID: Int(marker), rowWidth: 4
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? Inkling2ImagePromptError,
+                .spanLengthMismatch(image: 0, expected: 2, actual: 3)
+            )
+        }
+        // A range past the prompt's end cannot be addressed at all.
+        XCTAssertThrowsError(
+            try Inkling2ImagePrompt.place(
+                tokenIds: [marker, marker], spans: [one], at: [1..<3],
+                imageTokenID: Int(marker), rowWidth: 4
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? Inkling2ImagePromptError,
+                .spanRangeInvalid(image: 0, range: 1..<3, promptTokens: 2)
+            )
+        }
+        // Spans and ranges must describe the same number of pictures.
+        XCTAssertThrowsError(
+            try Inkling2ImagePrompt.place(
+                tokenIds: [marker, marker], spans: [one, one], at: [0..<2],
+                imageTokenID: Int(marker), rowWidth: 4
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? Inkling2ImagePromptError,
+                .spanCountMismatch(spans: 2, ranges: 1)
+            )
+        }
+        // Two images must keep prompt order: a second span before the first is
+        // a spliced prompt the recorded layout does not describe.
+        XCTAssertThrowsError(
+            try Inkling2ImagePrompt.place(
+                tokenIds: [marker, marker, marker, marker], spans: [one, one],
+                at: [2..<4, 0..<2], imageTokenID: Int(marker), rowWidth: 4
+            )
+        ) { error in
+            XCTAssertEqual(error as? Inkling2ImagePromptError, .spanRangeOutOfOrder(image: 1))
+        }
+    }
+
+    // MARK: The turn
+
+    /// Loads the checkpoint the way the APP loads it and installs it in the
+    /// shared engine. The engine holds the shard mappings (see `engine`), so it
+    /// must outlive the caller's turn.
+    private func configureAppOrderEngine() throws -> (
+        directory: URL, tokenizer: DynaMoeTokenizer, config: Inkling2Config
+    ) {
+        let directory = try snapshot()
+        guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("No Metal GPU device") }
+        let tokenizer = try DynaMoeTokenizer(
+            tokenizerPath: directory.appendingPathComponent("tokenizer.json").path
+        )
+        let modelConfig = try XCTUnwrap(ModelConfig.load(from: directory))
+        let config = try Inkling2Config.decode(
+            contentsOf: directory.appendingPathComponent("config.json")
+        )
+        let engine = try DynaMoeEngine(filePath: directory.path)
+        self.engine = engine
+        let indexed = try engine.getSummary()
+        let summary = try InferenceEngine.segmentShardsForMetal(
+            indexed, maxBufferLength: UInt64(device.maxBufferLength)
+        )
+        var buffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            let length = Int(shard.length)
+            guard length > 0, length <= Int(device.maxBufferLength),
+                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)),
+                  let buffer = device.makeBuffer(
+                      bytesNoCopy: pointer, length: length, options: .storageModeShared, deallocator: nil
+                  ) else { continue }
+            buffers[shard.index] = buffer
+        }
+        CompletionEngine.shared.configure(
+            summary: summary, modelConfig: modelConfig, tokenizer: tokenizer,
+            shardBuffers: buffers, activeLoadedModelPath: directory.path
+        )
+        return (directory, tokenizer, config)
+    }
+
+    /// A turn must actually use the Metal visit runner: a silent host fallback
+    /// is correct but turns a fraction of a second per visit into seconds, and
+    /// nothing in the stream says so. The status `launchTurn` records is
+    /// assertable, and this is what pins it.
+    func testTheEngineInstallsTheMetalVisitRunner() async throws {
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_image_turn"),
+            "opt-in; touch /tmp/dynamoe_inkling2_image_turn to run"
+        )
+        let (directory, tokenizer, _) = try configureAppOrderEngine()
+        defer {
+            CompletionEngine.shared.configure(
+                summary: nil, modelConfig: nil, tokenizer: nil,
+                shardBuffers: [:], activeLoadedModelPath: nil
+            )
+        }
+        let rendered = try Inkling2Prompt().render(
+            turns: [.user([.text("Hi")])], effort: 0
+        )
+        let ids = try tokenizer.encode(text: rendered)
+        let request = CompletionTurnRequest(
+            promptTokenIds: ids,
+            formattedPrompt: rendered,
+            sessionId: nil,
+            sampling: TurnSampling(
+                temperature: 0, topP: 1, minP: 0, topK: 1,
+                repetitionPenalty: 1, maxTokens: 1
+            ),
+            memory: TurnMemorySettings(
+                executionMode: .residentRAM, budgetMode: .unrestricted, kvPrecision: .fp32
+            ),
+            agentToolsEnabled: false,
+            thinkingEnabled: false
+        )
+        let launch = try CompletionEngine.shared.launchTurn(request)
+        let status = CompletionEngine.shared.inklingDeviceHalfStatus
+        print("🔎 [inkling2 device runner] \(status) for \(directory.lastPathComponent)")
+        launch.handle.task.cancel()
+        XCTAssertNotEqual(status, "not attempted", "launchTurn never reached the device-half decision")
+        XCTAssertFalse(status.hasPrefix("failed"), status)
+        XCTAssertNotEqual(status, "no Metal device, queue or library", status)
+        XCTAssertNotEqual(status, "disabled by dynamoe_inkling2_device_off", status)
+    }
+
+    /// The engine's own device-half construction, with the engine's own
+    /// parameters (`stagedPositions` = the provisioned context). The direct
+    /// kernel tests build the executor with a DEFAULT workspace, so this is
+    /// the one place the production widths are exercised before a turn: a
+    /// failure here is why a turn would silently run the host graph.
+    func testTheEnginesDeviceHalfBuildsAtTheProvisionedWidth() throws {
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_image_turn"),
+            "opt-in; touch /tmp/dynamoe_inkling2_image_turn to run"
+        )
+        let directory = try snapshot()
+        guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("No Metal GPU device") }
+        guard let library = device.makeDefaultLibrary() else { throw XCTSkip("no default library") }
+        guard let queue = device.makeCommandQueue() else { throw XCTSkip("no compute queue") }
+        let engine = try DynaMoeEngine(filePath: directory.path)
+        self.engine = engine
+        let indexed = try engine.getSummary()
+        let summary = try InferenceEngine.segmentShardsForMetal(
+            indexed, maxBufferLength: UInt64(device.maxBufferLength)
+        )
+        let config = try Inkling2Config.decode(
+            contentsOf: directory.appendingPathComponent("config.json")
+        )
+        let catalog = Inkling2WeightCatalog(
+            mainFile: summary.tensors.map { Inkling2TensorRef(metadata: $0) },
+            layerCount: config.numHiddenLayers
+        )
+        var buffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            let length = Int(shard.length)
+            guard length > 0, length <= Int(device.maxBufferLength),
+                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)),
+                  let buffer = device.makeBuffer(
+                      bytesNoCopy: pointer, length: length, options: .storageModeShared, deallocator: nil
+                  ) else { continue }
+            buffers[shard.index] = buffer
+        }
+        let plan = Inkling2MemoryPlan.make(
+            config: config, catalog: catalog, contextLength: config.maxPositionEmbeddings
+        )
+        // `unrestricted`'s RSS budget, which is what an app turn asks for.
+        let contextLength = plan.affordableContextLength(budgetGB: 36.6)
+        print("🔎 [inkling2 device half] provisioned \(contextLength) positions")
+        let source = Inkling2SnapshotWeights(
+            config: config, catalog: catalog, shardBuffers: buffers
+        )
+        let hostForward = try Inkling2CPUForward(
+            config: config, weights: source,
+            options: Inkling2ForwardOptions(maxPositions: contextLength)
+        )
+        let weights = Inkling2DeviceWeights(
+            config: config, catalog: catalog, shardBuffers: buffers
+        )
+        do {
+            _ = try Inkling2MetalForward(
+                device: device, library: library, queue: queue, weights: weights, host: hostForward
+            )
+            print("🔎 [inkling2 device half] executor ok")
+            _ = try Inkling2DeviceWorkspace(
+                device: device, config: config, stagedPositions: contextLength
+            )
+            print("🔎 [inkling2 device half] workspace ok")
+        } catch {
+            XCTFail("the engine's device half cannot be built: \(error)")
+        }
+    }
+
+    /// The engine seam end to end on real weights: a red rectangle pads to two
+    /// 40-pixel cells, the tower emits one residual row per cell, the single
+    /// template placeholder expands to two markers, and the turn answers about
+    /// the colour. Opt-in because the host tower is scalar Swift.
+    func testARealImageTurnAnswersAboutThePicture() async throws {
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_image_turn"),
+            "opt-in image turn; touch /tmp/dynamoe_inkling2_image_turn to run"
+        )
+        let (_, tokenizer, config) = try configureAppOrderEngine()
+        defer {
+            CompletionEngine.shared.configure(
+                summary: nil, modelConfig: nil, tokenizer: nil,
+                shardBuffers: [:], activeLoadedModelPath: nil
+            )
+        }
+
+        // 50 x 40 pixels: one cell row, two cell columns. Two cells is the
+        // smallest grid that proves the placeholder really expands rather than
+        // passing through.
+        let width = 50
+        let height = 40
+        var rgb = [UInt8](repeating: 0, count: width * height * 3)
+        for index in stride(from: 0, to: rgb.count, by: 3) {
+            rgb[index] = 220
+            rgb[index + 1] = 20
+            rgb[index + 2] = 20
+        }
+        let pixels = Inkling2ImagePixels.RGB(rgb: rgb, width: width, height: height)
+        let grid = try Inkling2ImagePixels.cells(pixels).grid
+        XCTAssertEqual(grid, Inkling2ImageGrid(cellRows: 1, cellColumns: 2))
+
+        let rendered = try Inkling2Prompt().render(
+            turns: [.user([.image(grid), .text("What colour is this rectangle? Answer with one word.")])],
+            effort: 0
+        )
+        let promptIds = try tokenizer.encode(text: rendered)
+        let marker = UInt32(config.imageTokenID)
+        XCTAssertEqual(promptIds.filter { $0 == marker }.count, 1, "the template writes one marker")
+
+        var result: TurnResult?
+        let request = CompletionTurnRequest(
+            promptTokenIds: promptIds,
+            formattedPrompt: rendered,
+            sessionId: nil,
+            sampling: TurnSampling(
+                temperature: 0, topP: 1, minP: 0, topK: 1,
+                repetitionPenalty: 1, maxTokens: 64
+            ),
+            memory: TurnMemorySettings(
+                executionMode: .residentRAM, budgetMode: .unrestricted, kvPrecision: .fp32
+            ),
+            agentToolsEnabled: false,
+            thinkingEnabled: false,
+            images: [TurnImage(
+                rgb: pixels.rgb, width: pixels.width, height: pixels.height,
+                sha256: "inkling2-red-rectangle"
+            )]
+        )
+        for await event in try CompletionEngine.shared.launchTurn(request).stream {
+            switch event {
+            case .finished(let value):
+                result = value
+            case .failedTurn(let failure):
+                XCTFail("the image turn failed: \(failure.message)")
+            default:
+                break
+            }
+        }
+        let turn = try XCTUnwrap(result)
+        print("🔎 [inkling2 image] answer: \(turn.rawDecodedText)")
+        print("🔎 [inkling2 image] response: \(turn.responseText)")
+        // The checkpoint opens the reasoning channel itself at effort 0, so the
+        // colour lives in the content channel and not in the whole transcript.
+        let contentMarker = Inkling2PromptMarkers.familyDefault.contentText
+        guard let answerStart = turn.rawDecodedText.range(of: contentMarker) else {
+            XCTFail("the model never opened a content block: \(turn.rawDecodedText)")
+            return
+        }
+        let answer = turn.rawDecodedText[answerStart.upperBound...]
+        XCTAssertTrue(
+            answer.lowercased().contains("red"),
+            "the answer did not name the colour: \(answer)"
+        )
+        // The prompt the cache and the sampler saw carries one marker per CELL,
+        // and the span is where the picture's rows sit.
+        XCTAssertEqual(turn.promptTokenIds.filter { $0 == marker }.count, grid.languagePositions)
+        XCTAssertEqual(turn.promptTokenIds.count, promptIds.count + grid.languagePositions - 1)
+        XCTAssertEqual(turn.imageSpans.count, 1)
+        XCTAssertEqual(turn.imageSpans.first?.range.count, grid.languagePositions)
+        XCTAssertEqual(turn.imageSpans.first?.sha256, "inkling2-red-rectangle")
+        XCTAssertEqual(
+            turn.imageSpans.first.map { Array(turn.promptTokenIds[$0.range]) },
+            [UInt32](repeating: marker, count: grid.languagePositions)
+        )
+    }
+
     // MARK: The tower
 
     func testTheTowerMatchesTheReferenceStageByStage() throws {
