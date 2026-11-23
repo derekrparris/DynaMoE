@@ -4350,11 +4350,19 @@ struct ContentView: View {
         // because a marker there would expand to rows the model never receives.
         // `turnImages` is what the engine encodes, in prompt order, so it must be
         // filled by the same walk that writes the markers.
+        // Pictures in the prompt. Only a family with a vision tower can read
+        // pixels this turn; every other local family keeps the metadata notice,
+        // because a marker there would expand to rows the model never receives.
+        // `turnImages` is what the engine encodes, in prompt order, so it must be
+        // filled by the same walk that writes the markers (DeepSeek V4.1) or the
+        // typed content blocks (Inkling 2).
         let visionMarkers: DeepSeekV41VisionMarkers? = {
             guard modelConfig?.isDeepSeekV41Model == true,
                   ModelConfig.supportsVision(modelPath: activeLoadedModelPath) else { return nil }
             return DeepSeekV41VisionMarkers.familyDefault
         }()
+        let inklingVision = (modelConfig?.isInkling2Model == true
+            && ModelConfig.supportsVision(modelPath: activeLoadedModelPath))
         var turnImages: [TurnImage] = []
         func attachmentFragment(for message: ChatMessage) -> String {
             guard let refs = message.attachments, !refs.isEmpty else { return "" }
@@ -4381,6 +4389,31 @@ struct ContentView: View {
             // turn still answers about something, and the user's picture is not
             // silently claimed to have been seen.
             return fragment.isEmpty ? Self.localAttachmentNotice(for: message) : fragment
+        }
+        // Inkling 2 gives a picture its own typed content block, so a picture is
+        // attached to the turn rather than spliced into its text, and this is the
+        // walk that fills `turnImages` for that family. The grid is the one the
+        // pixels produce, which is what the renderer writes and what the engine's
+        // placeholder expansion prices, so the three cannot disagree about how
+        // many cells the picture became.
+        func inklingImageGrids(for message: ChatMessage) -> [Inkling2ImageGrid] {
+            guard inklingVision, let refs = message.attachments, !refs.isEmpty else { return [] }
+            var grids: [Inkling2ImageGrid] = []
+            for ref in refs {
+                guard let data = ImageAttachmentStore.shared.data(for: ref),
+                      let pixels = try? Inkling2ImagePixels.decode(data),
+                      let cells = try? Inkling2ImagePixels.cells(pixels) else { continue }
+                grids.append(cells.grid)
+                turnImages.append(
+                    TurnImage(
+                        rgb: pixels.rgb,
+                        width: pixels.width,
+                        height: pixels.height,
+                        sha256: ref.sha256
+                    )
+                )
+            }
+            return grids
         }
         if isDeepSeekV41 {
             // The checkpoint's own turn structure, rendered by the same function
@@ -4633,9 +4666,10 @@ struct ContentView: View {
                 let cleanMsg = storedTurnText(msg.content, isAssistant: msg.role == .assistant)
                 let hasTools = (msg.toolCalls != nil && !msg.toolCalls!.isEmpty)
                 let hasReasoning = !(msg.thinkingContent ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                guard !cleanMsg.isEmpty || hasReasoning || hasTools else { continue }
+                let grids = msg.role == .user ? inklingImageGrids(for: msg) : []
+                guard !cleanMsg.isEmpty || hasReasoning || hasTools || !grids.isEmpty else { continue }
                 if msg.role == .user {
-                    turns.append(.init(role: .user, text: cleanMsg))
+                    turns.append(.init(role: .user, text: cleanMsg, imageGrids: grids))
                 } else if msg.role == .assistant {
                     var body = cleanMsg
                     if hasReasoning {

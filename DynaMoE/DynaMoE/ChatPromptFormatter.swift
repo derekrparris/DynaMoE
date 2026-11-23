@@ -300,6 +300,43 @@ public enum ChatPromptFormatter {
         }
     }
 
+    /// One user or tool turn's text as Inkling 2's typed content parts, with each
+    /// picture placed where the caller marked it.
+    ///
+    /// The checkpoint gives a picture its own content block, so an image is a
+    /// PART and never a marker spliced into the text. The API server's decoders
+    /// keep a message's content order as a `U+FFFC` sentinel per picture, which
+    /// is what decides where the block goes and is never itself emitted; a turn
+    /// with pictures but no sentinel has them move in front, which is the order
+    /// the in-app composer writes and the checkpoint's own prompts use.
+    ///
+    /// A count mismatch renders NOTHING, which is fail-closed rather than
+    /// reconciled: an empty turn leaves the prompt without the placeholders the
+    /// attached pictures need, so the engine's own picture/placeholder check
+    /// refuses the turn by name. Both entry points check this first; this is the
+    /// backstop for a caller that assembled turns itself.
+    nonisolated static func inklingContentParts(
+        text: String,
+        grids: [Inkling2ImageGrid]
+    ) -> [Inkling2ContentPart] {
+        let chunks = text.components(separatedBy: ServerImageParts.imagePlaceholder)
+        let sentinels = chunks.count - 1
+        guard sentinels == 0 || sentinels == grids.count else { return [] }
+        guard sentinels > 0 else {
+            // No sentinel: the pictures go in front, the order the in-app composer
+            // writes and the order the checkpoint's own prompts use.
+            var parts = grids.map { Inkling2ContentPart.image($0) }
+            if !text.isEmpty { parts.append(.text(text)) }
+            return parts.isEmpty ? [.text(text)] : parts
+        }
+        var parts: [Inkling2ContentPart] = []
+        for (offset, chunk) in chunks.enumerated() {
+            if offset > 0 { parts.append(.image(grids[offset - 1])) }
+            if !chunk.isEmpty { parts.append(.text(chunk)) }
+        }
+        return parts
+    }
+
     /// Whether a *historical* assistant turn is rendered with its reasoning block
     /// open.
     ///
@@ -375,11 +412,25 @@ public enum ChatPromptFormatter {
         public var role: Role
         public var text: String
         public var kind: Kind
+        /// The pictures this turn carries, in content order.
+        ///
+        /// Only Inkling 2 renders these: its template gives a picture its own
+        /// typed content block, so the grid is a PART of the turn rather than a
+        /// marker spliced into `text` (which is how DeepSeek V4.1, the only
+        /// other family with a tower, carries one). A family that does not read
+        /// pictures ignores this and keeps rendering `text` alone.
+        public var imageGrids: [Inkling2ImageGrid]
 
-        public init(role: Role, text: String, kind: Kind = .text) {
+        public init(
+            role: Role,
+            text: String,
+            kind: Kind = .text,
+            imageGrids: [Inkling2ImageGrid] = []
+        ) {
             self.role = role
             self.text = text
             self.kind = kind
+            self.imageGrids = imageGrids
         }
     }
 
@@ -420,10 +471,15 @@ public enum ChatPromptFormatter {
             for turn in turns {
                 switch turn.kind {
                 case .toolResult(let name):
-                    rendered.append(.tool(name: name, content: [.text(turn.text)]))
+                    rendered.append(.tool(
+                        name: name,
+                        content: inklingContentParts(text: turn.text, grids: turn.imageGrids)
+                    ))
                 case .text:
                     guard turn.role == .assistant else {
-                        rendered.append(.user([.text(turn.text)]))
+                        rendered.append(.user(
+                            inklingContentParts(text: turn.text, grids: turn.imageGrids)
+                        ))
                         continue
                     }
                     let text = turn.text

@@ -1254,12 +1254,13 @@ public struct ModelConfig: Codable {
 
     /// Whether a local checkpoint can be sent images.
     ///
-    /// Only DeepSeek V4.1 qualifies today, and only when its `config.json`
-    /// publishes a `vision_config` AND the tower's weights are actually in the
-    /// snapshot: the flag makes the composer offer an attachment button, so a
-    /// checkpoint whose vision shards are missing must not advertise it. This is
-    /// the same family sniff `supportsThinkingLevels` uses, with a config decode
-    /// instead of a template read, so both flags agree about what the family is.
+    /// DeepSeek V4.1 and Inkling 2 qualify, and only when the family's
+    /// `config.json` publishes a `vision_config` AND the tower's weights are
+    /// actually in the snapshot: the flag makes the composer offer an attachment
+    /// button, so a checkpoint whose vision shards are missing must not
+    /// advertise it. This is the same family sniff `supportsThinkingLevels`
+    /// uses, with a config decode instead of a template read, so both flags
+    /// agree about what the family is.
     nonisolated public static func supportsVision(modelPath: String?) -> Bool {
         guard let path = modelPath, !path.isEmpty else { return false }
         let key = path as NSString
@@ -1285,6 +1286,15 @@ public struct ModelConfig: Codable {
             // exactly the half-downloaded case the load path refuses for the
             // backbone; here it must keep the composer closed instead.
             supported = DeepSeekV41VisionWeights.directoryHasTower(directory)
+        } else if Inkling2Availability.isRuntimeAvailable, isInkling2Directory(directory),
+                  let config = try? Inkling2Config.decode(
+                      contentsOf: directory.appendingPathComponent("config.json")
+                  ),
+                  config.vision != nil {
+            // Same rule as above, and the anchors are the catalog's own names, so
+            // the gate cannot disagree with the tower about which tensors are
+            // vision.
+            supported = Inkling2Preflight.visionTowerIsPresent(snapshotDir: directory)
         }
         visionCache.setObject(
             StampedSupportBox(supported: supported, stamp: supported ? nil : stamp),

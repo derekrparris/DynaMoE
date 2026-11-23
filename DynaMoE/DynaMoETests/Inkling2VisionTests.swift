@@ -15,6 +15,7 @@
 
 import Metal
 import XCTest
+import AppKit
 @testable import DynaMoE
 
 final class Inkling2VisionTests: XCTestCase {
@@ -845,5 +846,262 @@ final class Inkling2VisionTests: XCTestCase {
         XCTAssertEqual(pooler.first?.count, spec.textHiddenSize)
         XCTAssertEqual(relativeError(pooler.flatMap { $0 }, reference.flatMap { $0 }), 0, accuracy: bar)
         print("vision tower: \(spec.numHiddenLayers) layers, worst stage \(worst.name) \(worst.error) relative")
+    }
+}
+
+// MARK: - Plumbing the picture into the prompt
+
+/// The half of the image path that runs with no weights: how a picture becomes
+/// a typed content block, how the API server hands one over, and when the
+/// composer is allowed to offer an attachment at all.
+///
+/// These are the seams that fail SILENTLY when they drift -- a picture in the
+/// wrong block, a sentinel reaching the tokenizer, a half-downloaded snapshot
+/// advertising a tower -- so each is pinned here rather than at the turn.
+final class Inkling2VisionPlumbingTests: XCTestCase {
+
+    private let marker = Inkling2PromptMarkers.familyDefault
+    private let oneByTwo = Inkling2ImageGrid(cellRows: 1, cellColumns: 2)
+    private let twoByThree = Inkling2ImageGrid(cellRows: 2, cellColumns: 3)
+
+    // MARK: Content parts
+
+    /// The checkpoint gives a picture its own content block, so the renderer
+    /// must be handed parts rather than a sentence with a marker inside it.
+    func testAPictureBecomesItsOwnContentBlock() {
+        XCTAssertEqual(
+            ChatPromptFormatter.inklingContentParts(text: "What colour?", grids: []),
+            [.text("What colour?")],
+            "a turn with no picture is one text block"
+        )
+        XCTAssertEqual(
+            ChatPromptFormatter.inklingContentParts(text: "What colour?", grids: [oneByTwo]),
+            [.image(oneByTwo), .text("What colour?")],
+            "a picture with no sentinel goes in front of the words"
+        )
+        // Text, picture, text, picture: the server's decoders keep a message's
+        // content order as one sentinel per picture, and that order has to survive
+        // as parts or the model answers about a picture in a different relation to
+        // the words.
+        let sentinel = ServerImageParts.imagePlaceholder
+        XCTAssertEqual(
+            ChatPromptFormatter.inklingContentParts(
+                text: "Before \(sentinel) between \(sentinel) after",
+                grids: [oneByTwo, twoByThree]
+            ),
+            [
+                .text("Before "), .image(oneByTwo),
+                .text(" between "), .image(twoByThree),
+                .text(" after")
+            ]
+        )
+    }
+
+    /// A count mismatch is fail-closed: nothing is rendered, so the prompt is left
+    /// without the placeholders the pictures need and the engine refuses the turn
+    /// by name. Repeating or dropping a marker would shift every later position.
+    func testAPictureCountThatDisagreesWithItsMarkersRendersNothing() {
+        let sentinel = ServerImageParts.imagePlaceholder
+        XCTAssertEqual(
+            ChatPromptFormatter.inklingContentParts(text: "before \(sentinel) after", grids: []),
+            [],
+            "a sentinel with no picture has nowhere to go"
+        )
+        XCTAssertEqual(
+            ChatPromptFormatter.inklingContentParts(
+                text: "a \(sentinel) b \(sentinel) c", grids: [oneByTwo]
+            ),
+            [],
+            "two sentinels and one picture cannot both be honoured"
+        )
+    }
+
+    /// The parts render with the checkpoint's own markers, and the sentinel itself
+    /// never reaches them.
+    func testTheRenderedBlockCarriesTheCheckpointsMarkers() throws {
+        let sentinel = ServerImageParts.imagePlaceholder
+        let parts = ChatPromptFormatter.inklingContentParts(
+            text: "Which colour? \(sentinel)", grids: [oneByTwo]
+        )
+        let rendered = try Inkling2Prompt().render(parts: parts, role: "user")
+        XCTAssertEqual(
+            rendered,
+            marker.contentText + "Which colour? " + marker.endMessage
+                + marker.contentImage + marker.imagePlaceholder + marker.endMessage
+        )
+        XCTAssertFalse(rendered.contains(sentinel), "the sentinel is a caller's, not the model's")
+    }
+
+    // MARK: Server seam
+
+    /// The server decodes each part, records one picture per part, and leaves the
+    /// turn's sentinel in place for the renderer to consume.
+    func testTheServerGivesEachPictureItsOwnBlock() throws {
+        let png = try pngData(width: 50, height: 40)
+        var turns = [
+            ChatPromptFormatter.ConversationTurn(
+                role: .user, text: "Which colour? \(ServerImageParts.imagePlaceholder)"
+            )
+        ]
+        let resolved = try ServerController.attachImageGrids(
+            turns: turns,
+            images: [0: [ServerImagePart(payload: .inline(png, mediaType: "image/png"))]]
+        )
+        turns = resolved.turns
+        XCTAssertEqual(turns[0].imageGrids, [oneByTwo], "50 x 40 pixels is one cell row of two")
+        XCTAssertEqual(resolved.images.count, 1)
+        XCTAssertEqual(resolved.images[0].width, 50)
+        XCTAssertEqual(resolved.images[0].height, 40)
+        XCTAssertTrue(
+            turns[0].text.contains(ServerImageParts.imagePlaceholder),
+            "the sentinel is what places the block, so the server leaves it in place"
+        )
+        XCTAssertEqual(
+            ChatPromptFormatter.inklingContentParts(
+                text: turns[0].text, grids: turns[0].imageGrids
+            ),
+            [.text("Which colour? "), .image(oneByTwo)]
+        )
+    }
+
+    /// The count the server checks the budget against and reports as usage is
+    /// the EXPANDED one, because that is the prompt the cache runs.
+    func testTheServerPricesTheExpandedPicture() throws {
+        let markerID = 200_054
+        let ids: [UInt32] = [11, 12, UInt32(markerID), 13]
+        XCTAssertEqual(
+            try ServerController.inklingPromptTokenCount(
+                tokenIds: ids, grids: [oneByTwo], imageTokenID: markerID
+            ),
+            4 - 1 + oneByTwo.languagePositions,
+            "one placeholder becomes one marker per cell"
+        )
+        XCTAssertThrowsError(
+            try ServerController.inklingPromptTokenCount(
+                tokenIds: [UInt32(markerID)], grids: [oneByTwo, twoByThree], imageTokenID: markerID
+            ),
+            "a prompt with fewer placeholders than pictures has nowhere to put the rest"
+        )
+    }
+
+    func testAPictureOnATurnThatDoesNotExistIsRefused() throws {
+        let png = try pngData(width: 40, height: 40)
+        XCTAssertThrowsError(
+            try ServerController.attachImageGrids(
+                turns: [ChatPromptFormatter.ConversationTurn(role: .user, text: "hi")],
+                images: [3: [ServerImagePart(payload: .inline(png, mediaType: "image/png"))]]
+            )
+        )
+    }
+
+    // MARK: The composer gate
+
+    /// The attachment button is opened by `supportsVision`, so a snapshot that
+    /// merely CLAIMS a tower must not open it, and the flag has to turn on once
+    /// the files land.
+    func testTheGateOpensOnlyWhenTheTowerHasShipped() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("inkling2-vision-gate-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            ModelConfig.invalidateVisionCache()
+            try? FileManager.default.removeItem(at: root)
+        }
+        ModelConfig.invalidateVisionCache()
+
+        var config = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: Data(Inkling2ConfigTests.smallJSON.utf8)
+            ) as? [String: Any]
+        )
+        config["vision_config"] = [
+            "model_type": "inkling2_vision",
+            "text_hidden_size": 64,
+            "temporal_patch_size": 2,
+            "native_patch_size": 20,
+            "adapter_merge_size": 2,
+            "projection_hidden_dim": 32,
+            "hidden_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "mlp_ratio": 4.0,
+            "posemb_grid_size": 32,
+            "layer_norm_eps": 1e-05
+        ]
+        try JSONSerialization.data(withJSONObject: config)
+            .write(to: root.appendingPathComponent("config.json"))
+
+        XCTAssertFalse(
+            ModelConfig.supportsVision(modelPath: root.path),
+            "a config that promises a tower the snapshot has not shipped is not vision"
+        )
+
+        let anchors = [
+            "model.visual.backbone.embeddings.patch_embedding.weight",
+            "model.visual.backbone.embeddings.class_embedding",
+            "model.visual.backbone.embeddings.position_embedding",
+            "model.visual.backbone.ln_pre.weight",
+            "model.visual.backbone.layers.0.self_attn.q_proj.weight",
+            "model.visual.backbone.layers.0.mlp.c_fc.weight",
+            "model.visual.proj_in.weight",
+            "model.visual.proj_out.weight"
+        ]
+        let index: [String: Any] = [
+            "weight_map": Dictionary(
+                uniqueKeysWithValues: anchors.map { ($0, "model-00001-of-00001.safetensors") }
+            )
+        ]
+        try JSONSerialization.data(withJSONObject: index)
+            .write(to: root.appendingPathComponent("model.safetensors.index.json"))
+        ModelConfig.invalidateVisionCache()
+        XCTAssertFalse(
+            ModelConfig.supportsVision(modelPath: root.path),
+            "a name in the index proves nothing while the shard it names is missing"
+        )
+
+        try Data().write(to: root.appendingPathComponent("model-00001-of-00001.safetensors"))
+        ModelConfig.invalidateVisionCache()
+        XCTAssertTrue(
+            ModelConfig.supportsVision(modelPath: root.path),
+            "the shards have landed, so the composer may offer an attachment"
+        )
+    }
+
+    /// The downloaded checkpoint is one, and that is what makes the composer's
+    /// button appear for it rather than only for the family's tests.
+    func testThePublishedCheckpointAdvertisesItsTower() throws {
+        let path = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(Inkling2PublishedTensorTests.snapshotRelativePath)
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: path.path),
+            "Inkling 2 snapshot is not downloaded at \(path.path)"
+        )
+        XCTAssertTrue(ModelConfig.supportsVision(modelPath: path.path))
+    }
+
+    // MARK: Helpers
+
+    /// A real PNG, because the server path decodes encoded bytes rather than the
+    /// raw RGB a `TurnImage` carries.
+    private func pngData(width: Int, height: Int) throws -> Data {
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,
+            bitsPerSample: 8, samplesPerPixel: 3, hasAlpha: false, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+        ) else {
+            throw XCTSkip("NSBitmapImageRep refused \(width)x\(height)")
+        }
+        if let base = rep.bitmapData {
+            for y in 0..<height {
+                let row = base + y * rep.bytesPerRow
+                for x in 0..<width {
+                    let pixel = row + x * 3
+                    pixel[0] = 220
+                    pixel[1] = 20
+                    pixel[2] = 20
+                }
+            }
+        }
+        return try XCTUnwrap(rep.representation(using: .png, properties: [:]))
     }
 }

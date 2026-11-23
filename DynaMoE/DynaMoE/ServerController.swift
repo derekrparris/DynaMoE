@@ -1594,13 +1594,16 @@ final class ServerController: ObservableObject {
         var images: [TurnImage]
     }
 
-    /// Writes one marker per attachment into its turn and decodes the pixels.
+    /// Writes each attachment into its turn and decodes the pixels.
     ///
     /// This is the server's whole image gate. A checkpoint with no tower is refused
     /// here, by name, rather than downstream where the engine would refuse an
     /// expanded prompt whose placeholders have no rows; a URL is refused rather
-    /// than fetched; and the marker is the checkpoint's own image token, so the
+    /// than fetched; and what lands in the turn is the family's own form, so the
     /// prompt the renderer produces is the same one the in-app composer produces.
+    /// DeepSeek V4.1 takes a one-token marker at the head of the turn; Inkling 2
+    /// takes a typed content block whose grid is the cell count its placeholder
+    /// expands to.
     nonisolated private static func resolveTurnImages(
         _ inputs: TurnPlanInputs,
         info: CompletionEngine.LoadedModelInfo
@@ -1608,14 +1611,107 @@ final class ServerController: ObservableObject {
         guard inputs.images.values.contains(where: { !$0.isEmpty }) else {
             return ResolvedTurnImages(turns: inputs.conversation, images: [])
         }
-        guard info.supportsVision,
-              let marker = ServerImageParts.visionMarker(
-                  modelPath: info.path,
-                  config: CompletionEngine.shared.promptModelConfig
-              ) else {
+        guard info.supportsVision else { throw noVisionTower(info) }
+        if CompletionEngine.shared.promptModelConfig?.isInkling2Model == true {
+            return try attachImageGrids(turns: inputs.conversation, images: inputs.images)
+        }
+        guard let marker = ServerImageParts.visionMarker(
+            modelPath: info.path,
+            config: CompletionEngine.shared.promptModelConfig
+        ) else {
             throw noVisionTower(info)
         }
         return try attachImageMarkers(turns: inputs.conversation, images: inputs.images, marker: marker)
+    }
+
+    /// The bytes an image part carries, or the refusal that names why it has none.
+    nonisolated static func imagePartBytes(_ part: ServerImagePart) throws -> Data {
+        guard let data = part.bytes else {
+            switch part.payload {
+            case let .remoteURL(url):
+                throw ServerAPIError.unsupportedContent(
+                    "This server will not fetch an image from a URL (\(url)). Send the picture "
+                        + "inline as base64 (a `data:image/png;base64,...` URL), which is what the "
+                        + "OpenAI and Anthropic SDKs send."
+                )
+            case let .malformed(reason):
+                throw ServerAPIError.unsupportedContent("An attached image could not be read: \(reason).")
+            case .inline:
+                throw ServerAPIError.unsupportedContent("An attached image carried no bytes.")
+            }
+        }
+        return data
+    }
+
+    /// What Inkling 2's prompt will really occupy once its pictures expand.
+    ///
+    /// The rendered prompt carries ONE placeholder per picture and each expands
+    /// to one marker per 40-pixel cell, so the number the budget is checked
+    /// against and the number the client is told are the expanded size. This is
+    /// the same arithmetic the engine prices with, over the same grids, so the
+    /// usage a turn reports is the prompt it ran.
+    nonisolated static func inklingPromptTokenCount(
+        tokenIds: [UInt32],
+        grids: [Inkling2ImageGrid],
+        imageTokenID: Int
+    ) throws -> Int {
+        let marker = UInt32(clamping: imageTokenID)
+        let placeholders = tokenIds.reduce(0) { $0 + ($1 == marker ? 1 : 0) }
+        guard placeholders == grids.count else {
+            throw ServerAPIError.badRequest(
+                "The attached image could not be placed in the prompt: "
+                    + Inkling2ImagePromptError.placeholderCountMismatch(
+                        placeholders: placeholders, images: grids.count
+                    ).description
+            )
+        }
+        return tokenIds.count - placeholders + grids.reduce(0) { $0 + $1.languagePositions }
+    }
+
+    /// Inkling 2's half of the gate: each picture becomes a typed content block.
+    ///
+    /// The turn's text keeps the `U+FFFC` sentinels its decoder wrote, because
+    /// they are what tells the renderer where each block goes; the renderer
+    /// consumes them and refuses a turn whose sentinel and picture counts
+    /// disagree, which is why nothing is spliced into the text here.
+    nonisolated static func attachImageGrids(
+        turns: [ChatPromptFormatter.ConversationTurn],
+        images: [Int: [ServerImagePart]]
+    ) throws -> ResolvedTurnImages {
+        var turns = turns
+        var decoded: [TurnImage] = []
+        for index in images.keys.sorted() {
+            let parts = images[index] ?? []
+            guard !parts.isEmpty else { continue }
+            guard index >= 0, index < turns.count else {
+                throw ServerAPIError.badRequest("An image was attached to a conversation turn that does not exist.")
+            }
+            var grids: [Inkling2ImageGrid] = []
+            for part in parts {
+                let data = try imagePartBytes(part)
+                let pixels: Inkling2ImagePixels.RGB
+                let cells: Inkling2ImagePixels.Cells
+                do {
+                    pixels = try Inkling2ImagePixels.decode(data)
+                    cells = try Inkling2ImagePixels.cells(pixels)
+                } catch {
+                    throw ServerAPIError.unsupportedContent(
+                        "An attached image could not be decoded: \(error.localizedDescription)"
+                    )
+                }
+                grids.append(cells.grid)
+                decoded.append(
+                    TurnImage(
+                        rgb: pixels.rgb,
+                        width: pixels.width,
+                        height: pixels.height,
+                        sha256: ServerImageParts.digest([part])
+                    )
+                )
+            }
+            turns[index].imageGrids = grids
+        }
+        return ResolvedTurnImages(turns: turns, images: decoded)
     }
 
     /// The placement half of the gate, split out so it can be tested without a
@@ -1636,20 +1732,7 @@ final class ServerController: ObservableObject {
             }
             var markerTexts: [String] = []
             for part in parts {
-                guard let data = part.bytes else {
-                    switch part.payload {
-                    case let .remoteURL(url):
-                        throw ServerAPIError.unsupportedContent(
-                            "This server will not fetch an image from a URL (\(url)). Send the picture "
-                                + "inline as base64 (a `data:image/png;base64,...` URL), which is what the "
-                                + "OpenAI and Anthropic SDKs send."
-                        )
-                    case let .malformed(reason):
-                        throw ServerAPIError.unsupportedContent("An attached image could not be read: \(reason).")
-                    case .inline:
-                        throw ServerAPIError.unsupportedContent("An attached image carried no bytes.")
-                    }
-                }
+                let data = try imagePartBytes(part)
                 let pixels: DeepSeekV41ImagePixels
                 do {
                     pixels = try DeepSeekV41ImagePixels.decode(data)
@@ -1809,7 +1892,14 @@ final class ServerController: ObservableObject {
         // extension of the previous turn's prompt+generation and the pinned
         // KV prefix stays reusable across turns.
         let formattedPrompt: String
-        if conversation.count == 1, conversation[0].role == .user {
+        // A single plain user turn renders exactly as before (native template
+        // with zero wrapper noise), but only when it is PLAIN: the single-turn
+        // path takes a string, so a turn carrying Inkling 2's typed content
+        // blocks -- or a leftover picture sentinel -- has to go through the
+        // conversation renderer, which is the only one that places them.
+        if conversation.count == 1, conversation[0].role == .user,
+           conversation[0].imageGrids.isEmpty,
+           !conversation[0].text.contains(ServerImageParts.imagePlaceholder) {
             formattedPrompt = ChatPromptFormatter.formatPrompt(
                 prompt: conversation[0].text,
                 cleanSystem: cleanSystem,
@@ -1855,23 +1945,38 @@ final class ServerController: ObservableObject {
         // marker is a 400 here instead of an engine error later.
         var promptTokenCount = promptTokenIds.count
         if !vision.images.isEmpty {
-            guard let spec = ModelConfig.visionSpec(modelPath: info.path) else {
-                throw noVisionTower(info)
-            }
-            do {
-                promptTokenCount = try DeepSeekV41TurnImages.price(
+            if engine.promptModelConfig?.isInkling2Model == true {
+                // One placeholder per picture expands to one marker per 40-pixel
+                // cell, and the grids on the turns are in the order the renderer
+                // wrote them.
+                let path = info.path.map { URL(fileURLWithPath: $0).appendingPathComponent("config.json") }
+                guard let path, let config = try? Inkling2Config.decode(contentsOf: path) else {
+                    throw noVisionTower(info)
+                }
+                promptTokenCount = try Self.inklingPromptTokenCount(
                     tokenIds: promptTokenIds,
-                    images: vision.images.map {
-                        DeepSeekV41ImageInput(
-                            rgb: $0.rgb, width: $0.width, height: $0.height, sha256: $0.sha256
-                        )
-                    },
-                    spec: spec
-                ).promptTokens
-            } catch {
-                throw ServerAPIError.badRequest(
-                    "The attached image could not be placed in the prompt: \(error.localizedDescription)"
+                    grids: vision.turns.flatMap(\.imageGrids),
+                    imageTokenID: config.imageTokenID
                 )
+            } else {
+                guard let spec = ModelConfig.visionSpec(modelPath: info.path) else {
+                    throw noVisionTower(info)
+                }
+                do {
+                    promptTokenCount = try DeepSeekV41TurnImages.price(
+                        tokenIds: promptTokenIds,
+                        images: vision.images.map {
+                            DeepSeekV41ImageInput(
+                                rgb: $0.rgb, width: $0.width, height: $0.height, sha256: $0.sha256
+                            )
+                        },
+                        spec: spec
+                    ).promptTokens
+                } catch {
+                    throw ServerAPIError.badRequest(
+                        "The attached image could not be placed in the prompt: \(error.localizedDescription)"
+                    )
+                }
             }
         }
         let promptTokenCap = Self.resolvedMaxPromptTokens
