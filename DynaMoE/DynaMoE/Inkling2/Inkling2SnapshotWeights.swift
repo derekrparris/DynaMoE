@@ -33,6 +33,20 @@ nonisolated public final class Inkling2SnapshotWeights: Inkling2WeightSource {
     /// holds. `MTLBuffer` is only used for its `contents`/`length` view, so
     /// this file needs no device of its own.
     private let shardBuffers: [UInt32: MTLBuffer]
+    /// Decoded control matrices, keyed by role and layer.
+    ///
+    /// A visit asks for the same message-gate and convolution-tap matrices on
+    /// every position, and decoding one copies the tensor out of the shard and
+    /// widens it -- work that was being redone dozens of times per token. Only
+    /// tensors under `matrixCacheByteLimit` are kept: this path also serves the
+    /// fused expert banks and the unembedding, and caching those would hold
+    /// gigabytes for a single read.
+    private let matrixCacheLock = NSLock()
+    private var matrixCache: [String: [Float]] = [:]
+    /// What one cached matrix may cost. The largest control matrix is an
+    /// `attn_res` query block (hidden x 3 * hidden, ~64 MB at the published
+    /// width), so this admits every control tensor and excludes the banks.
+    public static let matrixCacheByteLimit = 96 * 1_024 * 1_024
 
     public init(
         config: Inkling2Config,
@@ -174,9 +188,32 @@ nonisolated public final class Inkling2SnapshotWeights: Inkling2WeightSource {
 
     public func matrix(_ role: Inkling2TensorRole, layer: Int?) throws -> [Float] {
         let ref = try tensor(role, layer: layer)
+        let key = "\(role.rawValue)|\(layer.map(String.init) ?? "-")"
+        // A tensor too large to keep is decoded and handed back uncached.
+        let cacheable = ref.elementCount * MemoryLayout<Float>.stride <= Self.matrixCacheByteLimit
+        if cacheable {
+            matrixCacheLock.lock()
+            let cached = matrixCache[key]
+            matrixCacheLock.unlock()
+            if let cached { return cached }
+        }
         let pointer = try bytes(of: ref)
         let raw = Self.rawValues(pointer, count: ref.elementCount, dtype: ref.dtype)
-        return Self.decode(raw, dtype: ref.dtype, count: ref.elementCount)
+        let decoded = Self.decode(raw, dtype: ref.dtype, count: ref.elementCount)
+        if cacheable {
+            matrixCacheLock.lock()
+            matrixCache[key] = decoded
+            matrixCacheLock.unlock()
+        }
+        return decoded
+    }
+
+    /// How many matrices the cache holds, and what they cost. For the tests
+    /// that have to see a repeat read served from memory rather than a shard.
+    public var cachedMatrixCount: Int {
+        matrixCacheLock.lock()
+        defer { matrixCacheLock.unlock() }
+        return matrixCache.count
     }
 
     /// The unembedding's logits, decoded a CHUNK of rows at a time.

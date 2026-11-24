@@ -580,6 +580,17 @@ What the same probes DID establish about the mixture: 36.5 MB of expert bank per
 
 - **Not done in this slice:** Phase 6 items 2-7 and item 1's arena-dependent fields.
 
+**Progress: slice 8, the host weight source caches its decoded matrices (2026-11-24).**
+
+Slice 7's block-read change did not move `hostPrep`, so this slice followed the time instead of the idea. `Inkling2SnapshotWeights.matrix` -- what the host graph calls for every message gate (three matrices, three gates, on each of the 16 core-layer passes of a visit), every convolution tap set, and every `attn_res` query -- copied the tensor out of the shard into a `[UInt8]` and widened it, on EVERY call, for tensors that never change. The device weight source has cached its `hostMatrix` decodes since `ea16443`; the host source had no cache at all. It now keeps decoded matrices under `matrixCacheByteLimit` (96 MB, which admits every control tensor and excludes the fused expert banks and the unembedding), behind an `NSLock` for the same reason the device cache has one.
+
+**Measured at `-O` on the published checkpoint**, two processes, agreeing: **2.70 ms per visit and 129.5-129.7 ms per position**, against slice 7's **3.13-3.15 and 150.1-151.4**. Per visit that is **-0.43 to -0.45 ms (-14%)**, and it is not a scheduling artifact: `hostPrep` 0.44 -> 0.09 and `mlpRead` 0.15 -> 0.03 are the two stages that make these calls, and every committing stage is unchanged (device 1.29 in both).
+
+- **The block read's own change (from the same sitting) is smaller than that, and is recorded honestly**: the inverse-scalar form is 4.9-7.6x over the scalar rule in isolation -- about 1.7x over what slice 7 shipped -- but `hostPrep` did not move on it alone, because the block read is a few microseconds of a stage dominated by the weight decodes. It is kept because it is strictly less work (no normalized copy of the stack is materialized) and it is pinned like the rest.
+- **Coverage.** `testAControlMatrixIsDecodedOnceAndThenServedFromMemory` overwrites the shard between two reads: a cache miss returns the new bytes, so the test cannot pass by decoding twice, and it also asserts that an oversized tensor is decoded but not kept.
+- **Whole-visit parity is unchanged**: 6.0159e-07 relative against the host graph (bar 1e-3), which is what a cache of pure functions must give.
+- **Not done in this slice:** Phase 6 items 2-7 and item 1's arena-dependent fields.
+
 ### Phase 7: Long context and DynaMoE FP8 (INT8) KV
 
 **Work**

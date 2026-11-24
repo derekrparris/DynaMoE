@@ -217,6 +217,72 @@ final class Inkling2ConfigTests: XCTestCase {
             XCTAssertEqual(error as? Inkling2ConfigError, .notInkling2)
         }
     }
+
+    /// A control matrix is decoded once and served from memory afterwards: a
+    /// visit asks for the same message-gate and convolution-tap matrices on
+    /// every position, so without this the same BF16 tensor was copied out of
+    /// the shard and widened dozens of times per token.
+    ///
+    /// The shard buffer is overwritten between the two reads. A cache miss
+    /// would therefore return the NEW bytes, which is the only way this test
+    /// can tell a cached read from a repeat decode -- comparing two reads of
+    /// unchanged bytes passes either way.
+    func testAControlMatrixIsDecodedOnceAndThenServedFromMemory() throws {
+        let config = try config()
+        let width = config.hiddenSize
+        // Sink projection: one row per attention head, BF16.
+        let shape = [config.numAttentionHeads, width]
+        let count = shape.reduce(1, *)
+        let bytes = count * 2
+        let shard = try XCTUnwrap(MTLCreateSystemDefaultDevice()).makeBuffer(
+            length: bytes, options: .storageModeShared
+        )
+        let shardBuffer = try XCTUnwrap(shard)
+        let pointer = shardBuffer.contents().bindMemory(to: UInt16.self, capacity: count)
+        for index in 0..<count {
+            // Small positive BF16 values whose low bits differ per index.
+            pointer[index] = UInt16(0x3F00 &+ UInt16(index % 0x40))
+        }
+        let name = "model.llm.layers.0.attn.attn_sink_proj.weight"
+        let catalog = Inkling2WeightCatalog(
+            mainFile: [Inkling2TensorRef(
+                name: name, dtype: "BF16", shape: shape, shardIndex: 0, byteOffset: 0
+            )],
+            layerCount: config.numHiddenLayers
+        )
+        let source = Inkling2SnapshotWeights(
+            config: config, catalog: catalog, shardBuffers: [0: shardBuffer]
+        )
+        let first = try source.matrix(.attnSinkProj, layer: 0)
+        XCTAssertEqual(first.count, count)
+        XCTAssertEqual(source.cachedMatrixCount, 1)
+
+        for index in 0..<count { pointer[index] = 0 }
+        let second = try source.matrix(.attnSinkProj, layer: 0)
+        XCTAssertEqual(second, first, "the second read came from the shard, not the cache")
+
+        // A tensor past the cache's limit is decoded but never kept: this path
+        // also serves the expert banks and the unembedding.
+        XCTAssertEqual(source.cachedMatrixCount, 1)
+        let bigCount = Inkling2SnapshotWeights.matrixCacheByteLimit / 2
+        let bigShard = try XCTUnwrap(
+            MTLCreateSystemDefaultDevice()?.makeBuffer(
+                length: bigCount * 2, options: .storageModeShared
+            )
+        )
+        let bigCatalog = Inkling2WeightCatalog(
+            mainFile: [Inkling2TensorRef(
+                name: "model.llm.layers.0.attn.attn_sink_proj.weight", dtype: "BF16",
+                shape: [1, bigCount], shardIndex: 0, byteOffset: 0
+            )],
+            layerCount: config.numHiddenLayers
+        )
+        let bigSource = Inkling2SnapshotWeights(
+            config: config, catalog: bigCatalog, shardBuffers: [0: bigShard]
+        )
+        _ = try bigSource.matrix(.attnSinkProj, layer: 0)
+        XCTAssertEqual(bigSource.cachedMatrixCount, 0, "an oversized tensor must not be cached")
+    }
 }
 
 // MARK: - Primitives: element formats
