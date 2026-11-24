@@ -1211,6 +1211,113 @@ final class Inkling2DeviceKernelTests: XCTestCase {
 
     // MARK: The MLP half
 
+    /// The batched projection entry: eight contiguous position rows through
+    /// `gemv` are the same numbers eight single-position dispatches give, and a
+    /// block wider than the kernel reads is refused instead of silently
+    /// truncated to its first eight.
+    ///
+    /// This is the seam the batched prefill will call, and the reason it is a
+    /// kernel case rather than a graph one: the graph still drives positions one
+    /// at a time, so nothing else can compare the two forms on the same bytes.
+    func testTheBatchedProjectionIsEightSingleOnesAndRefusesMore() throws {
+        let (device, library, queue) = try environment()
+        let config = try Inkling2Config.decode(jsonData: Data(Inkling2ConfigTests.smallJSON.utf8))
+        let outDim = 12, inDim = config.hiddenSize
+        let weights: [Float] = (0..<(outDim * inDim)).map { index in
+            Float((index % 19) - 9) / 8
+        }
+        let halves = weights.map { UInt16(truncatingIfNeeded: $0.bitPattern >> 16) }
+        let weightBytes = halves.withUnsafeBytes { raw in
+            device.makeBuffer(bytes: raw.baseAddress!, length: raw.count, options: .storageModeShared)!
+        }
+        let name = "model.llm.layers.0.attn.wq_du.weight"
+        let catalog = Inkling2WeightCatalog(
+            mainFile: [Inkling2TensorRef(
+                name: name, dtype: "BF16", shape: [outDim, inDim], shardIndex: 0, byteOffset: 0
+            )],
+            layerCount: config.numHiddenLayers
+        )
+        let deviceWeights = Inkling2DeviceWeights(
+            config: config, catalog: catalog, shardBuffers: [0: weightBytes]
+        )
+        let hostSource = Inkling2SnapshotWeights(
+            config: config, catalog: catalog, shardBuffers: [0: weightBytes]
+        )
+        let host = try Inkling2CPUForward(config: config, weights: hostSource)
+        let metal = try Inkling2MetalForward(
+            device: device, library: library, queue: queue, weights: deviceWeights, host: host
+        )
+
+        let positions = 8
+        let input: [Float] = (0..<(positions * inDim)).map { index in
+            Float((index % 13) - 6) / 8
+        }
+        let inputBuffer = try buffer(device, input)
+        let batchedOutput = try XCTUnwrap(
+            device.makeBuffer(length: positions * outDim * 4, options: .storageModeShared)
+        )
+        let singleOutput = try XCTUnwrap(
+            device.makeBuffer(length: positions * outDim * 4, options: .storageModeShared)
+        )
+        let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+        let encoder = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
+        try metal.gemv(
+            encoder: encoder, weight: weightBytes, weightOffset: 0,
+            input: inputBuffer, inputOffset: 0,
+            output: batchedOutput, outputOffset: 0,
+            rows: outDim, columns: inDim, positions: positions,
+            arena: Inkling2ScalarArena(device: device)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+
+        // The same eight positions, one at a time, through the one-row form.
+        let singleBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+        let singleEncoder = try XCTUnwrap(singleBuffer.makeComputeCommandEncoder())
+        let singleArena = Inkling2ScalarArena(device: device)
+        for position in 0..<positions {
+            try metal.gemv(
+                encoder: singleEncoder, weight: weightBytes, weightOffset: 0,
+                input: inputBuffer, inputOffset: position * inDim * 4,
+                output: singleOutput, outputOffset: position * outDim * 4,
+                rows: outDim, columns: inDim, positions: 1, arena: singleArena
+            )
+        }
+        singleEncoder.endEncoding()
+        singleBuffer.commit()
+        singleBuffer.waitUntilCompleted()
+        XCTAssertNil(singleBuffer.error)
+
+        let batched = batchedOutput.contents().bindMemory(to: Float.self, capacity: positions * outDim)
+        let single = singleOutput.contents().bindMemory(to: Float.self, capacity: positions * outDim)
+        var worst: Float = 0, scale: Float = 0
+        for index in 0..<(positions * outDim) {
+            worst = max(worst, abs(batched[index] - single[index]))
+            scale = max(scale, abs(single[index]))
+        }
+        print("🔎 [inkling2 device] batched projection: \(worst / scale) relative over \(positions) positions")
+        XCTAssertLessThanOrEqual(worst / scale, 1e-5, "eight positions against eight single ones")
+
+        // A block wider than the kernel reads is refused, by name, rather than
+        // silently running its first eight rows.
+        let refusalBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+        let refusalEncoder = try XCTUnwrap(refusalBuffer.makeComputeCommandEncoder())
+        XCTAssertThrowsError(
+            try metal.gemv(
+                encoder: refusalEncoder, weight: weightBytes, weightOffset: 0,
+                input: inputBuffer, inputOffset: 0,
+                output: batchedOutput, outputOffset: 0,
+                rows: outDim, columns: inDim, positions: 9,
+                arena: Inkling2ScalarArena(device: device)
+            )
+        ) { error in
+            XCTAssertTrue("\(error)".contains("one to eight positions"), "\(error)")
+        }
+        refusalEncoder.endEncoding()
+    }
+
     /// The MLP half against the host graph's own stages, on the real
     /// checkpoint: the block read and the message gate stay on the host, so the
     /// comparison covers the norm, the router and its selection, and the expert

@@ -517,12 +517,40 @@ nonisolated public final class Inkling2MetalForward {
         positions: Int = 1,
         arena: Inkling2ScalarArena
     ) throws {
-        // The BLOCK form reads eight positions unconditionally, so it is only
-        // valid when the input really holds eight rows -- dispatching it for one
-        // position reads seven rows past the buffer, which the GPU reports as an
-        // address fault. A walk therefore takes the one-thread-per-row form.
-        let kernel = positions >= 8 ? "bf16_gemv_rows8" : "bf16_gemv"
         let (weightBuffer, weightOffset) = try weights.tensor(role, layer: layer)
+        try gemv(
+            encoder: encoder, weight: weightBuffer, weightOffset: weightOffset,
+            input: input, inputOffset: inputOffset, output: output, outputOffset: outputOffset,
+            rows: rows, columns: columns, positions: positions, arena: arena
+        )
+    }
+
+    /// The shared body of `gemm`, for a weight already resolved (a fused bank's
+    /// expert slice has no single role).
+    ///
+    /// `positions` is a BLOCK: eight or more positions whose rows are already
+    /// contiguous in `input`/`output` take `bf16_gemv_rows8`, which streams the
+    /// weight row ONCE for all of them. That is the batched-prefill win -- the
+    /// walk re-reads the weight per position (measured 4.9-8.3x on this
+    /// checkpoint's own projection shapes). A shorter block falls back to the
+    /// one-thread-per-row form with its token axis, because the eight-position
+    /// kernel reads eight rows unconditionally.
+    func gemv(
+        encoder: MTLComputeCommandEncoder,
+        weight: MTLBuffer, weightOffset: UInt64,
+        input: MTLBuffer, inputOffset: Int,
+        output: MTLBuffer, outputOffset: Int,
+        rows: Int, columns: Int, positions: Int = 1,
+        arena: Inkling2ScalarArena
+    ) throws {
+        let kernel = positions >= 8 ? "bf16_gemv_rows8" : "bf16_gemv"
+        // The eight-position form reads and writes exactly eight rows; a taller
+        // block would silently run only its first eight, so it is refused.
+        if positions > 8 {
+            throw Inkling2ForwardError.unsupported(
+                "a batched projection is one to eight positions, got \(positions)"
+            )
+        }
         let offset = arena.make(UInt64(weightOffset))
         let inDim = arena.make(UInt32(columns))
         let outDim = arena.make(UInt32(rows))
@@ -530,7 +558,7 @@ nonisolated public final class Inkling2MetalForward {
         let inputStride = arena.make(zero)
         let outputStride = arena.make(zero)
         encoder.setComputePipelineState(try pipeline(kernel))
-        encoder.setBuffer(weightBuffer, offset: 0, index: 0)
+        encoder.setBuffer(weight, offset: 0, index: 0)
         encoder.setBuffer(input, offset: inputOffset, index: 1)
         encoder.setBuffer(output, offset: outputOffset, index: 2)
         encoder.setBuffer(offset, offset: 0, index: 3)

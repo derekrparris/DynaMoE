@@ -619,6 +619,14 @@ An earlier attempt this slice rewrote `forwardHidden` into a switch over the lis
 - **The schedule logic was checked against a walk on a tiny fake forward before the real checkpoint was run**, which is what separated "my driver is wrong" from "the test's setup is wrong": the two agreed there while the real run was dying in setup.
 - **Not done in this slice:** batching the projector weight reads across the block (the token axis in one buffer per stage), and the mixture's per-block expert union. Phase 6 items 2-6 remain as before.
 
+**Progress: slice 12, the batched projection entry (2026-11-24).**
+
+`gemm`'s body became `gemv`, which takes a resolved `(weight, weightOffset)` instead of a role -- a fused bank's expert slice has no single role -- and a `positions` count that is now enforced: eight or more contiguous position rows take `bf16_gemv_rows8` (the weight row streamed once for all of them), fewer take the one-thread-per-row form with its token axis, and MORE than eight is refused by name because that kernel reads and writes exactly eight rows and would otherwise silently run the first eight. `gemm` is a thin wrapper that resolves the role and calls it.
+
+**Measured at the kernel**: eight positions through `gemv` are **bit-identical (0.0 relative)** to eight single-position dispatches on the same bytes, and a nine-position block throws with "one to eight positions". The graph still drives one position per visit, so this is the seam the block driver will call, not a speed-up yet -- what it enables is the 4.9-8.3x slice 10 measured on these shapes.
+
+- **Not done in this slice:** the block's front actually dispatching batched (it needs per-position workspaces and a batched convolution, since a convolution reads the visit state's history), and the mixture's per-block expert union.
+
 ### Phase 7: Long context and DynaMoE FP8 (INT8) KV
 
 **Work**
