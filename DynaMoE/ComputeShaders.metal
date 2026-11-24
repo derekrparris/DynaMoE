@@ -13959,13 +13959,33 @@ kernel void inkling_attention_f32(
     float denominator = exp(sinkLogits[head] - maximum);
     for (uint row = 0; row < keyRows; row++) { denominator += exp(scores[row] - maximum); }
 
+    // The value fold keeps FOUR independent accumulators per lane. One
+    // accumulator is a dependent chain of `keyRows` adds, which is the defect
+    // "DSV4.1 #17" measured on the DeepSeek attention (2.74x there); here the
+    // A/B at the published widths (24 heads, 128-wide heads, 1,024 rows) is
+    // 1.26x, and the same four chains applied to the SCORE loop are 0.92x
+    // because that loop's reduction already breaks the dependency -- so only
+    // the fold changed. The sum is the same expression associated differently
+    // (measured 3.8e-06 relative against the one-accumulator form).
+    uint64_t column = ((uint64_t)kvHead * headDim);
     for (uint d = tid; d < headDim; d += tgSize) {
-        float accumulator = 0.0f;
-        for (uint row = 0; row < keyRows; row++) {
-            float weight = exp(scores[row] - maximum) / denominator;
-            accumulator += weight * values[((uint64_t)row * kvWidth) + ((uint64_t)kvHead * headDim) + d];
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        uint row = 0;
+        for (; row + 4 <= keyRows; row += 4) {
+            float w0 = exp(scores[row] - maximum) / denominator;
+            float w1 = exp(scores[row + 1] - maximum) / denominator;
+            float w2 = exp(scores[row + 2] - maximum) / denominator;
+            float w3 = exp(scores[row + 3] - maximum) / denominator;
+            a0 += w0 * values[(uint64_t)row * kvWidth + column + d];
+            a1 += w1 * values[(uint64_t)(row + 1) * kvWidth + column + d];
+            a2 += w2 * values[(uint64_t)(row + 2) * kvWidth + column + d];
+            a3 += w3 * values[(uint64_t)(row + 3) * kvWidth + column + d];
         }
-        out[d] = accumulator;
+        for (; row < keyRows; row++) {
+            float weight = exp(scores[row] - maximum) / denominator;
+            a0 += weight * values[(uint64_t)row * kvWidth + column + d];
+        }
+        out[d] = (a0 + a1) + (a2 + a3);
     }
 }
 

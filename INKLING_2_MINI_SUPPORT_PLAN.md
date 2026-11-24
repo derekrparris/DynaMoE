@@ -627,6 +627,18 @@ An earlier attempt this slice rewrote `forwardHidden` into a switch over the lis
 
 - **Not done in this slice:** the block's front actually dispatching batched (it needs per-position workspaces and a batched convolution, since a convolution reads the visit state's history), and the mixture's per-block expert union.
 
+**Progress: slice 13, the attention's value fold keeps four chains (2026-11-24).**
+
+The attention kernel is the largest device stage left that is not a weight read: `attentionFront` + `attentionTail` carry ~0.37 ms of device window per visit, one threadgroup of 32 lanes per head, each lane owning four dimensions and folding every KV row into ONE accumulator -- a dependent chain of `keyRows` adds. `Benchmarks/PERF_FINDINGS.md` "DSV4.1 #17" measured that exact shape on the DeepSeek attention and fixed it with independent accumulators, so it was tested here rather than assumed.
+
+**Isolated A/B at the published widths** (24 heads, 8 KV heads, 128-wide heads, 1,024 rows), four arms rotated: the shipped fold **17.0-17.4 ms**; four independent accumulators in the value fold **13.4-14.0 ms (1.24-1.27x)**; four chains in the SCORE loop **18.1-18.3 ms (0.93-0.95x)**; precomputing the softmax weights once per row instead of once per row per dimension **13.9-14.0 (1.22-1.24x)**. Only the value fold is a win, and the weight precompute is the same win (the two are not additive, so the `exp` calls were never the cost).
+
+**Measured in place** at `-O` on the published checkpoint, two processes: **127.9-128.6 ms per position and 2.67-2.68 ms per visit** against the previous 129.5-129.7 / 2.70, with `attentionFront` device 0.213 -> 0.211 and `attentionTail` 0.162 -> 0.159. The in-situ move is ~1%, much smaller than the isolated ratio, and that gap is the honest result: the attention's device window is only ~25% of the kernel's own isolated time, so most of what the A/B measured is outside the graph's accounting. It is kept because it is a strict reduction of a dependency chain, it reproduces, and parity holds: the attention kernel 3.39e-07 per head, the whole visit 5.60e-07 (bar 1e-3).
+
+- **A duplicated KV read was tested and is NOT the lever.** Twenty-four query heads over eight KV heads read each KV half-row three times, so a head-group-per-threadgroup form (one KV read per group) was written. At a groups-of-one geometry, where its per-head reduction is a whole SIMD slice, it is **1.03x** -- and it did not reproduce the expected values, which is why it was dropped rather than debugged: a 3% ceiling does not justify chasing reduction-slice arithmetic.
+- **Two more measured negatives from the same sitting**: the expert projection with four output rows per threadgroup is 1.28-1.51x isolated but **slower in place** (mixture device 0.643 -> 0.717 ms in two processes), so it was reverted; and an E4M3 lookup table is 0.97x.
+- **Not done in this slice:** the block's batched front, and the mixture's per-block expert union.
+
 ### Phase 7: Long context and DynaMoE FP8 (INT8) KV
 
 **Work**
