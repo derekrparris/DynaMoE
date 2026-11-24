@@ -63,18 +63,17 @@ nonisolated public enum Inkling2VisitStage: String, Sendable, CaseIterable {
     case mlpRead
     /// The MLP norm, the router and its top-k selection, in one buffer.
     case mlpFront
-    /// Every routed expert, one command buffer each: gate/up, the softcapped
-    /// SwiGLU, the down projection and the weighted fold.
+    /// Every routed expert, in one buffer: gate/up, the softcapped SwiGLU, the
+    /// down projection and the weighted fold -- and, since slice 6, the post-MLP
+    /// convolution, which rides this buffer rather than paying its own commit.
     case expertMixture
-    /// The post-MLP convolution and the residual add.
-    case mlpTail
 
     /// The stages that commit at least one command buffer.
     public var commits: Bool {
         switch self {
         case .hostPrep, .attentionState, .mlpRead: return false
         case .attentionFront, .attentionTail,
-             .mlpFront, .expertMixture, .mlpTail: return true
+             .mlpFront, .expertMixture: return true
         }
     }
 }

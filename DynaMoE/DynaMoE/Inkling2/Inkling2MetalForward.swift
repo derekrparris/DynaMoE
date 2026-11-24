@@ -1347,6 +1347,18 @@ nonisolated public final class Inkling2MetalForward {
                 mixtureBytes += UInt64(hiddenWidth) &* UInt64(down.rowStride &+ down.scaleRowStride)
             }
         }
+        // 3. The post-MLP convolution rides this buffer too: it reads the
+        //    accumulator the last expert wrote and writes `workspace.hidden`,
+        //    which no expert touches. Its history takes the mixture
+        //    (pre-convolution), pushed after the one wait -- the next reader of
+        //    that history is the next visit.
+        try convolve(
+            encoder: mixtureEncoder, state: state, index: 3,
+            values: workspace.residualAccumulator, valuesCount: hiddenWidth,
+            dynamicInput: mlpInput,
+            layer: layer, isFull: false, headDim: config.headDim,
+            output: workspace.hidden, arena: mixtureArena
+        )
         mixtureEncoder.endEncoding()
         mixtureEncoded = true
         let mixtureCommit = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
@@ -1355,6 +1367,8 @@ nonisolated public final class Inkling2MetalForward {
         mixtureBuffer.waitUntilCompleted()
         let mixtureWaitEnded = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         if let error = mixtureBuffer.error { throw error }
+        state.pushConvolution(3, value: readBack(workspace.residualAccumulator, count: hiddenWidth))
+        let convolved = readBack(workspace.hidden, count: hiddenWidth)
         if let profile {
             var billed = Inkling2StageTiming()
             billed.add(
@@ -1369,46 +1383,6 @@ nonisolated public final class Inkling2MetalForward {
                 buffers: billed
             )
             profile.recordExperts(count: indices.count, bytes: mixtureBytes)
-        }
-
-        // 3. The post-MLP convolution, then the residual add. The convolution's
-        //    history takes the mixture (pre-convolution), so it is pushed only
-        //    after the buffer completes.
-        let tailStart = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
-        let (tailBuffer, tailEncoder) = try commandComponents()
-        let tailArena = Inkling2ScalarArena(device: device)
-        defer { tailArena.clear() }
-        var tailEncoded = false
-        defer { if !tailEncoded { tailEncoder.endEncoding() } }
-        try convolve(
-            encoder: tailEncoder, state: state, index: 3,
-            values: workspace.residualAccumulator, valuesCount: hiddenWidth,
-            dynamicInput: mlpInput,
-            layer: layer, isFull: false, headDim: config.headDim,
-            output: workspace.hidden, arena: tailArena
-        )
-        tailEncoder.endEncoding()
-        tailEncoded = true
-        let tailCommit = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
-        tailBuffer.commit()
-        let tailWaitBegan = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
-        tailBuffer.waitUntilCompleted()
-        let tailWaitEnded = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
-        if let error = tailBuffer.error { throw error }
-        state.pushConvolution(3, value: readBack(workspace.residualAccumulator, count: hiddenWidth))
-
-        let convolved = readBack(workspace.hidden, count: hiddenWidth)
-        if let profile {
-            var billed = Inkling2StageTiming()
-            billed.add(
-                Inkling2BufferClock(encodeStart: tailStart, commit: tailCommit, buffer: tailBuffer),
-                drainNanoseconds: tailWaitEnded - tailWaitBegan
-            )
-            profile.record(
-                stage: .mlpTail,
-                wallNanoseconds: DispatchTime.now().uptimeNanoseconds - tailStart,
-                buffers: billed
-            )
         }
         return zip(residual, convolved).map(+)
     }

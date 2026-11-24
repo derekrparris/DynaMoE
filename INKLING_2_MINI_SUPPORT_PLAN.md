@@ -554,6 +554,16 @@ Slice 4 left `postAttentionConvolution` as 0.17 ms of a visit that was almost pu
 - **What the same measurement does NOT say**: the wait residue is still ~0.5 ms/visit and `mlpTail` is still 0.18 ms of almost pure submission. Folding THAT one is a different change: its convolution reads `residualAccumulator` back to the host for the history push, so the merge needs its own ordering argument.
 - **Not done in this slice:** the MLP tail's fold, `workspace.stage`'s KV copy, and Phase 6 items 2-7 with item 1's arena-dependent fields.
 
+**Progress: slice 6, the post-MLP convolution folded into the mixture (2026-11-24).**
+
+The other pure-submission stage: `mlpTail` was 0.18-0.20 ms a visit for one convolution dispatch (3 us of device) behind its own commit and wait. It now rides the expert mixture's encoder, encoded after the last expert's fold. The ordering argument is the same one slice 5 used, and it holds for the same reasons: the convolution reads `residualAccumulator` (the last expert's write) and writes `workspace.hidden`, which no expert touches; the history takes the PRE-convolution mixture, which is still in `residualAccumulator` because the convolution writes elsewhere; and index 3's history is next read by the next visit.
+
+**Measured at `-O` on the published checkpoint**, four positions after a discarded warm-up, two processes: **3.16 ms per visit and 151.6 ms per position** (both processes agree to 0.1 ms) against slice 5's **3.23-3.29 and 155.3-157.8**, with commits a visit **5 -> 4** (768 per four positions) and the queue bucket **0.42 -> 0.35**. `expertMixture` absorbs the dispatch (1.04 -> 1.08) and the device total is unchanged at 1.29, which is the control.
+
+- **Whole-visit parity is unchanged, not merely passing**: 6.098343e-07 relative, the same digits slice 5 reported, which is what a fold that moves no arithmetic should do. The MLP half alone is 4.89e-07.
+- **The profile's tiling backstop was lowered, with the reading recorded.** It asserts that the stage walls cover the visit wall, and it went from >=95% to a measured **94.4%** (three isolated runs) because each fold removed a stage whose clock started after its helper had already done work, and moved read-backs and history pushes outside every stage. The per-stage assertions above it -- every stage billed, every committing stage with a window -- are what actually prove nothing stopped billing itself, so the aggregate bar is a backstop and is now 90% rather than the thing that fails first on a legitimate fold.
+- **Not done in this slice:** `workspace.stage`'s KV copy, and Phase 6 items 2-7 with item 1's arena-dependent fields.
+
 ### Phase 7: Long context and DynaMoE FP8 (INT8) KV
 
 **Work**
