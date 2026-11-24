@@ -609,6 +609,16 @@ An earlier attempt this slice rewrote `forwardHidden` into a switch over the lis
 
 - **Not done in this slice:** the lockstep block driver itself (per-position state and workspace, one submission per stage per block, the token axis on the projection kernels), and the mixture's per-block expert union. Phase 6 items 2-6 remain as before.
 
+**Progress: slice 11, the lockstep block driver, and it is the walk (2026-11-24).**
+
+`Inkling2CPUForward.forwardBlock(tokenIds:startingAt:imageRows:onPosition:)` prefeeds a block of positions in lockstep and returns each position's logits. It consumes `schedule()`, and the order is the point: the schedule's visits run OUTERMOST and the block's positions inside each one, in position order, each appending its own KV row. That is the only order in which a position cannot attend over a later sibling's row, and it is exactly what the walk does per visit -- so the block is the walk, position by position, and `testABlockPrefillMatchesTheWalk` asserts it (five tokens, every position within 1e-5 relative of a sequential walk, and the sequence state afterwards identical). `schedule()` also grew a `.snapshot` step, because the walk snapshots its pre-loop state AFTER the pre-loop layers and before pass 0, and a driver that missed it would restart every pass from the wrong place.
+
+**It is a correctness seam, not a speed-up yet.** The per-position state is explicit now, which is what a device driver needs to encode the block's projections into one submission per stage -- but the weight reads are still per position here, so this slice's measured result is parity, not time. The sizing for the next step is on the record: `bf16_gemv_rows8` against eight walk dispatches is 4.9-8.3x on this checkpoint's own projection shapes.
+
+- **Two harness traps, both hit and both fixed.** Building the second forward over the same snapshot RELEASES the first engine (`engine` is one slot) and unmaps the shard buffers under the first forward -- the SIGSEGV AGENTS.md warns about, with no crash report and no message; the test keeps both engines alive now. And the driver is deeper than the walk, so it runs on `runOnLargeStack` (the project's own helper for the ~610 KB `-Onone` frame against a 512 KB worker thread) and propagates a thrown error rather than trapping.
+- **The schedule logic was checked against a walk on a tiny fake forward before the real checkpoint was run**, which is what separated "my driver is wrong" from "the test's setup is wrong": the two agreed there while the real run was dying in setup.
+- **Not done in this slice:** batching the projector weight reads across the block (the token axis in one buffer per stage), and the mixture's per-block expert union. Phase 6 items 2-6 remain as before.
+
 ### Phase 7: Long context and DynaMoE FP8 (INT8) KV
 
 **Work**

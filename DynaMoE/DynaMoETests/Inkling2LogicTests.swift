@@ -2067,13 +2067,91 @@ final class Inkling2HostForwardTests: XCTestCase {
             "one visit per slot of the plan"
         )
         // A restart sits between two passes and nowhere else: passes 1 and 2 of
-        // the loop each begin with one.
+        // the loop each begin with one, and the snapshot is taken once.
         let restarts = schedule.filter { $0.kind == .restart }.count
         XCTAssertEqual(restarts, max(0, forward.config.numPasses - 1))
+        let snapshots = schedule.filter { $0.kind == .snapshot }.count
+        XCTAssertEqual(snapshots, 1)
+        // The snapshot is after the pre-loop layers and before the first pass.
+        let snapshotIndex = try XCTUnwrap(schedule.firstIndex { $0.kind == .snapshot })
+        if case .visit(let lastPreLoop, _) = schedule[snapshotIndex - 1].kind {
+            XCTAssertEqual(lastPreLoop, forward.config.loopCoreStart - 1)
+        } else {
+            XCTFail("the step before the snapshot must be the last pre-loop visit")
+        }
+        if case .visit(let firstCore, let firstPass) = schedule[snapshotIndex + 1].kind {
+            XCTAssertEqual(firstCore, forward.config.loopCoreStart)
+            XCTAssertEqual(firstPass, 0)
+        } else {
+            XCTFail("the step after the snapshot must be the first core visit")
+        }
         // Messages are built only on a pass after the first, for the layers
         // that have a previous pass to read.
         let withMessages = schedule.filter(\.buildsMessages)
         XCTAssertEqual(withMessages.count, (forward.config.numPasses - 1) * (forward.config.loopCoreEnd - forward.config.loopCoreStart))
+    }
+
+    /// A block prefill is the walk, position by position.
+    ///
+    /// The two executors are built over the same weights and run the same ids:
+    /// one position at a time through `forwardHidden`, and as a block. Every
+    /// position's logits must agree -- a block's only freedom is the ORDER it
+    /// runs positions in within a visit, and this is what proves that order
+    /// leaves each position attending over exactly its own prefix.
+    func testABlockPrefillMatchesTheWalk() throws {
+        let walk = try makeForward()
+        // The engine owns the shard mappings, and `engine` is one slot: a second
+        // `makeForward()` would release the first engine and unmap the buffers
+        // the walk's forward is still reading (AGENTS.md records that SIGSEGV),
+        // so both are kept alive here.
+        let walkEngine = engine
+        let batched = try makeForward()
+        try withExtendedLifetime(walkEngine) {
+        let ids = [11, 12, 13, 14, 15]
+        let source = try snapshot()
+        let tokenizer = try DynaMoeTokenizer(
+            tokenizerPath: source.appendingPathComponent("tokenizer.json").path
+        )
+        let prompt = try tokenizer.encode(text: "Hi there").map { Int($0) }
+        let tokens = prompt + ids
+
+        var walked: [[Float]] = []
+        for (position, id) in tokens.enumerated() {
+            walked.append(try walk.forwardToken(token: UInt32(id), position: position))
+        }
+        var reported: [Int: [Float]] = [:]
+        // On a large stack: this driver is deeper than the walk (a schedule loop
+        // over per-position visits), and an unoptimized frame of the dense
+        // pipeline is already past what a Swift-concurrency worker thread has
+        // (AGENTS.md records the SIGBUS that costs).
+        let result = runOnLargeStack { () -> Result<[[Float]], Error> in
+            do {
+                return .success(
+                    try batched.forwardBlock(
+                        tokenIds: tokens, startingAt: 0,
+                        onPosition: { position, logits in reported[position] = logits }
+                    )
+                )
+            } catch {
+                return .failure(error)
+            }
+        }
+        let block = try result.get()
+        XCTAssertEqual(block.count, tokens.count)
+        XCTAssertEqual(reported.count, tokens.count, "every position is reported")
+        for position in 0..<tokens.count {
+            let scale = walked[position].reduce(Float(0)) { max($0, abs($1)) }
+            let delta = zip(block[position], walked[position]).reduce(Float(0)) { max($0, abs($1.0 - $1.1)) }
+            XCTAssertLessThanOrEqual(
+                delta / max(scale, 1e-9), 1e-5,
+                "position \(position) of the block against the walk"
+            )
+        }
+        // The sequence state afterwards is the walk's too: the same committed
+        // rows, which is what a resumed turn would read.
+        XCTAssertEqual(batched.storedPositions, walk.storedPositions)
+        XCTAssertEqual(batched.storedPositions, tokens.count)
+        }
     }
 
     /// A cancelled turn leaves the cache holding exactly its committed prefix,

@@ -281,6 +281,11 @@ nonisolated public final class Inkling2CPUForward {
     nonisolated public struct Inkling2ScheduleStep: Sendable, Equatable {
         public enum Kind: Sendable, Equatable {
             case visit(layer: Int, pass: Int)
+            /// The pre-loop layers are done: the walk snapshots its hidden
+            /// state and residual stack here, and every pass restarts from it.
+            case snapshot
+            /// A pass begins: the loop reads the previous pass's leftovers
+            /// first, then the snapshot is restored.
             case restart
         }
         public let kind: Kind
@@ -291,9 +296,9 @@ nonisolated public final class Inkling2CPUForward {
         public let buildsMessages: Bool
     }
 
-    /// The schedule for this config: the pre-loop layers, `numPasses` passes
-    /// over the core range with a restart between them, then the post-loop
-    /// layers.
+    /// The schedule for this config: the pre-loop layers, the snapshot, then
+    /// `numPasses` passes over the core range with a restart before each pass
+    /// after the first, then the post-loop layers.
     public func schedule() throws -> [Inkling2ScheduleStep] {
         let coreStart = config.loopCoreStart
         let coreEnd = config.loopCoreEnd
@@ -309,6 +314,7 @@ nonisolated public final class Inkling2CPUForward {
             )
         }
         for layer in 0..<coreStart { visit(layer, pass: 0, messages: false) }
+        steps.append(.init(kind: .snapshot, appendsBoundary: false, buildsMessages: false))
         for pass in 0..<config.numPasses {
             if pass > 0 { steps.append(.init(kind: .restart, appendsBoundary: false, buildsMessages: false)) }
             for layer in coreStart..<coreEnd { visit(layer, pass: pass, messages: pass > 0) }
@@ -410,6 +416,128 @@ nonisolated public final class Inkling2CPUForward {
         )
         let logits = try rawLogits(hidden)
         return Inkling2Math.finalLogitSoftcap(logits, softcap: config.finalLogitSoftcapping)
+    }
+
+    // MARK: A block of positions, in lockstep
+
+    /// One position's state inside a block.
+    nonisolated public struct Inkling2BlockPosition {
+        public var hidden: [Float]
+        public var blockStates: [[Float]]
+        public var position: Int
+    }
+
+    /// Prefills `positions` token ids as one block and returns each position's
+    /// logits, in order.
+    ///
+    /// Visit-major, on purpose: the schedule's visits run outermost and the
+    /// block's positions inside each one, in position order, each appending its
+    /// own KV row. That is the ONLY order in which a position cannot attend
+    /// over a later sibling's row, and it is exactly what the walk does per
+    /// visit -- so the result is the walk's, position by position, and
+    /// `testABlockPrefillMatchesTheWalk` asserts that rather than assuming it.
+    ///
+    /// What this form buys is the seam, not yet the speed: the per-position
+    /// state is explicit, so a device driver can encode the block's projections
+    /// into one submission per stage instead of one per position. The weight
+    /// reads are still per position here.
+    ///
+    /// `imageRows` are supplied residual rows, keyed by position within the
+    /// block, exactly as `forwardToken`/`forwardRow` take them.
+    public func forwardBlock(
+        tokenIds: [Int],
+        startingAt startPosition: Int,
+        imageRows: [Int: [Float]] = [:],
+        onPosition: ((Int, [Float]) -> Void)? = nil
+    ) throws -> [[Float]] {
+        let count = tokenIds.count
+        guard count > 0 else { return [] }
+        try sequence.checkCapacity(position: startPosition + count - 1)
+        // Every position's embedding first: a position's visits read only its
+        // own hidden state, so nothing depends on the order of this pass.
+        var block: [Inkling2BlockPosition] = []
+        for (offset, id) in tokenIds.enumerated() {
+            let position = startPosition + offset
+            let hidden: [Float]
+            if let row = imageRows[offset] {
+                guard row.count == config.hiddenSize else {
+                    throw Inkling2ForwardError.shapeMismatch(
+                        "an image row is \(row.count) wide, expected \(config.hiddenSize)"
+                    )
+                }
+                hidden = row
+            } else {
+                let table = try weights.shape(.tokenEmbedding, layer: nil)
+                guard table.count == 2, id >= 0, id < table[0] else {
+                    throw Inkling2ForwardError.shapeMismatch(
+                        "token \(id) is outside the embedding table"
+                    )
+                }
+                let row = try weights.row(.tokenEmbedding, layer: nil, index: id)
+                hidden = Inkling2Math.rmsNorm(
+                    row, gain: try weights.matrix(.embeddingNorm, layer: nil),
+                    eps: config.rmsNormEps
+                )
+            }
+            block.append(
+                Inkling2BlockPosition(hidden: hidden, blockStates: [], position: position)
+            )
+        }
+        var snapshot: [(hidden: [Float], blockStates: [[Float]])]?
+        var previous: [(hidden: [Float], blocks: [[Float]])] = Array(
+            repeating: ([], []), count: count
+        )
+        for step in try schedule() {
+            switch step.kind {
+            case .visit(let layer, let pass):
+                for index in block.indices {
+                    var messages: [[Float]]?
+                    if step.buildsMessages {
+                        messages = try messageInput(
+                            blockStates: Array(
+                                previous[index].blocks.dropFirst(snapshot!.first!.blockStates.count + 1)
+                            ),
+                            partial: previous[index].hidden,
+                            coreIndex: layer - config.loopCoreStart, pass: pass
+                        )
+                    }
+                    let input = block[index].hidden
+                    let (output, _) = try runVisitOrSubstitute(
+                        layer: layer, pass: pass, hidden: input,
+                        blockStates: &block[index].blockStates,
+                        messages: messages, position: block[index].position
+                    )
+                    // The walk appends the layer's INPUT after the visit, then
+                    // assigns its output; the order is kept so the two drivers
+                    // read the same way, not only compute the same value.
+                    if step.appendsBoundary { block[index].blockStates.append(input) }
+                    block[index].hidden = output
+                }
+            case .snapshot:
+                snapshot = block.map { ($0.hidden, $0.blockStates) }
+            case .restart:
+                for index in block.indices {
+                    previous[index] = (block[index].hidden, block[index].blockStates)
+                    block[index].hidden = snapshot![index].hidden
+                    block[index].blockStates = snapshot![index].blockStates
+                }
+            }
+        }
+        let outputQuery = try weights.matrix(.attnResOutputQuery, layer: nil)
+        return try block.map { position -> [Float] in
+            var hidden = blockRead(
+                blockStates: position.blockStates, partial: position.hidden, queries: [outputQuery]
+            )[0]
+            hidden = Inkling2Math.rmsNorm(
+                hidden, gain: try weights.matrix(.finalNorm, layer: nil), eps: config.rmsNormEps
+            )
+            let logits = try rawLogits(hidden)
+            let softcapped = Inkling2Math.finalLogitSoftcap(
+                logits, softcap: config.finalLogitSoftcapping
+            )
+            onPosition?(position.position, softcapped)
+            return softcapped
+        }
     }
 
     /// One visit, through the installed executor when there is one.
