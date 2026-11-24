@@ -564,6 +564,22 @@ The other pure-submission stage: `mlpTail` was 0.18-0.20 ms a visit for one conv
 - **The profile's tiling backstop was lowered, with the reading recorded.** It asserts that the stage walls cover the visit wall, and it went from >=95% to a measured **94.4%** (three isolated runs) because each fold removed a stage whose clock started after its helper had already done work, and moved read-backs and history pushes outside every stage. The per-stage assertions above it -- every stage billed, every committing stage with a window -- are what actually prove nothing stopped billing itself, so the aggregate bar is a backstop and is now 90% rather than the thing that fails first on a legitimate fold.
 - **Not done in this slice:** `workspace.stage`'s KV copy, and Phase 6 items 2-7 with item 1's arena-dependent fields.
 
+**Progress: slice 7, the KV staging copy vectorized (and three measured negatives) (2026-11-24).**
+
+`workspace.stage` was the last scalar host loop in a visit and the only one whose cost grows with context: every retained K/V row copied element by element into the staging block the attention kernel reads. It is now one `vDSP_mmov` per row -- a contiguous row-major copy on both sides, so the bytes and their order are unchanged (bit-identical, it is a copy). Measured in isolation at the published row width (1,024 floats): **4.35-5.06x faster**, 0.249 -> 0.057 ms at a full 1,024-row window, 0.068 -> 0.014 at 256 rows.
+
+**Measured at `-O` on the published checkpoint**, two processes: **3.13-3.15 ms per visit and 150.1-151.4 ms per position**, against slice 6's 3.16 and 151.6. That is inside this machine's process-to-process spread and is recorded as such rather than as a win: at eight positions the copy is a few microseconds, and the isolated ratio is what says the change is a win of size proportional to retained rows. The attention parity case, which is what reads the staged rows, passes at **3.39e-07 relative** per head.
+
+Three candidates were measured and REJECTED in the same sitting, so they are not re-proposed later:
+
+- **Four independent accumulation chains in `inkling_expert_row_f32`: 0.87x** (1.73 vs 2.00 ms at the published 2,304x2,304 shape, queue kept full). `#17`'s 2.74x came from a kernel that was a dependent FMA chain; this one is bound by the E4M3 decode arithmetic, so a second accumulator set only costs registers.
+- **An E4M3 decode through a 256-entry threadgroup table: 0.97x**, bit-identical. The branch arithmetic is already cheaper than the table read.
+- **`setBytes` instead of the arena's scalar `MTLBuffer`s: 6.74 -> 4.62 us per scalar in isolation**, but the mixture's ~30 scalars make that ~0.065 ms of a 3.16 ms visit -- inside the documented spread, so nothing was changed. The arena stays, and its use-after-free argument is unaffected.
+
+What the same probes DID establish about the mixture: 36.5 MB of expert bank per visit in 0.643 ms is 57 GB/s, and a stripped-decode arm of the same kernel reaches 88-103 GB/s on the same bytes at a full queue, so ~15% of that stage is the decode arithmetic and the rest is memory -- with no form measured yet that beats the shipped one.
+
+- **Not done in this slice:** Phase 6 items 2-7 and item 1's arena-dependent fields.
+
 ### Phase 7: Long context and DynaMoE FP8 (INT8) KV
 
 **Work**
