@@ -591,6 +591,12 @@ Slice 7's block-read change did not move `hostPrep`, so this slice followed the 
 - **Whole-visit parity is unchanged**: 6.0159e-07 relative against the host graph (bar 1e-3), which is what a cache of pure functions must give.
 - **Not done in this slice:** Phase 6 items 2-7 and item 1's arena-dependent fields.
 
+**Progress: slice 9, the expert mixture's in-situ gap probed (a negative) (2026-11-24).**
+
+The mixture's device half is 36.5 MB of expert bank per visit in 0.643 ms -- 57 GB/s -- while the same kernel on resident pages reaches 88-103 GB/s, and this family's banks are the shard `mmap`, so the obvious suspect was the GPU faulting pages in while it works (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #19" measured that path at 0.065-0.2 GB/s once it interleaves with GPU work). `Inkling2MetalForward.prefaultsExpertBanks` (off in production) touches every page of each routed expert's weight and scale ranges on the host before encoding the mixture, and the measurement case runs the arms alternated (off, on, on, off) on a reset sequence each: **1.132 / 1.765 / 1.096 / 1.062 ms per visit for the mixture**. The two "on" arms are not faster, and one is much slower -- the host walk costs more than the faults it could remove -- so **the 57 GB/s is not a page-fault artefact** and the seam stays off. The position is unchanged (2.67 ms per visit, 128.3 ms), and the probe's own first cut is a lesson worth keeping: it ended with a write into the shard buffer to keep the reads alive, which is a `SIGBUS` (`KERN_PROTECTION_FAILURE`) because a shard is a read-only mapping -- the loads now accumulate into a checksum instead.
+
+- **Not done in this slice:** Phase 6 items 2-7 and item 1's arena-dependent fields.
+
 ### Phase 7: Long context and DynaMoE FP8 (INT8) KV
 
 **Work**

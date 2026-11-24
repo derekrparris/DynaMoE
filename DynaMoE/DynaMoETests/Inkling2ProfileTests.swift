@@ -468,11 +468,34 @@ final class Inkling2VisitProfileTests: XCTestCase {
         // measured ones: a first pass on an idle GPU reads several times slow
         // (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #53").
         _ = try harness.forward.forwardToken(token: 0, position: 0)
+
+        // The prefault question, alternated: does touching the expert banks on
+        // the host before the mixture dispatch move its device window? The arm
+        // order flips every round because a first pass is faster for being first
+        // ("DSV4.1 #53"), so a fixed order would decide it by itself. Each arm
+        // starts from a RESET sequence: the same position twice would advance
+        // the KV and convolution state past what the window can hold.
+        var arms = [Double](repeating: 0, count: 4)
+        for (round, prefaults) in [false, true, true, false].enumerated() {
+            metal.prefaultsExpertBanks = prefaults
+            harness.forward.reset()
+            profile.reset()
+            visits = 0
+            _ = try harness.forward.forwardToken(token: 0, position: 0)
+            arms[round] = Double(profile.timing(.expertMixture).wallNanoseconds) / Double(max(1, visits)) / 1_000_000
+        }
+        metal.prefaultsExpertBanks = false
+        print(
+            "🔎 [inkling2 profile] mixture ms/visit by arm (off, on, on, off): "
+                + arms.map { String(format: "%.3f", $0) }.joined(separator: " ")
+        )
+
+        harness.forward.reset()
         profile.reset()
         visits = 0
         let positions = 4
         let start = CFAbsoluteTimeGetCurrent()
-        for position in 1...positions {
+        for position in 0..<positions {
             _ = try harness.forward.forwardToken(token: 0, position: position)
         }
         let seconds = CFAbsoluteTimeGetCurrent() - start

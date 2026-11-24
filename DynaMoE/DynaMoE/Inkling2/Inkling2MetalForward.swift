@@ -402,6 +402,19 @@ nonisolated public final class Inkling2MetalForward {
     /// parity test compares against. It reads the same weights.
     public let host: Inkling2CPUForward
 
+    /// Touches every byte of a weight range on the HOST before a dispatch reads
+    /// it, so the GPU meets resident pages instead of faulting them in.
+    ///
+    /// Off by default and a measurement seam only: this family has no expert
+    /// arena, its banks are the shard `mmap`, and `Benchmarks/PERF_FINDINGS.md`
+    /// "DSV4.1 #19" measured a fault path at 0.065-0.2 GB/s once it interleaves
+    /// with GPU work. Whether that is what the mixture's in-situ rate is missing
+    /// is a question this switch answers, not an assumption.
+    public var prefaultsExpertBanks = false
+    /// The bytes `prefaultsExpertBanks` read, accumulated so the loads cannot
+    /// be eliminated as dead. Zero in every production path.
+    public private(set) var touchedChecksum: UInt8 = 0
+
     /// Whether `runVisit` bills its stages into `visitProfile`.
     ///
     /// Off by default and off in every production path: the seam that turns it
@@ -1321,6 +1334,16 @@ nonisolated public final class Inkling2MetalForward {
         for (slot, expert) in indices.enumerated() {
             let weight = routeWeights[slot]
             let gateUp = try weights.expertBank(.expertW13, layer: layer, expert: expert)
+            if prefaultsExpertBanks {
+                touchedChecksum &+= Self.touch(
+                    gateUp.buffer, offset: gateUp.baseOffset + gateUp.expertOffset,
+                    bytes: UInt64(2 * intermediate) * UInt64(gateUp.rowStride)
+                )
+                touchedChecksum &+= Self.touch(
+                    gateUp.scaleBuffer, offset: gateUp.scaleBaseOffset + gateUp.scaleExpertOffset,
+                    bytes: UInt64(2 * intermediate) * UInt64(gateUp.scaleRowStride)
+                )
+            }
             try expertRow(
                 encoder: mixtureEncoder,
                 weight: gateUp.buffer, weightOffset: gateUp.baseOffset + gateUp.expertOffset,
@@ -1338,6 +1361,16 @@ nonisolated public final class Inkling2MetalForward {
                 output: workspace.expertIntermediate, intermediate: intermediate, arena: mixtureArena
             )
             let down = try weights.expertBank(.expertW2, layer: layer, expert: expert)
+            if prefaultsExpertBanks {
+                touchedChecksum &+= Self.touch(
+                    down.buffer, offset: down.baseOffset + down.expertOffset,
+                    bytes: UInt64(hiddenWidth) * UInt64(down.rowStride)
+                )
+                touchedChecksum &+= Self.touch(
+                    down.scaleBuffer, offset: down.scaleBaseOffset + down.scaleExpertOffset,
+                    bytes: UInt64(hiddenWidth) * UInt64(down.scaleRowStride)
+                )
+            }
             try expertRow(
                 encoder: mixtureEncoder,
                 weight: down.buffer, weightOffset: down.baseOffset + down.expertOffset,
@@ -1684,5 +1717,26 @@ nonisolated public final class Inkling2MetalForward {
         Array(UnsafeBufferPointer(
             start: buffer.contents().bindMemory(to: UInt32.self, capacity: count), count: count
         )).map(Int.init)
+    }
+
+    /// Reads every page of a weight range on the host, one byte per page.
+    /// Measurement only: a no-op unless `prefaultsExpertBanks` is set.
+    ///
+    /// The bytes go into `touchedChecksum` rather than being written back: a
+    /// shard is a read-only mapping of the checkpoint, so storing into it is a
+    /// bus error, and an unused read would be eliminated. The checksum makes
+    /// the loads observable without writing anything.
+    nonisolated static func touch(_ buffer: MTLBuffer, offset: UInt64, bytes: UInt64) -> UInt8 {
+        guard bytes > 0, offset < UInt64(buffer.length) else { return 0 }
+        let length = Int(min(bytes, UInt64(buffer.length) - offset))
+        let base = buffer.contents().advanced(by: Int(offset))
+        let page = max(1, Int(getpagesize()))
+        var checksum: UInt8 = 0
+        var index = 0
+        while index < length {
+            checksum = checksum &+ base.load(fromByteOffset: index, as: UInt8.self)
+            index += page
+        }
+        return checksum
     }
 }
