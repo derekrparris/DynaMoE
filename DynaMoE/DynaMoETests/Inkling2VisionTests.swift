@@ -24,7 +24,8 @@ final class Inkling2VisionTests: XCTestCase {
 
     /// The engine owns the shard mappings and the zero-copy buffers point into
     /// them, so letting it go out of scope unmaps the weights under the source.
-    private var engine: DynaMoeEngine?
+    /// Internal so an extension in another file can hold it across a turn.
+    var engine: DynaMoeEngine?
 
     // MARK: Goldens
 
@@ -521,7 +522,7 @@ final class Inkling2VisionTests: XCTestCase {
     /// Loads the checkpoint the way the APP loads it and installs it in the
     /// shared engine. The engine holds the shard mappings (see `engine`), so it
     /// must outlive the caller's turn.
-    private func configureAppOrderEngine() throws -> (
+    func configureAppOrderEngine() throws -> (
         directory: URL, tokenizer: DynaMoeTokenizer, config: Inkling2Config
     ) {
         let directory = try snapshot()
@@ -937,7 +938,7 @@ final class Inkling2VisionPlumbingTests: XCTestCase {
     /// The server decodes each part, records one picture per part, and leaves the
     /// turn's sentinel in place for the renderer to consume.
     func testTheServerGivesEachPictureItsOwnBlock() throws {
-        let png = try pngData(width: 50, height: 40)
+        let png = try inklingTestPNG(width: 50, height: 40)
         var turns = [
             ChatPromptFormatter.ConversationTurn(
                 role: .user, text: "Which colour? \(ServerImageParts.imagePlaceholder)"
@@ -985,7 +986,7 @@ final class Inkling2VisionPlumbingTests: XCTestCase {
     }
 
     func testAPictureOnATurnThatDoesNotExistIsRefused() throws {
-        let png = try pngData(width: 40, height: 40)
+        let png = try inklingTestPNG(width: 40, height: 40)
         XCTAssertThrowsError(
             try ServerController.attachImageGrids(
                 turns: [ChatPromptFormatter.ConversationTurn(role: .user, text: "hi")],
@@ -1081,27 +1082,231 @@ final class Inkling2VisionPlumbingTests: XCTestCase {
 
     // MARK: Helpers
 
-    /// A real PNG, because the server path decodes encoded bytes rather than the
-    /// raw RGB a `TurnImage` carries.
-    private func pngData(width: Int, height: Int) throws -> Data {
-        guard let rep = NSBitmapImageRep(
-            bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,
-            bitsPerSample: 8, samplesPerPixel: 3, hasAlpha: false, isPlanar: false,
-            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
-        ) else {
-            throw XCTSkip("NSBitmapImageRep refused \(width)x\(height)")
-        }
-        if let base = rep.bitmapData {
-            for y in 0..<height {
-                let row = base + y * rep.bytesPerRow
-                for x in 0..<width {
-                    let pixel = row + x * 3
-                    pixel[0] = 220
-                    pixel[1] = 20
-                    pixel[2] = 20
-                }
+}
+
+/// A real PNG of a solid red rectangle, because both the server seam and the
+/// live request decode ENCODED bytes rather than the raw RGB a `TurnImage`
+/// carries.
+private func inklingTestPNG(width: Int, height: Int) throws -> Data {
+    guard let rep = NSBitmapImageRep(
+        bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,
+        bitsPerSample: 8, samplesPerPixel: 3, hasAlpha: false, isPlanar: false,
+        colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+    ) else {
+        throw XCTSkip("NSBitmapImageRep refused \(width)x\(height)")
+    }
+    if let base = rep.bitmapData {
+        for y in 0..<height {
+            let row = base + y * rep.bytesPerRow
+            for x in 0..<width {
+                let pixel = row + x * 3
+                pixel[0] = 220
+                pixel[1] = 20
+                pixel[2] = 20
             }
         }
-        return try XCTUnwrap(rep.representation(using: .png, properties: [:]))
+    }
+    return try XCTUnwrap(rep.representation(using: .png, properties: [:]))
+}
+
+// MARK: - The same picture, over HTTP
+
+extension Inkling2VisionTests {
+
+    /// The API's half of the image path, on the published checkpoint.
+    ///
+    /// Every other case here drives the engine directly, and the two seams this
+    /// slice added -- the grid-carrying turn and the expanded price -- are only
+    /// PART of what a client meets: the adapter decodes the part, the server
+    /// chooses the family's placement, the renderer writes the block, the
+    /// planner prices the expansion and `launchTurn` binds the rows. A mistake
+    /// anywhere along it is a refusal or a 500, never a wrong token, so the
+    /// request is the only thing that can prove the whole path.
+    ///
+    /// The picture's cost is checked as a DELTA against the same question sent
+    /// plain: the block is three tokens (`<|content_image|>`, the placeholder
+    /// and `<|end_message|>`) and the placeholder then expands to one marker per
+    /// cell, so the difference is `2 + cells` with no renderer detail assumed.
+    func testAnAPIRequestWithAnImageAnswersOnThePublishedCheckpoint() async throws {
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_image_turn"),
+            "opt-in image turn; touch /tmp/dynamoe_inkling2_image_turn to run"
+        )
+        let (directory, _, _) = try configureAppOrderEngine()
+        defer {
+            CompletionEngine.shared.configure(
+                summary: nil, modelConfig: nil, tokenizer: nil,
+                shardBuffers: [:], activeLoadedModelPath: nil
+            )
+            withExtendedLifetime(engine) {}
+        }
+        XCTAssertTrue(
+            ModelConfig.supportsVision(modelPath: directory.path),
+            "the gate the request passes through must see this checkpoint's tower"
+        )
+        let png = try inklingTestPNG(width: 50, height: 40)
+        let pixels = try Inkling2ImagePixels.decode(png)
+        let grid = try Inkling2ImagePixels.cells(pixels).grid
+        XCTAssertEqual(grid, Inkling2ImageGrid(cellRows: 1, cellColumns: 2))
+
+        let port = 8795
+        try await withLocalServer(port: port) { _ in
+            let catalog = try await getModels(port: port)
+            let vision = (catalog.first?["capabilities"] as? [String: Any])?["vision"] as? Bool
+            XCTAssertEqual(vision, true, "the models list must advertise the tower it uses")
+            XCTAssertNil(
+                (catalog.first?["capabilities"] as? [String: Any])?["vision_cost"],
+                "no price is published for a tower whose cost has not been measured"
+            )
+
+            let question = "What colour is this rectangle? Answer with one word."
+            let plain = try await postChat(port: port, text: question, imageBase64: nil)
+            let pictured = try await postChat(
+                port: port, text: question, imageBase64: png.base64EncodedString()
+            )
+            print(
+                "🔎 [inkling2 server] plain \(plain.promptTokens) / pictured "
+                    + "\(pictured.promptTokens) prompt tokens, \(pictured.completionTokens) "
+                    + "generated, answer \(pictured.content.debugDescription)"
+            )
+            XCTAssertEqual(
+                pictured.promptTokens - plain.promptTokens,
+                2 + grid.languagePositions,
+                "the block is three tokens and its placeholder expands to one per cell"
+            )
+            XCTAssertTrue(
+                pictured.content.lowercased().contains("red"),
+                "the answer did not name the colour: \(pictured.content)"
+            )
+        }
+    }
+
+    private struct ServerChatTurn {
+        var content: String
+        var promptTokens: Int
+        var completionTokens: Int
+        var finishReason: String?
+    }
+
+    /// Runs the real server on a private port with every setting saved and
+    /// restored, so a developer's app on 8787 is neither disturbed nor used.
+    private func withLocalServer(
+        port: Int, _ body: (ServerRequestLogStore) async throws -> Void
+    ) async throws {
+        let defaults = UserDefaults.standard
+        let savedEnabled = defaults.object(forKey: ServerController.enabledKey)
+        let savedPort = defaults.object(forKey: ServerController.portKey)
+        let savedKey = defaults.object(forKey: ServerController.apiKeyKey)
+        let savedCapture = defaults.object(forKey: ServerRequestLogRecorder.captureBodiesKey)
+        let store = ServerRequestLogStore.inMemory()
+        func restore() {
+            if let savedEnabled {
+                defaults.set(savedEnabled, forKey: ServerController.enabledKey)
+            } else {
+                defaults.removeObject(forKey: ServerController.enabledKey)
+            }
+            if let savedPort {
+                defaults.set(savedPort, forKey: ServerController.portKey)
+            } else {
+                defaults.removeObject(forKey: ServerController.portKey)
+            }
+            if let savedKey {
+                defaults.set(savedKey, forKey: ServerController.apiKeyKey)
+            } else {
+                defaults.removeObject(forKey: ServerController.apiKeyKey)
+            }
+            if let savedCapture {
+                defaults.set(savedCapture, forKey: ServerRequestLogRecorder.captureBodiesKey)
+            } else {
+                defaults.removeObject(forKey: ServerRequestLogRecorder.captureBodiesKey)
+            }
+            ServerRequestLogRecorder.shared.useOverrideStore(nil)
+        }
+        defaults.set(true, forKey: ServerController.enabledKey)
+        defaults.set(port, forKey: ServerController.portKey)
+        // The case sends unauthenticated requests, so a saved key would turn them
+        // into a 401.
+        defaults.removeObject(forKey: ServerController.apiKeyKey)
+        defaults.set(true, forKey: ServerRequestLogRecorder.captureBodiesKey)
+        ServerRequestLogRecorder.shared.useOverrideStore(store)
+        if ServerController.shared.isRunning {
+            await ServerController.shared.stop()
+        }
+        ServerController.shared.start()
+        do {
+            let deadline = Date().addingTimeInterval(20)
+            var listening = false
+            while Date() < deadline {
+                if let (_, response) = try? await URLSession.shared.data(
+                    from: URL(string: "http://127.0.0.1:\(port)/health")!
+                ), (response as? HTTPURLResponse)?.statusCode == 200 {
+                    listening = true
+                    break
+                }
+                try await Task.sleep(nanoseconds: 100_000_000)
+            }
+            try XCTSkipUnless(listening, "the local server never answered /health on port \(port)")
+            try await body(store)
+        } catch {
+            await ServerController.shared.stop()
+            restore()
+            throw error
+        }
+        await ServerController.shared.stop()
+        restore()
+    }
+
+    private func getModels(port: Int) async throws -> [[String: Any]] {
+        let (data, response) = try await URLSession.shared.data(
+            from: URL(string: "http://127.0.0.1:\(port)/v1/models")!
+        )
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        return json["data"] as? [[String: Any]] ?? []
+    }
+
+    private func postChat(
+        port: Int, text: String, imageBase64: String?
+    ) async throws -> ServerChatTurn {
+        var parts = ["{\"type\":\"text\",\"text\":\"\(text)\"}"]
+        if let imageBase64, !imageBase64.isEmpty {
+            parts.append(
+                "{\"type\":\"image_url\",\"image_url\":"
+                    + "{\"url\":\"data:image/png;base64,\(imageBase64)\"}}"
+            )
+        }
+        // The checkpoint opens its reasoning channel at effort 0, so the budget
+        // has to cover the trace before the one-word answer.
+        let body = """
+        {"model":"any","max_tokens":96,"messages":[
+            {"role":"user","content":[\(parts.joined(separator: ","))]}
+        ]}
+        """
+        var request = URLRequest(
+            url: URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!
+        )
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data(body.utf8)
+        request.timeoutInterval = 1800
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let http = try XCTUnwrap(response as? HTTPURLResponse)
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any],
+            "the reply was not JSON: " + String(decoding: data, as: UTF8.self)
+        )
+        guard http.statusCode == 200 else {
+            XCTFail("\(http.statusCode) from the local server: \(json)")
+            return ServerChatTurn(content: "", promptTokens: -1, completionTokens: -1, finishReason: nil)
+        }
+        let choice = try XCTUnwrap((json["choices"] as? [[String: Any]])?.first)
+        let message = try XCTUnwrap(choice["message"] as? [String: Any])
+        let usage = try XCTUnwrap(json["usage"] as? [String: Any])
+        return ServerChatTurn(
+            content: message["content"] as? String ?? "",
+            promptTokens: usage["prompt_tokens"] as? Int ?? -1,
+            completionTokens: usage["completion_tokens"] as? Int ?? -1,
+            finishReason: choice["finish_reason"] as? String
+        )
     }
 }
