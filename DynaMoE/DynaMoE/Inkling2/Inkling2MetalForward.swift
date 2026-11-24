@@ -929,6 +929,11 @@ nonisolated public final class Inkling2MetalForward {
         position: Int,
         workspace: Inkling2DeviceWorkspace,
         dumpsAttentionScores: Bool = false,
+        // Folds the post-attention convolution into this half's last buffer, so
+        // the visit pays one commit for both. Opt-in and off by default: the
+        // caller then owns the wait, the history push and the read-back, which
+        // is what `runVisit` does.
+        foldsPostAttentionConvolution: Bool = false,
         profile: Inkling2VisitProfile? = nil
     ) throws -> [Float] {
         let stageStart = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
@@ -1101,6 +1106,19 @@ nonisolated public final class Inkling2MetalForward {
             rows: hidden, columns: heads * headDim,
             arena: tailArena
         )
+        // The post-attention convolution rides this buffer when the caller asks
+        // for it: it reads `projectionOutput` (this buffer's own last write) and
+        // writes `workspace.hidden`, which nothing here touches, so the tail
+        // pays one commit for both. Its history takes the pre-convolution value,
+        // pushed by the caller after the wait; the next reader of that history
+        // is the next visit.
+        if foldsPostAttentionConvolution {
+            try encodePostAttentionConvolution(
+                encoder: tailEncoder, state: state, values: workspace.projectionOutput,
+                valuesCount: hidden, dynamicInput: [],
+                layer: layer, output: workspace.hidden, arena: tailArena
+            )
+        }
 
         tailEncoder.endEncoding()
         tailEncoded = true
@@ -1121,6 +1139,9 @@ nonisolated public final class Inkling2MetalForward {
                 wallNanoseconds: tailWaitEnded - tailStart,
                 buffers: billed
             )
+        }
+        if foldsPostAttentionConvolution {
+            state.pushConvolution(2, value: readBack(workspace.projectionOutput, count: hidden))
         }
         return readBack(workspace.projectionOutput, count: hidden)
     }
@@ -1600,15 +1621,15 @@ nonisolated public final class Inkling2MetalForward {
                 buffers: Inkling2StageTiming()
             )
         }
-        let attentionOutput = try attentionHalf(
+        _ = try attentionHalf(
             layer: layer, state: state, queryInput: queryInput, keyInput: keyInput,
-            valueInput: valueInput, position: position, workspace: workspace, profile: profile
+            valueInput: valueInput, position: position, workspace: workspace,
+            foldsPostAttentionConvolution: true, profile: profile
         )
-        // 4. The post-attention convolution.
-        let postAttention = try shortConvolution(
-            encoderlessState: state, index: 2, values: attentionOutput, layer: layer,
-            workspace: workspace, profile: profile
-        )
+        // 4. The post-attention convolution, already run inside the attention
+        //    half's last buffer: it read that projection and wrote
+        //    `workspace.hidden`, and the history took the pre-convolution value.
+        let postAttention = readBack(workspace.hidden, count: config.hiddenSize)
         let mlpReadStart = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
 
         // 5. The residual: the boundary append is LOCAL to the MLP read.
@@ -1647,51 +1668,24 @@ nonisolated public final class Inkling2MetalForward {
         return (output, attentionQueries)
     }
 
-    /// The post-attention / post-MLP convolution: one dispatch, one commit, and
-    /// the history pushed after it.
-    func shortConvolution(
-        encoderlessState state: Inkling2VisitState, index: Int, values: [Float],
-        layer: Int, workspace: Inkling2DeviceWorkspace,
-        profile: Inkling2VisitProfile? = nil
-    ) throws -> [Float] {
-        let stageStart = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
-        let inputBuffer = try staging(workspace.projectionOutput, values)
-        let encodeStart = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
-        let (commandBuffer, encoder) = try commandComponents()
-        let arena = Inkling2ScalarArena(device: device)
-        var encoded = false
-        defer {
-            if !encoded { encoder.endEncoding() }
-            arena.clear()
-        }
+    /// The post-attention convolution, encoded into a caller's buffer.
+    ///
+    /// One dispatch, and the wait and the history push belong to the caller:
+    /// folded into the attention tail it shares that buffer's single wait, and
+    /// index 2's history is not read again until the NEXT visit, so pushing it
+    /// after the tail's wait is the same ordering with one commit fewer.
+    func encodePostAttentionConvolution(
+        encoder: MTLComputeCommandEncoder,
+        state: Inkling2VisitState, values: MTLBuffer, valuesCount: Int,
+        dynamicInput: [Float], layer: Int,
+        output: MTLBuffer, arena: Inkling2ScalarArena
+    ) throws {
         try convolve(
-            encoder: encoder, state: state, index: index,
-            values: inputBuffer, valuesCount: config.hiddenSize, dynamicInput: values,
+            encoder: encoder, state: state, index: 2,
+            values: values, valuesCount: valuesCount, dynamicInput: dynamicInput,
             layer: layer, isFull: false, headDim: config.headDim,
-            output: workspace.hidden, arena: arena
+            output: output, arena: arena
         )
-        encoder.endEncoding()
-        encoded = true
-        let commitStamp = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
-        commandBuffer.commit()
-        let waitBegan = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
-        commandBuffer.waitUntilCompleted()
-        let waitEnded = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
-        if let error = commandBuffer.error { throw error }
-        if let profile {
-            var billed = Inkling2StageTiming()
-            billed.add(
-                Inkling2BufferClock(encodeStart: encodeStart, commit: commitStamp, buffer: commandBuffer),
-                drainNanoseconds: waitEnded - waitBegan
-            )
-            profile.record(
-                stage: .postAttentionConvolution,
-                wallNanoseconds: waitEnded - stageStart,
-                buffers: billed
-            )
-        }
-        state.pushConvolution(index, value: values)
-        return readBack(workspace.hidden, count: config.hiddenSize)
     }
 
     /// The routing indices as integers, which the host needs to address a bank.

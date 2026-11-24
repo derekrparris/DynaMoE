@@ -55,10 +55,10 @@ nonisolated public enum Inkling2VisitStage: String, Sendable, CaseIterable {
     /// KV row this position attends over. Host only, and the copy grows with
     /// the context.
     case attentionState
-    /// The attention kernel, the output gate and the grouped output projection.
+    /// The attention kernel, the output gate, the grouped output projection and
+    /// -- since slice 5 -- the post-attention convolution, which shares this
+    /// buffer rather than paying its own commit.
     case attentionTail
-    /// The post-attention convolution (`shortConvolution` index 2).
-    case postAttentionConvolution
     /// The MLP block read, its message gate and the residual bookkeeping.
     case mlpRead
     /// The MLP norm, the router and its top-k selection, in one buffer.
@@ -73,7 +73,7 @@ nonisolated public enum Inkling2VisitStage: String, Sendable, CaseIterable {
     public var commits: Bool {
         switch self {
         case .hostPrep, .attentionState, .mlpRead: return false
-        case .attentionFront, .attentionTail, .postAttentionConvolution,
+        case .attentionFront, .attentionTail,
              .mlpFront, .expertMixture, .mlpTail: return true
         }
     }

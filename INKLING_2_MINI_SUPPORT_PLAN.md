@@ -543,6 +543,17 @@ With the mixture folded, the two largest stages that commit nothing were pure ho
 - **The existing mirrors were not re-pinned.** They passed unchanged at 1e-6, which is the statement that the reordering is smaller than the bar they were written with -- the decision not to rewrite independent numbers is recorded rather than assumed.
 - **Not done in this slice:** `workspace.stage`'s KV copy (the remaining part of `attentionState`, and it grows with context), the drain residue (~0.6 ms/visit of `waitUntilCompleted` wake-up), and Phase 6 items 2-7 with item 1's arena-dependent fields, as before.
 
+**Progress: slice 5, the post-attention convolution folded into the attention tail (2026-11-24).**
+
+Slice 4 left `postAttentionConvolution` as 0.17 ms of a visit that was almost pure submission: one convolution dispatch -- 3 us of device work -- behind its own command buffer, commit and wait (85 us of queue, 25 of encode). It is the one remaining stage whose whole cost is hand-off, so it now rides the attention tail: `attentionHalf` takes `foldsPostAttentionConvolution` (opt-in, default false), encodes the convolution into its own encoder right after the `wo` projection, and the visit pays ONE commit for both. The ordering argument is why this is safe rather than lucky: the convolution reads `projectionOutput` (that buffer's own last write) and writes `workspace.hidden`, which nothing in the tail touches, and the convolution history for index 2 is pushed by the caller AFTER the wait -- its next reader is the next visit, which begins after this whole visit returns. `shortConvolution` became `encodePostAttentionConvolution`, encode-only.
+
+**Measured at `-O` on the published checkpoint**, four positions after a discarded warm-up, two processes: **3.23-3.29 ms per visit and 155.3-157.8 ms per position** against slice 4's **3.46 and 165.9-166.3**, and the commit count per visit goes **6 -> 5** (960 commits per four positions). The stage that disappeared was 0.17 ms with 3 us of device; `attentionTail` absorbs its dispatch (0.33 -> 0.35) and the visit's queue bucket drops **0.50 -> 0.42**. Device total is unchanged at 1.29 ms/visit, which is the control.
+
+- **The stage was removed from the instrument rather than left as a case that can never be recorded.** `Inkling2VisitStage.postAttentionConvolution` is deleted (nine cases -> eight), `describe` simply stops naming it, and `testTheStageTableSaysWhichStagesCommit` now pins the five committing stages and the count.
+- **Parity is the whole visit against the host graph, on the folded path**: `testTheDeviceVisitMatchesTheHostGraph` passes at **6.10e-07 relative** (bar 1e-3), and the attention half alone at 9.38e-07. The fold changes no arithmetic -- it moves one dispatch into an existing encoder -- so the bar is the same one the unfurled path met.
+- **What the same measurement does NOT say**: the wait residue is still ~0.5 ms/visit and `mlpTail` is still 0.18 ms of almost pure submission. Folding THAT one is a different change: its convolution reads `residualAccumulator` back to the host for the history push, so the merge needs its own ordering argument.
+- **Not done in this slice:** the MLP tail's fold, `workspace.stage`'s KV copy, and Phase 6 items 2-7 with item 1's arena-dependent fields.
+
 ### Phase 7: Long context and DynaMoE FP8 (INT8) KV
 
 **Work**

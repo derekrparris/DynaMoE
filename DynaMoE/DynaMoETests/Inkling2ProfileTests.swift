@@ -166,16 +166,19 @@ final class Inkling2StageTimingTests: XCTestCase {
     }
 
     /// The stage list is the visit's own structure, and the three stages that
-    /// commit nothing are marked as such: a caller summing `commits` over all
-    /// nine must get thirteen per visit, not nine.
+    /// commit nothing are marked as such: a caller summing `commits` over every
+    /// stage must get six per visit, not eight.
     func testTheStageTableSaysWhichStagesCommit() {
         let committing = Inkling2VisitStage.allCases.filter(\.commits)
         XCTAssertEqual(
             Set(committing),
-            [.attentionFront, .attentionTail, .postAttentionConvolution,
+            [.attentionFront, .attentionTail,
              .mlpFront, .expertMixture, .mlpTail]
         )
-        XCTAssertEqual(Inkling2VisitStage.allCases.count, 9)
+        // Nine until slice 5 folded the post-attention convolution into the
+        // attention tail, which removed that stage rather than leaving a case
+        // that can never be recorded.
+        XCTAssertEqual(Inkling2VisitStage.allCases.count, 8)
     }
 }
 
