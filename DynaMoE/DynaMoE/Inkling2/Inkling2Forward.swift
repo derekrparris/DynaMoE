@@ -270,6 +270,53 @@ nonisolated public final class Inkling2CPUForward {
 
     // MARK: The schedule
 
+    /// One step of the 48-visit schedule, as data.
+    ///
+    /// `forwardHidden` is the definition of the schedule and stays written as
+    /// it is; this list is what a second driver (a batched prefill) consumes,
+    /// and `testTheScheduleListIsTheVisitSequenceForwardHiddenRuns` pins the two
+    /// against each other by recording the visits the real method makes. A step
+    /// is either a visit or the pass restart, where the loop reads the previous
+    /// pass's leftovers and restores its pre-loop snapshot.
+    nonisolated public struct Inkling2ScheduleStep: Sendable, Equatable {
+        public enum Kind: Sendable, Equatable {
+            case visit(layer: Int, pass: Int)
+            case restart
+        }
+        public let kind: Kind
+        /// The layer's INPUT is appended to the residual stack before its output
+        /// replaces it (a block boundary, done by the caller around the visit).
+        public let appendsBoundary: Bool
+        /// The visit takes cross-pass messages built from the previous pass.
+        public let buildsMessages: Bool
+    }
+
+    /// The schedule for this config: the pre-loop layers, `numPasses` passes
+    /// over the core range with a restart between them, then the post-loop
+    /// layers.
+    public func schedule() throws -> [Inkling2ScheduleStep] {
+        let coreStart = config.loopCoreStart
+        let coreEnd = config.loopCoreEnd
+        let block = config.nLayersPerAttnResBlock
+        var steps: [Inkling2ScheduleStep] = []
+        func visit(_ layer: Int, pass: Int, messages: Bool) {
+            steps.append(
+                Inkling2ScheduleStep(
+                    kind: .visit(layer: layer, pass: pass),
+                    appendsBoundary: layer % block == 0,
+                    buildsMessages: messages
+                )
+            )
+        }
+        for layer in 0..<coreStart { visit(layer, pass: 0, messages: false) }
+        for pass in 0..<config.numPasses {
+            if pass > 0 { steps.append(.init(kind: .restart, appendsBoundary: false, buildsMessages: false)) }
+            for layer in coreStart..<coreEnd { visit(layer, pass: pass, messages: pass > 0) }
+        }
+        for layer in coreEnd..<config.numHiddenLayers { visit(layer, pass: 0, messages: false) }
+        return steps
+    }
+
     /// The 48-visit schedule over one position's embedding, then the final
     /// residual read, norm, unembedding and softcap.
     public func forwardHidden(_ embedding: [Float], position: Int) throws -> [Float] {

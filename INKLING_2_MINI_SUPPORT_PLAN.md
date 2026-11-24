@@ -597,6 +597,18 @@ The mixture's device half is 36.5 MB of expert bank per visit in 0.643 ms -- 57 
 
 - **Not done in this slice:** Phase 6 items 2-7 and item 1's arena-dependent fields.
 
+**Progress: slice 10, batched prefill, first step -- the schedule as data (2026-11-24).**
+
+Phase 6 item 7 is the one structural lever left. The prefill today is a WALK in chunks of eight: `Inkling2TurnRunner.run` says so itself ("a scheduling unit and not a batching one"), and `gemm` already has a `positions` parameter nobody passes more than one to. A batched pass needs two things this family does not have: a driver that advances N positions in lockstep (the residual stack, KV cache, convolution histories and messages are all per position, so only the weight reads and dispatches can be shared), and a statement of the schedule that a second driver can consume without re-deriving it.
+
+**Sizing first, because the decision depends on it.** An isolated A/B of `bf16_gemv_rows8` (a weight row streamed once for eight positions) against eight `bf16_gemv` dispatches, at this checkpoint's own projection shapes: `attn.wq_du` 3072x2304 **8.25x**, `attn.wk_dv` 1024x2304 5.75x, `attn.wo_ud` 2304x3072 6.30x, `mlp.gate` 128x2304 4.93x. The walk re-reads every weight eight times for a block; the block form reads it once. That is the prize, and it is why this is worth building rather than a 2% polish.
+
+This slice lands the foundation and nothing speculative: `Inkling2Forward.schedule()` is the 48-visit schedule as a declarative list (`visit(layer:pass:)` with the two facts a caller needs around it -- a boundary append and whether cross-pass messages are built -- plus the pass restart where the loop reads the previous pass's leftovers and restores its pre-loop snapshot). `forwardHidden` is deliberately NOT rewritten to consume it; it stays the definition, and `testTheScheduleListIsTheVisitSequenceForwardHiddenRuns` pins the list against the REAL method by recording the visits its runner makes on the published checkpoint, asserting the same layers in the same order, the same pass numbers, one visit per plan slot, `numPasses - 1` restarts, and messages only on passes after the first.
+
+An earlier attempt this slice rewrote `forwardHidden` into a switch over the list; it was reverted before any test ran. The oracle is what every parity case in this family is measured against, and a refactor of it is a change to the measuring stick -- the list is pinned to it instead of replacing it.
+
+- **Not done in this slice:** the lockstep block driver itself (per-position state and workspace, one submission per stage per block, the token axis on the projection kernels), and the mixture's per-block expert union. Phase 6 items 2-6 remain as before.
+
 ### Phase 7: Long context and DynaMoE FP8 (INT8) KV
 
 **Work**

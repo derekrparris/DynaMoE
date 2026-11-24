@@ -2032,6 +2032,50 @@ final class Inkling2HostForwardTests: XCTestCase {
         )
     }
 
+    /// The schedule as data is the schedule the model actually runs.
+    ///
+    /// This is the guard for a second driver (a batched prefill) consuming
+    /// `schedule()` while `forwardHidden` stays the definition: the visits are
+    /// recorded from the REAL method through its visit runner, and the list must
+    /// reproduce them in order, with the same pass numbers, the same boundary
+    /// appends and messages only on the passes after the first.
+    func testTheScheduleListIsTheVisitSequenceForwardHiddenRuns() throws {
+        let forward = try makeForward()
+        var recorded: [(layer: Int, pass: Int)] = []
+        forward.visitRunner = { layer, pass, hidden, blockStates, messages, position in
+            recorded.append((layer, pass))
+            if messages != nil {
+                XCTAssertGreaterThan(pass, 0, "messages only exist after the first pass")
+            }
+            return try forward.runVisit(
+                layer: layer, pass: pass, hidden: hidden,
+                blockStates: &blockStates, messages: messages, position: position
+            )
+        }
+        _ = try forward.forwardHidden([Float](repeating: 0.5, count: forward.config.hiddenSize), position: 0)
+        forward.visitRunner = nil
+
+        let schedule = try forward.schedule()
+        let listed = schedule.compactMap { step -> (layer: Int, pass: Int)? in
+            guard case .visit(let layer, let pass) = step.kind else { return nil }
+            return (layer, pass)
+        }
+        XCTAssertEqual(recorded.map(\.0), listed.map(\.0), "the schedule's layers, in order")
+        XCTAssertEqual(recorded.map(\.1), listed.map(\.1), "the schedule's passes, in order")
+        XCTAssertEqual(
+            recorded.count, forward.config.executedVisitCount,
+            "one visit per slot of the plan"
+        )
+        // A restart sits between two passes and nowhere else: passes 1 and 2 of
+        // the loop each begin with one.
+        let restarts = schedule.filter { $0.kind == .restart }.count
+        XCTAssertEqual(restarts, max(0, forward.config.numPasses - 1))
+        // Messages are built only on a pass after the first, for the layers
+        // that have a previous pass to read.
+        let withMessages = schedule.filter(\.buildsMessages)
+        XCTAssertEqual(withMessages.count, (forward.config.numPasses - 1) * (forward.config.loopCoreEnd - forward.config.loopCoreStart))
+    }
+
     /// A cancelled turn leaves the cache holding exactly its committed prefix,
     /// and a resumed turn from that point answers what a fresh prefill answers.
     ///
