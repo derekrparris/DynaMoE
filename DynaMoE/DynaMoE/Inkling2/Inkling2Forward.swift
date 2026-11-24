@@ -33,6 +33,7 @@
 //  ever compared with itself proves nothing.
 //
 
+import Accelerate
 import Foundation
 
 // MARK: - Weight source
@@ -533,7 +534,9 @@ nonisolated public final class Inkling2CPUForward {
     /// The block-attention residual read: FP32 softmax of the queries over the
     /// RMS-normalized stack plus the current partial, `1/sqrt(hidden)` scaled.
     public func blockRead(blockStates: [[Float]], partial: [Float], queries: [[Float]]) -> [[Float]] {
-        Inkling2Math.blockResidualRead(blockStates: blockStates, partial: partial, queries: queries)
+        Inkling2Math.blockResidualReadVectorized(
+            blockStates: blockStates, partial: partial, queries: queries
+        )
     }
 
     func unpackRows(_ tensor: [Float], count: Int) -> [[Float]] {
@@ -585,19 +588,14 @@ nonisolated public final class Inkling2CPUForward {
         }
     }
 
-    /// `y = W x` for a `[rows][input.count]` matrix.
+    /// `y = W x` for a `[rows][input.count]` matrix. The rule is
+    /// `Inkling2Math.linear` (vDSP per row, with `linearScalar` beside it as the
+    /// definition); this method exists because the graph calls it.
     public func linear(_ matrix: [Float], _ input: [Float], rows: Int) throws -> [Float] {
         guard matrix.count >= rows * input.count else {
             throw Inkling2ForwardError.shapeMismatch("linear has \(matrix.count) values for \(rows) x \(input.count)")
         }
-        var output = [Float](repeating: 0, count: rows)
-        for row in 0..<rows {
-            var total: Float = 0
-            let base = row * input.count
-            for column in 0..<input.count { total += matrix[base + column] * input[column] }
-            output[row] = total
-        }
-        return output
+        return Inkling2Math.linear(matrix, input, rows: rows)
     }
 
     /// Four messages for one core layer, from the previous pass's stack slice

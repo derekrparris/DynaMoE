@@ -505,6 +505,63 @@ final class Inkling2LayerRuleTests: XCTestCase {
         }
     }
 
+    /// The vectorized block read is the same rule, not a new one: it agrees
+    /// with the scalar definition on the same inputs at a width where vDSP
+    /// engages. The bar is the reordering's own size (~1e-06 relative at the
+    /// published width), so a wrong op order or a lost row fails by name.
+    func testTheVectorizedBlockReadAgreesWithTheRuleAsWritten() {
+        var seed: UInt64 = 7
+        func next() -> Float {
+            seed = seed &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            return Float(Double(seed >> 11) / Double(UInt64(1) << 53)) - 0.5
+        }
+        let width = 37
+        let blockStates = (0..<5).map { _ in (0..<width).map { _ in next() } }
+        let partial = (0..<width).map { _ in next() }
+        let queries = (0..<3).map { _ in (0..<width).map { _ in next() } }
+        let expected = Inkling2Math.blockResidualRead(
+            blockStates: blockStates, partial: partial, queries: queries
+        )
+        let actual = Inkling2Math.blockResidualReadVectorized(
+            blockStates: blockStates, partial: partial, queries: queries
+        )
+        XCTAssertEqual(actual.count, expected.count)
+        for (gotRow, wantRow) in zip(actual, expected) {
+            XCTAssertEqual(gotRow.count, wantRow.count)
+            for (got, want) in zip(gotRow, wantRow) {
+                XCTAssertEqual(got, want, accuracy: 1e-6, "the vectorized block read")
+            }
+        }
+    }
+
+    /// Same contract for the projection: the vDSP rows are the scalar rows to
+    /// the reordering's size, at a width past the scalar threshold.
+    func testTheVectorizedLinearAgreesWithTheRuleAsWritten() {
+        var seed: UInt64 = 11
+        func next() -> Float {
+            seed = seed &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            return Float(Double(seed >> 11) / Double(UInt64(1) << 53)) - 0.5
+        }
+        let rows = 7, columns = 129
+        let matrix = (0..<(rows * columns)).map { _ in next() }
+        let input = (0..<columns).map { _ in next() }
+        let expected = Inkling2Math.linearScalar(matrix, input, rows: rows)
+        let actual = Inkling2Math.linear(matrix, input, rows: rows)
+        for (got, want) in zip(actual, expected) {
+            XCTAssertEqual(got, want, accuracy: 1e-5, "the vectorized projection")
+        }
+    }
+
+    /// Below the measured crossover vDSP is not faster, so a short row takes
+    /// the scalar form -- and it must still be the same answer.
+    func testAShortProjectionStaysScalarAndAgreesWithTheLongForm() {
+        let matrix: [Float] = [1, 2, 3, 4, 5, 6]
+        let input: [Float] = [0.5, -1.5, 2.0]
+        let actual = Inkling2Math.linear(matrix, input, rows: 2)
+        XCTAssertEqual(actual, Inkling2Math.linearScalar(matrix, input, rows: 2))
+        XCTAssertEqual(actual[0], 0.5 - 3.0 + 6.0, accuracy: 1e-6)
+    }
+
     func testMessageGateMatchesTheMirror() {
         let result = Inkling2Math.messageGate(
             current: [1.0, -2.0, 0.5], message: [0.25, 3.0, -1.0],

@@ -522,6 +522,27 @@ Slice 2 priced the strongest candidate it found and deliberately did not take it
 - **The instrument's own commit invariant moved with the change, deliberately.** `Inkling2ProfileTests` asserted `expertMixture.commits == visits * topK`; it now asserts `== visits`, with the twelve-commit reading recorded beside it. The `experts` and `expertBytes` totals are unchanged (1,536 experts and 7,016.6 MB per four positions), because the fold removed buffers, not work.
 - **Not done in this slice:** Phase 6 items 2-7 and the rest of item 1's arena-dependent fields (misses/hits/evictions, pread time, arena allocations) -- this family still has no expert arena, so those belong with item 6, and prefill shape and KV precision stay turn-level facts in the log label and `TurnPrepInfo` rather than invented visit fields.
 
+**Progress: slice 4, the host inner products through Accelerate (2026-11-24).**
+
+With the mixture folded, the two largest stages that commit nothing were pure host: `hostPrep` (0.72 ms, 17.2%) and `attentionState` (0.46, 11.0%), plus `mlpRead` (0.25). All three are the host graph's own arithmetic running inside a device visit -- the `attn_res` block reads, the message gates, the input norms, the relative and sink projections, the KV staging copy -- and all of it was bounds-checked scalar loops. They now go through Accelerate: `Inkling2Math.linear` is one `vDSP_dotpr` per row with `linearScalar` beside it as the definition, `blockResidualReadVectorized` is the same expression as `blockResidualRead` with each loop as a vDSP call, and `rmsNorm` / `l2Clip` are `vDSP_svesq` + `vDSP_vsmul` (+ `vDSP_vmul` for the gain). `Inkling2CPUForward.linear` delegates to the math rule and `blockRead` calls the vectorized form, so the graph keeps its method while the rule is pinned model-free.
+
+**Measured at `-O` on the published checkpoint**, four positions after a discarded warm-up, two processes, against slice 3's same-harness reading:
+
+| | slice 3 | slice 4 |
+|---|---|---|
+| ms/visit | 4.21 | **3.46** (both processes) |
+| ms/position | 202.06 | **165.88 - 166.25** |
+| hostPrep | 0.71 | **0.44** |
+| attentionState | 0.46 | **0.09** |
+| mlpRead | 0.25 | **0.15** |
+
+- **The two stages that were pure host fell by exactly what the isolated A/B predicted.** `relativeStates` (384x2304 of scalar dots) measured 10.3x with vDSP and `sinkLogits` 10.0x, and `attentionState` went 0.46 -> 0.09 (5.1x in situ, the remainder being the KV read-backs and the staging copy this slice did not touch). `hostPrep` 0.71 -> 0.44 is the block read's 2.5-3.7x isolated arriving diluted by the message gates and three norms in the same stage.
+- **Nothing on the device moved, which is the control.** Every committing stage reads the same as slice 3 (`attentionFront` 0.44, `mlpFront` 0.44, `attentionTail` 0.33, `expertMixture` 1.05 with device 0.639, `mlpTail` 0.20, `postAttentionConvolution` 0.17), so the change is confined to the host residue and did not perturb the GPU graph's arithmetic.
+- **The isolated A/B chose the threshold, not a copied one.** vDSP on a short dot was measured slower (0.90-0.91x at widths 3 and 8), even at 16 (1.03x), and clearly ahead from 32 up (1.37x at 32, 2.4x at 64, 4.2x at 128, 10.4x at 2,304), so `linear` keeps rows under 16 columns scalar. The exact-shape A/B on this graph's own shapes: relative states 10.3x, sink logits 10.0x, gate-down 10.8x, gate-forget 2.8x, all agreeing with the scalar rule to ~1e-06 relative.
+- **The scalar rules stay in the source as the oracles**, which is the repo's habit (`linearRowByRow` vs `linearBatched`, `softmax` vs `softmaxRow`): `linearScalar` and `blockResidualRead` are public, and three model-free cases pin the vectorized forms against them -- the block read at width 37 with five stack rows and three queries, the projection at 7x129 (past the threshold), and a short 3-wide projection that must take the scalar branch and still agree. A ragged stack was tried as a fourth case and dropped: the scalar rule traps on it too, so there is no defined answer to compare against; the vectorized form hands a ragged stack to the scalar rule rather than reading past a short row.
+- **The existing mirrors were not re-pinned.** They passed unchanged at 1e-6, which is the statement that the reordering is smaller than the bar they were written with -- the decision not to rewrite independent numbers is recorded rather than assumed.
+- **Not done in this slice:** `workspace.stage`'s KV copy (the remaining part of `attentionState`, and it grows with context), the drain residue (~0.6 ms/visit of `waitUntilCompleted` wake-up), and Phase 6 items 2-7 with item 1's arena-dependent fields, as before.
+
 ### Phase 7: Long context and DynaMoE FP8 (INT8) KV
 
 **Work**
