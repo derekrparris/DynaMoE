@@ -395,12 +395,10 @@ final class Inkling2VisitProfileTests: XCTestCase {
                 XCTAssertEqual(time.commits, 0, "\(stage) committed a buffer")
             }
         }
-        // One expert buffer per routed expert: thirteen commits a visit, and the
-        // expert stage is the one that is `topK` of them.
-        XCTAssertEqual(
-            profile.timing(.expertMixture).commits,
-            profile.visits * harness.config.numExpertsPerToken
-        )
+        // The whole mixture is ONE buffer per visit, whatever the routed expert
+        // count: twelve commits a visit, and `topK` expert slices inside the
+        // mixture's single one (it read thirteen before the folds were folded).
+        XCTAssertEqual(profile.timing(.expertMixture).commits, profile.visits)
         XCTAssertEqual(profile.experts, profile.visits * harness.config.numExpertsPerToken)
         XCTAssertGreaterThan(profile.expertBytes, 0)
 

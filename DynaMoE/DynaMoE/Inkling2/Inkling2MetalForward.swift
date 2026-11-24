@@ -1262,26 +1262,29 @@ nonisolated public final class Inkling2MetalForward {
 
         // 2. The experts. Each one is gate/up over the normed input, the
         //    softcapped SwiGLU, the down projection, and a weighted fold into
-        //    the accumulator. All of it is one command buffer per expert, and
-        //    the folds are serialized by the queue.
+        //    the accumulator. All of it is ONE command buffer for the whole
+        //    mixture: the dispatches of a compute encoder run in the order they
+        //    were encoded, so the folds still land in route order, and nothing
+        //    reads a value back between experts -- eight separate buffers meant
+        //    eight commits and eight waits for arithmetic the queue had already
+        //    serialized.
         let accumulatorPointer = workspace.residualAccumulator.contents()
             .bindMemory(to: Float.self, capacity: hiddenWidth)
         for index in 0..<hiddenWidth { accumulatorPointer[index] = 0 }
-        var mixture = Inkling2StageTiming()
         var mixtureBytes: UInt64 = 0
+        let mixtureEncodeStart = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
+        let (mixtureBuffer, mixtureEncoder) = try commandComponents()
+        let mixtureArena = Inkling2ScalarArena(device: device)
+        var mixtureEncoded = false
+        defer {
+            if !mixtureEncoded { mixtureEncoder.endEncoding() }
+            mixtureArena.clear()
+        }
         for (slot, expert) in indices.enumerated() {
             let weight = routeWeights[slot]
-            let expertEncodeStart = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
-            let (expertBuffer, expertEncoder) = try commandComponents()
-            let expertArena = Inkling2ScalarArena(device: device)
-            var expertEncoded = false
-            defer {
-                if !expertEncoded { expertEncoder.endEncoding() }
-                expertArena.clear()
-            }
             let gateUp = try weights.expertBank(.expertW13, layer: layer, expert: expert)
             try expertRow(
-                encoder: expertEncoder,
+                encoder: mixtureEncoder,
                 weight: gateUp.buffer, weightOffset: gateUp.baseOffset + gateUp.expertOffset,
                 scales: gateUp.scaleBuffer, scaleOffset: gateUp.scaleBaseOffset + gateUp.scaleExpertOffset,
                 input: workspace.attentionInput, output: workspace.expertGateUp,
@@ -1290,15 +1293,15 @@ nonisolated public final class Inkling2MetalForward {
                 outerScale: gateUp.layout.requiresAmaxDenominator && gateUp.denominator > 0
                     ? gateUp.amax / gateUp.denominator : 1,
                 weightRowStride: gateUp.rowStride, scaleRowStride: gateUp.scaleRowStride,
-                arena: expertArena
+                arena: mixtureArena
             )
             try softcappedSwiGLUInterleaved(
-                encoder: expertEncoder, gateUp: workspace.expertGateUp,
-                output: workspace.expertIntermediate, intermediate: intermediate, arena: expertArena
+                encoder: mixtureEncoder, gateUp: workspace.expertGateUp,
+                output: workspace.expertIntermediate, intermediate: intermediate, arena: mixtureArena
             )
             let down = try weights.expertBank(.expertW2, layer: layer, expert: expert)
             try expertRow(
-                encoder: expertEncoder,
+                encoder: mixtureEncoder,
                 weight: down.buffer, weightOffset: down.baseOffset + down.expertOffset,
                 scales: down.scaleBuffer, scaleOffset: down.scaleBaseOffset + down.scaleExpertOffset,
                 input: workspace.expertIntermediate, output: workspace.expertDown,
@@ -1307,28 +1310,14 @@ nonisolated public final class Inkling2MetalForward {
                 outerScale: down.layout.requiresAmaxDenominator && down.denominator > 0
                     ? down.amax / down.denominator : 1,
                 weightRowStride: down.rowStride, scaleRowStride: down.scaleRowStride,
-                arena: expertArena
+                arena: mixtureArena
             )
             try weightedAccumulate(
-                encoder: expertEncoder, accumulator: workspace.residualAccumulator,
+                encoder: mixtureEncoder, accumulator: workspace.residualAccumulator,
                 source: workspace.expertDown, weight: weight, count: hiddenWidth,
-                arena: expertArena
+                arena: mixtureArena
             )
-            expertEncoder.endEncoding()
-            expertEncoded = true
-            let expertCommit = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
-            expertBuffer.commit()
-            let expertWaitBegan = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
-            expertBuffer.waitUntilCompleted()
-            let expertWaitEnded = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
-            if let error = expertBuffer.error { throw error }
             if profile != nil {
-                mixture.add(
-                    Inkling2BufferClock(
-                        encodeStart: expertEncodeStart, commit: expertCommit, buffer: expertBuffer
-                    ),
-                    drainNanoseconds: expertWaitEnded - expertWaitBegan
-                )
                 // The bank's own strides: a packed row is `rowStride` bytes and a
                 // scale row is `scaleRowStride`, so this is what a residency
                 // policy would have to move for this expert, not an estimate
@@ -1337,11 +1326,26 @@ nonisolated public final class Inkling2MetalForward {
                 mixtureBytes += UInt64(hiddenWidth) &* UInt64(down.rowStride &+ down.scaleRowStride)
             }
         }
+        mixtureEncoder.endEncoding()
+        mixtureEncoded = true
+        let mixtureCommit = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
+        mixtureBuffer.commit()
+        let mixtureWaitBegan = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
+        mixtureBuffer.waitUntilCompleted()
+        let mixtureWaitEnded = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
+        if let error = mixtureBuffer.error { throw error }
         if let profile {
+            var billed = Inkling2StageTiming()
+            billed.add(
+                Inkling2BufferClock(
+                    encodeStart: mixtureEncodeStart, commit: mixtureCommit, buffer: mixtureBuffer
+                ),
+                drainNanoseconds: mixtureWaitEnded - mixtureWaitBegan
+            )
             profile.record(
                 stage: .expertMixture,
                 wallNanoseconds: DispatchTime.now().uptimeNanoseconds - mixtureStart,
-                buffers: mixture
+                buffers: billed
             )
             profile.recordExperts(count: indices.count, bytes: mixtureBytes)
         }

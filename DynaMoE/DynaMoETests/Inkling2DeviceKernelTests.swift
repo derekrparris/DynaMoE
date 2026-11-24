@@ -1321,6 +1321,22 @@ final class Inkling2DeviceKernelTests: XCTestCase {
                        oracleStages["postMlpConv"] ?? [])
         ]
         print("🔎 [inkling2 device] mlp stages: " + stageRows.joined(separator: " "))
+
+        // The mixture alone is asserted, not just printed. Its eight expert
+        // slices are encoded into ONE command buffer, so the route order is the
+        // encoder's dispatch order rather than eight commits' -- and a fold that
+        // lost that order would still land inside the half's 3e-3 band above
+        // while moving this stage. Measured 2.3e-06 relative, so the bar is 1e-4.
+        let mixtureRows = try XCTUnwrap(
+            oracleStages["mixtureOut"], "the host captured no mixture"
+        )
+        let mixtureScale = mixtureRows.reduce(Float(0)) { max($0, abs($1)) }
+        let mixtureDelta = zip(metal.readBack(workspace.residualAccumulator, count: hiddenWidth), mixtureRows)
+            .reduce(Float(0)) { max($0, abs($1.0 - $1.1)) }
+        XCTAssertLessThanOrEqual(
+            mixtureDelta / mixtureScale, 1e-4,
+            "the folded mixture accumulator against the host graph"
+        )
         withExtendedLifetime(engine) {}
     }
 
