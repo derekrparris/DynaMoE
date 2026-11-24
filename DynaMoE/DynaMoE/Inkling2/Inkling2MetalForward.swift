@@ -385,6 +385,19 @@ nonisolated public final class Inkling2MetalForward {
     /// parity test compares against. It reads the same weights.
     public let host: Inkling2CPUForward
 
+    /// Whether `runVisit` bills its stages into `visitProfile`.
+    ///
+    /// Off by default and off in every production path: the seam that turns it
+    /// on is `dynamoe_inkling2_profile`, read once per turn. A nil profile at
+    /// every call site is what keeps the cost of the instrument out of the
+    /// shipping graph rather than a promise that it is cheap.
+    public var recordsVisitTiming = false
+
+    /// The per-stage table `runVisit` fills while `recordsVisitTiming` is on.
+    /// Its owner calls `reset()` at the start of a turn and `describe()` at the
+    /// end; a turn that is cancelled still leaves what it measured.
+    public let visitProfile = Inkling2VisitProfile()
+
     private let pipelines: [String: MTLComputePipelineState]
 
     /// Every pipeline this graph dispatches, by kernel name. A missing one is
@@ -915,8 +928,10 @@ nonisolated public final class Inkling2MetalForward {
         valueInput: [Float],
         position: Int,
         workspace: Inkling2DeviceWorkspace,
-        dumpsAttentionScores: Bool = false
+        dumpsAttentionScores: Bool = false,
+        profile: Inkling2VisitProfile? = nil
     ) throws -> [Float] {
+        let stageStart = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         let isFull = !config.isLocalLayer(layer)
         let heads = isFull ? config.numAttentionHeads : config.swaNumAttentionHeads
         let kvHeads = isFull ? config.numKeyValueHeads : config.swaNumKeyValueHeads
@@ -928,6 +943,7 @@ nonisolated public final class Inkling2MetalForward {
         let keyInputBuffer = try staging(workspace.keyInput, keyInput)
         let valueInputBuffer = try staging(workspace.valueInput, valueInput)
 
+        let encodeStart = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         let (commandBuffer, encoder) = try commandComponents()
         // Every dispatch's scalar argument lives in the arena until the command
         // buffer has completed: the GPU reads them when it runs the work.
@@ -999,9 +1015,26 @@ nonisolated public final class Inkling2MetalForward {
 
         encoder.endEncoding()
         encoded = true
+        let frontCommit = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         commandBuffer.commit()
+        let frontWaitBegan = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         commandBuffer.waitUntilCompleted()
+        let frontWaitEnded = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         if let error = commandBuffer.error { throw error }
+        if let profile {
+            var billed = Inkling2StageTiming()
+            billed.add(
+                Inkling2BufferClock(
+                    encodeStart: encodeStart, commit: frontCommit, buffer: commandBuffer
+                ),
+                drainNanoseconds: frontWaitEnded - frontWaitBegan
+            )
+            profile.record(
+                stage: .attentionFront,
+                wallNanoseconds: frontWaitEnded - stageStart,
+                buffers: billed
+            )
+        }
 
         // The host state advances NOW, from what the GPU actually produced:
         // the convolution histories take the projections, and the position's own
@@ -1028,6 +1061,14 @@ nonisolated public final class Inkling2MetalForward {
         // The KV rows this position attends over, staged: the second command
         // buffer, because the attention reads the row the first one wrote.
         let rows = workspace.stage(state)
+        let tailStart = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
+        if let profile {
+            profile.record(
+                stage: .attentionState,
+                wallNanoseconds: tailStart - frontWaitEnded,
+                buffers: Inkling2StageTiming()
+            )
+        }
         let (tailBuffer, tailEncoder) = try commandComponents()
         let tailArena = Inkling2ScalarArena(device: device)
         defer { tailArena.clear() }
@@ -1063,9 +1104,24 @@ nonisolated public final class Inkling2MetalForward {
 
         tailEncoder.endEncoding()
         tailEncoded = true
+        let tailCommit = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         tailBuffer.commit()
+        let tailWaitBegan = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         tailBuffer.waitUntilCompleted()
+        let tailWaitEnded = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         if let error = tailBuffer.error { throw error }
+        if let profile {
+            var billed = Inkling2StageTiming()
+            billed.add(
+                Inkling2BufferClock(encodeStart: tailStart, commit: tailCommit, buffer: tailBuffer),
+                drainNanoseconds: tailWaitEnded - tailWaitBegan
+            )
+            profile.record(
+                stage: .attentionTail,
+                wallNanoseconds: tailWaitEnded - tailStart,
+                buffers: billed
+            )
+        }
         return readBack(workspace.projectionOutput, count: hidden)
     }
 
@@ -1136,8 +1192,10 @@ nonisolated public final class Inkling2MetalForward {
         state: Inkling2VisitState,
         mlpInput: [Float],
         residual: [Float],
-        workspace: Inkling2DeviceWorkspace
+        workspace: Inkling2DeviceWorkspace,
+        profile: Inkling2VisitProfile? = nil
     ) throws -> [Float] {
+        let stageStart = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         let hiddenWidth = config.hiddenSize
         let intermediate = config.moeIntermediateSize
         let experts = config.numRoutedExperts
@@ -1145,6 +1203,7 @@ nonisolated public final class Inkling2MetalForward {
 
         // 1. The MLP norm, then the router and its selection, in one buffer.
         let mlpInputBuffer = try staging(workspace.hidden, mlpInput)
+        let encodeStart = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         let (commandBuffer, encoder) = try commandComponents()
         let arena = Inkling2ScalarArena(device: device)
         defer { arena.clear() }
@@ -1172,11 +1231,32 @@ nonisolated public final class Inkling2MetalForward {
         )
         encoder.endEncoding()
         encoded = true
+        let frontCommit = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         commandBuffer.commit()
+        let frontWaitBegan = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         commandBuffer.waitUntilCompleted()
+        let frontWaitEnded = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         if let error = commandBuffer.error { throw error }
+        if let profile {
+            var billed = Inkling2StageTiming()
+            billed.add(
+                Inkling2BufferClock(
+                    encodeStart: encodeStart, commit: frontCommit, buffer: commandBuffer
+                ),
+                drainNanoseconds: frontWaitEnded - frontWaitBegan
+            )
+            profile.record(
+                stage: .mlpFront,
+                wallNanoseconds: frontWaitEnded - stageStart,
+                buffers: billed
+            )
+        }
 
         // The selection is a device value the host needs to address the bank.
+        // The mixture's clock starts where the front's ended, so the two
+        // read-backs and the accumulator clear are billed to the mixture rather
+        // than falling between two stages.
+        let mixtureStart = frontWaitEnded
         let indices = readBackIndices(workspace.routeIndices, count: topK)
         let routeWeights = readBack(workspace.routeWeights, count: topK)
 
@@ -1187,8 +1267,11 @@ nonisolated public final class Inkling2MetalForward {
         let accumulatorPointer = workspace.residualAccumulator.contents()
             .bindMemory(to: Float.self, capacity: hiddenWidth)
         for index in 0..<hiddenWidth { accumulatorPointer[index] = 0 }
+        var mixture = Inkling2StageTiming()
+        var mixtureBytes: UInt64 = 0
         for (slot, expert) in indices.enumerated() {
             let weight = routeWeights[slot]
+            let expertEncodeStart = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
             let (expertBuffer, expertEncoder) = try commandComponents()
             let expertArena = Inkling2ScalarArena(device: device)
             var expertEncoded = false
@@ -1233,14 +1316,40 @@ nonisolated public final class Inkling2MetalForward {
             )
             expertEncoder.endEncoding()
             expertEncoded = true
+            let expertCommit = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
             expertBuffer.commit()
+            let expertWaitBegan = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
             expertBuffer.waitUntilCompleted()
+            let expertWaitEnded = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
             if let error = expertBuffer.error { throw error }
+            if profile != nil {
+                mixture.add(
+                    Inkling2BufferClock(
+                        encodeStart: expertEncodeStart, commit: expertCommit, buffer: expertBuffer
+                    ),
+                    drainNanoseconds: expertWaitEnded - expertWaitBegan
+                )
+                // The bank's own strides: a packed row is `rowStride` bytes and a
+                // scale row is `scaleRowStride`, so this is what a residency
+                // policy would have to move for this expert, not an estimate
+                // from the logical shape.
+                mixtureBytes += UInt64(2 * intermediate) &* UInt64(gateUp.rowStride &+ gateUp.scaleRowStride)
+                mixtureBytes += UInt64(hiddenWidth) &* UInt64(down.rowStride &+ down.scaleRowStride)
+            }
+        }
+        if let profile {
+            profile.record(
+                stage: .expertMixture,
+                wallNanoseconds: DispatchTime.now().uptimeNanoseconds - mixtureStart,
+                buffers: mixture
+            )
+            profile.recordExperts(count: indices.count, bytes: mixtureBytes)
         }
 
         // 3. The post-MLP convolution, then the residual add. The convolution's
         //    history takes the mixture (pre-convolution), so it is pushed only
         //    after the buffer completes.
+        let tailStart = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         let (tailBuffer, tailEncoder) = try commandComponents()
         let tailArena = Inkling2ScalarArena(device: device)
         defer { tailArena.clear() }
@@ -1255,12 +1364,27 @@ nonisolated public final class Inkling2MetalForward {
         )
         tailEncoder.endEncoding()
         tailEncoded = true
+        let tailCommit = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         tailBuffer.commit()
+        let tailWaitBegan = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         tailBuffer.waitUntilCompleted()
+        let tailWaitEnded = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         if let error = tailBuffer.error { throw error }
         state.pushConvolution(3, value: readBack(workspace.residualAccumulator, count: hiddenWidth))
 
         let convolved = readBack(workspace.hidden, count: hiddenWidth)
+        if let profile {
+            var billed = Inkling2StageTiming()
+            billed.add(
+                Inkling2BufferClock(encodeStart: tailStart, commit: tailCommit, buffer: tailBuffer),
+                drainNanoseconds: tailWaitEnded - tailWaitBegan
+            )
+            profile.record(
+                stage: .mlpTail,
+                wallNanoseconds: DispatchTime.now().uptimeNanoseconds - tailStart,
+                buffers: billed
+            )
+        }
         return zip(residual, convolved).map(+)
     }
 
@@ -1412,6 +1536,8 @@ nonisolated public final class Inkling2MetalForward {
         position: Int,
         workspace: Inkling2DeviceWorkspace
     ) throws -> (output: [Float], attentionQueries: Int) {
+        let profile: Inkling2VisitProfile? = recordsVisitTiming ? visitProfile : nil
+        let visitStart = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         let visitIndex = try host.visitIndex(layer: layer, pass: pass)
         let state = host.states[visitIndex]
         let isFull = !config.isLocalLayer(layer)
@@ -1463,14 +1589,23 @@ nonisolated public final class Inkling2MetalForward {
         }
 
         // 3. The attention half, on the device.
+        if let profile {
+            profile.record(
+                stage: .hostPrep,
+                wallNanoseconds: DispatchTime.now().uptimeNanoseconds - visitStart,
+                buffers: Inkling2StageTiming()
+            )
+        }
         let attentionOutput = try attentionHalf(
             layer: layer, state: state, queryInput: queryInput, keyInput: keyInput,
-            valueInput: valueInput, position: position, workspace: workspace
+            valueInput: valueInput, position: position, workspace: workspace, profile: profile
         )
         // 4. The post-attention convolution.
         let postAttention = try shortConvolution(
-            encoderlessState: state, index: 2, values: attentionOutput, layer: layer, workspace: workspace
+            encoderlessState: state, index: 2, values: attentionOutput, layer: layer,
+            workspace: workspace, profile: profile
         )
+        let mlpReadStart = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
 
         // 5. The residual: the boundary append is LOCAL to the MLP read.
         var residual = postAttention
@@ -1488,9 +1623,23 @@ nonisolated public final class Inkling2MetalForward {
             )
         }
         // 6. The MLP half, on the device (it returns residual + convolved mixture).
+        if let profile {
+            profile.record(
+                stage: .mlpRead,
+                wallNanoseconds: DispatchTime.now().uptimeNanoseconds - mlpReadStart,
+                buffers: Inkling2StageTiming()
+            )
+        }
         let output = try mlpHalf(
-            layer: layer, state: state, mlpInput: mlpHidden, residual: residual, workspace: workspace
+            layer: layer, state: state, mlpInput: mlpHidden, residual: residual,
+            workspace: workspace, profile: profile
         )
+        if let profile {
+            profile.closeVisit(
+                wallNanoseconds: DispatchTime.now().uptimeNanoseconds - visitStart,
+                attentionQueries: attentionQueries
+            )
+        }
         return (output, attentionQueries)
     }
 
@@ -1498,9 +1647,12 @@ nonisolated public final class Inkling2MetalForward {
     /// the history pushed after it.
     func shortConvolution(
         encoderlessState state: Inkling2VisitState, index: Int, values: [Float],
-        layer: Int, workspace: Inkling2DeviceWorkspace
+        layer: Int, workspace: Inkling2DeviceWorkspace,
+        profile: Inkling2VisitProfile? = nil
     ) throws -> [Float] {
+        let stageStart = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         let inputBuffer = try staging(workspace.projectionOutput, values)
+        let encodeStart = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         let (commandBuffer, encoder) = try commandComponents()
         let arena = Inkling2ScalarArena(device: device)
         var encoded = false
@@ -1516,9 +1668,24 @@ nonisolated public final class Inkling2MetalForward {
         )
         encoder.endEncoding()
         encoded = true
+        let commitStamp = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         commandBuffer.commit()
+        let waitBegan = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         commandBuffer.waitUntilCompleted()
+        let waitEnded = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         if let error = commandBuffer.error { throw error }
+        if let profile {
+            var billed = Inkling2StageTiming()
+            billed.add(
+                Inkling2BufferClock(encodeStart: encodeStart, commit: commitStamp, buffer: commandBuffer),
+                drainNanoseconds: waitEnded - waitBegan
+            )
+            profile.record(
+                stage: .postAttentionConvolution,
+                wallNanoseconds: waitEnded - stageStart,
+                buffers: billed
+            )
+        }
         state.pushConvolution(index, value: values)
         return readBack(workspace.hidden, count: config.hiddenSize)
     }

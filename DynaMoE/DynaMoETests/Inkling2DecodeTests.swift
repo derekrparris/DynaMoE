@@ -450,8 +450,11 @@ final class Inkling2PublishedHeadTests: XCTestCase {
         let hostSeconds = CFAbsoluteTimeGetCurrent() - hostStart
 
         // One whole position with the head installed exactly as the engine
-        // installs it, so the share is measured on the turn's path.
-        let forward = try Inkling2CPUForward(config: harness.config, weights: harness.source)
+        // installs it, so the share is measured on the turn's path. The forward
+        // is the executor's OWN host graph, which is what the engine does:
+        // `runVisit` reads and appends that graph's visit states, so a second
+        // forward here would run a valid position against the wrong sequence.
+        let forward = harness.oracle
         let executor = harness.metal
         let workspace = harness.workspace
         forward.visitRunner = { layer, pass, value, blockStates, messages, position in

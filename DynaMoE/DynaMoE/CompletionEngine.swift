@@ -1010,6 +1010,12 @@ public final class CompletionEngine: @unchecked Sendable {
                     try half.executor.headLogits(hidden: hidden, workspace: half.workspace)
                 }
             }
+            // Phase 6 instrumentation: off unless the debug seam is set. The
+            // executor is cached across turns, so the table is reset per turn
+            // and summarized per turn -- otherwise the second turn reports the
+            // first one's visits as its own.
+            let inklingProfileRequested = UserDefaults.standard.bool(forKey: "dynamoe_inkling2_profile")
+            deviceHalfForTurn?.executor.recordsVisitTiming = inklingProfileRequested
 
             // A supplied image row is the one thing an id prefix cannot vouch
             // for: two same-sized pictures expand to identical marker ids, so
@@ -1063,9 +1069,17 @@ public final class CompletionEngine: @unchecked Sendable {
                 engineSelf.turnDidBegin(myGenerationId)
                 forward.visitRunner = inklingVisitRunner
                 forward.headRunner = inklingHeadRunner
+                if let executor = deviceHalfForTurn?.executor { executor.visitProfile.reset() }
                 defer {
                     forward.visitRunner = nil
                     forward.headRunner = nil
+                    if inklingProfileRequested, let executor = deviceHalfForTurn?.executor,
+                       executor.visitProfile.visits > 0 {
+                        DiagLog.info(
+                            "inkling2.profile",
+                            executor.visitProfile.describe(label: "prompt \(inklingPromptIds.count)")
+                        )
+                    }
                     engineSelf.turnDidEnd(id: myGenerationId)
                     continuation.finish()
                 }
