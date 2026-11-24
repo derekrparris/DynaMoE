@@ -4667,9 +4667,20 @@ struct ContentView: View {
                 let hasTools = (msg.toolCalls != nil && !msg.toolCalls!.isEmpty)
                 let hasReasoning = !(msg.thinkingContent ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 let grids = msg.role == .user ? inklingImageGrids(for: msg) : []
-                guard !cleanMsg.isEmpty || hasReasoning || hasTools || !grids.isEmpty else { continue }
+                // A picture that did not become a grid -- a decode failure, or a
+                // snapshot whose tower is not installed -- must not vanish from
+                // the turn: the model would then be asked about a picture it was
+                // never sent, and nothing in the prompt would say so. Every
+                // other family appends the notice; this branch has to as well,
+                // because its grids are built before the render rather than by
+                // `attachmentFragment`.
+                let attachmentNotice = grids.isEmpty ? Self.localAttachmentNotice(for: msg) : ""
+                guard !cleanMsg.isEmpty || hasReasoning || hasTools
+                        || !grids.isEmpty || !attachmentNotice.isEmpty else { continue }
                 if msg.role == .user {
-                    turns.append(.init(role: .user, text: cleanMsg, imageGrids: grids))
+                    turns.append(.init(
+                        role: .user, text: cleanMsg + attachmentNotice, imageGrids: grids
+                    ))
                 } else if msg.role == .assistant {
                     var body = cleanMsg
                     if hasReasoning {

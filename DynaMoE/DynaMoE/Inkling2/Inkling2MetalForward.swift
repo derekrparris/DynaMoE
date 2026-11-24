@@ -232,6 +232,9 @@ nonisolated public final class Inkling2DeviceWorkspace {
     public let bank: MTLBuffer
     /// The attention's per-row scores, for a parity check of the stage inside.
     public let scoreDump: MTLBuffer
+    /// The unembedding's output: one FP32 logit per vocab row, so it is the one
+    /// workspace buffer sized by the vocabulary rather than by the width.
+    public let headLogits: MTLBuffer
 
     /// `stagedPositions` bounds the KV staging, i.e. the longest sequence one
     /// attention dispatch can read. The default is the checkpoint's declared
@@ -287,6 +290,9 @@ nonisolated public final class Inkling2DeviceWorkspace {
             "relative bank"
         )
         scoreDump = try make(config.maxPositionEmbeddings * MemoryLayout<Float>.stride, "score dump")
+        headLogits = try make(
+            config.unpaddedVocabSize * MemoryLayout<Float>.stride, "head logits"
+        )
     }
 
     /// Copies one visit's retained key and value rows into the staging buffers.
@@ -501,6 +507,101 @@ nonisolated public final class Inkling2MetalForward {
                 threadsPerThreadgroup: MTLSize(width: min(rows, 128), height: 1, depth: 1)
             )
         }
+    }
+
+    // MARK: - The output head
+
+    /// Which kernel the unembedding dispatches.
+    ///
+    /// The head is the one stage where the two shipped forms differ by roughly
+    /// an order of magnitude in COALESCING rather than in arithmetic: 200,058
+    /// rows of 2,304, read once per token. `rowThread` gives a thread a row, so
+    /// a warp's 32 lanes touch 32 rows at the same column and every 16-byte load
+    /// lands in its own 128-byte sector; `coalesced` gives a threadgroup a row
+    /// and strides the columns, so a warp reads one contiguous window. They are
+    /// both kept so the choice stays a measurement (see
+    /// `Inkling2DecodeMeasurementTests`) rather than a copied threshold.
+    public enum HeadKernelForm: String, Sendable, CaseIterable {
+        case coalesced
+        case rowThread
+    }
+
+    /// The form the graph ships, chosen by the rotated A/B in
+    /// `Inkling2PublishedHeadTests`: the coalesced form reads the 921 MB table
+    /// at 358 GB/s against the one-thread form's 209, and the very first pass --
+    /// on an idle GPU -- read the opposite. See the plan's Phase 6 slice-1
+    /// record for the numbers and the trap.
+    public static let shippedHeadForm: HeadKernelForm = .coalesced
+
+    /// The unembedding on the device: `logits = lmHead * hidden`, the raw
+    /// pre-softcap values for the first `unpaddedVocabSize` rows.
+    ///
+    /// One commit and one wait: the caller samples from the result, so there is
+    /// nothing to overlap it with. The 922 MB read is the cost and the GPU's
+    /// request rate is the point.
+    ///
+    /// It stages the hidden row in `workspace.queryInput`, which is the right
+    /// width and is not live here: the head runs after the last visit, and every
+    /// visit re-stages that buffer before it reads it.
+    public func headLogits(
+        hidden: [Float],
+        workspace: Inkling2DeviceWorkspace,
+        form: HeadKernelForm = Inkling2MetalForward.shippedHeadForm
+    ) throws -> [Float] {
+        let rows = config.unpaddedVocabSize
+        let columns = config.hiddenSize
+        guard hidden.count == columns else {
+            throw Inkling2ForwardError.shapeMismatch(
+                "the head wants a \(columns)-wide hidden row, got \(hidden.count)"
+            )
+        }
+        let (weightBuffer, weightOffset) = try weights.tensor(.lmHead, layer: nil)
+        let input = try staging(workspace.queryInput, hidden)
+        let arena = Inkling2ScalarArena(device: device)
+        var encoded = false
+        let (commandBuffer, encoder) = try commandComponents()
+        defer {
+            if !encoded { encoder.endEncoding() }
+            arena.clear()
+        }
+        let offset = arena.make(UInt64(weightOffset))
+        let inDim = arena.make(UInt32(columns))
+        let outDim = arena.make(UInt32(rows))
+        let zero: UInt32 = 0
+        let inputStride = arena.make(zero)
+        let outputStride = arena.make(zero)
+        encoder.setBuffer(weightBuffer, offset: 0, index: 0)
+        encoder.setBuffer(input, offset: 0, index: 1)
+        encoder.setBuffer(workspace.headLogits, offset: 0, index: 2)
+        encoder.setBuffer(offset, offset: 0, index: 3)
+        encoder.setBuffer(inDim, offset: 0, index: 4)
+        encoder.setBuffer(outDim, offset: 0, index: 5)
+        encoder.setBuffer(inputStride, offset: 0, index: 6)
+        encoder.setBuffer(outputStride, offset: 0, index: 7)
+        switch form {
+        case .coalesced:
+            let lanes = 128
+            encoder.setComputePipelineState(try pipeline("bf16_gemv_rows"))
+            // One float per 32 lanes, sized for the widest group a caller can
+            // ask for rather than for this one.
+            encoder.setThreadgroupMemoryLength(32 * MemoryLayout<Float>.stride, index: 0)
+            encoder.dispatchThreadgroups(
+                MTLSize(width: rows, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
+            )
+        case .rowThread:
+            encoder.setComputePipelineState(try pipeline("bf16_gemv"))
+            encoder.dispatchThreads(
+                MTLSize(width: rows, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
+            )
+        }
+        encoder.endEncoding()
+        encoded = true
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let error = commandBuffer.error { throw error }
+        return readBack(workspace.headLogits, count: rows)
     }
 
     /// The block read: `softmax(q . rmsnorm(row) / sqrt(width)) . rmsnorm(row)`

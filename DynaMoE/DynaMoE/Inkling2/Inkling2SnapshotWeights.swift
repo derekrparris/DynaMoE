@@ -127,6 +127,45 @@ nonisolated public final class Inkling2SnapshotWeights: Inkling2WeightSource {
         return raw.prefix(count).map { Float($0) }
     }
 
+    /// The same decode, straight from the mapping into a caller's buffer.
+    ///
+    /// Same values, same order; what it does not do is build an intermediate
+    /// `[UInt8]` copy of the tensor, which is what made the whole-table rule
+    /// 2.8 GB of traffic for a table that is the largest in the checkpoint.
+    static func decode(
+        _ pointer: UnsafeRawPointer, dtype: String, count: Int, into output: inout [Float]
+    ) {
+        guard count > 0, output.count >= count else { return }
+        let upper = dtype.uppercased()
+        output.withUnsafeMutableBufferPointer { destination in
+            if upper.contains("BF16") {
+                for index in 0..<count {
+                    let bits = pointer.loadUnaligned(fromByteOffset: index * 2, as: UInt16.self)
+                    destination[index] = Float(bitPattern: UInt32(bits) << 16)
+                }
+            } else if upper.contains("F32") {
+                for index in 0..<count {
+                    destination[index] = pointer.loadUnaligned(fromByteOffset: index * 4, as: Float.self)
+                }
+            } else if upper.contains("F8_E4M3") {
+                for index in 0..<count {
+                    destination[index] = Inkling2Element.decodeE4M3(
+                        pointer.loadUnaligned(fromByteOffset: index, as: UInt8.self)
+                    )
+                }
+            } else if upper.contains("F16") {
+                for index in 0..<count {
+                    let bits = pointer.loadUnaligned(fromByteOffset: index * 2, as: UInt16.self)
+                    destination[index] = Float(Float16(bitPattern: bits))
+                }
+            } else {
+                for index in 0..<count {
+                    destination[index] = Float(pointer.loadUnaligned(fromByteOffset: index, as: UInt8.self))
+                }
+            }
+        }
+    }
+
     // MARK: Inkling2WeightSource
 
     public func shape(_ role: Inkling2TensorRole, layer: Int?) throws -> [Int] {
@@ -139,6 +178,90 @@ nonisolated public final class Inkling2SnapshotWeights: Inkling2WeightSource {
         let raw = Self.rawValues(pointer, count: ref.elementCount, dtype: ref.dtype)
         return Self.decode(raw, dtype: ref.dtype, count: ref.elementCount)
     }
+
+    /// The unembedding's logits, decoded a CHUNK of rows at a time.
+    ///
+    /// The base rule decodes the whole tensor first, and this checkpoint's
+    /// unembedding is 200,058 x 2,304 BF16: 922 MB stored, 1.84 GB as `[Float]`,
+    /// re-decoded on every token. A turn therefore held a transient allocation
+    /// larger than the model's dense text weights, on a 16 GB machine. Here the
+    /// same arithmetic runs over `headChunkRows` rows at a time, so the peak is
+    /// a chunk rather than the table while the dot itself stays the reference's
+    /// column-ordered FP32 sum (chunking must not move the pinned host numbers).
+    ///
+    /// `headChunkRows` is 1,024: 9.4 MB of scratch, 196 passes over the table.
+    public static let headChunkRows = 1024
+
+    public func logits(_ hidden: [Float], rows: Int, hiddenSize: Int) throws -> [Float] {
+        guard hidden.count == hiddenSize else {
+            throw Inkling2ForwardError.shapeMismatch(
+                "the head wants a \(hiddenSize)-wide hidden row, got \(hidden.count)"
+            )
+        }
+        let ref = try tensor(.lmHead, layer: nil)
+        guard ref.shape.count == 2, ref.shape[1] == hiddenSize else {
+            throw Inkling2ForwardError.shapeMismatch(
+                "the unembedding is \(ref.shape), not [rows][\(hiddenSize)]"
+            )
+        }
+        guard rows >= 0, rows <= ref.shape[0] else {
+            throw Inkling2ForwardError.shapeMismatch(
+                "\(rows) logits do not fit the unembedding \(ref.shape)"
+            )
+        }
+        return try Self.headLogits(
+            from: try bytes(of: ref), dtype: ref.dtype, rows: rows,
+            hiddenSize: hiddenSize, hidden: hidden
+        )
+    }
+
+    /// The chunked rule itself, as a function of the mapped bytes.
+    ///
+    /// Split out so the chunk arithmetic is testable on a byte buffer rather
+    /// than only through a checkpoint: `chunkRows` is what a test varies, and
+    /// the whole point is that it changes the peak allocation and NOT the sums.
+    static func headLogits(
+        from pointer: UnsafeRawPointer,
+        dtype: String,
+        rows: Int,
+        hiddenSize: Int,
+        hidden: [Float],
+        chunkRows: Int = Inkling2SnapshotWeights.headChunkRows
+    ) throws -> [Float] {
+        guard hidden.count == hiddenSize else {
+            throw Inkling2ForwardError.shapeMismatch(
+                "the head wants a \(hiddenSize)-wide hidden row, got \(hidden.count)"
+            )
+        }
+        guard rows > 0 else { return [] }
+        guard chunkRows > 0 else {
+            throw Inkling2ForwardError.unsupported("a head chunk of \(chunkRows) rows")
+        }
+        let width = elementWidth(dtype)
+        var logits = [Float](repeating: 0, count: rows)
+        let chunk = min(rows, chunkRows)
+        var scratch = [Float](repeating: 0, count: chunk * hiddenSize)
+        var start = 0
+        while start < rows {
+            let count = min(chunk, rows - start)
+            let elements = count * hiddenSize
+            decode(
+                pointer.advanced(by: start * hiddenSize * width),
+                dtype: dtype, count: elements, into: &scratch
+            )
+            for row in 0..<count {
+                var total: Float = 0
+                let offset = row * hiddenSize
+                for column in 0..<hiddenSize {
+                    total += scratch[offset + column] * hidden[column]
+                }
+                logits[start + row] = total
+            }
+            start += count
+        }
+        return logits
+    }
+
 
     /// One row, read without materializing the table: the embedding is 201,024
     /// rows of 2,304 and a token needs one.

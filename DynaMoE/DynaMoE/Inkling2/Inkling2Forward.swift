@@ -69,6 +69,42 @@ public extension Inkling2WeightSource {
         }
         return Array(all[(index * width)..<((index + 1) * width)])
     }
+
+    /// The unembedding's raw logits for one hidden row, before the softcap.
+    ///
+    /// A REQUIREMENT-shaped default, for the same reason `row` is: a call
+    /// through the protocol dispatches statically to an extension method, so
+    /// this body is the rule a source is held to and a file-backed source
+    /// overrides it to stream the table instead of materializing it. The
+    /// arithmetic (a column-ordered FP32 dot per row) is the reference's, and
+    /// an override that changes it changes the pinned host numbers.
+    func logits(_ hidden: [Float], rows: Int, hiddenSize: Int) throws -> [Float] {
+        guard hidden.count == hiddenSize else {
+            throw Inkling2ForwardError.shapeMismatch(
+                "the head wants a \(hiddenSize)-wide hidden row, got \(hidden.count)"
+            )
+        }
+        let head = try matrix(.lmHead, layer: nil)
+        let tensorShape = try shape(.lmHead, layer: nil)
+        guard tensorShape.count == 2, tensorShape[1] == hiddenSize else {
+            throw Inkling2ForwardError.shapeMismatch(
+                "the unembedding is \(tensorShape), not [rows][\(hiddenSize)]"
+            )
+        }
+        guard rows >= 0, rows <= tensorShape[0], head.count >= rows * hiddenSize else {
+            throw Inkling2ForwardError.shapeMismatch(
+                "\(rows) logits do not fit the unembedding \(tensorShape)"
+            )
+        }
+        var logits = [Float](repeating: 0, count: rows)
+        for row in 0..<rows {
+            var total: Float = 0
+            let base = row * hiddenSize
+            for column in 0..<hiddenSize { total += head[base + column] * hidden[column] }
+            logits[row] = total
+        }
+        return logits
+    }
 }
 
 nonisolated public enum Inkling2ForwardError: Error, Equatable, CustomStringConvertible {
@@ -149,6 +185,43 @@ nonisolated public final class Inkling2CPUForward {
         _ messages: [[Float]]?, _ position: Int
     ) throws -> (output: [Float], attentionQueries: Int)
     public var visitRunner: VisitRunner?
+
+    /// Runs the unembedding in place of the host rule, or nil for the host.
+    ///
+    /// Same reason as `visitRunner`: the stage is one line of the graph and the
+    /// MACHINE it runs on is what changes. It returns the RAW logits (the
+    /// softcap is applied by `rawLogits`' caller, once, so the two paths cannot
+    /// disagree about it or apply it twice). The unembedding is 922 MB of BF16
+    /// read once per token, which is why this is the seam a decode bottleneck
+    /// moves first.
+    public typealias HeadRunner = (_ hidden: [Float]) throws -> [Float]
+    public var headRunner: HeadRunner?
+
+    /// The unembedding's raw logits for one hidden row. The device head
+    /// replaces `weights.logits` and nothing else.
+    public func rawLogits(_ hidden: [Float]) throws -> [Float] {
+        guard hidden.count == config.hiddenSize else {
+            throw Inkling2ForwardError.shapeMismatch(
+                "the head wants a \(config.hiddenSize)-wide hidden row, got \(hidden.count)"
+            )
+        }
+        if let headRunner {
+            let logits = try headRunner(hidden)
+            // A runner that answers a different number of logits would shrink
+            // the vocabulary the sampler is handed, silently: it derives its
+            // range from `logits.count`, so a short array is a smaller model.
+            guard logits.count == config.unpaddedVocabSize else {
+                throw Inkling2ForwardError.shapeMismatch(
+                    "the head runner answered \(logits.count) logits, not "
+                        + "\(config.unpaddedVocabSize)"
+                )
+            }
+            return logits
+        }
+        return try weights.logits(
+            hidden, rows: config.unpaddedVocabSize, hiddenSize: config.hiddenSize
+        )
+    }
 
     public init(
         config: Inkling2Config,
@@ -287,15 +360,7 @@ nonisolated public final class Inkling2CPUForward {
         hidden = Inkling2Math.rmsNorm(
             hidden, gain: try weights.matrix(.finalNorm, layer: nil), eps: config.rmsNormEps
         )
-        let head = try weights.matrix(.lmHead, layer: nil)
-        let unpadded = config.unpaddedVocabSize
-        var logits = [Float](repeating: 0, count: unpadded)
-        for row in 0..<unpadded {
-            var total: Float = 0
-            let base = row * config.hiddenSize
-            for column in 0..<config.hiddenSize { total += head[base + column] * hidden[column] }
-            logits[row] = total
-        }
+        let logits = try rawLogits(hidden)
         return Inkling2Math.finalLogitSoftcap(logits, softcap: config.finalLogitSoftcapping)
     }
 

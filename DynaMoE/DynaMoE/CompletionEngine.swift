@@ -1000,6 +1000,16 @@ public final class CompletionEngine: @unchecked Sendable {
                     )
                 }
             }
+            // The unembedding rides with the visit runner: it is 922 MB of BF16
+            // read once per token, which the GPU does at its own request rate
+            // and the host does through a decode. Installed and cleared with the
+            // runner so a turn never drives a workspace that is already gone,
+            // and nil on a host-only turn, which then runs `weights.logits`.
+            let inklingHeadRunner: Inkling2CPUForward.HeadRunner? = deviceHalfForTurn.map { half in
+                { hidden in
+                    try half.executor.headLogits(hidden: hidden, workspace: half.workspace)
+                }
+            }
 
             // A supplied image row is the one thing an id prefix cannot vouch
             // for: two same-sized pictures expand to identical marker ids, so
@@ -1052,8 +1062,10 @@ public final class CompletionEngine: @unchecked Sendable {
                 }
                 engineSelf.turnDidBegin(myGenerationId)
                 forward.visitRunner = inklingVisitRunner
+                forward.headRunner = inklingHeadRunner
                 defer {
                     forward.visitRunner = nil
+                    forward.headRunner = nil
                     engineSelf.turnDidEnd(id: myGenerationId)
                     continuation.finish()
                 }
