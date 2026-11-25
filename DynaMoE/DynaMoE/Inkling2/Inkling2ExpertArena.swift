@@ -25,6 +25,7 @@
 //
 
 import Foundation
+import Metal
 
 // MARK: - Geometry
 
@@ -110,6 +111,153 @@ nonisolated public struct Inkling2ArenaCounters: Sendable, Equatable {
     }
 }
 
+// MARK: - Reading a shard
+
+/// Errors an arena read can fail with, named rather than left as an errno.
+nonisolated public enum Inkling2ArenaError: Error, Equatable, CustomStringConvertible {
+    case cannotOpen(String)
+    case shortRead(path: String, offset: Int, wanted: Int, got: Int)
+    case rangeOutsideTheShard(path: String, offset: Int, length: Int, fileSize: Int)
+
+    public var description: String {
+        switch self {
+        case .cannotOpen(let detail):
+            return "cannot open an expert shard: \(detail)"
+        case let .shortRead(path, offset, wanted, got):
+            return "expert read (\(path)) at \(offset) returned \(got) of \(wanted) bytes"
+        case let .rangeOutsideTheShard(path, offset, length, fileSize):
+            return "expert read (\(path)) at \(offset) for \(length) bytes runs past the \(fileSize)-byte shard"
+        }
+    }
+}
+
+/// POSIX `pread` into caller-chosen destinations, fanned out across a concurrent
+/// queue when there is more than one range.
+///
+/// The same shape the DeepSeek V4.1 port ships, for the same reason: one read per
+/// range is a round trip each, and a fill that misses one expert asks for a
+/// handful of ranges, so the queue DEPTH rather than the range size is what turns
+/// a round trip into throughput. Every range writes a disjoint destination, so
+/// the fan-out needs no coordination. Deliberately no `F_NOCACHE`: the DSV4.1
+/// journal measured that as a 2.2x LOSS through Metal's shared memory.
+nonisolated public final class Inkling2ArenaShardReader: @unchecked Sendable {
+    public struct Range {
+        public let fileOffset: Int
+        public let destination: UnsafeMutableRawPointer
+        public let length: Int
+        public init(fileOffset: Int, destination: UnsafeMutableRawPointer, length: Int) {
+            self.fileOffset = fileOffset
+            self.destination = destination
+            self.length = length
+        }
+    }
+
+    public let path: String
+    public let fileSize: Int
+    private let descriptor: Int32
+    private let lock = NSLock()
+    private var isClosed = false
+
+    public init(url: URL) throws {
+        let fd = open(url.path, O_RDONLY | O_CLOEXEC)
+        guard fd >= 0 else {
+            throw Inkling2ArenaError.cannotOpen("\(url.lastPathComponent): errno \(errno)")
+        }
+        var status = stat()
+        guard fstat(fd, &status) == 0 else {
+            let code = errno
+            close(fd)
+            throw Inkling2ArenaError.cannotOpen("\(url.lastPathComponent): fstat failed, errno \(code)")
+        }
+        self.descriptor = fd
+        self.path = url.lastPathComponent
+        self.fileSize = Int(status.st_size)
+    }
+
+    deinit { closeNow() }
+
+    public func closeNow() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isClosed else { return }
+        isClosed = true
+        close(descriptor)
+    }
+
+    /// Reads every range. Returns the bytes read, and throws the first failure
+    /// with the range that caused it.
+    @discardableResult
+    public func read(_ ranges: [Range]) throws -> Int {
+        guard !ranges.isEmpty else { return 0 }
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isClosed else { throw Inkling2ArenaError.cannotOpen("\(path) was closed") }
+        // Checked before any read: a short read in the middle of a matrix is a
+        // silently wrong weight row.
+        for range in ranges {
+            guard range.fileOffset >= 0, range.length >= 0,
+                  range.fileOffset + range.length <= fileSize else {
+                throw Inkling2ArenaError.rangeOutsideTheShard(
+                    path: path, offset: range.fileOffset,
+                    length: range.length, fileSize: fileSize
+                )
+            }
+        }
+        let fd = descriptor
+        let path = self.path
+        let failure = Inkling2ReadFailure()
+        let readOne: @Sendable (Int) -> Void = { index in
+            let range = ranges[index]
+            var total = 0
+            while total < range.length {
+                let got = pread(
+                    fd, range.destination.advanced(by: total),
+                    range.length - total, off_t(range.fileOffset + total)
+                )
+                if got < 0 {
+                    if errno == EINTR { continue }
+                    failure.record(.shortRead(
+                        path: path, offset: range.fileOffset + total,
+                        wanted: range.length - total, got: Int(got)
+                    ))
+                    return
+                }
+                if got == 0 {
+                    failure.record(.shortRead(
+                        path: path, offset: range.fileOffset + total,
+                        wanted: range.length - total, got: 0
+                    ))
+                    return
+                }
+                total += got
+            }
+        }
+        if ranges.count >= 2 {
+            DispatchQueue.concurrentPerform(iterations: ranges.count, execute: readOne)
+        } else {
+            for index in ranges.indices { readOne(index) }
+        }
+        if let first = failure.first { throw first }
+        return ranges.reduce(0) { $0 + $1.length }
+    }
+}
+
+/// The first failure of a fan-out, shared across its reads.
+nonisolated private final class Inkling2ReadFailure: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Inkling2ArenaError?
+    func record(_ error: Inkling2ArenaError) {
+        lock.lock()
+        if stored == nil { stored = error }
+        lock.unlock()
+    }
+    var first: Inkling2ArenaError? {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
+    }
+}
+
 /// A least-recently-used set of resident (layer, expert) pairs backed by
 /// caller-provided slot buffers.
 ///
@@ -173,6 +321,73 @@ nonisolated public final class Inkling2ExpertArena: @unchecked Sendable {
         order.insert((layer, expert), at: 0)
         counters.bytesRead += bytes
         counters.preadNanoseconds += preadNanoseconds
+    }
+
+    /// The slot buffers, when the arena was given memory to fill. One buffer
+    /// holds every slot, `geometry.slotBytes` apart.
+    public private(set) var slotBuffer: MTLBuffer?
+
+    /// Gives the arena a device buffer of `capacity * geometry.slotBytes`.
+    public func attachSlotBuffer(_ buffer: MTLBuffer) {
+        slotBuffer = buffer
+    }
+
+    /// The slot holding (layer, expert), filled from `reader` on a miss.
+    ///
+    /// A hit costs the bookkeeping above. A miss reads the expert's four ranges
+    /// -- `w13` weight and scale, `w2` weight and scale -- out of the fused banks
+    /// at this expert's offset into its slot, timed, and records what it cost.
+    /// Returns the slot index; the caller binds `slotBuffer` at
+    /// `slot * geometry.slotBytes`.
+    @discardableResult
+    public func slot(
+        layer: Int, expert: Int, reader: Inkling2ArenaShardReader,
+        gateUpSourceOffset: UInt64, gateUpScaleSourceOffset: UInt64,
+        downSourceOffset: UInt64, downScaleSourceOffset: UInt64
+    ) throws -> Int {
+        if let hit = resident(layer: layer, expert: expert) { return hit }
+        let slot = slotForFill(layer: layer, expert: expert)
+        guard let buffer = slotBuffer else {
+            // Bookkeeping only: the caller fills the slot itself.
+            didFill(
+                slot: slot, layer: layer, expert: expert,
+                gateUpSourceOffset: gateUpSourceOffset, downSourceOffset: downSourceOffset,
+                bytes: 0, preadNanoseconds: 0
+            )
+            return slot
+        }
+        let base = buffer.contents().advanced(by: slot * geometry.slotBytes)
+        let ranges = [
+            Inkling2ArenaShardReader.Range(
+                fileOffset: Int(gateUpSourceOffset),
+                destination: base.advanced(by: geometry.gateUpWeightOffset),
+                length: geometry.gateUpWeightBytes
+            ),
+            Inkling2ArenaShardReader.Range(
+                fileOffset: Int(gateUpScaleSourceOffset),
+                destination: base.advanced(by: geometry.gateUpScaleOffset),
+                length: geometry.gateUpScaleBytes
+            ),
+            Inkling2ArenaShardReader.Range(
+                fileOffset: Int(downSourceOffset),
+                destination: base.advanced(by: geometry.downWeightOffset),
+                length: geometry.downWeightBytes
+            ),
+            Inkling2ArenaShardReader.Range(
+                fileOffset: Int(downScaleSourceOffset),
+                destination: base.advanced(by: geometry.downScaleOffset),
+                length: geometry.downScaleBytes
+            )
+        ]
+        let started = DispatchTime.now().uptimeNanoseconds
+        let read = try reader.read(ranges)
+        let elapsed = DispatchTime.now().uptimeNanoseconds - started
+        didFill(
+            slot: slot, layer: layer, expert: expert,
+            gateUpSourceOffset: gateUpSourceOffset, downSourceOffset: downSourceOffset,
+            bytes: UInt64(read), preadNanoseconds: elapsed
+        )
+        return slot
     }
 
     public func evictAll() {

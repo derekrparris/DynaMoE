@@ -803,6 +803,100 @@ final class Inkling2MemoryPlanTests: XCTestCase {
         )
     }
 
+    /// The arena's fill is a real pread into the slot, at the slot's own offsets,
+    /// and the counters item 1 was missing come out of it.
+    ///
+    /// A temporary file stands in for a shard -- the reader is the same POSIX
+    /// call either way -- so this runs with no checkpoint. The bank bytes are
+    /// patterned per range, so a range written to the wrong slot offset (or
+    /// read from the wrong file offset) is a wrong value, not a plausible one.
+    func testTheArenaFillsASlotByPreadAndCountsIt() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice(), "no Metal device")
+        let geometry = try XCTUnwrap(
+            Inkling2ExpertSlotGeometry.make(
+                gateUpRows: 4, gateUpRowStride: 3, gateUpScaleRowStride: 1,
+                downRows: 2, downRowStride: 5, downScaleRowStride: 1
+            )
+        )
+        // Four ranges, each at a known file offset, with distinct bytes.
+        let gateUpWeight: [UInt8] = (0..<geometry.gateUpWeightBytes).map { UInt8(0x10 + $0) }
+        let gateUpScale: [UInt8] = (0..<geometry.gateUpScaleBytes).map { UInt8(0x40 + $0) }
+        let downWeight: [UInt8] = (0..<geometry.downWeightBytes).map { UInt8(0x70 + $0) }
+        let downScale: [UInt8] = (0..<geometry.downScaleBytes).map { UInt8(0xA0 + $0) }
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("inkling2-arena-\(UUID().uuidString).bin")
+        var contents = [UInt8](repeating: 0xEE, count: 8)
+        contents += gateUpWeight + gateUpScale + downWeight + downScale
+        try Data(contents).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let reader = try Inkling2ArenaShardReader(url: file)
+
+        let slotBytes = geometry.slotBytes
+        let buffer = try XCTUnwrap(
+            device.makeBuffer(length: 2 * slotBytes, options: .storageModeShared)
+        )
+        let arena = Inkling2ExpertArena(capacity: 2, geometry: geometry)
+        arena.attachSlotBuffer(buffer)
+        let gateUpBase: UInt64 = 8
+        let gateUpScaleBase = gateUpBase + UInt64(gateUpWeight.count)
+        let downBase = gateUpScaleBase + UInt64(gateUpScale.count)
+        let downScaleBase = downBase + UInt64(downWeight.count)
+
+        let slot = try arena.slot(
+            layer: 3, expert: 7, reader: reader,
+            gateUpSourceOffset: gateUpBase, gateUpScaleSourceOffset: gateUpScaleBase,
+            downSourceOffset: downBase, downScaleSourceOffset: downScaleBase
+        )
+        XCTAssertEqual(slot, 0)
+        let pointer = buffer.contents().bindMemory(to: UInt8.self, capacity: 2 * slotBytes)
+        let base = slot * slotBytes
+        for index in 0..<gateUpWeight.count {
+            XCTAssertEqual(pointer[base + geometry.gateUpWeightOffset + index], gateUpWeight[index])
+        }
+        for index in 0..<gateUpScale.count {
+            XCTAssertEqual(pointer[base + geometry.gateUpScaleOffset + index], gateUpScale[index])
+        }
+        for index in 0..<downWeight.count {
+            XCTAssertEqual(pointer[base + geometry.downWeightOffset + index], downWeight[index])
+        }
+        for index in 0..<downScale.count {
+            XCTAssertEqual(pointer[base + geometry.downScaleOffset + index], downScale[index])
+        }
+        let afterMiss = arena.statistics
+        XCTAssertEqual(afterMiss.misses, 1)
+        XCTAssertEqual(afterMiss.hits, 0)
+        XCTAssertEqual(afterMiss.bytesRead, UInt64(slotBytes))
+
+        // A second ask is a hit and reads nothing.
+        let again = try arena.slot(
+            layer: 3, expert: 7, reader: reader,
+            gateUpSourceOffset: gateUpBase, gateUpScaleSourceOffset: gateUpScaleBase,
+            downSourceOffset: downBase, downScaleSourceOffset: downScaleBase
+        )
+        XCTAssertEqual(again, slot)
+        let afterHit = arena.statistics
+        XCTAssertEqual(afterHit.hits, 1)
+        XCTAssertEqual(afterHit.misses, 1)
+        XCTAssertEqual(afterHit.bytesRead, afterMiss.bytesRead)
+        XCTAssertEqual(afterHit.preadNanoseconds, afterMiss.preadNanoseconds)
+
+        // A range past the end of the file is refused before any read, by name.
+        var thrown: Error?
+        do {
+            _ = try arena.slot(
+                layer: 0, expert: 0, reader: reader,
+                gateUpSourceOffset: UInt64(reader.fileSize), gateUpScaleSourceOffset: 0,
+                downSourceOffset: 0, downScaleSourceOffset: 0
+            )
+        } catch {
+            thrown = error
+        }
+        XCTAssertNotNil(thrown)
+        guard case Inkling2ArenaError.rangeOutsideTheShard? = thrown as? Inkling2ArenaError else {
+            return XCTFail("expected a range-outside-the-shard refusal, got \(String(describing: thrown))")
+        }
+    }
+
     /// The arena's residency sequence: a hit, then fills until the capacity is
     /// spent, then the least recently used pair is the one evicted.
     ///
