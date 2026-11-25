@@ -17,12 +17,82 @@
 //       its rows in position order, and `windowStart` is what turns a row index
 //       back into a position.
 //
-//  The KV rows are stored as FP32 here because the host reference computes in
-//  FP32; the INT8/FP16 storage DynaMoE's FP8 setting uses is a later phase, and
-//  it reuses the same addressing rule (a ring read is chronological either way).
+//  The KV rows are FP32 by default because the host reference computes in
+//  FP32; INT8 storage is opt-in per sequence (`Inkling2KVStorage.int8`), using
+//  DynaMoE's existing KV contract, and it reuses the same addressing rule (a
+//  ring read is chronological either way).
 //
 
 import Foundation
+
+// MARK: - Storage
+
+/// How a visit's KV rows are held.
+///
+/// `float32` is what the host reference computes in and what every existing
+/// path gets. `int8` is Phase 7's DynaMoE KV contract: per (token, KV head) for
+/// K and V independently, `scale = max(abs(x), 1e-7) / 127`, the stored value
+/// rounded and clamped to +/-127, the scale kept as FP16, and a read back is
+/// `stored * scale`. It is NOT E4M3 and is independent of expert-activation
+/// quantization.
+///
+/// The stored rows are exposed through the same `keys`/`values` accessors, so
+/// every reader -- attention, the profile dump, the device staging copy -- sees
+/// dequantized FP32 and none of them needs to know which storage is in use.
+nonisolated public enum Inkling2KVStorage: String, Sendable, Equatable {
+    case float32
+    case int8
+
+    /// Bytes one stored element occupies, before the FP16 scale.
+    public var bytesPerElement: Int {
+        switch self {
+        case .float32: return 4
+        case .int8: return 1
+        }
+    }
+
+    /// The FP16 scale one (token, head) carries in `int8`, zero otherwise.
+    public var scaleBytesPerHead: Int {
+        self == .int8 ? MemoryLayout<UInt16>.stride : 0
+    }
+}
+
+/// The INT8 store/dequantize rule, in one place.
+///
+/// Written on the host exactly as `store_kv_cache_fp8` writes it on the device,
+/// because the two are the same contract: a divergence here is a cache whose
+/// bytes depend on which path wrote them, and a resumed prefix would then
+/// dequantize differently than the turn that produced it.
+nonisolated public enum Inkling2KVQuantization {
+    /// `max(abs(x), 1e-7) / 127`: the smallest scale that keeps the row in range.
+    public static func scale(_ row: ArraySlice<Float>) -> Float {
+        var maximum: Float = 0
+        for value in row { maximum = max(maximum, abs(value)) }
+        return max(maximum, 1e-7) / 127
+    }
+
+    public static func scale(_ row: [Float]) -> Float { scale(row[...]) }
+
+    /// Rounds half away from zero and clamps, then stores as a signed byte.
+    /// `round` in MSL is half away from zero, and Swift's `.rounded()` is the
+    /// same, so the two agree on the tie cases rather than only on the easy ones.
+    public static func store(_ value: Float, inverseScale: Float) -> Int8 {
+        let scaled = (value * inverseScale).rounded()
+        return Int8(max(-127, min(127, scaled)))
+    }
+
+    /// A stored byte and its FP16 scale, read back as the attention kernels read it.
+    public static func load(_ stored: Int8, scale: UInt16) -> Float {
+        Float(stored) * Float(Float16(bitPattern: scale))
+    }
+
+    /// One row through the whole round trip, for a golden that pins the rule.
+    public static func stored(_ row: [Float]) -> (values: [Int8], scale: UInt16) {
+        let factor = scale(row)
+        let inverse = 1 / factor
+        return (row.map { store($0, inverseScale: inverse) }, Float16(factor).bitPattern)
+    }
+}
 
 // MARK: - Per-visit state
 
@@ -39,8 +109,26 @@ nonisolated public final class Inkling2VisitState {
     public let window: Int
     public let historyDepth: Int
     /// Keys and values, one row per retained position, chronologically.
-    public private(set) var keys: [[Float]] = []
-    public private(set) var values: [[Float]] = []
+    /// How these rows are held. FP32 unless the sequence asked otherwise.
+    public let storage: Inkling2KVStorage
+    /// The stored rows in `storage`'s own form: one row per retained position,
+    /// chronologically, exactly as `keys`/`values` were handed in.
+    private var storedKeys: [[Int8]] = []
+    private var storedValues: [[Int8]] = []
+    /// Per (row, KV head) FP16 scales, K and V separately. Empty in FP32.
+    private var keyScales: [[UInt16]] = []
+    private var valueScales: [[UInt16]] = []
+    /// The dequantized rows, kept so a reader gets FP32 whatever the storage is.
+    /// They are the cache's own copy, not the caller's array: a row is read many
+    /// times (every attention over it) and dequantizing per read would put the
+    /// conversion in the inner loop.
+    private var decodedKeys: [[Float]] = []
+    private var decodedValues: [[Float]] = []
+
+    /// Keys and values, dequantized to FP32, one row per retained position,
+    /// chronologically. In FP32 storage these ARE the stored rows.
+    public var keys: [[Float]] { decodedKeys }
+    public var values: [[Float]] { decodedValues }
     /// Absolute position of the next row to be appended.
     public private(set) var committedPositions = 0
     /// Absolute position of `keys[0]`; a ring drops from the front.
@@ -52,11 +140,16 @@ nonisolated public final class Inkling2VisitState {
     /// drops from the front and never reaches it.
     public let maxRows: Int?
 
-    public init(isFullAttention: Bool, window: Int, stateWidths: [Int], historyDepth: Int, maxRows: Int? = nil) {
+    public init(
+        isFullAttention: Bool, window: Int, stateWidths: [Int], historyDepth: Int,
+        maxRows: Int? = nil, storage: Inkling2KVStorage = .float32, heads: Int = 1
+    ) {
         self.isFullAttention = isFullAttention
         self.window = max(1, window)
         self.historyDepth = max(0, historyDepth)
         self.maxRows = maxRows
+        self.storage = storage
+        self.heads = max(1, heads)
         self.convolutionHistory = stateWidths.map { _ in [] }
     }
 
@@ -70,18 +163,77 @@ nonisolated public final class Inkling2VisitState {
     /// Appends one position's K/V and returns the absolute range of rows the
     /// position may attend over.
     public func append(key: [Float], value: [Float]) -> Range<Int> {
-        keys.append(key)
-        values.append(value)
+        switch storage {
+        case .float32:
+            decodedKeys.append(key)
+            decodedValues.append(value)
+        case .int8:
+            // Per KV head, both directions, as the device kernel does it: one
+            // scale per (token, head), the row read back as stored * scale.
+            func quantize(_ row: [Float], into stored: inout [[Int8]], scales: inout [[UInt16]]) {
+                var bytes = [Int8](repeating: 0, count: row.count)
+                var rowScales = [UInt16](repeating: 0, count: heads)
+                for head in 0..<heads {
+                    let range = (head * headWidth)..<min(row.count, (head + 1) * headWidth)
+                    guard !range.isEmpty else { continue }
+                    let factor = Inkling2KVQuantization.scale(row[range])
+                    let inverse = 1 / factor
+                    for index in range {
+                        bytes[index] = Inkling2KVQuantization.store(row[index], inverseScale: inverse)
+                    }
+                    rowScales[head] = Float16(factor).bitPattern
+                }
+                stored.append(bytes)
+                scales.append(rowScales)
+            }
+            quantize(key, into: &storedKeys, scales: &keyScales)
+            quantize(value, into: &storedValues, scales: &valueScales)
+            decodedKeys.append(Self.dequantize(
+                storedKeys[storedKeys.count - 1], keyScales[keyScales.count - 1], headWidth: headWidth
+            ))
+            decodedValues.append(Self.dequantize(
+                storedValues[storedValues.count - 1], valueScales[valueScales.count - 1], headWidth: headWidth
+            ))
+        }
         committedPositions += 1
         if !isFullAttention {
-            let excess = max(0, keys.count - window)
+            let excess = max(0, decodedKeys.count - window)
             if excess > 0 {
-                keys.removeFirst(excess)
-                values.removeFirst(excess)
+                dropFirst(excess)
                 windowStart += excess
             }
         }
-        return windowStart..<(windowStart + keys.count)
+        return windowStart..<(windowStart + decodedKeys.count)
+    }
+
+    /// KV heads, so a scale is per head and not per row.
+    public var heads: Int = 1
+
+    /// The width of one KV head's slice, which is what a scale covers: a row is
+    /// `heads` equal slices.
+    private var headWidth: Int {
+        guard let first = decodedKeys.first, !first.isEmpty else { return 1 }
+        return max(1, first.count / max(1, heads))
+    }
+
+    private func dropFirst(_ count: Int) {
+        decodedKeys.removeFirst(count)
+        decodedValues.removeFirst(count)
+        if !storedKeys.isEmpty {
+            storedKeys.removeFirst(count)
+            storedValues.removeFirst(count)
+            keyScales.removeFirst(count)
+            valueScales.removeFirst(count)
+        }
+    }
+
+    /// `stored * scale`, per head, as attention reads it.
+    static func dequantize(_ stored: [Int8], _ scales: [UInt16], headWidth: Int) -> [Float] {
+        guard !scales.isEmpty, headWidth > 0 else { return stored.map(Float.init) }
+        return stored.enumerated().map { index, byte in
+            let head = min(index / headWidth, scales.count - 1)
+            return Inkling2KVQuantization.load(byte, scale: scales[head])
+        }
     }
 
     /// Drops every row at or after `positions`: the rollback a rejected
@@ -91,9 +243,15 @@ nonisolated public final class Inkling2VisitState {
         let removed = max(0, committedPositions - positions)
         committedPositions = positions
         if removed > 0 {
-            let drop = min(removed, keys.count)
-            keys.removeLast(drop)
-            values.removeLast(drop)
+            let drop = min(removed, decodedKeys.count)
+            decodedKeys.removeLast(drop)
+            decodedValues.removeLast(drop)
+            if !storedKeys.isEmpty {
+                storedKeys.removeLast(min(drop, storedKeys.count))
+                storedValues.removeLast(min(drop, storedValues.count))
+                keyScales.removeLast(min(drop, keyScales.count))
+                valueScales.removeLast(min(drop, valueScales.count))
+            }
         }
         return removed
     }
@@ -119,8 +277,12 @@ nonisolated public final class Inkling2VisitState {
     }
 
     public func reset() {
-        keys.removeAll()
-        values.removeAll()
+        decodedKeys.removeAll()
+        decodedValues.removeAll()
+        storedKeys.removeAll()
+        storedValues.removeAll()
+        keyScales.removeAll()
+        valueScales.removeAll()
         committedPositions = 0
         windowStart = 0
         convolutionHistory = convolutionHistory.map { _ in [] }
@@ -146,15 +308,21 @@ nonisolated public final class Inkling2SequenceState {
     /// visit never reaches it because it holds at most its window.
     public let maxPositions: Int
 
+    /// `storage` is how every visit holds its KV rows, and `kvHeads` is what a
+    /// per-head INT8 scale covers. Both default to the FP32 reference behavior,
+    /// so every existing caller is unchanged and INT8 is an explicit choice.
     public init(
         plan: [Inkling2VisitPlan],
         window: Int,
         kvWidth: Int,
         hidden: Int,
         historyDepth: Int,
-        maxPositions: Int
+        maxPositions: Int,
+        storage: Inkling2KVStorage = .float32,
+        kvHeads: Int = 1
     ) {
         self.maxPositions = max(1, maxPositions)
+        self.storage = storage
         self.plan = plan
         self.visits = plan.map { visit in
             Inkling2VisitState(
@@ -164,10 +332,15 @@ nonisolated public final class Inkling2SequenceState {
                 historyDepth: historyDepth,
                 // Only a full-attention visit grows without bound; a ring is
                 // capped at its window and must not be refused at the budget.
-                maxRows: visit.isFullAttention ? maxPositions : nil
+                maxRows: visit.isFullAttention ? maxPositions : nil,
+                storage: storage,
+                heads: kvHeads
             )
         }
     }
+
+    /// How this sequence's KV rows are held.
+    public let storage: Inkling2KVStorage
 
     /// Positions every visit agrees on. They advance together or not at all:
     /// a visit that committed more than another is a bug, and reporting the

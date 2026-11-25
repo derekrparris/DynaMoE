@@ -727,6 +727,16 @@ The arena's counters reach item 1's instrument now: `Inkling2VisitProfile.arena`
 - A disabled DSpark costs no sidecar memory or target capture overhead.
 - Shipped speedup is reproduced over multiple runs and includes draft, verify, head, and expert-fill costs. Poor acceptance falls back to walking without user-visible failure.
 
+**Progress: slice 1, the INT8 storage contract in Inkling 2's KV cache (2026-11-25).**
+
+`Inkling2VisitState` now holds its KV rows in either `Inkling2KVStorage.float32` (the default, and every existing path) or `.int8`, which is DynaMoE's KV contract applied per (token, KV head) for K and V independently: `scale = max(abs(x), 1e-7) / 127`, the stored value rounded and clamped to +/-127, the scale kept as FP16, and a read back `stored * scale`. `Inkling2KVQuantization` is the rule in one place, written on the host exactly as `store_kv_cache_fp8` writes it on the device -- a divergence there would make a cache's bytes depend on which path wrote them, and a resumed prefix would then dequantize differently than the turn that produced it.
+
+The stored rows stay private and `keys`/`values` return the dequantized FP32 rows, so every reader (attention, the profile dump, the device staging copy) is unchanged and none of them needs to know the storage. `Inkling2SequenceState.init` threads `storage` and `kvHeads` into every visit, both defaulted so nothing existing moves.
+
+- **Pinned with no model** (`Inkling2KVStorageTests`, 9 cases): hand-computed goldens for the scale and the stored bytes (worked out from the formula, not from the implementation), the clamp on overflow, the one-step round-trip bound, the ring dropping the OLDEST row in both storages, a rollback removing the same rows an append added, a per-head scale (one head's large values must not coarsen another's small ones), and a zero row staying zero.
+- **The zero row is the trap this pins**: a row of zeros gets the FLOORED scale `1e-7/127`, which rounds to zero in FP16, so the byte and the scale multiply to zero only because the byte is zero too. Any nonzero stored value in such a row would vanish -- which is why the scale is floored rather than left to `max(abs)`.
+- **Not done in this slice:** the device store kernel for the Inkling path (the generic `store_kv_cache_fp8` is the contract's reference, not yet dispatched by Inkling's attention), the KV-precision plumbing into `KVCacheProvisioning.turnFit`, and the INT8-vs-BF16 logit bound. The storage contract is the piece everything else reads.
+
 ### Phase 9: Release hardening and sustained dogfood
 
 **Work**

@@ -374,6 +374,160 @@ final class Inkling2ElementFormatTests: XCTestCase {
     }
 }
 
+// MARK: - KV storage
+
+/// Phase 7's INT8 KV contract, pinned against hand-computed goldens.
+///
+/// The rule is `scale = max(abs(x), 1e-7) / 127`, the stored value rounded and
+/// clamped to +/-127, the scale kept as FP16, and a read back `stored * scale`.
+/// These expectations were worked out from that formula alone, not from the
+/// implementation, so a change that keeps the code self-consistent still fails.
+final class Inkling2KVStorageTests: XCTestCase {
+
+    private func visit(
+        storage: Inkling2KVStorage, heads: Int = 1, window: Int = 4, full: Bool = true, width: Int = 4
+    ) -> Inkling2VisitState {
+        Inkling2VisitState(
+            isFullAttention: full, window: window,
+            stateWidths: [width, width, width, width], historyDepth: 2,
+            storage: storage, heads: heads
+        )
+    }
+
+    /// The scale is the row's largest magnitude over 127, floored at 1e-7/127.
+    func testTheScaleIsTheLargestMagnitudeOverOneTwentySeven() {
+        XCTAssertEqual(Inkling2KVQuantization.scale([1.0, -127.0]), 1.0, accuracy: 1e-7)
+        XCTAssertEqual(Inkling2KVQuantization.scale([0.125, -0.25]), 0.25 / 127, accuracy: 1e-9)
+        // A row of zeros still gets a usable scale: 1e-7 / 127, not zero, or the
+        // inverse would be infinite and every stored value NaN.
+        XCTAssertEqual(Inkling2KVQuantization.scale([0, 0]), 1e-7 / 127, accuracy: 1e-12)
+        XCTAssertEqual(Inkling2KVQuantization.scale([1e-9, 3.0]), 3.0 / 127, accuracy: 1e-7)
+    }
+
+    /// Store then load is the identity to within one quantization step, and the
+    /// stored bytes are the hand-computed ones.
+    func testTheRoundTripIsTheHandComputedGolden() {
+        let cases: [(row: [Float], stored: [Int8], scale: Float16)] = [
+            ([1.0, -127.0], [1, -127], 1.0),
+            ([127.0, -63.5], [127, -64], 1.0),
+            ([0.125, -0.25], [64, -127], 0.0019683837890625),
+            ([1e-9, 3.0], [0, 127], 0.02362060546875)
+        ]
+        for entry in cases {
+            let result = Inkling2KVQuantization.stored(entry.row)
+            XCTAssertEqual(result.values, entry.stored, "\(entry.row) stored")
+            XCTAssertEqual(Float16(bitPattern: result.scale), entry.scale, "\(entry.row) scale")
+            let restored = zip(result.values, entry.row).map { byte, original in
+                Inkling2KVQuantization.load(byte, scale: result.scale) - original
+            }
+            let step = Float(entry.scale)
+            for difference in restored {
+                XCTAssertLessThanOrEqual(abs(difference), step, "\(entry.row) within one step")
+            }
+        }
+    }
+
+    /// Clamping is what keeps a value in range when the scale is floored: a
+    /// huge value against a tiny scale would otherwise overflow the byte.
+    func testStoredValuesClampRatherThanWrap() {
+        XCTAssertEqual(Inkling2KVQuantization.store(1e9, inverseScale: 1e9), 127)
+        XCTAssertEqual(Inkling2KVQuantization.store(-1e9, inverseScale: 1e9), -127)
+        // Swift's rounding is half away from zero, matching MSL's round.
+        XCTAssertEqual(Inkling2KVQuantization.store(2.5, inverseScale: 1), 3)
+        XCTAssertEqual(Inkling2KVQuantization.store(-2.5, inverseScale: 1), -3)
+    }
+
+    /// A stored row is a row of the cache, and the cache still reads it back in
+    /// full: same count, same width, same order.
+    func testTheCacheKeepsTheRowsItWasGiven() {
+        for storage in [Inkling2KVStorage.float32, .int8] {
+            let state = visit(storage: storage)
+            _ = state.append(key: [1, 2, 3, 4], value: [5, 6, 7, 8])
+            _ = state.append(key: [9, 10, 11, 12], value: [13, 14, 15, 16])
+            XCTAssertEqual(state.keys.count, 2, "\(storage)")
+            XCTAssertEqual(state.values.count, 2, "\(storage)")
+            XCTAssertEqual(state.keys[0].count, 4, "\(storage)")
+            let tolerance: Float = storage == .int8 ? 0.03 : 0
+            XCTAssertEqual(state.keys[1][0], 9, accuracy: tolerance, "\(storage)")
+            XCTAssertEqual(state.values[1][3], 16, accuracy: tolerance, "\(storage)")
+        }
+    }
+
+    /// A ring drops from the front in both storages, so a chronological read
+    /// stays chronological: the oldest row is the one that goes.
+    func testTheRingDropsTheOldestRowInBothStorages() {
+        for storage in [Inkling2KVStorage.float32, .int8] {
+            let state = visit(storage: storage, window: 2, full: false)
+            var range = state.append(key: [1, 0, 0, 0], value: [1, 0, 0, 0])
+            XCTAssertEqual(range, 0..<1)
+            range = state.append(key: [2, 0, 0, 0], value: [2, 0, 0, 0])
+            XCTAssertEqual(range, 0..<2)
+            range = state.append(key: [3, 0, 0, 0], value: [3, 0, 0, 0])
+            XCTAssertEqual(range, 1..<3, "\(storage): the window slid by one")
+            XCTAssertEqual(state.keys.count, 2, "\(storage)")
+            let tolerance: Float = storage == .int8 ? 0.03 : 0
+            XCTAssertEqual(state.keys[0][0], 2, accuracy: tolerance, "\(storage): oldest kept row")
+            XCTAssertEqual(state.keys[1][0], 3, accuracy: tolerance, "\(storage): newest row")
+        }
+    }
+
+    /// A rollback removes the same rows the append added, in both storages.
+    func testARollbackRemovesTheRowsInBothStorages() {
+        for storage in [Inkling2KVStorage.float32, .int8] {
+            let state = visit(storage: storage)
+            for index in 0..<4 { _ = state.append(key: [Float(index), 0, 0, 0], value: [Float(index), 0, 0, 0]) }
+            XCTAssertEqual(state.rollback(to: 2), 2, "\(storage)")
+            XCTAssertEqual(state.keys.count, 2, "\(storage)")
+            XCTAssertEqual(state.committedPositions, 2, "\(storage)")
+            let tolerance: Float = storage == .int8 ? 0.03 : 0
+            XCTAssertEqual(state.keys[1][0], 1, accuracy: tolerance, "\(storage)")
+            // And the next append continues from there rather than skipping.
+            _ = state.append(key: [9, 0, 0, 0], value: [9, 0, 0, 0])
+            XCTAssertEqual(state.keys[2][0], 9, accuracy: tolerance, "\(storage)")
+        }
+    }
+
+    /// The scale is per KV HEAD: one head's large values must not coarsen
+    /// another head's small ones.
+    func testEachHeadGetsItsOwnScale() {
+        // Two heads of width two: head 0 is tiny, head 1 is full scale.
+        let state = visit(storage: .int8, heads: 2, width: 4)
+        _ = state.append(key: [0.001, -0.001, 127, -127], value: [0, 0, 0, 0])
+        let row = state.keys[0]
+        // Head 0's step is 0.001/127, so its values survive to within that;
+        // a row-wide scale would round them both to zero.
+        XCTAssertEqual(row[0], 0.001, accuracy: 0.001 / 127 + 1e-6)
+        XCTAssertEqual(row[1], -0.001, accuracy: 0.001 / 127 + 1e-6)
+        XCTAssertNotEqual(row[0], 0)
+    }
+
+    /// A zero row stays zero: the floored scale is finite, so nothing becomes
+    /// NaN even though the FP16 scale rounds to zero.
+    func testAZeroRowStaysZero() {
+        let state = visit(storage: .int8)
+        _ = state.append(key: [0, 0, 0, 0], value: [0, 0, 0, 0])
+        XCTAssertEqual(state.keys[0], [0, 0, 0, 0])
+        XCTAssertEqual(state.values[0], [0, 0, 0, 0])
+    }
+
+    /// The sequence's choice reaches every visit, and the default stays FP32.
+    func testTheSequenceThreadsItsStorageIntoEveryVisit() throws {
+        let config = try Inkling2Config.decode(jsonData: Data(Inkling2ConfigTests.smallJSON.utf8))
+        let plan = try config.makeVisitPlan()
+        let plain = Inkling2SequenceState(
+            plan: plan, window: 16, kvWidth: 8, hidden: 8, historyDepth: 2, maxPositions: 32
+        )
+        XCTAssertEqual(plain.storage, Inkling2KVStorage.float32)
+        XCTAssertTrue(plain.visits.allSatisfy { $0.storage == Inkling2KVStorage.float32 })
+        let quantized = Inkling2SequenceState(
+            plan: plan, window: 16, kvWidth: 8, hidden: 8, historyDepth: 2, maxPositions: 32,
+            storage: .int8, kvHeads: 2
+        )
+        XCTAssertEqual(quantized.storage, Inkling2KVStorage.int8)
+        XCTAssertTrue(quantized.visits.allSatisfy { $0.storage == Inkling2KVStorage.int8 && $0.heads == 2 })
+    }
+}
+
 // MARK: - Primitives: activation quantizers
 
 final class Inkling2ActivationQuantizerTests: XCTestCase {
