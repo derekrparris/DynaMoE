@@ -786,6 +786,18 @@ enum KVCacheProvisioning {
         )
     }
 
+    /// The same layout with its element width set by an INT8 storage choice.
+    ///
+    /// INT8 is not a `KVCachePrecision` case: that enum is the generic runtime's
+    /// FP8 (E4M3), while this is DynaMoE's signed-byte contract with an FP16
+    /// per-head scale. They are different store rules with different bytes, so
+    /// folding one into the other would price a cache the kernels do not write.
+    static func int8(geometry: Geometry) -> Geometry {
+        var quantized = geometry
+        quantized.elementBytes = Inkling2KVStorage.int8.bytesPerElement
+        return quantized
+    }
+
     /// Number of ring (sliding-window) slots in the layout.
     static func ringSlotCount(_ geometry: Geometry) -> Int {
         guard geometry.slidingRingLen > 0, let flags = geometry.slidingSlotFlags else { return 0 }
@@ -808,16 +820,32 @@ enum KVCacheProvisioning {
     /// Bytes the K and V caches together allocate for `maxSeqLen` — the amount
     /// the KV budget is actually spent on.
     static func requiredBytes(maxSeqLen: Int, geometry: Geometry) -> Int {
+        requiredBytes(maxSeqLen: maxSeqLen, geometry: geometry, scaleBytesPerRow: 0)
+    }
+
+    /// As above, with the per-row scale bytes an INT8 cache also allocates:
+    /// K and V each carry one FP16 scale per KV head.
+    static func requiredBytes(maxSeqLen: Int, geometry: Geometry, scaleBytesPerRow: Int) -> Int {
         let rows = positions(maxSeqLen: maxSeqLen, geometry: geometry)
-        return rows * (geometry.kStride + geometry.vStride) * geometry.elementBytes
+        return rows * ((geometry.kStride + geometry.vStride) * geometry.elementBytes + scaleBytesPerRow)
+    }
+
+    /// Scale bytes one row of an INT8 cache carries: K and V, one FP16 each per
+    /// KV head. Zero for every other storage.
+    static func scaleBytesPerRow(geometry: Geometry, storage: Inkling2KVStorage) -> Int {
+        geometry.kvHeadCapacity * storage.scaleBytesPerHead * 2
     }
 
     /// Sequence rows the KV budget alone can hold for `geometry`. Unconstrained
     /// layouts (no linear slots, or a non-finite budget) return `Int.max`.
-    static func affordableSeqLen(geometry: Geometry, budgetGB: Double) -> Int {
+    static func affordableSeqLen(
+        geometry: Geometry, budgetGB: Double, scaleBytesPerRow: Int = 0
+    ) -> Int {
         let ringSlots = ringSlotCount(geometry)
         let linearSlots = max(0, geometry.totalSlots - ringSlots)
-        let bytesPerLinearPosition = Double((geometry.kStride + geometry.vStride) * geometry.elementBytes)
+        let bytesPerLinearPosition = Double(
+            (geometry.kStride + geometry.vStride) * geometry.elementBytes + scaleBytesPerRow
+        )
         guard linearSlots > 0, bytesPerLinearPosition > 0, budgetGB.isFinite else { return Int.max }
         let fixedRingBytes = Double(ringSlots * geometry.slidingRingLen) * bytesPerLinearPosition
         let budgetBytes = max(0.0, budgetGB * 1_073_741_824)
@@ -829,9 +857,13 @@ enum KVCacheProvisioning {
     /// passes through unchanged. The floor deliberately wins over the budget,
     /// so callers that must never provision past the budget check
     /// `affordableSeqLen` (and reject) before trusting this raising behavior.
-    static func clampedSeqLen(requested: Int, floor: Int, geometry: Geometry, budgetGB: Double) -> Int {
+    static func clampedSeqLen(
+        requested: Int, floor: Int, geometry: Geometry, budgetGB: Double, scaleBytesPerRow: Int = 0
+    ) -> Int {
         guard requested > floor, budgetGB.isFinite else { return requested }
-        let affordable = affordableSeqLen(geometry: geometry, budgetGB: budgetGB)
+        let affordable = affordableSeqLen(
+            geometry: geometry, budgetGB: budgetGB, scaleBytesPerRow: scaleBytesPerRow
+        )
         return max(floor, min(requested, affordable))
     }
 
@@ -1095,7 +1127,12 @@ enum KVCacheProvisioning {
         modelFootprintGB: Double,
         physicalGB: Double,
         residentFootprintGB: Double? = nil,
-        policyMaxRows: Int = maxProvisionedRows
+        policyMaxRows: Int = maxProvisionedRows,
+        /// How this turn's KV rows are stored. FP32 is the reference; `.int8`
+        /// is DynaMoE's signed-byte contract, priced at one byte per element
+        /// plus an FP16 scale per KV head per row, so a turn that would be
+        /// clamped by the budget is not when its cache is a quarter the size.
+        kvStorage: Inkling2KVStorage = .float32
     ) -> TurnFit {
         let requested = neededSeqLen(
             sessionFloor: sessionFloor,
@@ -1103,7 +1140,7 @@ enum KVCacheProvisioning {
             requestedMaxTokens: requestedMaxTokens,
             policyMaxRows: policyMaxRows
         )
-        let kvGeometry = geometry(
+        let priced = geometry(
             config: config,
             actualLayers: actualLayers,
             totalLoops: totalLoops,
@@ -1113,18 +1150,23 @@ enum KVCacheProvisioning {
             slidingSlotFlags: slidingSlotFlags,
             slidingRingLen: slidingRingLen
         )
+        let kvGeometry = kvStorage == .int8 ? int8(geometry: priced) : priced
+        let scaleBytes = scaleBytesPerRow(geometry: kvGeometry, storage: kvStorage)
         let budget = budgetGB(
             physicalGB: physicalGB,
             modelFootprintGB: modelFootprintGB,
             budgetMode: budgetMode,
             residentFootprintGB: residentFootprintGB
         )
-        let affordable = affordableSeqLen(geometry: kvGeometry, budgetGB: budget)
+        let affordable = affordableSeqLen(
+            geometry: kvGeometry, budgetGB: budget, scaleBytesPerRow: scaleBytes
+        )
         let provisioned = clampedSeqLen(
             requested: requested,
             floor: affordableFloor(sessionFloor: sessionFloor, affordableRows: affordable),
             geometry: kvGeometry,
-            budgetGB: budget
+            budgetGB: budget,
+            scaleBytesPerRow: scaleBytes
         )
         let clamped = provisioned < requested
         // The prompt itself needs its own row (its tokens live at 0..<prompt,

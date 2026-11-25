@@ -27,7 +27,8 @@ final class TurnFitLogicTests: XCTestCase {
         vStride: Int = 1024,
         precision: KVCachePrecision = .fp16,
         slidingSlotFlags: [Bool]? = nil,
-        slidingRingLen: Int = 0
+        slidingRingLen: Int = 0,
+        kvStorage: Inkling2KVStorage = .float32
     ) -> KVCacheProvisioning.TurnFit {
         KVCacheProvisioning.turnFit(
             sessionFloor: KVCacheProvisioning.sessionFloor(isAgentSession: isAgentSession, configured: configuredFloor),
@@ -43,7 +44,42 @@ final class TurnFitLogicTests: XCTestCase {
             slidingRingLen: slidingRingLen,
             budgetMode: budgetMode,
             modelFootprintGB: modelFootprintGB,
-            physicalGB: physicalGB
+            physicalGB: physicalGB,
+            kvStorage: kvStorage
+        )
+    }
+
+    /// INT8 KV storage buys context on the same budget, and the scales are
+    /// priced rather than free: a tight budget that clamps FP32 must afford
+    /// strictly more rows in INT8, but not four times as many (a row is one
+    /// byte per element PLUS one FP16 scale per head).
+    func testInt8StorageAffordsMoreContextOnTheSameBudget() {
+        // A budget tight enough to clamp: a large model footprint on 16 GB.
+        let fp32 = fit(
+            promptTokens: 4_000, requestedMaxTokens: 512, modelFootprintGB: 12.0,
+            totalSlots: 36, kStride: 1024, vStride: 1024, precision: .fp32
+        )
+        let int8 = fit(
+            promptTokens: 4_000, requestedMaxTokens: 512, modelFootprintGB: 12.0,
+            totalSlots: 36, kStride: 1024, vStride: 1024, precision: .fp32, kvStorage: .int8
+        )
+        XCTAssertTrue(fp32.clampedByBudget, "the fixture must actually clamp, or it proves nothing")
+        XCTAssertGreaterThan(int8.affordableRows, fp32.affordableRows, "INT8 must afford more rows")
+        XCTAssertLessThan(
+            int8.affordableRows, fp32.affordableRows * 4,
+            "the FP16 scales are real bytes, so it cannot be a clean 4x"
+        )
+        // The scale bytes are exactly what separates the two pricings.
+        let geometry = KVCacheProvisioning.Geometry(
+            totalSlots: 36, slidingRingLen: 0, kStride: 1024, vStride: 1024,
+            elementBytes: 1, kvHeadCapacity: 4
+        )
+        XCTAssertEqual(
+            KVCacheProvisioning.scaleBytesPerRow(geometry: geometry, storage: .int8), 16,
+            "4 KV heads x FP16 x K and V"
+        )
+        XCTAssertEqual(
+            KVCacheProvisioning.scaleBytesPerRow(geometry: geometry, storage: .float32), 0
         )
     }
 
