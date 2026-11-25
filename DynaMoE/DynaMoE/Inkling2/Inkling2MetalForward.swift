@@ -484,6 +484,69 @@ nonisolated public final class Inkling2MetalForward {
         return pipeline
     }
 
+    /// The block's Q/K/V projections in ONE submission: position `p`'s row is
+    /// slot `p` of `input`, and each projection streams its weight once for the
+    /// whole block.
+    ///
+    /// This is the first stage that actually batches, and it is deliberately
+    /// only the projections: everything after them reads the visit state's
+    /// history per position, so the block driver still runs those one position
+    /// at a time. It takes EIGHT slots (the kernel reads eight rows
+    /// unconditionally), and a longer input is the caller's to split.
+    ///
+    /// `q`, `k` and `v` are one block-sized buffer each, `slots` rows wide; a
+    /// caller that wants a short block pads its input and reads back only what
+    /// it wrote.
+    public func encodeBlockQKV(
+        layer: Int,
+        queryInput: MTLBuffer,
+        keyInput: MTLBuffer,
+        valueInput: MTLBuffer,
+        query: MTLBuffer,
+        key: MTLBuffer,
+        value: MTLBuffer,
+        slots: Int
+    ) throws {
+        let isFull = !config.isLocalLayer(layer)
+        let heads = isFull ? config.numAttentionHeads : config.swaNumAttentionHeads
+        let kvHeads = isFull ? config.numKeyValueHeads : config.swaNumKeyValueHeads
+        let headDim = isFull ? config.headDim : config.swaHeadDim
+        let hidden = config.hiddenSize
+        guard slots == 8 else {
+            throw Inkling2ForwardError.unsupported(
+                "the batched projection runs exactly eight slots, got \(slots)"
+            )
+        }
+        guard let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw Inkling2ForwardError.unsupported("could not make a command buffer")
+        }
+        let arena = Inkling2ScalarArena(device: device)
+        defer { arena.clear() }
+        var encoded = false
+        defer { if !encoded { encoder.endEncoding() } }
+        try gemm(
+            encoder: encoder, role: .attnWqDu, layer: layer,
+            input: queryInput, inputOffset: 0, output: query, outputOffset: 0,
+            rows: heads * headDim, columns: hidden, positions: slots, arena: arena
+        )
+        try gemm(
+            encoder: encoder, role: .attnWkDv, layer: layer,
+            input: keyInput, inputOffset: 0, output: key, outputOffset: 0,
+            rows: kvHeads * headDim, columns: hidden, positions: slots, arena: arena
+        )
+        try gemm(
+            encoder: encoder, role: .attnWvDv, layer: layer,
+            input: valueInput, inputOffset: 0, output: value, outputOffset: 0,
+            rows: kvHeads * headDim, columns: hidden, positions: slots, arena: arena
+        )
+        encoder.endEncoding()
+        encoded = true
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let error = commandBuffer.error { throw error }
+    }
+
     // MARK: Small constants
 
     /// A `constant` argument, as the buffer the shader binds.

@@ -1212,6 +1212,127 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         )
     }
 
+    // MARK: The batched front
+
+    /// The block's Q/K/V projections are the walk's, position by position, on
+    /// the real checkpoint: eight contiguous slots through one submission must
+    /// equal eight single-slot submissions through the same entry point.
+    ///
+    /// This is the first stage that actually batches, so it is where a slot
+    /// indexing bug would first be possible: a kernel that read slot 0 eight
+    /// times, or a projection whose input stride was the dimension rather than
+    /// the block's slot count, would still produce plausible numbers.
+    func testTheBatchedQKVProjectionIsEightSingleOnes() throws {
+        let snapshot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(Inkling2PublishedTensorTests.snapshotRelativePath)
+        guard FileManager.default.fileExists(atPath: snapshot.path) else {
+            throw XCTSkip("Inkling 2 snapshot is not downloaded at \(snapshot.path)")
+        }
+        let (device, library, queue) = try environment()
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let summary = try engine.getSummary()
+        let config = try Inkling2Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let catalog = Inkling2WeightCatalog(
+            mainFile: summary.tensors.map { Inkling2TensorRef(metadata: $0) },
+            layerCount: config.numHiddenLayers
+        )
+        var shardBuffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            guard shard.length > 0,
+                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)) else { continue }
+            if let buffer = device.makeBuffer(
+                bytesNoCopy: pointer, length: Int(shard.length), options: .storageModeShared, deallocator: nil
+            ) { shardBuffers[shard.index] = buffer }
+        }
+        let source = Inkling2SnapshotWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
+        let reference = try Inkling2CPUForward(config: config, weights: source)
+        let deviceWeights = Inkling2DeviceWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
+        let metal = try Inkling2MetalForward(
+            device: device, library: library, queue: queue, weights: deviceWeights, host: reference
+        )
+
+        let layer = 0
+        let isFull = !config.isLocalLayer(layer)
+        let heads = isFull ? config.numAttentionHeads : config.swaNumAttentionHeads
+        let kvHeads = isFull ? config.numKeyValueHeads : config.swaNumKeyValueHeads
+        let headDim = isFull ? config.headDim : config.swaHeadDim
+        let hidden = config.hiddenSize
+        let slots = 8
+
+        // Eight DISTINCT input rows, so a kernel that re-read slot 0 fails.
+        let queryRows = (0..<slots).flatMap { slot in values(hidden, seed: 70 + slot) }
+        let keyRows = (0..<slots).flatMap { slot in values(hidden, seed: 90 + slot) }
+        let valueRows = (0..<slots).flatMap { slot in values(hidden, seed: 110 + slot) }
+        let queryInput = try buffer(device, queryRows)
+        let keyInput = try buffer(device, keyRows)
+        let valueInput = try buffer(device, valueRows)
+        func makeBlock(_ width: Int) -> MTLBuffer {
+            device.makeBuffer(length: slots * width * 4, options: .storageModeShared)!
+        }
+        let queryBlock = makeBlock(heads * headDim)
+        let keyBlock = makeBlock(kvHeads * headDim)
+        let valueBlock = makeBlock(kvHeads * headDim)
+        // The batched submission under test: one encoder, three projections,
+        // eight slots.
+        try metal.encodeBlockQKV(
+            layer: layer, queryInput: queryInput, keyInput: keyInput, valueInput: valueInput,
+            query: queryBlock, key: keyBlock, value: valueBlock, slots: slots
+        )
+
+        // The same eight slots, one at a time: each slot's row goes into slot 0
+        // of a block-sized buffer (the kernel reads all eight rows
+        // unconditionally, so a one-row buffer is an out-of-bounds read that
+        // never completes) and each projection gets its OWN output buffer --
+        // sharing one would let the last projection overwrite the others.
+        func singles(
+            _ rows: [Float], _ width: Int, _ outputWidth: Int
+        ) throws -> (q: [[Float]], k: [[Float]], v: [[Float]]) {
+            var q: [[Float]] = [], k: [[Float]] = [], v: [[Float]] = []
+            for slot in 0..<slots {
+                var padded = [Float](repeating: 0, count: slots * width)
+                padded.replaceSubrange(
+                    0..<width, with: rows[(slot * width)..<((slot + 1) * width)]
+                )
+                let one = try buffer(device, padded)
+                func makeOutput() -> MTLBuffer {
+                    device.makeBuffer(length: slots * outputWidth * 4, options: .storageModeShared)!
+                }
+                let qOut = makeOutput(), kOut = makeOutput(), vOut = makeOutput()
+                try metal.encodeBlockQKV(
+                    layer: layer, queryInput: one, keyInput: one, valueInput: one,
+                    query: qOut, key: kOut, value: vOut, slots: slots
+                )
+                q.append(Array(read(qOut, slots * outputWidth)[0..<outputWidth]))
+                k.append(Array(read(kOut, slots * outputWidth)[0..<outputWidth]))
+                v.append(Array(read(vOut, slots * outputWidth)[0..<outputWidth]))
+            }
+            return (q, k, v)
+        }
+        func compare(_ label: String, _ block: MTLBuffer, _ walked: [[Float]], _ width: Int) {
+            let batched = read(block, slots * width)
+            var worst: Float = 0, scale: Float = 0
+            for slot in 0..<slots {
+                for index in 0..<width {
+                    let mine = batched[slot * width + index]
+                    let theirs = walked[slot][index]
+                    worst = max(worst, abs(mine - theirs))
+                    scale = max(scale, abs(theirs))
+                }
+            }
+            print("🔎 [inkling2 device] batched QKV: \(label) \(worst / scale) relative over \(slots) slots")
+            XCTAssertLessThanOrEqual(worst / scale, 1e-5, "\(label): the batched form against eight single ones")
+        }
+        let querySingles = try singles(queryRows, hidden, heads * headDim)
+        let keySingles = try singles(keyRows, hidden, kvHeads * headDim)
+        let valueSingles = try singles(valueRows, hidden, kvHeads * headDim)
+        compare("Q", queryBlock, querySingles.q, heads * headDim)
+        compare("K", keyBlock, keySingles.k, kvHeads * headDim)
+        compare("V", valueBlock, valueSingles.v, kvHeads * headDim)
+        withExtendedLifetime(engine) {}
+    }
+
     // MARK: The MLP half
 
     /// The batched projection entry: eight contiguous position rows through
