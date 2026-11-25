@@ -44,6 +44,11 @@ nonisolated public struct Inkling2ExpertSlotGeometry: Sendable, Equatable {
     /// bank's own column count, not the logical width.
     public let weightRowStride: Int
     public let scaleRowStride: Int
+    /// The down bank's own strides. They are NOT the gate/up ones: `w13` rows are
+    /// `packedHidden` wide and `w2` rows are `packedIntermediate`, so one shared
+    /// stride would read the down projection's scales off by the width ratio.
+    public let downWeightRowStride: Int
+    public let downScaleRowStride: Int
 
     /// One slot holds all four ranges, in this order.
     public var gateUpWeightOffset: Int { 0 }
@@ -51,6 +56,55 @@ nonisolated public struct Inkling2ExpertSlotGeometry: Sendable, Equatable {
     public var downWeightOffset: Int { gateUpScaleOffset + gateUpScaleBytes }
     public var downScaleOffset: Int { downWeightOffset + downWeightBytes }
     public var slotBytes: Int { downScaleOffset + downScaleBytes }
+
+    /// How the mixture kernel addresses a RESIDENT slot.
+    ///
+    /// A slot is one packed buffer, not four separate tensors, so every region
+    /// is a byte offset from the slot's base and every row is a stride inside
+    /// it -- there is no per-tensor bind offset to carry. This is the whole
+    /// reason the mixture could not read a resident slot: its kernel takes a
+    /// weight pointer and a scale pointer with independent strides, which a
+    /// packed slot does not have.
+    public struct SlotAddress: Sendable, Equatable {
+        /// Byte offset of the expert's first `w13` weight row from the slot base.
+        public let gateUpWeight: Int
+        public let gateUpScale: Int
+        public let downWeight: Int
+        public let downScale: Int
+        /// Rows of each region, so a caller projects exactly the range the
+        /// geometry priced.
+        public let gateUpRows: Int
+        public let downRows: Int
+        public let gateUpWeightRowStride: Int
+        public let gateUpScaleRowStride: Int
+        public let downWeightRowStride: Int
+        public let downScaleRowStride: Int
+
+        /// What one projection needs from the packed slot: where its weight and
+        /// scale rows start, and the stride of each. They are per region on
+        /// purpose -- `w13` and `w2` do not share a row width.
+        public func projection(isGateUp: Bool) -> (weightOffset: Int, scaleOffset: Int, weightRowStride: Int, scaleRowStride: Int) {
+            isGateUp
+                ? (gateUpWeight, gateUpScale, gateUpWeightRowStride, gateUpScaleRowStride)
+                : (downWeight, downScale, downWeightRowStride, downScaleRowStride)
+        }
+    }
+
+    /// The published shape of the gate/up bank's rows: two rows per intermediate
+    /// index, because the bank interleaves gate and up.
+    public var gateUpLogicalRows: Int { gateUpWeightBytes / weightRowStride }
+    public var downLogicalRows: Int { downWeightBytes / downWeightRowStride }
+
+    /// The slot as the mixture kernel reads it.
+    public var slotAddress: SlotAddress {
+        SlotAddress(
+            gateUpWeight: gateUpWeightOffset, gateUpScale: gateUpScaleOffset,
+            downWeight: downWeightOffset, downScale: downScaleOffset,
+            gateUpRows: gateUpLogicalRows, downRows: downLogicalRows,
+            gateUpWeightRowStride: weightRowStride, gateUpScaleRowStride: scaleRowStride,
+            downWeightRowStride: downWeightRowStride, downScaleRowStride: downScaleRowStride
+        )
+    }
 
     /// The geometry of the published bank shapes.
     ///
@@ -74,7 +128,9 @@ nonisolated public struct Inkling2ExpertSlotGeometry: Sendable, Equatable {
             downWeightBytes: downRows * downRowStride,
             downScaleBytes: downRows * downScaleRowStride,
             weightRowStride: gateUpRowStride,
-            scaleRowStride: gateUpScaleRowStride
+            scaleRowStride: gateUpScaleRowStride,
+            downWeightRowStride: downRowStride,
+            downScaleRowStride: downScaleRowStride
         )
     }
 }
@@ -258,6 +314,59 @@ nonisolated private final class Inkling2ReadFailure: @unchecked Sendable {
     }
 }
 
+/// One expert projection straight out of a RESIDENT slot: the arena's packed
+/// buffer, with each region addressed from the slot's own base.
+///
+/// This is the same `inkling_expert_row_f32` dispatch the mmap path makes, with
+/// two differences and no third: the weight and scale are the SAME buffer (a
+/// slot is packed), and each region's offset is the slot's base plus the
+/// geometry's region offset rather than a fused bank's expert offset. The row
+/// strides are per region -- `w13` rows are `packedHidden` wide, `w2` rows
+/// `packedIntermediate` -- so a caller passing the gate/up stride for both would
+/// read the down projection's scales off by the width ratio, which is a
+/// plausible number rather than a crash.
+///
+/// It lives here rather than beside the other dispatch helpers because the
+/// packed-slot layout is the arena's own, and this way the binding can be run
+/// against the host rule with no checkpoint at all.
+nonisolated public enum Inkling2SlotProjection {
+    public static func encode(
+        pipeline: MTLComputePipelineState,
+        encoder: MTLComputeCommandEncoder,
+        slot: MTLBuffer, slotBaseOffset: Int,
+        address: Inkling2ExpertSlotGeometry.SlotAddress,
+        isGateUp: Bool,
+        input: MTLBuffer, output: MTLBuffer,
+        rows: Int, logicalColumns: Int,
+        layout: Inkling2ExpertQuantLayout, outerScale: Float,
+        arena: Inkling2ScalarArena
+    ) {
+        let region = address.projection(isGateUp: isGateUp)
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(slot, offset: 0, index: 0)
+        encoder.setBuffer(slot, offset: 0, index: 1)
+        encoder.setBuffer(input, offset: 0, index: 2)
+        encoder.setBuffer(output, offset: 0, index: 3)
+        encoder.setBuffer(arena.make(UInt32(logicalColumns)), offset: 0, index: 4)
+        encoder.setBuffer(arena.make(UInt32(region.weightRowStride)), offset: 0, index: 5)
+        encoder.setBuffer(arena.make(UInt32(region.scaleRowStride)), offset: 0, index: 6)
+        encoder.setBuffer(arena.make(UInt32(layout.blockSize)), offset: 0, index: 7)
+        encoder.setBuffer(arena.make(layout == .nvfp4), offset: 0, index: 8)
+        encoder.setBuffer(arena.make(outerScale), offset: 0, index: 9)
+        encoder.setBuffer(
+            arena.make(UInt64(slotBaseOffset + region.weightOffset)), offset: 0, index: 10
+        )
+        encoder.setBuffer(
+            arena.make(UInt64(slotBaseOffset + region.scaleOffset)), offset: 0, index: 11
+        )
+        encoder.setThreadgroupMemoryLength(32 * MemoryLayout<Float>.stride, index: 0)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: rows, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
+        )
+    }
+}
+
 /// A least-recently-used set of resident (layer, expert) pairs backed by
 /// caller-provided slot buffers.
 ///
@@ -326,6 +435,17 @@ nonisolated public final class Inkling2ExpertArena: @unchecked Sendable {
     /// The slot buffers, when the arena was given memory to fill. One buffer
     /// holds every slot, `geometry.slotBytes` apart.
     public private(set) var slotBuffer: MTLBuffer?
+
+    /// The slot holding (layer, expert) as the mixture kernel binds it: the
+    /// arena's buffer plus the byte offset of that slot's four regions. Nil on a
+    /// miss or before a slot buffer was attached -- a caller must fill first, so
+    /// a kernel is never handed a slot that holds another expert's bytes.
+    public func residentSlot(layer: Int, expert: Int) -> (buffer: MTLBuffer, address: Inkling2ExpertSlotGeometry.SlotAddress, slot: Int)? {
+        guard let buffer = slotBuffer,
+              let slot = residents.firstIndex(where: { $0?.layer == layer && $0?.expert == expert })
+        else { return nil }
+        return (buffer, geometry.slotAddress, slot)
+    }
 
     /// Gives the arena a device buffer of `capacity * geometry.slotBytes`.
     public func attachSlotBuffer(_ buffer: MTLBuffer) {

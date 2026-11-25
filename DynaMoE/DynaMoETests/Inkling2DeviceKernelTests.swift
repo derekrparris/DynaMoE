@@ -519,6 +519,130 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         }
     }
 
+    /// A resident packed slot projects exactly as the host rule says, for BOTH
+    /// regions and BOTH layouts.
+    ///
+    /// This is the binding the arena needs before it can be wired into the
+    /// mixture: a slot is ONE buffer holding four regions at the geometry's own
+    /// offsets, and the kernel addresses each region from the slot's base. The
+    /// fixture is built so a plausible bug fails: the two regions have
+    /// DIFFERENT row strides (as the real banks do), the slot has a leading pad
+    /// and a second slot behind it, and the bytes are wide-ranging -- so a
+    /// kernel that read the down region with the gate/up stride, or that ignored
+    /// the slot's base offset, or that read slot 0 when asked for slot 1, is a
+    /// wrong value rather than a plausible one.
+    func testAResidentSlotProjectsAsTheHostRuleSays() throws {
+        let (device, library, queue) = try environment()
+        let pipeline = try XCTUnwrap(try device.makeComputePipelineState(
+            function: XCTUnwrap(library.makeFunction(name: "inkling_expert_row_f32"))
+        ))
+        for layout in [Inkling2ExpertQuantLayout.nvfp4, .mxfp8] {
+            let valuesPerByte = layout.valuesPerByte
+            // Gate/up: 4 rows of 40 logical columns; down: 3 rows of 24, so the
+            // two regions cannot share a stride by accident.
+            let gateUpRows = 4, gateUpColumns = 40
+            let downRows = 3, downColumns = 24
+            let gateUpPacked = gateUpColumns / valuesPerByte + 2
+            let downPacked = downColumns / valuesPerByte + 1
+            let gateUpScaleStride = gateUpColumns / layout.blockSize + 1
+            let downScaleStride = downColumns / layout.blockSize + 1
+            let geometry = try XCTUnwrap(Inkling2ExpertSlotGeometry.make(
+                gateUpRows: gateUpRows, gateUpRowStride: gateUpPacked,
+                gateUpScaleRowStride: gateUpScaleStride,
+                downRows: downRows, downRowStride: downPacked,
+                downScaleRowStride: downScaleStride
+            ))
+            let address = geometry.slotAddress
+            XCTAssertEqual(address.gateUpWeightRowStride, gateUpPacked)
+            XCTAssertEqual(address.downWeightRowStride, downPacked)
+            XCTAssertEqual(address.gateUpRows, gateUpRows)
+            XCTAssertEqual(address.downRows, downRows)
+
+            // Two slots. The scale regions hold small exponents (E4M3 near 2^0
+            // for NVFP4, E8M0 near 2^1 for MXFP8) so no row cancels to noise,
+            // and the weight regions are wide-ranging patterns -- each slot's
+            // own, so a base-offset bug reads the neighbour's bytes.
+            let slots = 2
+            var slotBytes = [UInt8](repeating: 0, count: slots * geometry.slotBytes)
+            for slot in 0..<slots {
+                let base = slot * geometry.slotBytes
+                func isScale(_ index: Int) -> Bool {
+                    (index >= geometry.gateUpScaleOffset && index < geometry.downWeightOffset)
+                        || index >= geometry.downScaleOffset
+                }
+                for index in 0..<geometry.slotBytes {
+                    if isScale(index) {
+                        slotBytes[base + index] = layout == .nvfp4
+                            ? UInt8(122 + (index &+ slot) % 5)   // E4M3 around 1.0
+                            : UInt8(126 + (index &+ slot) % 3)   // E8M0 around 2^-1..2^1
+                    } else {
+                        slotBytes[base + index] = UInt8(0x01 + (index &* 7 &+ slot &* 53) % 0x7E)
+                    }
+                }
+            }
+            let slotBuffer = try XCTUnwrap(device.makeBuffer(
+                bytes: slotBytes, length: slotBytes.count, options: .storageModeShared
+            ))
+            let arena = Inkling2ScalarArena(device: device)
+            defer { arena.clear() }
+
+            for (isGateUp, rows, columns, weightOffset, scaleOffset, weightStride, scaleStride) in [
+                (true, gateUpRows, gateUpColumns, address.gateUpWeight, address.gateUpScale,
+                 address.gateUpWeightRowStride, address.gateUpScaleRowStride),
+                (false, downRows, downColumns, address.downWeight, address.downScale,
+                 address.downWeightRowStride, address.downScaleRowStride)
+            ] {
+                let input = values(columns, seed: isGateUp ? 11 : 13)
+                let inputBuffer = try buffer(device, input)
+                let outputBuffer = try XCTUnwrap(device.makeBuffer(
+                    length: rows * MemoryLayout<Float>.stride, options: .storageModeShared
+                ))
+                let amax: Float = 3.5, denominator: Float = 4
+                let outerScale = layout.requiresAmaxDenominator ? amax / denominator : 1
+                let slotIndex = 1
+                let base = slotIndex * geometry.slotBytes
+                let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+                let encoder = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
+                Inkling2SlotProjection.encode(
+                    pipeline: pipeline, encoder: encoder,
+                    slot: slotBuffer, slotBaseOffset: base,
+                    address: address, isGateUp: isGateUp,
+                    input: inputBuffer, output: outputBuffer,
+                    rows: rows, logicalColumns: columns,
+                    layout: layout, outerScale: outerScale, arena: arena
+                )
+                encoder.endEncoding()
+                commandBuffer.commit()
+                commandBuffer.waitUntilCompleted()
+                if let error = commandBuffer.error { throw error }
+
+                // The host rule reads the SAME bytes the kernel did: the slot's
+                // region at its own offset, row by row, with that region's
+                // stride.
+                let raw = slotBytes
+                func byte(_ index: Int) -> UInt8 { raw[base + index] }
+                let matrix = Inkling2PackedExpertMatrix(
+                    layout: layout,
+                    weight: (0..<(rows * weightStride)).map { byte(weightOffset + $0) },
+                    weightRowStride: weightStride,
+                    scales: (0..<(rows * scaleStride)).map { byte(scaleOffset + $0) },
+                    scaleRowStride: scaleStride,
+                    rows: rows, logicalColumns: columns,
+                    expertAmax: amax, outerScaleDenominator: denominator
+                )
+                let actual = read(outputBuffer, rows)
+                for row in 0..<rows {
+                    let expected = matrix.project(row: row, input: input)
+                    XCTAssertEqual(
+                        actual[row], expected,
+                        accuracy: max(1e-4, abs(expected) * 1e-3),
+                        "\(layout) \(isGateUp ? "gate/up" : "down") row \(row)"
+                    )
+                }
+            }
+        }
+    }
+
     // MARK: Routing
 
     /// The router's selection and weighting against `Inkling2Math.route`.
@@ -625,7 +749,7 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         }
         let (device, library, queue) = try environment()
         let engine = try DynaMoeEngine(filePath: snapshot.path)
-        let summary = try engine.getSummary()
+        let summary = try inkling2MetalReadySummary(try engine.getSummary())
         let config = try Inkling2Config.decode(
             contentsOf: snapshot.appendingPathComponent("config.json")
         )
@@ -634,13 +758,7 @@ final class Inkling2DeviceKernelTests: XCTestCase {
             layerCount: config.numHiddenLayers
         )
         var shardBuffers: [UInt32: MTLBuffer] = [:]
-        for shard in summary.shards {
-            guard shard.length > 0,
-                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)) else { continue }
-            if let buffer = device.makeBuffer(
-                bytesNoCopy: pointer, length: Int(shard.length), options: .storageModeShared, deallocator: nil
-            ) { shardBuffers[shard.index] = buffer }
-        }
+        shardBuffers = try inkling2MetalShardBuffers(summary, device: device)
         let hostSource = Inkling2SnapshotWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
         let host = try Inkling2CPUForward(config: config, weights: hostSource)
         let deviceWeights = Inkling2DeviceWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
@@ -773,7 +891,7 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         }
         let (device, library, queue) = try environment()
         let engine = try DynaMoeEngine(filePath: snapshot.path)
-        let summary = try engine.getSummary()
+        let summary = try inkling2MetalReadySummary(try engine.getSummary())
         let config = try Inkling2Config.decode(
             contentsOf: snapshot.appendingPathComponent("config.json")
         )
@@ -782,13 +900,7 @@ final class Inkling2DeviceKernelTests: XCTestCase {
             layerCount: config.numHiddenLayers
         )
         var shardBuffers: [UInt32: MTLBuffer] = [:]
-        for shard in summary.shards {
-            guard shard.length > 0,
-                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)) else { continue }
-            if let buffer = device.makeBuffer(
-                bytesNoCopy: pointer, length: Int(shard.length), options: .storageModeShared, deallocator: nil
-            ) { shardBuffers[shard.index] = buffer }
-        }
+        shardBuffers = try inkling2MetalShardBuffers(summary, device: device)
         let source = Inkling2SnapshotWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
         let oracle = try Inkling2CPUForward(config: config, weights: source)
         let reference = try Inkling2CPUForward(config: config, weights: source)
@@ -921,7 +1033,7 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         }
         let (device, library, queue) = try environment()
         let engine = try DynaMoeEngine(filePath: snapshot.path)
-        let summary = try engine.getSummary()
+        let summary = try inkling2MetalReadySummary(try engine.getSummary())
         let config = try Inkling2Config.decode(
             contentsOf: snapshot.appendingPathComponent("config.json")
         )
@@ -930,13 +1042,7 @@ final class Inkling2DeviceKernelTests: XCTestCase {
             layerCount: config.numHiddenLayers
         )
         var shardBuffers: [UInt32: MTLBuffer] = [:]
-        for shard in summary.shards {
-            guard shard.length > 0,
-                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)) else { continue }
-            if let buffer = device.makeBuffer(
-                bytesNoCopy: pointer, length: Int(shard.length), options: .storageModeShared, deallocator: nil
-            ) { shardBuffers[shard.index] = buffer }
-        }
+        shardBuffers = try inkling2MetalShardBuffers(summary, device: device)
         let source = Inkling2SnapshotWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
         let host = try Inkling2CPUForward(config: config, weights: source)
         let deviceWeights = Inkling2DeviceWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
@@ -1230,7 +1336,7 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         }
         let (device, library, queue) = try environment()
         let engine = try DynaMoeEngine(filePath: snapshot.path)
-        let summary = try engine.getSummary()
+        let summary = try inkling2MetalReadySummary(try engine.getSummary())
         let config = try Inkling2Config.decode(
             contentsOf: snapshot.appendingPathComponent("config.json")
         )
@@ -1239,13 +1345,7 @@ final class Inkling2DeviceKernelTests: XCTestCase {
             layerCount: config.numHiddenLayers
         )
         var shardBuffers: [UInt32: MTLBuffer] = [:]
-        for shard in summary.shards {
-            guard shard.length > 0,
-                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)) else { continue }
-            if let buffer = device.makeBuffer(
-                bytesNoCopy: pointer, length: Int(shard.length), options: .storageModeShared, deallocator: nil
-            ) { shardBuffers[shard.index] = buffer }
-        }
+        shardBuffers = try inkling2MetalShardBuffers(summary, device: device)
         let source = Inkling2SnapshotWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
         let reference = try Inkling2CPUForward(config: config, weights: source)
         let deviceWeights = Inkling2DeviceWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
@@ -1454,7 +1554,7 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         }
         let (device, library, queue) = try environment()
         let engine = try DynaMoeEngine(filePath: snapshot.path)
-        let summary = try engine.getSummary()
+        let summary = try inkling2MetalReadySummary(try engine.getSummary())
         let config = try Inkling2Config.decode(
             contentsOf: snapshot.appendingPathComponent("config.json")
         )
@@ -1463,13 +1563,7 @@ final class Inkling2DeviceKernelTests: XCTestCase {
             layerCount: config.numHiddenLayers
         )
         var shardBuffers: [UInt32: MTLBuffer] = [:]
-        for shard in summary.shards {
-            guard shard.length > 0,
-                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)) else { continue }
-            if let buffer = device.makeBuffer(
-                bytesNoCopy: pointer, length: Int(shard.length), options: .storageModeShared, deallocator: nil
-            ) { shardBuffers[shard.index] = buffer }
-        }
+        shardBuffers = try inkling2MetalShardBuffers(summary, device: device)
         let source = Inkling2SnapshotWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
         let oracle = try Inkling2CPUForward(config: config, weights: source)
         let reference = try Inkling2CPUForward(config: config, weights: source)
@@ -1602,19 +1696,13 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         )
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let engine = try DynaMoeEngine(filePath: snapshot.path)
-        let summary = try engine.getSummary()
+        let summary = try inkling2MetalReadySummary(try engine.getSummary())
         let catalog = Inkling2WeightCatalog(
             mainFile: summary.tensors.map { Inkling2TensorRef(metadata: $0) },
             layerCount: config.numHiddenLayers
         )
         var shardBuffers: [UInt32: MTLBuffer] = [:]
-        for shard in summary.shards {
-            guard shard.length > 0,
-                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)) else { continue }
-            if let buffer = device.makeBuffer(
-                bytesNoCopy: pointer, length: Int(shard.length), options: .storageModeShared, deallocator: nil
-            ) { shardBuffers[shard.index] = buffer }
-        }
+        shardBuffers = try inkling2MetalShardBuffers(summary, device: device)
         let source = Inkling2SnapshotWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
         let forward = try Inkling2CPUForward(config: config, weights: source)
         let markers = Inkling2PromptMarkers.familyDefault
@@ -1839,7 +1927,7 @@ final class Inkling2DeviceKernelTests: XCTestCase {
             throw XCTSkip("Inkling 2 snapshot is not downloaded at \(snapshot.path)")
         }
         let engine = try DynaMoeEngine(filePath: snapshot.path)
-        let summary = try engine.getSummary()
+        let summary = try inkling2MetalReadySummary(try engine.getSummary())
         let config = try Inkling2Config.decode(
             contentsOf: snapshot.appendingPathComponent("config.json")
         )
@@ -1847,12 +1935,8 @@ final class Inkling2DeviceKernelTests: XCTestCase {
             mainFile: summary.tensors.map { Inkling2TensorRef(metadata: $0) },
             layerCount: config.numHiddenLayers
         )
-        var shardBuffers: [UInt32: MTLBuffer] = [:]
-        for shard in summary.shards {
-            guard shard.length > 0,
-                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)) else { continue }
-            if let buffer = deviceBuffer(shard, pointer) { shardBuffers[shard.index] = buffer }
-        }
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice(), "no Metal device")
+        let shardBuffers = try inkling2MetalShardBuffers(summary, device: device)
         let source = Inkling2SnapshotWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
         let forward = try Inkling2CPUForward(config: config, weights: source)
         var logits: [Float] = []
@@ -1958,7 +2042,7 @@ final class Inkling2DeviceKernelTests: XCTestCase {
             throw XCTSkip("Inkling 2 snapshot is not downloaded at \(snapshot.path)")
         }
         let engine = try DynaMoeEngine(filePath: snapshot.path)
-        let summary = try engine.getSummary()
+        let summary = try inkling2MetalReadySummary(try engine.getSummary())
         let config = try Inkling2Config.decode(
             contentsOf: snapshot.appendingPathComponent("config.json")
         )
@@ -1966,15 +2050,10 @@ final class Inkling2DeviceKernelTests: XCTestCase {
             mainFile: summary.tensors.map { Inkling2TensorRef(metadata: $0) },
             layerCount: config.numHiddenLayers
         )
-        var shardBuffers: [UInt32: MTLBuffer] = [:]
-        for shard in summary.shards {
-            guard shard.length > 0,
-                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)) else { continue }
-            if let buffer = deviceBuffer(shard, pointer) { shardBuffers[shard.index] = buffer }
-        }
+        let (device, library, queue) = try environment()
+        let shardBuffers = try inkling2MetalShardBuffers(summary, device: device)
         let source = Inkling2SnapshotWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
         let forward = try Inkling2CPUForward(config: config, weights: source)
-        let (device, library, queue) = try environment()
         let deviceWeights = Inkling2DeviceWeights(
             config: config, catalog: catalog, shardBuffers: shardBuffers
         )
@@ -2154,7 +2233,7 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         )
         let promptIds = try tokenizer.encode(text: prompt).map { Int($0) }
         let engine = try DynaMoeEngine(filePath: snapshot.path)
-        let summary = try engine.getSummary()
+        let summary = try inkling2MetalReadySummary(try engine.getSummary())
         let config = try Inkling2Config.decode(
             contentsOf: snapshot.appendingPathComponent("config.json")
         )
@@ -2162,19 +2241,15 @@ final class Inkling2DeviceKernelTests: XCTestCase {
             mainFile: summary.tensors.map { Inkling2TensorRef(metadata: $0) },
             layerCount: config.numHiddenLayers
         )
+        let (device, library, queue) = try environment()
         var shardBuffers: [UInt32: MTLBuffer] = [:]
-        for shard in summary.shards {
-            guard shard.length > 0,
-                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)) else { continue }
-            if let buffer = deviceBuffer(shard, pointer) { shardBuffers[shard.index] = buffer }
-        }
+        shardBuffers = try inkling2MetalShardBuffers(summary, device: device)
         let source = Inkling2SnapshotWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
         let host = try Inkling2CPUForward(config: config, weights: source)
         // The device runs through the forward it is walking: `runVisit` reads
         // `host.states` for the KV rows its kernels append to, so pointing it at
         // a different forward would run the graph over a cache nobody wrote.
         let deviceHost = try Inkling2CPUForward(config: config, weights: source)
-        let (device, library, queue) = try environment()
         let deviceWeights = Inkling2DeviceWeights(
             config: config, catalog: catalog, shardBuffers: shardBuffers
         )
@@ -2449,7 +2524,7 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         }
         let (device, library, queue) = try environment()
         let engine = try DynaMoeEngine(filePath: snapshot.path)
-        let summary = try engine.getSummary()
+        let summary = try inkling2MetalReadySummary(try engine.getSummary())
         let config = try Inkling2Config.decode(
             contentsOf: snapshot.appendingPathComponent("config.json")
         )
@@ -2458,13 +2533,7 @@ final class Inkling2DeviceKernelTests: XCTestCase {
             layerCount: config.numHiddenLayers
         )
         var shardBuffers: [UInt32: MTLBuffer] = [:]
-        for shard in summary.shards {
-            guard shard.length > 0,
-                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)) else { continue }
-            if let buffer = device.makeBuffer(
-                bytesNoCopy: pointer, length: Int(shard.length), options: .storageModeShared, deallocator: nil
-            ) { shardBuffers[shard.index] = buffer }
-        }
+        shardBuffers = try inkling2MetalShardBuffers(summary, device: device)
         let source = Inkling2SnapshotWeights(config: config, catalog: catalog, shardBuffers: shardBuffers)
         let oracle = try Inkling2CPUForward(config: config, weights: source)
         let reference = try Inkling2CPUForward(config: config, weights: source)

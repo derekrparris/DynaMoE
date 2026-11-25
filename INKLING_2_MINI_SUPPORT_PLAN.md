@@ -671,7 +671,15 @@ Two things are deliberately separate. The arena owns the BOOKKEEPING only and ta
 
 Pinned with no model: the geometry's arithmetic (`testASlotIsTheSumOfItsFourRanges`, a zero stride refused by name) and the policy's ORDER (`testTheArenaEvictsTheLeastRecentlyUsedPair` -- A touched again before B, so a third pair evicts B, asserted step by step with its counters).
 
-- **Not done yet in item 6:** the pread-backed fill, the arena's wiring into the mixture, and the cold/warm comparison against mmap. The policy question is deliberately still open: the DSV4.1 journal's LRU-vs-frequency result came from a working set that fits, and this family's does not, so it has to be re-asked here with the arena's own counters.
+- **Not done yet in item 6:** the arena's wiring into the mixture, and the cold/warm comparison against mmap. The policy question is deliberately still open: the DSV4.1 journal's LRU-vs-frequency result came from a working set that fits, and this family's does not, so it has to be re-asked here with the arena's own counters.
+
+**Progress: slice 17, the mixture's slot addressing (2026-11-25).**
+
+The arena could hold an expert, but nothing could read one out of it: the mixture kernel takes a weight pointer and a scale pointer with their own row strides, and a resident slot is ONE packed buffer holding four regions. `Inkling2ExpertSlotGeometry.SlotAddress` is the answer -- each region as a byte offset from the slot's base, plus that region's own row counts and strides -- and `Inkling2SlotProjection.encode` is the binding that feeds the existing `inkling_expert_row_f32` from it (weight and scale are the same buffer; only the offsets differ from the mmap path). No new kernel was needed, which is itself the finding: the packed slot is a binding problem, not an arithmetic one.
+
+- **The two regions do not share a row stride, and one shared stride is the bug this pins.** `w13` rows are `packedHidden` wide and `w2` rows `packedIntermediate`, so a geometry that stored one stride would read the down projection's scales off by the width ratio -- plausible numbers, no crash. `Inkling2ExpertSlotGeometry` now stores `downWeightRowStride`/`downScaleRowStride` beside the gate/up pair, and `testASlotAddressesEachRegionWithItsOwnStride` pins them apart on a shape where the ratio is exactly 2.
+- **Pinned with no model:** the address arithmetic (`testASlotAddressesEachRegionWithItsOwnStride`), the lookup's exactness (`testAResidentSlotIsOnlyReturnedForItsOwnPair` -- another layer or another expert is a miss, a filled pair returns its buffer and slot), and the kernel binding against the host rule for BOTH regions and BOTH layouts (`testAResidentSlotProjectsAsTheHostRuleSays`, two slots so a base-offset bug reads the neighbour's bytes, distinct per-region strides, and scale bytes near 2^0 so no row cancels to noise).
+- **Not done in this slice:** the mixture does not yet call `slotExpertRow` -- it still reads the shard mmap -- so the arena is not in the decode path, and the cold/warm comparison has not been run. What is in place is the whole addressing contract that wiring needs, tested without a checkpoint.
 
 ### Phase 7: Long context and DynaMoE FP8 (INT8) KV
 
@@ -717,6 +725,14 @@ Pinned with no model: the geometry's arithmetic (`testASlotIsTheSumOfItsFourRang
 2. Exercise text, images, tools, API/SDK compatibility, cancellation, queueing, model switching, low-memory refusal, long resumed sessions and local agent dogfooding.
 3. Update the README/project docs, settings/help, architecture labels, quantization display, conformance ledger, and `Benchmarks/PERF_FINDINGS.md` with final findings and rejected optimizations.
 4. Record which reference revision and checkpoint hash was validated, and make new checkpoint/config rev changes fail closed until revalidated.
+
+**Progress: the 16 GB M1 Pro environment (2026-11-25).**
+
+The reference machine in AGENTS.md is a 16 GB M1 Pro, and running the checkpoint suites there surfaced two limits that are the machine's, not the port's:
+
+- **`maxBufferLength` is 8.88 GiB there, and the checkpoint is ONE 18 GB shard.** `makeBuffer(bytesNoCopy:)` simply returns nil for a shard that large, so every tensor reads "its shard is not mapped" unless the summary is segmented first. The app's loader already does that (`InferenceEngine.segmentShardsForMetal` in `ContentView`), but the Inkling TEST helpers mapped the raw shard -- so on this machine they were exercising a mapping the app never makes. They now go through `Inkling2TestSupport.swift` (`inkling2MetalReadySummary` + `inkling2MetalShardBuffers`), and the CATALOG is built from the segmented summary too, because segmentation rewrites each tensor's shard index and offsets (a catalog from the raw summary addresses an unsplit file and resolves tensors into the wrong segment).
+- **The local snapshot is a DIFFERENT checkpoint revision than the tests pin** (`c9d02830...` local vs `ed40e7da...` pinned). Its geometry matches (hidden 2304, 24 layers, 128 experts, top-8, intermediate 1152) but its tensor names do not: the expert banks are `w13_weight_scale` / `w2_weight_scale` (1244 tensors) where the code expects `w13_scale` / `w2_scale` (1298). So the checkpoint-gated suites skip (the pin is deliberate: Phase 9's "new checkpoint rev fails closed"), and running them under an alias fails on bank naming and byte split, not on the port. Re-download the pinned revision (`hf download thinkingmachines/Inkling-2-Mini --revision ed40e7da625f594fc9c4990f5f66be24873c22d7`) to run them here.
+- **What DOES run on 16 GB:** every model-free Inkling suite (122 tests, 18 skipped, green), the kernel-parity suites (`Inkling2DeviceKernelTests`' host-rule cases), and the whole build. What does not: the multi-position device and turn suites, which want the pinned revision and tens of GB of working set.
 
 **Exit gates**
 

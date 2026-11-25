@@ -1655,6 +1655,35 @@ nonisolated public final class Inkling2MetalForward {
         )
     }
 
+    /// One expert projection straight out of a RESIDENT slot: the arena's
+    /// packed buffer, with each region addressed from the slot's own base.
+    ///
+    /// The binding itself is `Inkling2SlotProjection.encode`, which lives with
+    /// the arena's geometry so the packed-slot layout and the way a kernel reads
+    /// it cannot drift apart -- and so it can be run against the host rule with
+    /// no checkpoint.
+    ///
+    /// `slotBaseOffset` is the slot index times `geometry.slotBytes`; it travels
+    /// as a constant because a packed region's offset is not 256-byte aligned.
+    func slotExpertRow(
+        encoder: MTLComputeCommandEncoder,
+        slot: MTLBuffer, slotBaseOffset: Int,
+        address: Inkling2ExpertSlotGeometry.SlotAddress,
+        isGateUp: Bool,
+        input: MTLBuffer, output: MTLBuffer,
+        rows: Int, logicalColumns: Int,
+        layout: Inkling2ExpertQuantLayout, outerScale: Float,
+        arena: Inkling2ScalarArena
+    ) throws {
+        Inkling2SlotProjection.encode(
+            pipeline: try pipeline("inkling_expert_row_f32"),
+            encoder: encoder, slot: slot, slotBaseOffset: slotBaseOffset,
+            address: address, isGateUp: isGateUp,
+            input: input, output: output, rows: rows, logicalColumns: logicalColumns,
+            layout: layout, outerScale: outerScale, arena: arena
+        )
+    }
+
     // MARK: The whole visit
 
     /// One visit with both halves on the device: the host's own

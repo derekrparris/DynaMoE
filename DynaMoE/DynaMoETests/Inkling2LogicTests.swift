@@ -941,6 +941,65 @@ final class Inkling2MemoryPlanTests: XCTestCase {
         XCTAssertTrue(arena.describe().contains("1 eviction(s)"), arena.describe())
     }
 
+    /// The slot's addressing is per region: `w13` and `w2` do not share a row
+    /// width, so the address a kernel reads must carry both strides and both
+    /// row counts. A single shared stride is the bug this pins -- it reads the
+    /// down projection's scales off by the width ratio and still returns
+    /// plausible numbers.
+    func testASlotAddressesEachRegionWithItsOwnStride() throws {
+        let geometry = try XCTUnwrap(
+            Inkling2ExpertSlotGeometry.make(
+                gateUpRows: 2_304, gateUpRowStride: 1_152, gateUpScaleRowStride: 72,
+                downRows: 2_304, downRowStride: 576, downScaleRowStride: 36
+            )
+        )
+        let address = geometry.slotAddress
+        XCTAssertEqual(address.gateUpWeight, geometry.gateUpWeightOffset)
+        XCTAssertEqual(address.gateUpScale, geometry.gateUpScaleOffset)
+        XCTAssertEqual(address.downWeight, geometry.downWeightOffset)
+        XCTAssertEqual(address.downScale, geometry.downScaleOffset)
+        XCTAssertEqual(address.gateUpRows, 2_304)
+        XCTAssertEqual(address.downRows, 2_304)
+        // The two regions keep their OWN strides, and the down one is half the
+        // gate/up one here, which is the ratio a shared stride would hide.
+        XCTAssertEqual(address.gateUpWeightRowStride, 1_152)
+        XCTAssertEqual(address.downWeightRowStride, 576)
+        XCTAssertNotEqual(address.gateUpWeightRowStride, address.downWeightRowStride)
+        XCTAssertEqual(address.projection(isGateUp: true).weightRowStride, 1_152)
+        XCTAssertEqual(address.projection(isGateUp: false).weightRowStride, 576)
+        XCTAssertEqual(address.projection(isGateUp: true).scaleOffset, geometry.gateUpScaleOffset)
+        XCTAssertEqual(address.projection(isGateUp: false).scaleOffset, geometry.downScaleOffset)
+    }
+
+    /// A lookup only answers for a pair that is actually resident: a slot filled
+    /// by another expert is not handed out under this one's name.
+    func testAResidentSlotIsOnlyReturnedForItsOwnPair() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice(), "no Metal device")
+        let geometry = try XCTUnwrap(
+            Inkling2ExpertSlotGeometry.make(
+                gateUpRows: 4, gateUpRowStride: 4, gateUpScaleRowStride: 1,
+                downRows: 4, downRowStride: 4, downScaleRowStride: 1
+            )
+        )
+        let arena = Inkling2ExpertArena(capacity: 2, geometry: geometry)
+        XCTAssertNil(arena.residentSlot(layer: 1, expert: 2), "nothing was filled yet")
+        let buffer = try XCTUnwrap(
+            device.makeBuffer(length: 2 * geometry.slotBytes, options: .storageModeShared)
+        )
+        arena.attachSlotBuffer(buffer)
+        let slot = arena.slotForFill(layer: 1, expert: 2)
+        arena.didFill(
+            slot: slot, layer: 1, expert: 2, gateUpSourceOffset: 0, downSourceOffset: 0,
+            bytes: UInt64(geometry.slotBytes), preadNanoseconds: 1
+        )
+        let found = try XCTUnwrap(arena.residentSlot(layer: 1, expert: 2))
+        XCTAssertEqual(found.slot, slot)
+        XCTAssertTrue(found.buffer === buffer)
+        XCTAssertEqual(found.address.downWeightRowStride, 4)
+        XCTAssertNil(arena.residentSlot(layer: 1, expert: 3), "another expert is a miss")
+        XCTAssertNil(arena.residentSlot(layer: 2, expert: 2), "another layer is a miss")
+    }
+
     private func config() throws -> Inkling2Config {
         try Inkling2Config.decode(jsonData: Data(Inkling2ConfigTests.smallJSON.utf8))
     }
@@ -1699,7 +1758,7 @@ final class Inkling2PublishedTensorTests: XCTestCase {
     private func mainTensors() throws -> (directory: URL, refs: [Inkling2TensorRef], config: Inkling2Config) {
         let directory = try snapshot()
         let engine = try DynaMoeEngine(filePath: directory.path)
-        let summary = try engine.getSummary()
+        let summary = try inkling2MetalReadySummary(try engine.getSummary())
         let config = try Inkling2Config.decode(
             contentsOf: directory.appendingPathComponent("config.json")
         )
@@ -1817,16 +1876,9 @@ final class Inkling2PublishedTensorTests: XCTestCase {
         let catalog = Inkling2WeightCatalog(mainFile: refs, layerCount: config.numHiddenLayers)
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let engine = try DynaMoeEngine(filePath: directory.path)
-        let summary = try engine.getSummary()
+        let summary = try inkling2MetalReadySummary(try engine.getSummary())
         var buffers: [UInt32: MTLBuffer] = [:]
-        for shard in summary.shards where shard.length > 0 {
-            guard let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)),
-                  shard.length <= UInt64(device.maxBufferLength) else { continue }
-            buffers[shard.index] = device.makeBuffer(
-                bytesNoCopy: pointer, length: Int(shard.length),
-                options: .storageModeShared, deallocator: nil
-            )
-        }
+        buffers = try inkling2MetalShardBuffers(summary, device: device)
         let source = Inkling2SnapshotWeights(config: config, catalog: catalog, shardBuffers: buffers)
 
         // Row 200010 of the embedding, from the file itself (numpy):
@@ -2114,7 +2166,7 @@ final class Inkling2HostForwardTests: XCTestCase {
         let directory = try snapshot()
         let engine = try DynaMoeEngine(filePath: directory.path)
         self.engine = engine
-        let summary = try engine.getSummary()
+        let summary = try inkling2MetalReadySummary(try engine.getSummary())
         let config = try Inkling2Config.decode(
             contentsOf: directory.appendingPathComponent("config.json")
         )
@@ -2124,16 +2176,7 @@ final class Inkling2HostForwardTests: XCTestCase {
         )
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         var buffers: [UInt32: MTLBuffer] = [:]
-        for shard in summary.shards {
-            guard shard.length > 0,
-                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)) else { continue }
-            guard shard.length <= UInt64(device.maxBufferLength) else { continue }
-            if let buffer = device.makeBuffer(
-                bytesNoCopy: pointer, length: Int(shard.length), options: .storageModeShared, deallocator: nil
-            ) {
-                buffers[shard.index] = buffer
-            }
-        }
+        buffers = try inkling2MetalShardBuffers(summary, device: device)
         let source = Inkling2SnapshotWeights(
             config: config, catalog: catalog, shardBuffers: buffers
         )
