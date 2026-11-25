@@ -5960,6 +5960,75 @@ final class DynaMoETests: XCTestCase {
         }
     }
 
+    /// An expanded expert bank is one tensor to its reader, so segmentation must
+    /// not split it across two Metal buffers: the Inkling catalog reassembles a
+    /// bank from its per-expert entries and requires them in ONE shard. This is
+    /// the 16 GB M1 Pro case -- on a machine where the whole shard fits, no
+    /// segmentation happens and the bug cannot appear.
+    func testShardSegmentationKeepsAnExpandedExpertBankTogether() throws {
+        let maxBufferLength: UInt64 = 1 << 20
+        let shardLength: UInt64 = 3 << 20
+        let page: UInt64 = 16384
+        let shards = [ShardMetadata(index: 0, filename: "big.safetensors", baseAddress: 0x1_0000_0000, length: shardLength)]
+        func tensor(_ name: String, _ start: UInt64, _ end: UInt64, expert: UInt32?) -> TensorMetadata {
+            TensorMetadata(
+                name: name, shapeDisplay: "[]", dtype: "U8", sizeMb: 1,
+                shardIndex: 0, offsetStart: start, offsetEnd: end,
+                category: "Routed Expert", layerIndex: 0, expertId: expert
+            )
+        }
+        // Filler puts the segment boundary in the middle of the bank: the first
+        // four experts would land in segment 0 and the rest in segment 1 under
+        // the plain size rule alone.
+        var tensors = [tensor("model.llm.layers.0.mlp.experts.w13_weight_amax", 0, 512, expert: nil)]
+        var offset: UInt64 = 512
+        var bankStart = offset + maxBufferLength - (512 + 4 * page + page / 2)
+        tensors.append(tensor("filler.weight", offset, bankStart, expert: nil))
+        offset = bankStart
+        for expert in 0..<8 {
+            tensors.append(tensor(
+                "model.llm.layers.0.mlp.experts.\(expert).w13_weight",
+                offset, offset + page, expert: UInt32(expert)
+            ))
+            offset += page
+        }
+        let summary = ModelSummary(
+            sizeGb: 3, tensorCount: UInt32(tensors.count), layerCount: 1, maxExpertId: 8,
+            shards: shards, tensors: tensors, layers: []
+        )
+        let segmented = try InferenceEngine.segmentShardsForMetal(summary, maxBufferLength: maxBufferLength)
+        let bank = segmented.tensors.filter { $0.expertId != nil }
+        XCTAssertEqual(bank.count, 8)
+        XCTAssertEqual(
+            Set(bank.map(\.shardIndex)).count, 1,
+            "every expert's entry must be in the same segment: \(bank.map { ($0.name, $0.shardIndex) })"
+        )
+        // And the segments themselves still fit the device.
+        XCTAssertTrue(segmented.shards.allSatisfy { $0.length <= maxBufferLength })
+
+        // A bank larger than one buffer cannot be kept together, so it is refused
+        // by name instead of being split silently.
+        var oversized = [TensorMetadata]()
+        var bigOffset: UInt64 = 0
+        for expert in 0..<4 {
+            oversized.append(tensor(
+                "model.llm.layers.0.mlp.experts.\(expert).w2_weight",
+                bigOffset, bigOffset + (maxBufferLength / 2), expert: UInt32(expert)
+            ))
+            bigOffset += maxBufferLength / 2
+        }
+        let bigSummary = ModelSummary(
+            sizeGb: 3, tensorCount: UInt32(oversized.count), layerCount: 1, maxExpertId: 4,
+            shards: [ShardMetadata(index: 0, filename: "big.safetensors", baseAddress: 0x1_0000_0000, length: 2 << 20)],
+            tensors: oversized, layers: []
+        )
+        XCTAssertThrowsError(try InferenceEngine.segmentShardsForMetal(bigSummary, maxBufferLength: maxBufferLength)) { error in
+            guard case MetalSegmentationError.tensorExceedsBufferLimit = error else {
+                return XCTFail("Expected tensorExceedsBufferLimit, got \(error)")
+            }
+        }
+    }
+
     func testShardSegmentationRejectsTensorOutsideSegments() throws {
         // A corrupt manifest can place tensor offsets beyond the shard; segmentation
         // must reject it rather than fall back to the last segment (which underflows or

@@ -1088,6 +1088,34 @@ public final class InferenceEngine {
                 curFirst = nil
             }
 
+            // The fused bank each tensor belongs to, if any. An expanded expert
+            // bank is many entries that ONE reader reassembles into a single
+            // tensor -- the Inkling catalog's coalescer, which requires them all
+            // in one shard -- so a bank must never be split across segments.
+            func bankKey(_ t: TensorMetadata) -> String? {
+                // The EXPERT index, not the first number in the name: `layers.4.`
+                // also matches a bare numeric component, and stripping that
+                // would key each expert of a bank separately.
+                guard let expert = t.expertId else { return nil }
+                let marker = ".experts.\(expert)."
+                guard let range = t.name.range(of: marker) else { return nil }
+                var name = t.name
+                name.replaceSubrange(range, with: ".experts.")
+                return "\(name)|\(t.layerIndex.map(String.init) ?? "-")|\(t.dtype)"
+            }
+            // Each bank's whole extent, so the segment can be closed BEFORE a
+            // bank starts rather than in the middle of it: a flush at the first
+            // entry that no longer fits would split exactly what it is meant to
+            // keep together.
+            var bankExtent: [String: (start: UInt64, end: UInt64, name: String)] = [:]
+            for t in tensors where !t.isStreamedTensor {
+                guard let key = bankKey(t) else { continue }
+                if let existing = bankExtent[key] {
+                    bankExtent[key] = (min(existing.start, t.offsetStart), max(existing.end, t.offsetEnd), existing.name)
+                } else {
+                    bankExtent[key] = (t.offsetStart, t.offsetEnd, t.name)
+                }
+            }
             for t in tensors where !t.isStreamedTensor {
                 // A single tensor whose page-aligned span exceeds the buffer limit cannot
                 // be contained by any segment. Without this check it is emitted in an
@@ -1111,8 +1139,23 @@ public final class InferenceEngine {
                     throw MetalSegmentationError.tensorExceedsBufferLimit(
                         name: t.name, alignedSpanBytes: singleSpan, maxBufferLength: maxBufferLength)
                 }
+                // A bank that fits nothing is refused by name here, once, rather
+                // than split later.
+                if let key = bankKey(t), let extent = bankExtent[key],
+                   min(alignUp(extent.end), total) - alignDown(extent.start) > maxBufferLength {
+                    throw MetalSegmentationError.tensorExceedsBufferLimit(
+                        name: extent.name,
+                        alignedSpanBytes: min(alignUp(extent.end), total) - alignDown(extent.start),
+                        maxBufferLength: maxBufferLength
+                    )
+                }
                 if let first = curFirst {
-                    let projected = alignUp(t.offsetEnd) - alignDown(first)
+                    var projected = alignUp(t.offsetEnd) - alignDown(first)
+                    // The bank decides the boundary, not this entry: if the whole
+                    // bank does not fit after `first`, close the segment now.
+                    if let key = bankKey(t), let extent = bankExtent[key] {
+                        projected = max(projected, min(alignUp(extent.end), total) - alignDown(first))
+                    }
                     if projected > maxBufferLength {
                         flush()
                     }
