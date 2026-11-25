@@ -306,15 +306,22 @@ nonisolated public final class Inkling2DeviceWorkspace {
     /// the published row width -- 0.25 ms -> 0.06 ms for a full 1,024-row
     /// window, and this stage grows with the context.
     public func stage(_ state: Inkling2VisitState) -> Int {
-        let rows = state.keys.count
-        let width = state.keys.first?.count ?? 0
+        let rows = state.rowCount
+        let width = state.rowWidth
         guard rows > 0, width > 0, rows <= stagedCapacity else { return 0 }
         // Row-major copy: the host keeps [[Float]], the kernel wants one block.
+        //
+        // In INT8 storage the rows are dequantized ONCE here, into this block,
+        // rather than being kept decoded in the cache: this buffer is the one
+        // place a whole window is already flat, and it is transient, while the
+        // cache's copy would live for every retained position.
+        let keyRows = state.keys
+        let valueRows = state.values
         let keyPointer = stagedKeys.contents().bindMemory(to: Float.self, capacity: rows * width)
         let valuePointer = stagedValues.contents().bindMemory(to: Float.self, capacity: rows * width)
         for row in 0..<rows {
-            let keyRow = state.keys[row]
-            let valueRow = state.values[row]
+            let keyRow = keyRows[row]
+            let valueRow = valueRows[row]
             let count = min(width, keyRow.count)
             keyRow.withUnsafeBufferPointer { source in
                 vDSP_mmov(

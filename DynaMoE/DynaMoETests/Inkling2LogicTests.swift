@@ -437,6 +437,33 @@ final class Inkling2KVStorageTests: XCTestCase {
         XCTAssertEqual(Inkling2KVQuantization.store(-2.5, inverseScale: 1), -3)
     }
 
+    /// INT8 storage actually holds less: the decoded rows are not kept beside
+    /// the stored ones. This is the whole point of the setting -- a decoded copy
+    /// on the side is no memory saved at all -- so it is asserted on the byte
+    /// count, not inferred from the field names.
+    func testInt8HoldsLessThanFloat32() {
+        let rows = 64, width = 128
+        let fp32 = visit(storage: .float32, window: 1_000, full: true, width: width)
+        let int8 = visit(storage: .int8, heads: 4, window: 1_000, full: true, width: width)
+        for row in 0..<rows {
+            let key = (0..<width).map { Float($0 + row) / Float(width) }
+            let value = (0..<width).map { Float(row) - Float($0) / Float(width) }
+            _ = fp32.append(key: key, value: value)
+            _ = int8.append(key: key, value: value)
+        }
+        // FP32: 64 rows x 2 vectors x 128 values x 4 bytes.
+        XCTAssertEqual(fp32.residentBytes, rows * 2 * width * 4)
+        // INT8: the same values in one byte each, plus one FP16 scale per
+        // (row, KV head) for K and V.
+        let expected = rows * 2 * width + rows * 2 * 4 * 2
+        XCTAssertEqual(int8.residentBytes, expected)
+        XCTAssertLessThan(int8.residentBytes, fp32.residentBytes / 3)
+        // And the rows still read back at the width they went in at.
+        XCTAssertEqual(int8.rowCount, rows)
+        XCTAssertEqual(int8.rowWidth, width)
+        XCTAssertEqual(int8.keys[7].count, width)
+    }
+
     /// A stored row is a row of the cache, and the cache still reads it back in
     /// full: same count, same width, same order.
     func testTheCacheKeepsTheRowsItWasGiven() {

@@ -118,17 +118,57 @@ nonisolated public final class Inkling2VisitState {
     /// Per (row, KV head) FP16 scales, K and V separately. Empty in FP32.
     private var keyScales: [[UInt16]] = []
     private var valueScales: [[UInt16]] = []
-    /// The dequantized rows, kept so a reader gets FP32 whatever the storage is.
-    /// They are the cache's own copy, not the caller's array: a row is read many
-    /// times (every attention over it) and dequantizing per read would put the
-    /// conversion in the inner loop.
+    /// The FP32 rows, in `float32` storage. Empty in `int8`: a decoded copy kept
+    /// beside the stored bytes is no memory saved at all, which is the whole
+    /// reason INT8 exists, so the decoded form is produced per read instead.
     private var decodedKeys: [[Float]] = []
     private var decodedValues: [[Float]] = []
 
-    /// Keys and values, dequantized to FP32, one row per retained position,
-    /// chronologically. In FP32 storage these ARE the stored rows.
-    public var keys: [[Float]] { decodedKeys }
-    public var values: [[Float]] { decodedValues }
+    /// Keys and values as FP32, one row per retained position, chronologically.
+    ///
+    /// In `float32` storage these are the stored rows themselves. In `int8` the
+    /// row is dequantized as it is asked for (`stored * scale`, per head): that
+    /// costs a multiply per element per read, and it is the price of the cache
+    /// actually being a quarter of the size. A caller that reads a row many
+    /// times should hold the result itself rather than ask twice.
+    public var keys: [[Float]] {
+        storage == .float32 ? decodedKeys
+            : zip(storedKeys, keyScales).map { Self.dequantize($0, $1, headWidth: headWidth) }
+    }
+    public var values: [[Float]] {
+        storage == .float32 ? decodedValues
+            : zip(storedValues, valueScales).map { Self.dequantize($0, $1, headWidth: headWidth) }
+    }
+
+    /// The stored bytes of a row and its per-head scales, for a reader that
+    /// wants the compact form (a device staging copy can hand these straight to
+    /// a dequantizing kernel). Nil in `float32` storage.
+    public func quantizedKey(_ row: Int) -> (stored: [Int8], scales: [UInt16])? {
+        guard storage == .int8, row >= 0, row < storedKeys.count else { return nil }
+        return (storedKeys[row], keyScales[row])
+    }
+
+    public func quantizedValue(_ row: Int) -> (stored: [Int8], scales: [UInt16])? {
+        guard storage == .int8, row >= 0, row < storedValues.count else { return nil }
+        return (storedValues[row], valueScales[row])
+    }
+
+    /// Bytes the cache is actually holding, which is the number an INT8 setting
+    /// exists to move: the stored rows plus their FP16 scales.
+    public var residentBytes: Int {
+        if storage == .float32 {
+            let rows = decodedKeys.count
+            let keyWidth = decodedKeys.first?.count ?? 0
+            let valueWidth = decodedValues.first?.count ?? 0
+            return rows * (keyWidth + valueWidth) * MemoryLayout<Float>.stride
+        }
+        let rows = storedKeys.count
+        let keyWidth = storedKeys.first?.count ?? 0
+        let valueWidth = storedValues.first?.count ?? 0
+        let scales = (keyScales.first?.count ?? 0) + (valueScales.first?.count ?? 0)
+        return rows * (keyWidth + valueWidth) * MemoryLayout<Int8>.stride
+            + rows * scales * MemoryLayout<UInt16>.stride
+    }
     /// Absolute position of the next row to be appended.
     public private(set) var committedPositions = 0
     /// Absolute position of `keys[0]`; a ring drops from the front.
@@ -170,6 +210,12 @@ nonisolated public final class Inkling2VisitState {
         case .int8:
             // Per KV head, both directions, as the device kernel does it: one
             // scale per (token, head), the row read back as stored * scale.
+            //
+            // The head width is taken BEFORE the closure: it reads the stored
+            // rows, and reading them while `&storedKeys` is in flight is an
+            // overlapping access (measured: Swift traps it as "Fatal access
+            // conflict", not as a wrong number).
+            let headWidth = max(1, key.count / max(1, heads))
             func quantize(_ row: [Float], into stored: inout [[Int8]], scales: inout [[UInt16]]) {
                 var bytes = [Int8](repeating: 0, count: row.count)
                 var rowScales = [UInt16](repeating: 0, count: heads)
@@ -188,42 +234,55 @@ nonisolated public final class Inkling2VisitState {
             }
             quantize(key, into: &storedKeys, scales: &keyScales)
             quantize(value, into: &storedValues, scales: &valueScales)
-            decodedKeys.append(Self.dequantize(
-                storedKeys[storedKeys.count - 1], keyScales[keyScales.count - 1], headWidth: headWidth
-            ))
-            decodedValues.append(Self.dequantize(
-                storedValues[storedValues.count - 1], valueScales[valueScales.count - 1], headWidth: headWidth
-            ))
         }
         committedPositions += 1
         if !isFullAttention {
-            let excess = max(0, decodedKeys.count - window)
+            let excess = max(0, rowCount - window)
             if excess > 0 {
                 dropFirst(excess)
                 windowStart += excess
             }
         }
-        return windowStart..<(windowStart + decodedKeys.count)
+        return windowStart..<(windowStart + rowCount)
+    }
+
+    /// Rows the cache holds, in either storage.
+    public var rowCount: Int {
+        storage == .int8 ? storedKeys.count : decodedKeys.count
+    }
+
+    /// The width of one row (K and V have the same width here: both are
+    /// `kvHeads * headDim`), without dequantizing anything.
+    public var rowWidth: Int {
+        storage == .int8 ? (storedKeys.first?.count ?? 0) : (decodedKeys.first?.count ?? 0)
     }
 
     /// KV heads, so a scale is per head and not per row.
     public var heads: Int = 1
 
-    /// The width of one KV head's slice, which is what a scale covers: a row is
-    /// `heads` equal slices.
-    private var headWidth: Int {
-        guard let first = decodedKeys.first, !first.isEmpty else { return 1 }
-        return max(1, first.count / max(1, heads))
+    /// The width of one KV head's slice, which is what a scale covers.
+    ///
+    /// Exactly `heads` equal slices by construction -- `kvWidth` is
+    /// `kvHeads * headDim` -- and the division is of the WIDTH, not of a padded
+    /// stride: the device kernel takes a `simd_max` over one head's `headDim`
+    /// values, so a host scale that covered a different span would be a
+    /// different contract with the same name.
+    public var headWidth: Int {
+        let width = storage == .int8
+            ? (storedKeys.first?.count ?? 0) : (decodedKeys.first?.count ?? 0)
+        guard width > 0 else { return 1 }
+        return max(1, width / max(1, heads))
     }
 
     private func dropFirst(_ count: Int) {
-        decodedKeys.removeFirst(count)
-        decodedValues.removeFirst(count)
-        if !storedKeys.isEmpty {
+        if storage == .int8 {
             storedKeys.removeFirst(count)
             storedValues.removeFirst(count)
             keyScales.removeFirst(count)
             valueScales.removeFirst(count)
+        } else {
+            decodedKeys.removeFirst(count)
+            decodedValues.removeFirst(count)
         }
     }
 
@@ -243,14 +302,16 @@ nonisolated public final class Inkling2VisitState {
         let removed = max(0, committedPositions - positions)
         committedPositions = positions
         if removed > 0 {
-            let drop = min(removed, decodedKeys.count)
-            decodedKeys.removeLast(drop)
-            decodedValues.removeLast(drop)
-            if !storedKeys.isEmpty {
-                storedKeys.removeLast(min(drop, storedKeys.count))
-                storedValues.removeLast(min(drop, storedValues.count))
+            if storage == .int8 {
+                let drop = min(removed, storedKeys.count)
+                storedKeys.removeLast(drop)
+                storedValues.removeLast(drop)
                 keyScales.removeLast(min(drop, keyScales.count))
                 valueScales.removeLast(min(drop, valueScales.count))
+            } else {
+                let drop = min(removed, decodedKeys.count)
+                decodedKeys.removeLast(drop)
+                decodedValues.removeLast(drop)
             }
         }
         return removed
