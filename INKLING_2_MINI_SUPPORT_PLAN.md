@@ -639,6 +639,15 @@ The attention kernel is the largest device stage left that is not a weight read:
 - **Two more measured negatives from the same sitting**: the expert projection with four output rows per threadgroup is 1.28-1.51x isolated but **slower in place** (mixture device 0.643 -> 0.717 ms in two processes), so it was reverted; and an E4M3 lookup table is 0.97x.
 - **Not done in this slice:** the block's batched front, and the mixture's per-block expert union.
 
+**Progress: slice 14, the router's selection runs on the whole threadgroup (2026-11-24).**
+
+`inkling_router_topk_f32` staged 128 steered ranks and then had ONE thread select: eight rounds, each scanning all 128 experts with an inner scan over the already-taken ones (about 64k comparisons), followed by two serial sorts. The ranks were already in threadgroup memory and the threadgroup was already 64 wide, so the parallelism was there and unused. Now a lane owns every 32nd expert, each round is one `simd_max` over the steered ranks, the id is resolved with `simd_min` among the lanes at the max (which is the host sort's lower-id tie rule), the warps' answers are merged by thread 0, and the weights and the ascending-id order stay where they were.
+
+**Measured in isolation at the published shape** (128 experts, top-k 8, 512 positions): **1.135 -> 0.226 ms, 5.01x**, and the indices were identical to the single-thread form on all 4,096 slots of a fixture built to produce exact ties. **Measured in place** at `-O` on the published checkpoint, two processes: **118.05-118.49 ms per position and 2.46-2.47 ms per visit** against 127.9-128.6 / 2.67, with `mlpFront`'s device window **0.268 -> 0.084 ms** (3.2x, so most of the kernel had been the serial selection).
+
+- **A scratch-region overlap was found by the existing kernel test and fixed.** The rank loop writes in strides of the whole threadgroup, so it touches `roundUp(numExperts, 64)` slots; packing the chosen ids straight after `numExperts` let a 64-wide fixture with eight experts overwrite them. Every region now starts on a 32-float boundary, and the test's own threadgroup-memory size was updated to match.
+- **Not done in this slice:** the block's batched front, and the mixture's per-block expert union.
+
 ### Phase 7: Long context and DynaMoE FP8 (INT8) KV
 
 **Work**

@@ -1550,7 +1550,12 @@ nonisolated public final class Inkling2MetalForward {
         // offset inside its shard is not buffer-aligned.
         encoder.setBuffer(arena.make(UInt64(biasOffset)), offset: 0, index: 7)
         encoder.setThreadgroupMemoryLength(
-            (32 + numExperts) * MemoryLayout<Float>.stride, index: 0
+            // 32 warp sums, the steered ranks padded to a threadgroup stride,
+            // the chosen ids, then one (rank, id) pair per warp for the
+            // cross-warp merge. 64 threads is two warps; the merge reads up to
+            // sixteen slots.
+            (32 + ((numExperts + 63) / 64) * 64 + 32 + 16 + 16) * MemoryLayout<Float>.stride,
+            index: 0
         )
         encoder.dispatchThreadgroups(
             MTLSize(width: 1, height: 1, depth: 1),

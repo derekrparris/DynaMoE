@@ -557,8 +557,11 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         // shard, and a kernel that read from zero would be exact only if it
         // happened to be first.
         let biasOffsetBuffer = try buffer(device, [UInt64(biasPad) * UInt64(MemoryLayout<Float>.stride)])
+        // The kernel's scratch: warp sums, the ranks padded to a threadgroup
+        // stride, the chosen ids, and one (rank, id) pair per warp.
+        let rankStride = ((numExperts + 63) / 64) * 64
         try run("inkling_router_topk_f32", threads: (positions, 1, 1), threadgroup: (64, 1, 1),
-                threadgroupMemory: (32 + numExperts) * MemoryLayout<Float>.stride,
+                threadgroupMemory: (32 + rankStride + 32 + 16 + 16) * MemoryLayout<Float>.stride,
                 byThreadgroup: true) { encoder in
             encoder.setBuffer(scoresBuffer, offset: 0, index: 0)
             encoder.setBuffer(biasBuffer, offset: 0, index: 1)
