@@ -663,6 +663,16 @@ The visit is 2.46 ms and 1.29 ms of it is device time; the remaining host share 
 - **A block driver is deeper than the walk, and that is a real constraint.** An unoptimized frame of the dense pipeline already exceeds a Swift-concurrency worker thread's 512 KB stack (AGENTS.md), and the block's schedule loop adds a level per position; the driver's loop is flat for that reason, and the tests that drive it run it on the project's large-stack helper.
 - **The expert kernel's threadgroup width is already at its peak**, measured rather than assumed: 32 / 64 / 128 / 256 / 512 lanes at the published shape give 370.6 / 379.4 / 379.4 / 371.4 / 356.1 GB/s, so the shipped 64 is within noise of the best and no change was made. A follow-up probe that cycled through many distinct weight regions to test the cache question was **discarded**: it made 64 regions read faster than one and 16 the slowest, which no cache story explains, and a number that contradicts itself that way is a flawed probe rather than a finding.
 
+**Progress: slice 16, the expert arena's geometry and residency policy (2026-11-24).**
+
+Item 6 is the largest item left, and the first thing it needs is a place for experts to be resident: this family's banks are the shard mmap, so there is nothing whose misses, hits or evictions item 1 could report. `Inkling2ExpertArena.swift` adds the arena -- LRU residency over (layer, expert) pairs, caller-provided slot buffers, and the counters item 1 was missing (`hits`, `misses`, `evictions`, `bytesRead`, `preadNanoseconds`, `slotsAllocated`, a hit rate and one log line).
+
+Two things are deliberately separate. The arena owns the BOOKKEEPING only and takes its fill from the caller, so the same policy runs under a test's in-memory fill and the executor's pread. And `Inkling2ExpertSlotGeometry` prices one expert's four contiguous ranges (`w13` weight and scale, `w2` weight and scale) from the BANK's stored strides, not the logical width -- a stride read from the logical width under-prices the slot by the padding factor, which is exactly how an arena appears to fit and then overruns.
+
+Pinned with no model: the geometry's arithmetic (`testASlotIsTheSumOfItsFourRanges`, a zero stride refused by name) and the policy's ORDER (`testTheArenaEvictsTheLeastRecentlyUsedPair` -- A touched again before B, so a third pair evicts B, asserted step by step with its counters).
+
+- **Not done yet in item 6:** the pread-backed fill, the arena's wiring into the mixture, and the cold/warm comparison against mmap. The policy question is deliberately still open: the DSV4.1 journal's LRU-vs-frequency result came from a working set that fits, and this family's does not, so it has to be re-asked here with the arena's own counters.
+
 ### Phase 7: Long context and DynaMoE FP8 (INT8) KV
 
 **Work**
