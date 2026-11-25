@@ -648,6 +648,17 @@ The attention kernel is the largest device stage left that is not a weight read:
 - **A scratch-region overlap was found by the existing kernel test and fixed.** The rank loop writes in strides of the whole threadgroup, so it touches `roundUp(numExperts, 64)` slots; packing the chosen ids straight after `numExperts` let a 64-wide fixture with eight experts overwrite them. Every region now starts on a 32-float boundary, and the test's own threadgroup-memory size was updated to match.
 - **Not done in this slice:** the block's batched front, and the mixture's per-block expert union.
 
+**Progress: slice 15, the attention-state work probed (one negative, one open) (2026-11-24).**
+
+`attentionState` is the last host-serial stage: four KV read-backs, the cache append, the relative and sink projections, three staging copies and the KV row copy. Of those, only the read-backs and the staging copies are actually per-element work, and they are what a kernel could take.
+
+- **A four-channels-per-thread convolution is 1.09x** (1.099 -> 1.009 ms at the published shape: 1,024 channels, 4 taps, 3 history rows, bit-identical). The tap and history accesses are already contiguous per channel, so vectorizing across channels buys almost nothing, and the convolution is a small share of a visit -- inside the noise floor in place. Rejected.
+- **The KV read-backs and staging copies are what is left**, and the honest statement is that they are already one contiguous copy each (`readBack` and `staging` are vector copies since slice 7). Taking them further means keeping the cache in one flat block instead of `[[Float]]`, which would touch every reader of `keys`/`values` in the host graph and the sequence state -- a refactor of the oracle, not a kernel.
+
+The visit is 2.46 ms and 1.29 ms of it is device time; the remaining host share is now spread thin across read-backs, the block reads and the message gates rather than concentrated anywhere.
+
+- **The expert kernel's threadgroup width is already at its peak**, measured rather than assumed: 32 / 64 / 128 / 256 / 512 lanes at the published shape give 370.6 / 379.4 / 379.4 / 371.4 / 356.1 GB/s, so the shipped 64 is within noise of the best and no change was made. A follow-up probe that cycled through many distinct weight regions to test the cache question was **discarded**: it made 64 regions read faster than one and 16 the slowest, which no cache story explains, and a number that contradicts itself that way is a flawed probe rather than a finding.
+
 ### Phase 7: Long context and DynaMoE FP8 (INT8) KV
 
 **Work**
