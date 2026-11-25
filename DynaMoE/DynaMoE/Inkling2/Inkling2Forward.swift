@@ -487,40 +487,48 @@ nonisolated public final class Inkling2CPUForward {
         var previous: [(hidden: [Float], blocks: [[Float]])] = Array(
             repeating: ([], []), count: count
         )
-        for step in try schedule() {
-            switch step.kind {
-            case .visit(let layer, let pass):
-                for index in block.indices {
-                    var messages: [[Float]]?
-                    if step.buildsMessages {
-                        messages = try messageInput(
-                            blockStates: Array(
-                                previous[index].blocks.dropFirst(snapshot!.first!.blockStates.count + 1)
-                            ),
-                            partial: previous[index].hidden,
-                            coreIndex: layer - config.loopCoreStart, pass: pass
-                        )
-                    }
-                    let input = block[index].hidden
-                    let (output, _) = try runVisitOrSubstitute(
-                        layer: layer, pass: pass, hidden: input,
-                        blockStates: &block[index].blockStates,
-                        messages: messages, position: block[index].position
-                    )
-                    // The walk appends the layer's INPUT after the visit, then
-                    // assigns its output; the order is kept so the two drivers
-                    // read the same way, not only compute the same value.
-                    if step.appendsBoundary { block[index].blockStates.append(input) }
-                    block[index].hidden = output
-                }
-            case .snapshot:
+        // A flat pass over the schedule, one visit per iteration: this is the
+        // deepest call in the app (it reaches the whole dense pipeline per
+        // position), so it keeps no nested per-step frames.
+        let steps = try schedule()
+        var stepIndex = 0
+        while stepIndex < steps.count {
+            let step = steps[stepIndex]
+            stepIndex += 1
+            if case .snapshot = step.kind {
                 snapshot = block.map { ($0.hidden, $0.blockStates) }
-            case .restart:
+                continue
+            }
+            if case .restart = step.kind {
                 for index in block.indices {
                     previous[index] = (block[index].hidden, block[index].blockStates)
                     block[index].hidden = snapshot![index].hidden
                     block[index].blockStates = snapshot![index].blockStates
                 }
+                continue
+            }
+            guard case .visit(let layer, let pass) = step.kind else { continue }
+            let stackBase = (snapshot?.first?.blockStates.count ?? 0) + 1
+            for index in block.indices {
+                var messages: [[Float]]?
+                if step.buildsMessages {
+                    messages = try messageInput(
+                        blockStates: Array(previous[index].blocks.dropFirst(stackBase)),
+                        partial: previous[index].hidden,
+                        coreIndex: layer - config.loopCoreStart, pass: pass
+                    )
+                }
+                let input = block[index].hidden
+                let (output, _) = try runVisitOrSubstitute(
+                    layer: layer, pass: pass, hidden: input,
+                    blockStates: &block[index].blockStates,
+                    messages: messages, position: block[index].position
+                )
+                // The walk appends the layer's INPUT after the visit, then
+                // assigns its output; the order is kept so the two drivers
+                // read the same way, not only compute the same value.
+                if step.appendsBoundary { block[index].blockStates.append(input) }
+                block[index].hidden = output
             }
         }
         let outputQuery = try weights.matrix(.attnResOutputQuery, layer: nil)
@@ -538,6 +546,32 @@ nonisolated public final class Inkling2CPUForward {
             onPosition?(position.position, softcapped)
             return softcapped
         }
+    }
+
+    /// Prefills `tokenIds` as one block and records them as the sequence's own
+    /// history, exactly as forwarding them one at a time would (`forwardToken`
+    /// records after its forward; an image row records the marker id and
+    /// nothing can prove which picture ran, which is why an image-bearing turn
+    /// never resumes a prefix).
+    ///
+    /// Returns each position's logits, in order.
+    @discardableResult
+    public func forwardBlockRecording(
+        tokenIds: [Int],
+        startingAt startPosition: Int,
+        imageRows: [Int: [Float]] = [:],
+        onPosition: ((Int, [Float]) -> Void)? = nil
+    ) throws -> [[Float]] {
+        let logits = try forwardBlock(
+            tokenIds: tokenIds, startingAt: startPosition, imageRows: imageRows,
+            onPosition: onPosition
+        )
+        for offset in tokenIds.indices {
+            sequence.record(
+                token: imageRows[offset] != nil ? config.imageTokenID : tokenIds[offset]
+            )
+        }
+        return logits
     }
 
     /// One visit, through the installed executor when there is one.

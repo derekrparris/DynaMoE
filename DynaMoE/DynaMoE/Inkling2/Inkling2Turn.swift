@@ -290,15 +290,34 @@ nonisolated public enum Inkling2TurnRunner {
                     storedPromptTokens: forward.storedPositions, cancelled: true
                 )
             }
-            for index in position..<end {
+            // A chunk of plain tokens goes through the BLOCK entry when the
+            // forward has one: the same positions in the same order, but one
+            // block the device can share weight reads across (see
+            // `Inkling2CPUForward.forwardBlockRecording`). A chunk carrying an
+            // image row keeps the walk, because a supplied row has its own seam
+            // and the block would have to stop at it.
+            let carriesImage = (position..<end).contains { imageRows[$0] != nil }
+            if !carriesImage, let blocks = forward as? Inkling2CPUForward {
                 do {
-                    if let row = imageRows[index] {
-                        logits = try forward.forwardRow(row, position: index)
-                    } else {
-                        logits = try forward.forwardToken(promptTokenIds[index], position: index)
-                    }
+                    let chunkIds = (position..<end).map { promptTokenIds[$0] }
+                    let chunkLogits = try blocks.forwardBlockRecording(
+                        tokenIds: chunkIds, startingAt: position
+                    )
+                    logits = chunkLogits.last ?? logits
                 } catch {
-                    throw Inkling2TurnError.prefillFailed(position: index, underlying: "\(error)")
+                    throw Inkling2TurnError.prefillFailed(position: position, underlying: "\(error)")
+                }
+            } else {
+                for index in position..<end {
+                    do {
+                        if let row = imageRows[index] {
+                            logits = try forward.forwardRow(row, position: index)
+                        } else {
+                            logits = try forward.forwardToken(promptTokenIds[index], position: index)
+                        }
+                    } catch {
+                        throw Inkling2TurnError.prefillFailed(position: index, underlying: "\(error)")
+                    }
                 }
             }
             position = end

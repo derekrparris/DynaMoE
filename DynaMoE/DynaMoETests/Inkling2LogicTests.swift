@@ -2032,6 +2032,76 @@ final class Inkling2HostForwardTests: XCTestCase {
         )
     }
 
+    /// A turn's prefill goes through the BLOCK entry now, and a turn is what the
+    /// app runs: the block prefill must answer what the walk answers, and the
+    /// sequence afterwards must hold the same history, or a follow-up turn would
+    /// resume a different prefix than it recorded.
+    func testATurnPrefillsThroughTheBlockAndMatchesTheWalk() throws {
+        // Each forward's engine is captured as it is made: `engine` is one
+        // slot, so building the second forward releases the first engine and
+        // unmaps the buffers the first forward is still reading (AGENTS.md
+        // records the SIGSEGV this produces, and it looks like a hang).
+        let forward = try makeForward()
+        let blockEngine = engine
+        let walk = try makeForward()
+        let walkEngine = engine
+        let tokenizer = try DynaMoeTokenizer(
+            tokenizerPath: try snapshot().appendingPathComponent("tokenizer.json").path
+        )
+        let ids = try tokenizer.encode(text: "Hi there").map { Int($0) }
+        let settings = Inkling2TurnRunner.Settings(
+            temperature: 0, topP: 1, minP: 0, topK: 1, maxTokens: 1,
+            eosTokenIds: [UInt32(clamping: forward.config.eosTokenID)]
+        )
+        func sample(_ logits: [Float], _ soFar: [UInt32]) -> UInt32 {
+            var scratch = logits
+            return scratch.withUnsafeMutableBufferPointer { buffer in
+                InferenceEngine.sampleNextToken(
+                    logits: buffer.baseAddress!, vocabSize: buffer.count,
+                    contextTokens: soFar, temperature: 0, topP: 1, minP: 0, topK: 1,
+                    repetitionPenalty: 1, presencePenalty: 0,
+                    eosTokenIds: settings.eosTokenIds
+                )
+            }
+        }
+        try withExtendedLifetime((walkEngine, blockEngine)) {
+            // Isolated first: the block entry alone, recording, as the turn uses it.
+            // On a large stack, which is what the production turn has to give it
+            // too: the block driver is deeper than the walk.
+            let recorded = try runOnLargeStack { () -> Result<[[Float]], Error> in
+                do { return .success(try forward.forwardBlockRecording(tokenIds: ids, startingAt: 0)) }
+                catch { return .failure(error) }
+            }.get()
+            XCTAssertEqual(recorded.count, ids.count)
+            XCTAssertEqual(forward.sequence.tokenHistory, ids)
+            forward.reset()
+            let blockStart = CFAbsoluteTimeGetCurrent()
+            let blockTurn = try Inkling2TurnRunner.run(
+                forward: forward, promptTokenIds: ids, settings: settings,
+                sample: sample, decode: { $0.map(String.init).joined() }
+            )
+            let blockSeconds = CFAbsoluteTimeGetCurrent() - blockStart
+            let walkStart = CFAbsoluteTimeGetCurrent()
+            let walkTurn = try Inkling2TurnRunner.run(
+                forward: walk, promptTokenIds: ids, settings: settings,
+                sample: sample, decode: { $0.map(String.init).joined() }
+            )
+            let walkSeconds = CFAbsoluteTimeGetCurrent() - walkStart
+            // The block path is wired for what it enables, not for a win it has
+            // not paid out yet: the driver still does one position's work at a
+            // time, so this asserts it has not REGRESSED, with room for the
+            // process's own spread rather than a tight ratio.
+            print(String(format: "🔎 [inkling2 real] turn: block %.2f s, walk %.2f s", blockSeconds, walkSeconds))
+            XCTAssertLessThanOrEqual(blockSeconds, walkSeconds * 1.10, "the block prefill is much slower than the walk")
+            XCTAssertEqual(
+                blockTurn.generatedTokenIds, walkTurn.generatedTokenIds,
+                "the block prefill must answer what the walk answers"
+            )
+            XCTAssertEqual(blockTurn.storedPromptTokens, walkTurn.storedPromptTokens)
+            XCTAssertEqual(forward.sequence.tokenHistory, walk.sequence.tokenHistory)
+        }
+    }
+
     /// The schedule as data is the schedule the model actually runs.
     ///
     /// This is the guard for a second driver (a batched prefill) consuming
