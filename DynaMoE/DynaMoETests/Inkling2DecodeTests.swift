@@ -311,7 +311,7 @@ final class Inkling2PublishedHeadTests: XCTestCase {
         let directory = try snapshot()
         let engine = try DynaMoeEngine(filePath: directory.path)
         self.engine = engine
-        let summary = try engine.getSummary()
+        let summary = try inkling2MetalReadySummary(try engine.getSummary())
         let config = try Inkling2Config.decode(
             contentsOf: directory.appendingPathComponent("config.json")
         )
@@ -324,15 +324,7 @@ final class Inkling2PublishedHeadTests: XCTestCase {
             throw XCTSkip("no Metal queue or default library")
         }
         var buffers: [UInt32: MTLBuffer] = [:]
-        for shard in summary.shards {
-            guard shard.length > 0,
-                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)) else { continue }
-            guard shard.length <= UInt64(device.maxBufferLength) else { continue }
-            if let buffer = device.makeBuffer(
-                bytesNoCopy: pointer, length: Int(shard.length),
-                options: .storageModeShared, deallocator: nil
-            ) { buffers[shard.index] = buffer }
-        }
+        buffers = try inkling2MetalShardBuffers(summary, device: device)
         let source = Inkling2SnapshotWeights(
             config: config, catalog: catalog, shardBuffers: buffers
         )

@@ -193,6 +193,11 @@ nonisolated public final class Inkling2VisitProfile: @unchecked Sendable {
     public private(set) var expertBytes: UInt64 = 0
     /// `attn_res` queries the visits asked for, summed.
     public private(set) var attentionQueries: Int = 0
+    /// The expert arena's counters, when one is installed: hits, misses,
+    /// evictions, bytes actually read and the time spent in pread. Nil is
+    /// "no arena", which is every production path -- it is not the same as an
+    /// arena with zero hits, and the two must not read alike.
+    public private(set) var arena: Inkling2ArenaCounters?
 
     public init() {}
 
@@ -203,6 +208,13 @@ nonisolated public final class Inkling2VisitProfile: @unchecked Sendable {
         experts = 0
         expertBytes = 0
         attentionQueries = 0
+        arena = nil
+    }
+
+    /// Takes the arena's counters as they stand. Cumulative on the arena's
+    /// side, so the last call wins rather than summing.
+    public func recordArena(_ counters: Inkling2ArenaCounters) {
+        arena = counters
     }
 
     /// Bills one stage of one visit.
@@ -270,6 +282,15 @@ nonisolated public final class Inkling2VisitProfile: @unchecked Sendable {
         line += String(format: "%.1f", Double(expertBytes) / 1_048_576) + " MB of expert banks)"
         line += "; " + parts.joined(separator: " | ")
         line += "; drain \(rate(drain)) of which queue \(rate(queueWait)), device \(rate(device))"
+        if let arena {
+            line += String(
+                format: "; arena %d hit(s) / %d miss(es) / %d eviction(s), %.1f MB read in %.1f ms (%.1f%% hit)",
+                arena.hits, arena.misses, arena.evictions,
+                Double(arena.bytesRead) / 1_048_576,
+                Double(arena.preadNanoseconds) / 1_000_000,
+                100 * arena.hitRate
+            )
+        }
         if empty > 0 { line += ", \(empty) buffer(s) with no device window" }
         return line
     }

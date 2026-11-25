@@ -428,6 +428,55 @@ nonisolated public final class Inkling2MetalForward {
     /// end; a turn that is cancelled still leaves what it measured.
     public let visitProfile = Inkling2VisitProfile()
 
+    /// The expert arena the mixture reads from, when one is installed.
+    ///
+    /// Nil in every production path -- this family's banks are the shard mmap
+    /// until a residency policy is measured to pay. When it is set, the mixture
+    /// asks it for each routed expert and projects a RESIDENT slot on a hit,
+    /// falling back to the mmap bank on a miss; the arena's own counters then
+    /// reach the profile through `recordExperts`, so a cold/warm comparison is
+    /// read from the same line as the stage table rather than a second
+    /// instrument.
+    ///
+    /// `arenaReader` is what fills a slot: the shard's POSIX `pread`. Both are
+    /// set together by `installExpertArena`, which is also where the slot
+    /// buffer is attached -- an arena with no buffer records bookkeeping only.
+    public private(set) var expertArena: Inkling2ExpertArena?
+    public private(set) var arenaReader: Inkling2ArenaShardReader?
+
+    /// Installs a bounded expert arena and the reader that fills it.
+    ///
+    /// `capacity` is in experts, and the caller owns the budget decision: one
+    /// slot is `geometry.slotBytes`, so `capacity * slotBytes` is the RAM the
+    /// arena takes from everything else (the KV cache included). The slot
+    /// buffer is allocated here at `capacity * slotBytes`, and a capacity the
+    /// device refuses is thrown rather than silently reduced -- an arena that
+    /// is smaller than asked for would change the hit rate under measurement.
+    public func installExpertArena(
+        capacity: Int,
+        geometry: Inkling2ExpertSlotGeometry,
+        reader: Inkling2ArenaShardReader
+    ) throws {
+        let bytes = capacity * geometry.slotBytes
+        guard bytes > 0, bytes <= device.maxBufferLength,
+              let buffer = device.makeBuffer(length: bytes, options: .storageModeShared) else {
+            throw Inkling2ForwardError.shapeMismatch(
+                "an expert arena of \(capacity) slot(s) needs \(bytes) bytes, which this device will not allocate"
+            )
+        }
+        let arena = Inkling2ExpertArena(capacity: capacity, geometry: geometry)
+        arena.attachSlotBuffer(buffer)
+        expertArena = arena
+        arenaReader = reader
+    }
+
+    /// Removes the arena, so the mixture goes back to the shard mmap.
+    public func removeExpertArena() {
+        expertArena?.evictAll()
+        expertArena = nil
+        arenaReader = nil
+    }
+
     private let pipelines: [String: MTLComputePipelineState]
 
     /// Every pipeline this graph dispatches, by kernel name. A missing one is
@@ -1425,6 +1474,15 @@ nonisolated public final class Inkling2MetalForward {
         for (slot, expert) in indices.enumerated() {
             let weight = routeWeights[slot]
             let gateUp = try weights.expertBank(.expertW13, layer: layer, expert: expert)
+            let down = try weights.expertBank(.expertW2, layer: layer, expert: expert)
+            // A resident slot, when an arena is installed: one buffer holding
+            // both banks, so the two projections read it at the slot's own
+            // region offsets instead of the fused banks' expert offsets. The
+            // layout comes from the MMAP banks (a slot is a byte copy of them),
+            // so the two paths decode identically by construction.
+            let resident = try residentSlot(
+                layer: layer, expert: expert, gateUp: gateUp, down: down
+            )
             if prefaultsExpertBanks {
                 touchedChecksum &+= Self.touch(
                     gateUp.buffer, offset: gateUp.baseOffset + gateUp.expertOffset,
@@ -1434,25 +1492,6 @@ nonisolated public final class Inkling2MetalForward {
                     gateUp.scaleBuffer, offset: gateUp.scaleBaseOffset + gateUp.scaleExpertOffset,
                     bytes: UInt64(2 * intermediate) * UInt64(gateUp.scaleRowStride)
                 )
-            }
-            try expertRow(
-                encoder: mixtureEncoder,
-                weight: gateUp.buffer, weightOffset: gateUp.baseOffset + gateUp.expertOffset,
-                scales: gateUp.scaleBuffer, scaleOffset: gateUp.scaleBaseOffset + gateUp.scaleExpertOffset,
-                input: workspace.attentionInput, output: workspace.expertGateUp,
-                rows: 2 * intermediate, logicalColumns: hiddenWidth,
-                layout: gateUp.layout,
-                outerScale: gateUp.layout.requiresAmaxDenominator && gateUp.denominator > 0
-                    ? gateUp.amax / gateUp.denominator : 1,
-                weightRowStride: gateUp.rowStride, scaleRowStride: gateUp.scaleRowStride,
-                arena: mixtureArena
-            )
-            try softcappedSwiGLUInterleaved(
-                encoder: mixtureEncoder, gateUp: workspace.expertGateUp,
-                output: workspace.expertIntermediate, intermediate: intermediate, arena: mixtureArena
-            )
-            let down = try weights.expertBank(.expertW2, layer: layer, expert: expert)
-            if prefaultsExpertBanks {
                 touchedChecksum &+= Self.touch(
                     down.buffer, offset: down.baseOffset + down.expertOffset,
                     bytes: UInt64(hiddenWidth) * UInt64(down.rowStride)
@@ -1462,18 +1501,62 @@ nonisolated public final class Inkling2MetalForward {
                     bytes: UInt64(hiddenWidth) * UInt64(down.scaleRowStride)
                 )
             }
-            try expertRow(
-                encoder: mixtureEncoder,
-                weight: down.buffer, weightOffset: down.baseOffset + down.expertOffset,
-                scales: down.scaleBuffer, scaleOffset: down.scaleBaseOffset + down.scaleExpertOffset,
-                input: workspace.expertIntermediate, output: workspace.expertDown,
-                rows: hiddenWidth, logicalColumns: intermediate,
-                layout: down.layout,
-                outerScale: down.layout.requiresAmaxDenominator && down.denominator > 0
-                    ? down.amax / down.denominator : 1,
-                weightRowStride: down.rowStride, scaleRowStride: down.scaleRowStride,
-                arena: mixtureArena
+            if let resident {
+                try slotExpertRow(
+                    encoder: mixtureEncoder,
+                    slot: resident.buffer, slotBaseOffset: resident.baseOffset,
+                    address: resident.address, isGateUp: true,
+                    input: workspace.attentionInput, output: workspace.expertGateUp,
+                    rows: 2 * intermediate, logicalColumns: hiddenWidth,
+                    layout: gateUp.layout,
+                    outerScale: gateUp.layout.requiresAmaxDenominator && gateUp.denominator > 0
+                        ? gateUp.amax / gateUp.denominator : 1,
+                    arena: mixtureArena
+                )
+            } else {
+                try expertRow(
+                    encoder: mixtureEncoder,
+                    weight: gateUp.buffer, weightOffset: gateUp.baseOffset + gateUp.expertOffset,
+                    scales: gateUp.scaleBuffer, scaleOffset: gateUp.scaleBaseOffset + gateUp.scaleExpertOffset,
+                    input: workspace.attentionInput, output: workspace.expertGateUp,
+                    rows: 2 * intermediate, logicalColumns: hiddenWidth,
+                    layout: gateUp.layout,
+                    outerScale: gateUp.layout.requiresAmaxDenominator && gateUp.denominator > 0
+                        ? gateUp.amax / gateUp.denominator : 1,
+                    weightRowStride: gateUp.rowStride, scaleRowStride: gateUp.scaleRowStride,
+                    arena: mixtureArena
+                )
+            }
+            try softcappedSwiGLUInterleaved(
+                encoder: mixtureEncoder, gateUp: workspace.expertGateUp,
+                output: workspace.expertIntermediate, intermediate: intermediate, arena: mixtureArena
             )
+            if let resident {
+                try slotExpertRow(
+                    encoder: mixtureEncoder,
+                    slot: resident.buffer, slotBaseOffset: resident.baseOffset,
+                    address: resident.address, isGateUp: false,
+                    input: workspace.expertIntermediate, output: workspace.expertDown,
+                    rows: hiddenWidth, logicalColumns: intermediate,
+                    layout: down.layout,
+                    outerScale: down.layout.requiresAmaxDenominator && down.denominator > 0
+                        ? down.amax / down.denominator : 1,
+                    arena: mixtureArena
+                )
+            } else {
+                try expertRow(
+                    encoder: mixtureEncoder,
+                    weight: down.buffer, weightOffset: down.baseOffset + down.expertOffset,
+                    scales: down.scaleBuffer, scaleOffset: down.scaleBaseOffset + down.scaleExpertOffset,
+                    input: workspace.expertIntermediate, output: workspace.expertDown,
+                    rows: hiddenWidth, logicalColumns: intermediate,
+                    layout: down.layout,
+                    outerScale: down.layout.requiresAmaxDenominator && down.denominator > 0
+                        ? down.amax / down.denominator : 1,
+                    weightRowStride: down.rowStride, scaleRowStride: down.scaleRowStride,
+                    arena: mixtureArena
+                )
+            }
             try weightedAccumulate(
                 encoder: mixtureEncoder, accumulator: workspace.residualAccumulator,
                 source: workspace.expertDown, weight: weight, count: hiddenWidth,
@@ -1524,6 +1607,7 @@ nonisolated public final class Inkling2MetalForward {
                 buffers: billed
             )
             profile.recordExperts(count: indices.count, bytes: mixtureBytes)
+            if let expertArena { profile.recordArena(expertArena.statistics) }
         }
         return zip(residual, convolved).map(+)
     }
@@ -1682,6 +1766,35 @@ nonisolated public final class Inkling2MetalForward {
             input: input, output: output, rows: rows, logicalColumns: logicalColumns,
             layout: layout, outerScale: outerScale, arena: arena
         )
+    }
+
+    /// The slot holding (layer, expert) for the mixture, filling it on a miss.
+    ///
+    /// Nil when no arena is installed -- the mixture then reads the shard
+    /// mmap exactly as it always did. A fill reads the expert's four ranges
+    /// out of the fused banks by pread; the offsets are the banks' own, so a
+    /// slot is a byte-for-byte copy of what the mmap path would have read.
+    func residentSlot(
+        layer: Int, expert: Int,
+        gateUp: (buffer: MTLBuffer, baseOffset: UInt64, expertOffset: UInt64,
+                 rowStride: Int, scaleBuffer: MTLBuffer, scaleBaseOffset: UInt64,
+                 scaleExpertOffset: UInt64, scaleRowStride: Int,
+                 layout: Inkling2ExpertQuantLayout, amax: Float, denominator: Float),
+        down: (buffer: MTLBuffer, baseOffset: UInt64, expertOffset: UInt64,
+               rowStride: Int, scaleBuffer: MTLBuffer, scaleBaseOffset: UInt64,
+               scaleExpertOffset: UInt64, scaleRowStride: Int,
+               layout: Inkling2ExpertQuantLayout, amax: Float, denominator: Float)
+    ) throws -> (buffer: MTLBuffer, baseOffset: Int, address: Inkling2ExpertSlotGeometry.SlotAddress)? {
+        guard let expertArena, let arenaReader else { return nil }
+        let slot = try expertArena.slot(
+            layer: layer, expert: expert, reader: arenaReader,
+            gateUpSourceOffset: gateUp.baseOffset + gateUp.expertOffset,
+            gateUpScaleSourceOffset: gateUp.scaleBaseOffset + gateUp.scaleExpertOffset,
+            downSourceOffset: down.baseOffset + down.expertOffset,
+            downScaleSourceOffset: down.scaleBaseOffset + down.scaleExpertOffset
+        )
+        guard let buffer = expertArena.slotBuffer else { return nil }
+        return (buffer, slot * expertArena.geometry.slotBytes, expertArena.geometry.slotAddress)
     }
 
     // MARK: The whole visit

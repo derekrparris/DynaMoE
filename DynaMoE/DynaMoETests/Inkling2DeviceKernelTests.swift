@@ -643,6 +643,137 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         }
     }
 
+    /// A slot filled from a bank file projects exactly as the bank itself does.
+    ///
+    /// This is the equivalence the mixture's arena path rests on: a resident
+    /// slot is a byte copy of the expert's four ranges, so the projection that
+    /// reads it must equal the one that reads the fused bank at that expert's
+    /// offset. It is checked on a temp file standing in for a shard (the reader
+    /// is the same POSIX call either way), so it runs with no checkpoint.
+    func testASlotFilledFromABankProjectsAsTheBankDoes() throws {
+        let (device, _, queue) = try environment()
+        guard let library = device.makeDefaultLibrary() else { throw XCTSkip("no default library") }
+        let pipeline = try XCTUnwrap(try device.makeComputePipelineState(
+            function: XCTUnwrap(library.makeFunction(name: "inkling_expert_row_f32"))
+        ))
+        let layout = Inkling2ExpertQuantLayout.nvfp4
+        let gateUpRows = 4, gateUpColumns = 32
+        let downRows = 3, downColumns = 16
+        let gateUpPacked = gateUpColumns / 2 + 2
+        let downPacked = downColumns / 2 + 1
+        let gateUpScaleStride = gateUpColumns / layout.blockSize + 1
+        let downScaleStride = downColumns / layout.blockSize + 1
+        let geometry = try XCTUnwrap(Inkling2ExpertSlotGeometry.make(
+            gateUpRows: gateUpRows, gateUpRowStride: gateUpPacked,
+            gateUpScaleRowStride: gateUpScaleStride,
+            downRows: downRows, downRowStride: downPacked,
+            downScaleRowStride: downScaleStride
+        ))
+        // A "shard": one expert's four ranges, in the arena's own order, behind
+        // a leading pad so nothing is accidentally at offset zero.
+        let pad = 16
+        var file = [UInt8](repeating: 0xAB, count: pad)
+        let gateUpWeight = (0..<geometry.gateUpWeightBytes).map { UInt8(0x11 + $0 % 0x40) }
+        let gateUpScale = (0..<geometry.gateUpScaleBytes).map { UInt8(120 + $0 % 6) }
+        let downWeight = (0..<geometry.downWeightBytes).map { UInt8(0x31 + $0 % 0x50) }
+        let downScale = (0..<geometry.downScaleBytes).map { UInt8(119 + $0 % 7) }
+        file += gateUpWeight + gateUpScale + downWeight + downScale
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("inkling2-slot-bank-\(UUID().uuidString).bin")
+        try Data(file).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let reader = try Inkling2ArenaShardReader(url: url)
+        let gateUpBase = UInt64(pad)
+        let gateUpScaleBase = gateUpBase + UInt64(gateUpWeight.count)
+        let downBase = gateUpScaleBase + UInt64(gateUpScale.count)
+        let downScaleBase = downBase + UInt64(downWeight.count)
+
+        let source = try XCTUnwrap(device.makeBuffer(
+            bytes: file, length: file.count, options: .storageModeShared
+        ))
+        let arena = Inkling2ExpertArena(capacity: 2, geometry: geometry)
+        let slotBuffer = try XCTUnwrap(device.makeBuffer(
+            length: 2 * geometry.slotBytes, options: .storageModeShared
+        ))
+        arena.attachSlotBuffer(slotBuffer)
+        let slot = try arena.slot(
+            layer: 0, expert: 0, reader: reader,
+            gateUpSourceOffset: gateUpBase, gateUpScaleSourceOffset: gateUpScaleBase,
+            downSourceOffset: downBase, downScaleSourceOffset: downScaleBase
+        )
+        // The slot must be a byte copy of the bank, not merely something that
+        // reads plausibly.
+        let slotPointer = slotBuffer.contents().bindMemory(to: UInt8.self, capacity: 2 * geometry.slotBytes)
+        let filePointer = source.contents().bindMemory(to: UInt8.self, capacity: file.count)
+        for index in 0..<geometry.slotBytes {
+            XCTAssertEqual(
+                slotPointer[slot * geometry.slotBytes + index], filePointer[pad + index],
+                "slot byte \(index)"
+            )
+        }
+
+        let scalars = Inkling2ScalarArena(device: device)
+        defer { scalars.clear() }
+        let address = geometry.slotAddress
+        for (isGateUp, rows, columns) in [
+            (true, gateUpRows, gateUpColumns), (false, downRows, downColumns)
+        ] {
+            let input = values(columns, seed: isGateUp ? 21 : 23)
+            let inputBuffer = try buffer(device, input)
+            let fromSlot = try XCTUnwrap(device.makeBuffer(
+                length: rows * MemoryLayout<Float>.stride, options: .storageModeShared
+            ))
+            let fromBank = try XCTUnwrap(device.makeBuffer(
+                length: rows * MemoryLayout<Float>.stride, options: .storageModeShared
+            ))
+            let outerScale: Float = 0.75
+            let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+            let encoder = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
+            Inkling2SlotProjection.encode(
+                pipeline: pipeline, encoder: encoder,
+                slot: slotBuffer, slotBaseOffset: slot * geometry.slotBytes,
+                address: address, isGateUp: isGateUp,
+                input: inputBuffer, output: fromSlot,
+                rows: rows, logicalColumns: columns,
+                layout: layout, outerScale: outerScale, arena: scalars
+            )
+            // The same projection off the bank, addressed directly: the shard
+            // buffer, the expert's region offset, the bank's own strides.
+            let region = address.projection(isGateUp: isGateUp)
+            encoder.setComputePipelineState(pipeline)
+            encoder.setBuffer(source, offset: 0, index: 0)
+            encoder.setBuffer(source, offset: 0, index: 1)
+            encoder.setBuffer(inputBuffer, offset: 0, index: 2)
+            encoder.setBuffer(fromBank, offset: 0, index: 3)
+            encoder.setBuffer(scalars.make(UInt32(columns)), offset: 0, index: 4)
+            encoder.setBuffer(scalars.make(UInt32(region.weightRowStride)), offset: 0, index: 5)
+            encoder.setBuffer(scalars.make(UInt32(region.scaleRowStride)), offset: 0, index: 6)
+            encoder.setBuffer(scalars.make(UInt32(layout.blockSize)), offset: 0, index: 7)
+            encoder.setBuffer(scalars.make(true), offset: 0, index: 8)
+            encoder.setBuffer(scalars.make(outerScale), offset: 0, index: 9)
+            encoder.setBuffer(scalars.make(gateUpBase + UInt64(region.weightOffset)), offset: 0, index: 10)
+            encoder.setBuffer(scalars.make(gateUpBase + UInt64(region.scaleOffset)), offset: 0, index: 11)
+            encoder.setThreadgroupMemoryLength(32 * MemoryLayout<Float>.stride, index: 0)
+            encoder.dispatchThreadgroups(
+                MTLSize(width: rows, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
+            )
+            encoder.endEncoding()
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            if let error = commandBuffer.error { throw error }
+            let resident = read(fromSlot, rows)
+            let direct = read(fromBank, rows)
+            for row in 0..<rows {
+                XCTAssertEqual(
+                    resident[row], direct[row],
+                    accuracy: max(1e-5, abs(direct[row]) * 1e-5),
+                    "\(isGateUp ? "gate/up" : "down") row \(row): the slot must be the bank"
+                )
+            }
+        }
+    }
+
     // MARK: Routing
 
     /// The router's selection and weighting against `Inkling2Math.route`.

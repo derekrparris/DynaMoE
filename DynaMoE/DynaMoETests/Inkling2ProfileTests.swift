@@ -165,6 +165,35 @@ final class Inkling2StageTimingTests: XCTestCase {
         XCTAssertTrue(line.contains("device 1.00"), line)
     }
 
+    /// The arena's counters reach the same line as the stage table, and "no
+    /// arena" is distinct from "an arena with no hits": a reader must not see a
+    /// 0% hit rate where no residency policy exists at all.
+    func testTheArenaCountersReachTheProfileLine() {
+        let profile = Inkling2VisitProfile()
+        profile.closeVisit(wallNanoseconds: 1_000_000, attentionQueries: 1)
+        let without = profile.describe(label: "unit")
+        XCTAssertNil(profile.arena)
+        XCTAssertFalse(without.contains("arena"), without)
+
+        var counters = Inkling2ArenaCounters()
+        counters.hits = 7
+        counters.misses = 3
+        counters.evictions = 1
+        counters.bytesRead = 4 * 1_048_576
+        counters.preadNanoseconds = 2_000_000
+        profile.recordArena(counters)
+        let with = profile.describe(label: "unit")
+        XCTAssertTrue(with.contains("7 hit(s)"), with)
+        XCTAssertTrue(with.contains("3 miss(es)"), with)
+        XCTAssertTrue(with.contains("1 eviction(s)"), with)
+        XCTAssertTrue(with.contains("4.0 MB read"), with)
+        XCTAssertTrue(with.contains("70.0% hit"), with)
+
+        // Cumulative on the arena's side: the latest snapshot wins, it does not sum.
+        profile.recordArena(counters)
+        XCTAssertEqual(profile.arena?.hits, 7)
+    }
+
     /// The stage list is the visit's own structure, and the three stages that
     /// commit nothing are marked as such: a caller summing `commits` over every
     /// stage must get four per visit, not seven.
@@ -294,7 +323,7 @@ final class Inkling2VisitProfileTests: XCTestCase {
         let directory = try snapshot()
         let engine = try DynaMoeEngine(filePath: directory.path)
         self.engine = engine
-        let summary = try engine.getSummary()
+        let summary = try inkling2MetalReadySummary(try engine.getSummary())
         let config = try Inkling2Config.decode(
             contentsOf: directory.appendingPathComponent("config.json")
         )
@@ -307,15 +336,7 @@ final class Inkling2VisitProfileTests: XCTestCase {
             throw XCTSkip("no Metal queue or default library")
         }
         var buffers: [UInt32: MTLBuffer] = [:]
-        for shard in summary.shards {
-            guard shard.length > 0,
-                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)) else { continue }
-            guard shard.length <= UInt64(device.maxBufferLength) else { continue }
-            if let buffer = device.makeBuffer(
-                bytesNoCopy: pointer, length: Int(shard.length),
-                options: .storageModeShared, deallocator: nil
-            ) { buffers[shard.index] = buffer }
-        }
+        buffers = try inkling2MetalShardBuffers(summary, device: device)
         let source = Inkling2SnapshotWeights(
             config: config, catalog: catalog, shardBuffers: buffers
         )

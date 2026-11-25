@@ -679,7 +679,17 @@ The arena could hold an expert, but nothing could read one out of it: the mixtur
 
 - **The two regions do not share a row stride, and one shared stride is the bug this pins.** `w13` rows are `packedHidden` wide and `w2` rows `packedIntermediate`, so a geometry that stored one stride would read the down projection's scales off by the width ratio -- plausible numbers, no crash. `Inkling2ExpertSlotGeometry` now stores `downWeightRowStride`/`downScaleRowStride` beside the gate/up pair, and `testASlotAddressesEachRegionWithItsOwnStride` pins them apart on a shape where the ratio is exactly 2.
 - **Pinned with no model:** the address arithmetic (`testASlotAddressesEachRegionWithItsOwnStride`), the lookup's exactness (`testAResidentSlotIsOnlyReturnedForItsOwnPair` -- another layer or another expert is a miss, a filled pair returns its buffer and slot), and the kernel binding against the host rule for BOTH regions and BOTH layouts (`testAResidentSlotProjectsAsTheHostRuleSays`, two slots so a base-offset bug reads the neighbour's bytes, distinct per-region strides, and scale bytes near 2^0 so no row cancels to noise).
-- **Not done in this slice:** the mixture does not yet call `slotExpertRow` -- it still reads the shard mmap -- so the arena is not in the decode path, and the cold/warm comparison has not been run. What is in place is the whole addressing contract that wiring needs, tested without a checkpoint.
+- **Not done in this slice:** the cold/warm comparison has not been run (the arena is now reachable from the mixture, but no measurement has been taken with one installed). What is in place is the whole addressing contract that wiring needs, tested without a checkpoint.
+
+**Progress: slice 18, the arena wired into the mixture (2026-11-25).**
+
+The mixture now reads a resident slot when an arena is installed. `Inkling2MetalForward.installExpertArena(capacity:geometry:reader:)` attaches a slot buffer of `capacity * geometry.slotBytes` and `removeExpertArena()` takes it away; the mixture asks `residentSlot` for each routed expert, projects the slot on a hit through `slotExpertRow` (both regions, each with its own stride), and falls back to the fused bank's mmap offset on a miss. The two paths decode identically by construction: the slot is a byte copy of the same ranges, read with the same layout.
+
+The arena's counters reach item 1's instrument now: `Inkling2VisitProfile.arena` holds `hits/misses/evictions/bytesRead/preadNanoseconds` and `describe()` appends them to the same line as the stage table. It is OPTIONAL on purpose -- nil is "no arena", which every production path is, and a 0% hit rate must not be printed where no residency policy exists.
+
+- **Capacity is the caller's budget, and a refused capacity throws rather than shrinking**: an arena quietly smaller than requested would change the hit rate being measured.
+- **Pinned with no model:** the slot's projection against the bank's own, byte for byte and then numerically, on a temp file standing in for a shard (`testASlotFilledFromABankProjectsAsTheBankDoes`), and the profile's arena fields including nil-vs-zero (`testTheArenaCountersReachTheProfileLine`).
+- **Not done in this slice:** the cold/warm measurement itself (mmap vs a bounded resident set vs streaming), which needs the pinned checkpoint revision and a bounded capacity chosen from the memory plan -- the arena is off by default until that comparison says it pays.
 
 ### Phase 7: Long context and DynaMoE FP8 (INT8) KV
 
