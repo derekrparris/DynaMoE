@@ -770,6 +770,83 @@ final class Inkling2ExpertLayoutTests: XCTestCase {
 
 final class Inkling2MemoryPlanTests: XCTestCase {
 
+    /// One expert's slot is its four contiguous ranges at the published shape,
+    /// and the total is their sum -- the arithmetic the arena's capacity is
+    /// spent on. A stride read from the logical width instead of the stored one
+    /// would under-price the slot by the padding factor, which is exactly how
+    /// an arena "fits" and then overruns.
+    func testASlotIsTheSumOfItsFourRanges() throws {
+        let geometry = try XCTUnwrap(
+            Inkling2ExpertSlotGeometry.make(
+                gateUpRows: 2_304, gateUpRowStride: 2_304, gateUpScaleRowStride: 72,
+                downRows: 2_304, downRowStride: 1_152, downScaleRowStride: 36
+            )
+        )
+        XCTAssertEqual(geometry.gateUpWeightBytes, 2_304 * 2_304)
+        XCTAssertEqual(geometry.gateUpScaleBytes, 2_304 * 72)
+        XCTAssertEqual(geometry.downWeightBytes, 2_304 * 1_152)
+        XCTAssertEqual(geometry.downScaleBytes, 2_304 * 36)
+        XCTAssertEqual(geometry.gateUpScaleOffset, geometry.gateUpWeightBytes)
+        XCTAssertEqual(geometry.downWeightOffset, geometry.gateUpScaleOffset + geometry.gateUpScaleBytes)
+        XCTAssertEqual(geometry.downScaleOffset, geometry.downWeightOffset + geometry.downWeightBytes)
+        XCTAssertEqual(
+            geometry.slotBytes,
+            geometry.gateUpWeightBytes + geometry.gateUpScaleBytes
+                + geometry.downWeightBytes + geometry.downScaleBytes
+        )
+        // A zero stride is not a shape any kernel can read, so it is refused.
+        XCTAssertNil(
+            Inkling2ExpertSlotGeometry.make(
+                gateUpRows: 8, gateUpRowStride: 0, gateUpScaleRowStride: 1,
+                downRows: 8, downRowStride: 8, downScaleRowStride: 1
+            )
+        )
+    }
+
+    /// The arena's residency sequence: a hit, then fills until the capacity is
+    /// spent, then the least recently used pair is the one evicted.
+    ///
+    /// The order is the whole policy, so it is asserted step by step rather
+    /// than through the counters alone: pair A is touched again before B, so
+    /// when a third pair needs a slot it is B that goes, not A.
+    func testTheArenaEvictsTheLeastRecentlyUsedPair() throws {
+        let geometry = try XCTUnwrap(
+            Inkling2ExpertSlotGeometry.make(
+                gateUpRows: 4, gateUpRowStride: 4, gateUpScaleRowStride: 1,
+                downRows: 4, downRowStride: 4, downScaleRowStride: 1
+            )
+        )
+        let arena = Inkling2ExpertArena(capacity: 2, geometry: geometry)
+        func load(_ layer: Int, _ expert: Int) -> Int {
+            if let slot = arena.resident(layer: layer, expert: expert) { return slot }
+            let slot = arena.slotForFill(layer: layer, expert: expert)
+            arena.didFill(
+                slot: slot, layer: layer, expert: expert,
+                gateUpSourceOffset: UInt64(expert), downSourceOffset: UInt64(expert),
+                bytes: UInt64(geometry.slotBytes), preadNanoseconds: 10
+            )
+            return slot
+        }
+        let a = load(0, 0)
+        let b = load(0, 1)
+        XCTAssertNotEqual(a, b)
+        // A again: a hit, and it becomes the most recently used.
+        XCTAssertEqual(load(0, 0), a)
+        // A third pair must evict B (the least recently used), not A.
+        let c = load(0, 2)
+        XCTAssertEqual(c, b, "the LRU pair's slot is the one reused")
+        XCTAssertNil(arena.resident(layer: 0, expert: 1), "B was evicted")
+        XCTAssertNotNil(arena.resident(layer: 0, expert: 0), "A survived, it was used more recently")
+        let stats = arena.statistics
+        XCTAssertEqual(stats.hits, 2, "the second A and the query for B's absence is not a hit")
+        XCTAssertEqual(stats.misses, 3)
+        XCTAssertEqual(stats.evictions, 1)
+        XCTAssertEqual(stats.slotsAllocated, 2)
+        XCTAssertEqual(stats.bytesRead, UInt64(3 * geometry.slotBytes))
+        XCTAssertEqual(stats.preadNanoseconds, 30)
+        XCTAssertTrue(arena.describe().contains("1 eviction(s)"), arena.describe())
+    }
+
     private func config() throws -> Inkling2Config {
         try Inkling2Config.decode(jsonData: Data(Inkling2ConfigTests.smallJSON.utf8))
     }
