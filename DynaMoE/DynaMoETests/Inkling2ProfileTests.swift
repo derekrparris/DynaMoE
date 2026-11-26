@@ -735,6 +735,7 @@ final class Inkling2VisitProfileTests: XCTestCase {
             streamedLogits = try position(4, arena: false).logits
         }
         let resident = try position(4, arena: true)
+        let shippedCapacities = metal.expertArenas.map { $0.arena.capacity }
         metal.removeExpertArena()
         XCTAssertEqual(resident.logits.count, config.unpaddedVocabSize)
         // The two arms are REPORTED, not required to agree: on this machine the
@@ -758,6 +759,70 @@ final class Inkling2VisitProfileTests: XCTestCase {
         let spread = (resident.logits.max() ?? 0) - (resident.logits.min() ?? 0)
         XCTAssertGreaterThan(spread, 1, "the arena arm's logits collapsed")
         XCTAssertGreaterThan(resident.logits.reduce(Float(0)) { max($0, abs($1)) }, 1)
+
+        // The capacity seam, exercised END TO END rather than only through its
+        // pure function: `dynamoe_inkling2_arena_slots` must change what a turn
+        // installs, and the install must say so.
+        //
+        // It is set IN PROCESS here, not with `defaults write`, because the test
+        // bundle is not the app: its `UserDefaults.standard` is the test
+        // runner's own domain, while the app's is its sandbox container
+        // (`~/Library/Containers/DRP.DynaMoE/Data/Library/Preferences`). A
+        // `defaults write DRP.DynaMoE` reaches the APP and not this process,
+        // which is worth knowing before a measurement is blamed on the seam.
+        let overrideSlots = (shippedCapacities.max() ?? 0) * 2
+        XCTAssertGreaterThan(overrideSlots, 0, "no shipped arena to double")
+        let overrideKey = Inkling2ArenaCapacity.overrideDefaultsKey
+        let previousOverride = UserDefaults.standard.object(forKey: overrideKey)
+        UserDefaults.standard.set(overrideSlots, forKey: overrideKey)
+        addTeardownBlock {
+            if let previousOverride {
+                UserDefaults.standard.set(previousOverride, forKey: overrideKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: overrideKey)
+            }
+        }
+        metal.removeExpertArena()
+        let overrideLine = try inkling2InstallExpertArenas(
+            executor: metal, weights: metal.weights, summary: harness.summary,
+            snapshot: try snapshot(), config: config, catalog: metal.weights.catalog,
+            positions: 8
+        )
+        let overrideCapacities = metal.expertArenas.map { $0.arena.capacity }
+        print(
+            "🔎 [inkling2 arena] override \(overrideSlots) slot(s): shipped "
+                + "\(shippedCapacities) -> \(overrideCapacities)"
+        )
+        XCTAssertTrue(
+            overrideLine.contains("[override \(overrideSlots)]"), overrideLine
+        )
+        XCTAssertGreaterThan(
+            overrideCapacities.max() ?? 0, shippedCapacities.max() ?? 0,
+            "the override did not change what was installed"
+        )
+        // What doubling the residency costs, on the same cold position the
+        // rounds above timed: the number to compare with the 1.71 GB baseline.
+        harness.forward.reset()
+        metal.visitProfile.reset()
+        let overrideStart = CFAbsoluteTimeGetCurrent()
+        let overrideResident = try harness.forward.forwardToken(token: 0, position: 5)
+        let overrideMs = (CFAbsoluteTimeGetCurrent() - overrideStart) * 1_000
+        let overrideVisits = max(1, metal.visitProfile.visits)
+        let overrideMixtureMs = Double(
+            metal.visitProfile.timing(.expertMixture).wallNanoseconds
+        ) / Double(overrideVisits) / 1_000_000
+        let overrideStats = Inkling2ArenaCounters.merged(metal.expertArenas.map { $0.arena.statistics })
+        metal.removeExpertArena()
+        XCTAssertEqual(overrideResident.count, config.unpaddedVocabSize)
+        XCTAssertGreaterThan(overrideResident.reduce(Float(0)) { max($0, abs($1)) }, 1)
+        print(
+            "🔎 [inkling2 arena] override arm: \(String(format: "%.1f", overrideMs)) ms, mixture "
+                + "\(String(format: "%.2f", overrideMixtureMs)) ms/visit, "
+                + "\(overrideStats.hits) hit(s) / \(overrideStats.misses) miss(es) / "
+                + "\(overrideStats.evictions) eviction(s), "
+                + String(format: "%.2f", Double(overrideStats.bytesRead) / 1_073_741_824)
+                + " GB read (" + String(format: "%.1f%%", 100 * overrideStats.hitRate) + " hit)"
+        )
     }
 }
 
