@@ -553,6 +553,73 @@ final class Inkling2KVStorageTests: XCTestCase {
         XCTAssertEqual(quantized.storage, Inkling2KVStorage.int8)
         XCTAssertTrue(quantized.visits.allSatisfy { $0.storage == Inkling2KVStorage.int8 && $0.heads == 2 })
     }
+
+    /// A scale covers one KV head, so a visit has to know ITS OWN geometry: a
+    /// local layer's KV heads are not the full layers' count, and quantizing a
+    /// sliding visit with the full count would put its scales over the wrong
+    /// spans while the bytes still looked right.
+    func testEachVisitQuotesItsOwnGeometrysHeadCount() throws {
+        let json = Inkling2ConfigTests.smallJSON
+            .replacingOccurrences(of: "\"swa_num_key_value_heads\": 2", with: "\"swa_num_key_value_heads\": 1")
+        let config = try Inkling2Config.decode(jsonData: Data(json.utf8))
+        XCTAssertEqual(config.numKeyValueHeads, 2)
+        XCTAssertEqual(config.swaNumKeyValueHeads, 1)
+        let plan = try config.makeVisitPlan()
+        let state = Inkling2SequenceState(
+            plan: plan, window: 16, kvWidth: 32, hidden: 64, historyDepth: 3, maxPositions: 32,
+            storage: .int8, kvHeads: config.numKeyValueHeads,
+            headsByVisit: plan.map {
+                $0.isFullAttention ? config.numKeyValueHeads : config.swaNumKeyValueHeads
+            }
+        )
+        let full = plan.enumerated().filter { $0.element.isFullAttention }
+        let local = plan.enumerated().filter { !$0.element.isFullAttention }
+        XCTAssertFalse(full.isEmpty)
+        XCTAssertFalse(local.isEmpty)
+        XCTAssertTrue(full.allSatisfy { state.visits[$0.offset].heads == 2 })
+        XCTAssertTrue(local.allSatisfy { state.visits[$0.offset].heads == 1 })
+    }
+
+    /// The forward's options decide the storage of the sequence a turn runs on,
+    /// which is what the device staging buffers are laid out for.
+    func testTheForwardOptionsChooseTheSequencesStorage() throws {
+        let config = try Inkling2Config.decode(jsonData: Data(Inkling2ConfigTests.smallJSON.utf8))
+        let plain = try Inkling2CPUForward(config: config, weights: Inkling2StubWeights())
+        XCTAssertEqual(plain.sequence.storage, Inkling2KVStorage.float32)
+        let quantized = try Inkling2CPUForward(
+            config: config, weights: Inkling2StubWeights(),
+            options: Inkling2ForwardOptions(maxPositions: 16, kvStorage: .int8)
+        )
+        XCTAssertEqual(quantized.sequence.storage, Inkling2KVStorage.int8)
+        XCTAssertTrue(quantized.sequence.visits.allSatisfy { $0.storage == .int8 })
+        // The per-visit geometry travels with the choice, not with the caller.
+        let plan = try config.makeVisitPlan()
+        for (index, visit) in plan.enumerated() {
+            XCTAssertEqual(
+                quantized.sequence.visits[index].heads,
+                visit.isFullAttention ? config.numKeyValueHeads : config.swaNumKeyValueHeads,
+                "visit \(index)"
+            )
+        }
+    }
+}
+
+/// A weight source that serves nothing: only the forward's CONSTRUCTION is
+/// under test (its state layout), and every read is an error no path in it
+/// should make.
+private struct Inkling2StubWeights: Inkling2WeightSource {
+    func matrix(_ role: Inkling2TensorRole, layer: Int?) throws -> [Float] {
+        throw Inkling2ForwardError.missingWeight(role.rawValue)
+    }
+    func shape(_ role: Inkling2TensorRole, layer: Int?) throws -> [Int] {
+        throw Inkling2ForwardError.missingWeight(role.rawValue)
+    }
+    func expertMatrix(_ role: Inkling2TensorRole, layer: Int, expert: Int) throws -> Inkling2PackedExpertMatrix {
+        throw Inkling2ForwardError.missingWeight(role.rawValue)
+    }
+    func row(_ role: Inkling2TensorRole, layer: Int?, index: Int) throws -> [Float] {
+        throw Inkling2ForwardError.missingWeight(role.rawValue)
+    }
 }
 
 // MARK: - Primitives: activation quantizers

@@ -372,6 +372,11 @@ nonisolated public final class Inkling2SequenceState {
     /// `storage` is how every visit holds its KV rows, and `kvHeads` is what a
     /// per-head INT8 scale covers. Both default to the FP32 reference behavior,
     /// so every existing caller is unchanged and INT8 is an explicit choice.
+    ///
+    /// `headsByVisit` overrides `kvHeads` per visit when the two attention
+    /// geometries disagree about how many KV heads a layer has: a scale is
+    /// stored per (row, KV head), so a visit quantized under one count cannot be
+    /// read under the other. Empty uses `kvHeads` for every visit.
     public init(
         plan: [Inkling2VisitPlan],
         window: Int,
@@ -380,12 +385,13 @@ nonisolated public final class Inkling2SequenceState {
         historyDepth: Int,
         maxPositions: Int,
         storage: Inkling2KVStorage = .float32,
-        kvHeads: Int = 1
+        kvHeads: Int = 1,
+        headsByVisit: [Int] = []
     ) {
         self.maxPositions = max(1, maxPositions)
         self.storage = storage
         self.plan = plan
-        self.visits = plan.map { visit in
+        self.visits = plan.enumerated().map { index, visit in
             Inkling2VisitState(
                 isFullAttention: visit.isFullAttention,
                 window: window,
@@ -395,7 +401,7 @@ nonisolated public final class Inkling2SequenceState {
                 // capped at its window and must not be refused at the budget.
                 maxRows: visit.isFullAttention ? maxPositions : nil,
                 storage: storage,
-                heads: kvHeads
+                heads: index < headsByVisit.count ? headsByVisit[index] : kvHeads
             )
         }
     }

@@ -38,6 +38,13 @@ nonisolated public final class Inkling2DeviceWeights {
     public let config: Inkling2Config
     public let catalog: Inkling2WeightCatalog
     private let shardBuffers: [UInt32: MTLBuffer]
+    /// Where each shard's BUFFER starts inside its file.
+    ///
+    /// A buffer's offsets are relative to the buffer, and after segmentation
+    /// that is not the file: a reader that opens the file itself (the expert
+    /// arena's `pread`) needs the origin added back, or it reads a plausible
+    /// range of the wrong bytes. Empty means "buffers are whole shards".
+    private let fileOrigins: [UInt32: UInt64]
     /// Dequantized FP32 matrices, keyed by role and layer.
     ///
     /// The small vectors this graph needs as VALUES (the relative bank, the
@@ -48,10 +55,14 @@ nonisolated public final class Inkling2DeviceWeights {
     private let cacheLock = NSLock()
     private var matrixCache: [String: [Float]] = [:]
 
-    public init(config: Inkling2Config, catalog: Inkling2WeightCatalog, shardBuffers: [UInt32: MTLBuffer]) {
+    public init(
+        config: Inkling2Config, catalog: Inkling2WeightCatalog, shardBuffers: [UInt32: MTLBuffer],
+        fileOrigins: [UInt32: UInt64] = [:]
+    ) {
         self.config = config
         self.catalog = catalog
         self.shardBuffers = shardBuffers
+        self.fileOrigins = fileOrigins
     }
 
     /// One tensor's buffer and byte offset, for a kernel's `[[buffer(n)]]` plus
@@ -124,7 +135,8 @@ nonisolated public final class Inkling2DeviceWeights {
     ) throws -> (buffer: MTLBuffer, baseOffset: UInt64, expertOffset: UInt64,
                  rowStride: Int, scaleBuffer: MTLBuffer, scaleBaseOffset: UInt64,
                  scaleExpertOffset: UInt64, scaleRowStride: Int,
-                 layout: Inkling2ExpertQuantLayout, amax: Float, denominator: Float) {
+                 layout: Inkling2ExpertQuantLayout, amax: Float, denominator: Float,
+                 fileWeightOffset: UInt64, fileScaleOffset: UInt64) {
         let scaleRole: Inkling2TensorRole = role == .expertW13 ? .expertW13Scale : .expertW2Scale
         let ref = catalog.tensor(role, layer: layer)
         let scaleRef = catalog.tensor(scaleRole, layer: layer)
@@ -171,12 +183,19 @@ nonisolated public final class Inkling2DeviceWeights {
             amax = try hostMatrix(amaxRole, layer: layer)[expert]
             denominator = try hostMatrix(denominatorRole, layer: layer)[0]
         }
+        let expertByteOffset = UInt64(expert) * UInt64(rows) * UInt64(columns) * UInt64(width)
+        let expertScaleOffset = UInt64(expert) * UInt64(scaleRows) * UInt64(scaleColumns) * UInt64(scaleWidth)
+        // The same two ranges as FILE offsets, which is what a `pread` reader
+        // (the expert arena) needs: the buffer's offsets are relative to a
+        // segment once the shard was segmented.
+        let fileWeight = (fileOrigins[shard] ?? 0) + baseOffset + expertByteOffset
+        let fileScale = (fileOrigins[scaleShard] ?? 0) + scaleBaseOffset + expertScaleOffset
         return (
-            buffer, baseOffset, UInt64(expert) * UInt64(rows) * UInt64(columns) * UInt64(width),
+            buffer, baseOffset, expertByteOffset,
             columns,
             scaleBuffer, scaleBaseOffset,
-            UInt64(expert) * UInt64(scaleRows) * UInt64(scaleColumns) * UInt64(scaleWidth),
-            scaleColumns, layout, amax, denominator
+            expertScaleOffset,
+            scaleColumns, layout, amax, denominator, fileWeight, fileScale
         )
     }
 }
@@ -219,9 +238,22 @@ nonisolated public final class Inkling2DeviceWorkspace {
     /// attention dispatch. The state itself stays host-side (it is what makes a
     /// resume provable), so a device attention reads a copy; the rows are
     /// `kvWidth` wide and the buffer holds the checkpoint's maximum context.
+    ///
+    /// How the rows are held matches `stagedStorage`: FP32 rows for the
+    /// reference path, one signed byte plus one FP16 scale per (row, KV head)
+    /// for `.int8`. The INT8 staging is a quarter of the bytes, and it is also
+    /// a straight byte copy -- the cache's own rows are already in the kernel's
+    /// form, so the host never dequantizes to move them.
     public let stagedKeys: MTLBuffer
     public let stagedValues: MTLBuffer
+    public let stagedKeyScales: MTLBuffer
+    public let stagedValueScales: MTLBuffer
     public let stagedCapacity: Int
+    /// The storage the staging buffers were laid out for. A visit whose own
+    /// cache holds a different form cannot be staged into them (see `stage`):
+    /// reading one-byte rows as floats is a wrong number, not an error the GPU
+    /// would report.
+    public let stagedStorage: Inkling2KVStorage
     /// The attention stage's remaining inputs, all small host-computed vectors
     /// or weights staged once per visit: the three projection inputs, the
     /// post-clip relative states, the sink logits and the relative bank.
@@ -242,8 +274,14 @@ nonisolated public final class Inkling2DeviceWorkspace {
     /// maximum, but a turn is capped by its KV budget, so the engine passes the
     /// cap it provisioned for -- the declared maximum at these widths is
     /// gigabytes of staging for rows that can never exist.
+    ///
+    /// `storage` is the form the KV staging buffers are laid out for, and the
+    /// sequence this workspace serves must hold its rows the same way.
     public init(
-        device: MTLDevice, config: Inkling2Config, stagedPositions: Int? = nil
+        device: MTLDevice,
+        config: Inkling2Config,
+        stagedPositions: Int? = nil,
+        storage: Inkling2KVStorage = .float32
     ) throws {
         let hiddenBytes = config.hiddenSize * MemoryLayout<Float>.stride
         let attentionWidth = config.numAttentionHeads * config.headDim
@@ -275,10 +313,19 @@ nonisolated public final class Inkling2DeviceWorkspace {
         // checkpoint's declared maximum is the safe bound and a few dozen MB at
         // FP32, which is the same order as the host's own rows.
         let kvWidth = config.numKeyValueHeads * config.headDim
+        stagedStorage = storage
         stagedCapacity = max(1, stagedPositions ?? config.maxPositionEmbeddings)
-        let stagedBytes = stagedCapacity * kvWidth * MemoryLayout<Float>.stride
+        let stagedBytes = stagedCapacity * kvWidth * storage.bytesPerElement
         stagedKeys = try make(stagedBytes, "staged keys")
         stagedValues = try make(stagedBytes, "staged values")
+        // A scale is per (row, KV head), and the two geometries may disagree
+        // about how many KV heads a visit has, so the block is sized by the
+        // wider one. In FP32 storage this is a placeholder byte range: the
+        // kernel is never handed it.
+        let scaleHeads = max(config.numKeyValueHeads, config.swaNumKeyValueHeads)
+        let scaleBytes = stagedCapacity * scaleHeads * max(1, storage.scaleBytesPerHead)
+        stagedKeyScales = try make(scaleBytes, "staged key scales")
+        stagedValueScales = try make(scaleBytes, "staged value scales")
         queryInput = try make(hiddenBytes, "query input")
         keyInput = try make(hiddenBytes, "key input")
         valueInput = try make(hiddenBytes, "value input")
@@ -305,36 +352,89 @@ nonisolated public final class Inkling2DeviceWorkspace {
     /// same order (bit-identical, it is a copy) and measured 4.4-5.1x faster at
     /// the published row width -- 0.25 ms -> 0.06 ms for a full 1,024-row
     /// window, and this stage grows with the context.
-    public func stage(_ state: Inkling2VisitState) -> Int {
+    ///
+    /// In `.int8` storage there is nothing to decode: the cache's rows are
+    /// already one signed byte per element plus one FP16 scale per KV head, so
+    /// the staging is a memcpy of both. Decoding on the host instead would cost
+    /// a multiply per element per position AND the 4x staging buffer that the
+    /// quantized cache exists to avoid.
+    public func stage(_ state: Inkling2VisitState) throws -> Int {
+        guard state.storage == stagedStorage else {
+            throw Inkling2ForwardError.unsupported(
+                "this workspace stages \(stagedStorage.rawValue) KV rows but the visit holds "
+                    + "\(state.storage.rawValue): build the workspace for the same storage"
+            )
+        }
         let rows = state.rowCount
         let width = state.rowWidth
         guard rows > 0, width > 0, rows <= stagedCapacity else { return 0 }
-        // Row-major copy: the host keeps [[Float]], the kernel wants one block.
-        //
-        // In INT8 storage the rows are dequantized ONCE here, into this block,
-        // rather than being kept decoded in the cache: this buffer is the one
-        // place a whole window is already flat, and it is transient, while the
-        // cache's copy would live for every retained position.
-        let keyRows = state.keys
-        let valueRows = state.values
-        let keyPointer = stagedKeys.contents().bindMemory(to: Float.self, capacity: rows * width)
-        let valuePointer = stagedValues.contents().bindMemory(to: Float.self, capacity: rows * width)
-        for row in 0..<rows {
-            let keyRow = keyRows[row]
-            let valueRow = valueRows[row]
-            let count = min(width, keyRow.count)
-            keyRow.withUnsafeBufferPointer { source in
-                vDSP_mmov(
-                    source.baseAddress!, keyPointer + row * width,
-                    vDSP_Length(count), 1, vDSP_Length(count), vDSP_Length(count)
-                )
+        switch stagedStorage {
+        case .float32:
+            // Row-major copy: the host keeps [[Float]], the kernel wants one block.
+            let keyRows = state.keys
+            let valueRows = state.values
+            let keyPointer = stagedKeys.contents().bindMemory(to: Float.self, capacity: rows * width)
+            let valuePointer = stagedValues.contents().bindMemory(to: Float.self, capacity: rows * width)
+            for row in 0..<rows {
+                let keyRow = keyRows[row]
+                let valueRow = valueRows[row]
+                let count = min(width, keyRow.count)
+                keyRow.withUnsafeBufferPointer { source in
+                    vDSP_mmov(
+                        source.baseAddress!, keyPointer + row * width,
+                        vDSP_Length(count), 1, vDSP_Length(count), vDSP_Length(count)
+                    )
+                }
+                valueRow.withUnsafeBufferPointer { source in
+                    vDSP_mmov(
+                        source.baseAddress!, valuePointer + row * width,
+                        vDSP_Length(min(count, valueRow.count)), 1,
+                        vDSP_Length(min(count, valueRow.count)), vDSP_Length(min(count, valueRow.count))
+                    )
+                }
             }
-            valueRow.withUnsafeBufferPointer { source in
-                vDSP_mmov(
-                    source.baseAddress!, valuePointer + row * width,
-                    vDSP_Length(min(count, valueRow.count)), 1,
-                    vDSP_Length(min(count, valueRow.count)), vDSP_Length(min(count, valueRow.count))
-                )
+        case .int8:
+            // The kernel indexes a scale by (row, KV head), so the cache's own
+            // per-head count has to be this visit's -- a sequence built with a
+            // different count would misread a row that is otherwise the right
+            // bytes.
+            let heads = state.heads
+            guard heads > 0 else {
+                throw Inkling2ForwardError.unsupported("an INT8 visit holds a row with no KV heads")
+            }
+            let keyPointer = stagedKeys.contents().bindMemory(to: Int8.self, capacity: rows * width)
+            let valuePointer = stagedValues.contents().bindMemory(to: Int8.self, capacity: rows * width)
+            let keyScalePointer = stagedKeyScales.contents().bindMemory(
+                to: UInt16.self, capacity: rows * heads
+            )
+            let valueScalePointer = stagedValueScales.contents().bindMemory(
+                to: UInt16.self, capacity: rows * heads
+            )
+            for row in 0..<rows {
+                guard let key = state.quantizedKey(row), let value = state.quantizedValue(row) else {
+                    throw Inkling2ForwardError.unsupported(
+                        "row \(row) of this INT8 visit has no stored bytes"
+                    )
+                }
+                let bytes = min(width, key.stored.count)
+                key.stored.withUnsafeBytes { source in
+                    memcpy(keyPointer + row * width, source.baseAddress!, bytes)
+                }
+                value.stored.withUnsafeBytes { source in
+                    memcpy(valuePointer + row * width, source.baseAddress!, min(bytes, value.stored.count))
+                }
+                key.scales.withUnsafeBytes { source in
+                    memcpy(
+                        keyScalePointer + row * heads, source.baseAddress!,
+                        min(heads, key.scales.count) * MemoryLayout<UInt16>.stride
+                    )
+                }
+                value.scales.withUnsafeBytes { source in
+                    memcpy(
+                        valueScalePointer + row * heads, source.baseAddress!,
+                        min(heads, value.scales.count) * MemoryLayout<UInt16>.stride
+                    )
+                }
             }
         }
         return rows
@@ -503,6 +603,7 @@ nonisolated public final class Inkling2MetalForward {
         "inkling_gate_multiply_f32",
         "inkling_block_read_f32",
         "inkling_attention_f32",
+        "inkling_attention_int8_f32",
         "inkling_expert_row_f32",
         "inkling_router_topk_f32",
         "bf16_gemv_rows8",
@@ -1242,7 +1343,7 @@ nonisolated public final class Inkling2MetalForward {
 
         // The KV rows this position attends over, staged: the second command
         // buffer, because the attention reads the row the first one wrote.
-        let rows = workspace.stage(state)
+        let rows = try workspace.stage(state)
         let tailStart = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         if let profile {
             profile.record(
@@ -1323,7 +1424,8 @@ nonisolated public final class Inkling2MetalForward {
         return readBack(workspace.projectionOutput, count: hidden)
     }
 
-    /// The attention kernel over one visit's staged KV rows.
+    /// The attention kernel over one visit's staged KV rows, in whatever form
+    /// the visit's cache holds them.
     func attention(
         encoder: MTLComputeCommandEncoder,
         workspace: Inkling2DeviceWorkspace,
@@ -1342,28 +1444,56 @@ nonisolated public final class Inkling2MetalForward {
         let kvHeads = isFull ? config.numKeyValueHeads : config.swaNumKeyValueHeads
         let headDim = isFull ? config.headDim : config.swaHeadDim
         let kvWidth = kvHeads * headDim
+        // The staging buffers were laid out for one storage form, and the two
+        // are not interchangeable: a byte row read as floats is a plausible
+        // number, not a fault. Refuse instead.
+        guard workspace.stagedStorage == state.storage else {
+            throw Inkling2ForwardError.unsupported(
+                "the workspace stages \(workspace.stagedStorage.rawValue) KV rows but this visit "
+                    + "holds \(state.storage.rawValue)"
+            )
+        }
         let values: [UInt32] = [
             UInt32(heads), UInt32(heads / kvHeads), UInt32(headDim), UInt32(kvWidth),
             UInt32(rows), UInt32(state.windowStart), UInt32(position),
             UInt32(config.dRel), UInt32(isFull ? config.relExtent : config.slidingWindowSize)
         ]
-        encoder.setComputePipelineState(try pipeline("inkling_attention_f32"))
-        encoder.setBuffer(workspace.query, offset: 0, index: 0)
-        encoder.setBuffer(workspace.stagedKeys, offset: 0, index: 1)
-        encoder.setBuffer(workspace.stagedValues, offset: 0, index: 2)
-        encoder.setBuffer(relative, offset: 0, index: 3)
-        encoder.setBuffer(bank, offset: 0, index: 4)
-        encoder.setBuffer(sink, offset: 0, index: 5)
-        encoder.setBuffer(output, offset: 0, index: 6)
-        for (index, value) in values.enumerated() {
-            encoder.setBuffer(arena.make(value), offset: 0, index: 7 + index)
+        switch state.storage {
+        case .float32:
+            encoder.setComputePipelineState(try pipeline("inkling_attention_f32"))
+            encoder.setBuffer(workspace.query, offset: 0, index: 0)
+            encoder.setBuffer(workspace.stagedKeys, offset: 0, index: 1)
+            encoder.setBuffer(workspace.stagedValues, offset: 0, index: 2)
+            encoder.setBuffer(relative, offset: 0, index: 3)
+            encoder.setBuffer(bank, offset: 0, index: 4)
+            encoder.setBuffer(sink, offset: 0, index: 5)
+            encoder.setBuffer(output, offset: 0, index: 6)
+            for (index, value) in values.enumerated() {
+                encoder.setBuffer(arena.make(value), offset: 0, index: 7 + index)
+            }
+            // An optional score dump, into the CALLER's workspace buffer: the host
+            // captures `scores_head0`, and comparing them is what separates the bias
+            // from the softmax from the value fold. It has to outlive this call for
+            // the caller to read it, so it cannot be the arena's.
+            encoder.setBuffer(workspace.scoreDump, offset: 0, index: 16)
+            encoder.setBuffer(arena.make(dumpsScores), offset: 0, index: 17)
+        case .int8:
+            encoder.setComputePipelineState(try pipeline("inkling_attention_int8_f32"))
+            encoder.setBuffer(workspace.query, offset: 0, index: 0)
+            encoder.setBuffer(workspace.stagedKeys, offset: 0, index: 1)
+            encoder.setBuffer(workspace.stagedValues, offset: 0, index: 2)
+            encoder.setBuffer(workspace.stagedKeyScales, offset: 0, index: 3)
+            encoder.setBuffer(workspace.stagedValueScales, offset: 0, index: 4)
+            encoder.setBuffer(relative, offset: 0, index: 5)
+            encoder.setBuffer(bank, offset: 0, index: 6)
+            encoder.setBuffer(sink, offset: 0, index: 7)
+            encoder.setBuffer(output, offset: 0, index: 8)
+            for (index, value) in values.enumerated() {
+                encoder.setBuffer(arena.make(value), offset: 0, index: 9 + index)
+            }
+            encoder.setBuffer(workspace.scoreDump, offset: 0, index: 18)
+            encoder.setBuffer(arena.make(dumpsScores), offset: 0, index: 19)
         }
-        // An optional score dump, into the CALLER's workspace buffer: the host
-        // captures `scores_head0`, and comparing them is what separates the bias
-        // from the softmax from the value fold. It has to outlive this call for
-        // the caller to read it, so it cannot be the arena's.
-        encoder.setBuffer(workspace.scoreDump, offset: 0, index: 16)
-        encoder.setBuffer(arena.make(dumpsScores), offset: 0, index: 17)
         encoder.setThreadgroupMemoryLength(
             (32 + rows) * MemoryLayout<Float>.stride, index: 0
         )
@@ -1786,19 +1916,32 @@ nonisolated public final class Inkling2MetalForward {
         gateUp: (buffer: MTLBuffer, baseOffset: UInt64, expertOffset: UInt64,
                  rowStride: Int, scaleBuffer: MTLBuffer, scaleBaseOffset: UInt64,
                  scaleExpertOffset: UInt64, scaleRowStride: Int,
-                 layout: Inkling2ExpertQuantLayout, amax: Float, denominator: Float),
+                 layout: Inkling2ExpertQuantLayout, amax: Float, denominator: Float,
+                 fileWeightOffset: UInt64, fileScaleOffset: UInt64),
         down: (buffer: MTLBuffer, baseOffset: UInt64, expertOffset: UInt64,
                rowStride: Int, scaleBuffer: MTLBuffer, scaleBaseOffset: UInt64,
                scaleExpertOffset: UInt64, scaleRowStride: Int,
-               layout: Inkling2ExpertQuantLayout, amax: Float, denominator: Float)
+               layout: Inkling2ExpertQuantLayout, amax: Float, denominator: Float,
+               fileWeightOffset: UInt64, fileScaleOffset: UInt64)
     ) throws -> (buffer: MTLBuffer, baseOffset: Int, address: Inkling2ExpertSlotGeometry.SlotAddress)? {
         guard let expertArena, let arenaReader else { return nil }
+        // A slot is a byte copy at FIXED strides, so a layer quantized another
+        // way cannot use this arena. The published checkpoint mixes NVFP4 and
+        // MXFP8 layers, and a copy at the wrong strides would report hits over
+        // the wrong bytes -- refuse and let the mmap path serve that layer.
+        guard expertArena.geometry.holds(
+            weightRowStride: gateUp.rowStride, scaleRowStride: gateUp.scaleRowStride,
+            downWeightRowStride: down.rowStride, downScaleRowStride: down.scaleRowStride
+        ) else {
+            expertArena.recordIncompatible()
+            return nil
+        }
         let slot = try expertArena.slot(
             layer: layer, expert: expert, reader: arenaReader,
-            gateUpSourceOffset: gateUp.baseOffset + gateUp.expertOffset,
-            gateUpScaleSourceOffset: gateUp.scaleBaseOffset + gateUp.scaleExpertOffset,
-            downSourceOffset: down.baseOffset + down.expertOffset,
-            downScaleSourceOffset: down.scaleBaseOffset + down.scaleExpertOffset
+            gateUpSourceOffset: gateUp.fileWeightOffset,
+            gateUpScaleSourceOffset: gateUp.fileScaleOffset,
+            downSourceOffset: down.fileWeightOffset,
+            downScaleSourceOffset: down.fileScaleOffset
         )
         guard let buffer = expertArena.slotBuffer else { return nil }
         return (buffer, slot * expertArena.geometry.slotBytes, expertArena.geometry.slotAddress)

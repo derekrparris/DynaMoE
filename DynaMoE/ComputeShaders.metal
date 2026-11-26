@@ -13989,6 +13989,113 @@ kernel void inkling_attention_f32(
     }
 }
 
+// `inkling_attention_f32` over an INT8 KV cache: the same relative bias, the
+// same sink and the same value fold, with the rows stored as signed bytes and
+// one FP16 scale per (row, KV head). This is DynaMoE's existing KV contract --
+// the one `store_kv_cache_fp8` writes and `gqa_attention_decode_fused_fp8`
+// reads -- so a row written by either side dequantizes identically.
+//
+// One scale covers a whole KV head, so it comes out of the sums rather than
+// riding every element: the score is `(q . stored) * kScale * scaling` and the
+// value fold weights one stored row by `softmax(row) * vScale`. That is the
+// arithmetic `gqa_attention_decode_fused_fp8` uses, and the host rule
+// (`Inkling2KVQuantization.load`) is `stored * scale` per element, i.e. the
+// same number associated differently -- measured at the published widths, the
+// reordering is below fp32 resolution of the accumulation.
+//
+// Everything else is deliberately a copy of the FP32 kernel: the two are
+// compared against each other and against the host graph, so a change here that
+// is not about storage belongs in both (or in neither).
+kernel void inkling_attention_int8_f32(
+    device const float* query [[buffer(0)]],
+    device const char* keys [[buffer(1)]],
+    device const char* values [[buffer(2)]],
+    device const half* keyScales [[buffer(3)]],
+    device const half* valueScales [[buffer(4)]],
+    device const float* relative [[buffer(5)]],
+    device const float* bank [[buffer(6)]],
+    device const float* sinkLogits [[buffer(7)]],
+    device float* outVector [[buffer(8)]],
+    constant uint32_t& heads [[buffer(9)]],
+    constant uint32_t& groups [[buffer(10)]],
+    constant uint32_t& headDim [[buffer(11)]],
+    constant uint32_t& kvWidth [[buffer(12)]],
+    constant uint32_t& keyRows [[buffer(13)]],
+    constant uint32_t& windowStart [[buffer(14)]],
+    constant uint32_t& position [[buffer(15)]],
+    constant uint32_t& dRel [[buffer(16)]],
+    constant uint32_t& extent [[buffer(17)]],
+    device float* scoreDump [[buffer(18)]],
+    constant bool& dumpsScores [[buffer(19)]],
+    threadgroup float* shared [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgSize [[threads_per_threadgroup]],
+    uint head [[threadgroup_position_in_grid]]
+) {
+    if (head >= heads || groups == 0) { return; }
+    uint kvHeads = heads / groups;
+    uint kvHead = head / groups;
+    device const float* q = query + ((uint64_t)head * headDim);
+    device const float* rel = relative + ((uint64_t)head * dRel);
+    device float* out = outVector + ((uint64_t)head * headDim);
+    float scaling = rsqrt((float)headDim);
+
+    threadgroup float* scores = shared + 32;
+    float localMax = -INFINITY;
+    for (uint row = 0; row < keyRows; row++) {
+        uint keyBase = (uint64_t)row * kvWidth + (uint64_t)kvHead * headDim;
+        float currentScale = float(keyScales[(uint64_t)row * kvHeads + kvHead]);
+        float localDot = 0.0f;
+        for (uint d = tid; d < headDim; d += tgSize) {
+            localDot += q[d] * (float(keys[keyBase + d]) * currentScale);
+        }
+        float dot = threadgroup_reduce_sum(localDot, shared, tid, tgSize);
+        int distance = (int)position - (int)(windowStart + row);
+        float bias = 0.0f;
+        if (distance >= 0 && distance < (int)extent) {
+            for (uint r = 0; r < dRel; r++) { bias += rel[r] * bank[r * extent + (uint)distance]; }
+        }
+        float score = dot * scaling + bias;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) { scores[row] = score; }
+        if (dumpsScores && head == 0 && tid == 0) { scoreDump[row] = score; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        localMax = max(localMax, score);
+    }
+    float maximum = max(localMax, sinkLogits[head]);
+    float denominator = exp(sinkLogits[head] - maximum);
+    for (uint row = 0; row < keyRows; row++) { denominator += exp(scores[row] - maximum); }
+
+    // Four independent accumulators per lane, for the same reason as the FP32
+    // kernel (a single chain is a dependent add per row); each row's value
+    // scale rides its own weight rather than the whole fold.
+    uint64_t column = ((uint64_t)kvHead * headDim);
+    for (uint d = tid; d < headDim; d += tgSize) {
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        uint row = 0;
+        for (; row + 4 <= keyRows; row += 4) {
+            float w0 = exp(scores[row] - maximum) / denominator
+                * float(valueScales[(uint64_t)row * kvHeads + kvHead]);
+            float w1 = exp(scores[row + 1] - maximum) / denominator
+                * float(valueScales[(uint64_t)(row + 1) * kvHeads + kvHead]);
+            float w2 = exp(scores[row + 2] - maximum) / denominator
+                * float(valueScales[(uint64_t)(row + 2) * kvHeads + kvHead]);
+            float w3 = exp(scores[row + 3] - maximum) / denominator
+                * float(valueScales[(uint64_t)(row + 3) * kvHeads + kvHead]);
+            a0 += w0 * float(values[(uint64_t)row * kvWidth + column + d]);
+            a1 += w1 * float(values[(uint64_t)(row + 1) * kvWidth + column + d]);
+            a2 += w2 * float(values[(uint64_t)(row + 2) * kvWidth + column + d]);
+            a3 += w3 * float(values[(uint64_t)(row + 3) * kvWidth + column + d]);
+        }
+        for (; row < keyRows; row++) {
+            float weight = exp(scores[row] - maximum) / denominator
+                * float(valueScales[(uint64_t)row * kvHeads + kvHead]);
+            a0 += weight * float(values[(uint64_t)row * kvWidth + column + d]);
+        }
+        out[d] = (a0 + a1) + (a2 + a3);
+    }
+}
+
 // E2M1 (FP4) decode of one nibble, and BF16 rounding, both matching
 // Inkling2Element.decodeE2M1 / roundToBF16 exactly -- the host rule the expert
 // kernel is checked against rounds each dequantized product to BF16 before it

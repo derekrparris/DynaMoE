@@ -310,6 +310,10 @@ public final class CompletionEngine: @unchecked Sendable {
     private var modelConfig: ModelConfig?
     private var tokenizer: DynaMoeTokenizer?
     private var shardBuffers: [UInt32: MTLBuffer] = [:]
+    /// Where each mapped shard's buffer starts inside its file, so a reader that
+    /// opens the file (an expert arena's `pread`) can address it after
+    /// segmentation. Empty when every buffer is a whole shard.
+    private var shardFileOrigins: [UInt32: UInt64] = [:]
     private var activeLoadedModelPath: String?
     private var cachedPromptDialect: DeepSeekV41PromptDialect?
     /// The DeepSeek-V4.1 runtime, kept across turns.
@@ -332,12 +336,20 @@ public final class CompletionEngine: @unchecked Sendable {
     /// the resident sequence away and re-prefill the whole conversation. It is
     /// the HOST graph (no Metal), so it holds no device memory beyond the shard
     /// buffers the app already mapped.
-    private var cachedInklingForward: (path: String, contextLength: Int, forward: Inkling2CPUForward)?
+    /// The storage is part of the identity: a sequence built for INT8 holds
+    /// byte rows, and reusing it under a turn that asked for FP32 (or the
+    /// reverse) would serve a cache whose form the reader did not expect.
+    private var cachedInklingForward: (
+        path: String, contextLength: Int, storage: Inkling2KVStorage, forward: Inkling2CPUForward
+    )?
     /// The device half of the same forward, built beside it from the same
     /// checkpoint: the host graph is the schedule and the oracle, and the
     /// executor substitutes a visit. Nil when Metal is unavailable, and the
     /// turn then runs wholly on the host.
-    private var cachedInklingDevice: (path: String, contextLength: Int, executor: Inkling2MetalForward, workspace: Inkling2DeviceWorkspace)?
+    private var cachedInklingDevice: (
+        path: String, contextLength: Int, storage: Inkling2KVStorage,
+        executor: Inkling2MetalForward, workspace: Inkling2DeviceWorkspace
+    )?
 
     /// The Inkling 2 image tower, built on the first image turn and kept.
     ///
@@ -639,6 +651,7 @@ public final class CompletionEngine: @unchecked Sendable {
             let path = activeLoadedModelPath
             let loadedSummary = summary
             let loadedShards = shardBuffers
+            let loadedOrigins = shardFileOrigins
             stateLock.unlock()
 
             guard let snapshotDir = path.map({ URL(fileURLWithPath: $0) }) else {
@@ -692,8 +705,23 @@ public final class CompletionEngine: @unchecked Sendable {
                 mainFile: loadedSummary.tensors.map { Inkling2TensorRef(metadata: $0) },
                 layerCount: inklingConfig.numHiddenLayers
             )
+            // How this turn's KV rows are held. FP32 is the reference graph's
+            // form and the default; `dynamoe_inkling_kv_storage=int8` selects
+            // DynaMoE's signed-byte contract, which the device attention reads
+            // directly (one byte per element plus an FP16 scale per KV head) and
+            // which is what makes a long conversation affordable here. It is read
+            // per turn because both the sequence and the device staging buffers
+            // are built for one storage form.
+            let inklingStorage = Inkling2KVStorage(
+                rawValue: UserDefaults.standard.string(forKey: "dynamoe_inkling_kv_storage") ?? ""
+            ) ?? .float32
             let memoryPlan = Inkling2MemoryPlan.make(
-                config: inklingConfig, catalog: catalog, contextLength: inklingConfig.maxPositionEmbeddings
+                config: inklingConfig, catalog: catalog,
+                contextLength: inklingConfig.maxPositionEmbeddings,
+                // Priced for what the sequence actually holds, so the INT8
+                // choice buys the context it claims. The per-head scales are
+                // ~1.5% of an INT8 record and deliberately not re-priced here.
+                kvElementBytes: inklingStorage.bytesPerElement
             )
             let contextLength = memoryPlan.affordableContextLength(
                 budgetGB: request.memory.budgetMode.targetMaxRssGB
@@ -744,10 +772,12 @@ public final class CompletionEngine: @unchecked Sendable {
             var deviceHalf: (executor: Inkling2MetalForward, workspace: Inkling2DeviceWorkspace)?
             stateLock.lock()
             if let cached = cachedInklingForward,
-               cached.path == snapshotDir.path, cached.contextLength >= contextLength {
+               cached.path == snapshotDir.path, cached.contextLength >= contextLength,
+               cached.storage == inklingStorage {
                 forward = cached.forward
                 if let device = cachedInklingDevice,
-                   device.path == snapshotDir.path, device.contextLength >= contextLength {
+                   device.path == snapshotDir.path, device.contextLength >= contextLength,
+                   device.storage == inklingStorage {
                     deviceHalf = (device.executor, device.workspace)
                     inklingDeviceHalfStatus = "cached"
                 }
@@ -760,10 +790,15 @@ public final class CompletionEngine: @unchecked Sendable {
                 let built = try Inkling2CPUForward(
                     config: inklingConfig,
                     weights: source,
-                    options: Inkling2ForwardOptions(maxPositions: contextLength)
+                    options: Inkling2ForwardOptions(
+                        maxPositions: contextLength, kvStorage: inklingStorage
+                    )
                 )
                 stateLock.lock()
-                cachedInklingForward = (path: snapshotDir.path, contextLength: contextLength, forward: built)
+                cachedInklingForward = (
+                    path: snapshotDir.path, contextLength: contextLength,
+                    storage: inklingStorage, forward: built
+                )
                 stateLock.unlock()
                 forward = built
             }
@@ -782,7 +817,8 @@ public final class CompletionEngine: @unchecked Sendable {
                    let queue = device.makeCommandQueue(),
                    let library = device.makeDefaultLibrary() {
                     let deviceWeights = Inkling2DeviceWeights(
-                        config: inklingConfig, catalog: catalog, shardBuffers: loadedShards
+                        config: inklingConfig, catalog: catalog, shardBuffers: loadedShards,
+                        fileOrigins: loadedOrigins
                     )
                     do {
                         let executor = try Inkling2MetalForward(
@@ -790,16 +826,17 @@ public final class CompletionEngine: @unchecked Sendable {
                             weights: deviceWeights, host: forward
                         )
                         let workspace = try Inkling2DeviceWorkspace(
-                            device: device, config: inklingConfig, stagedPositions: contextLength
+                            device: device, config: inklingConfig,
+                            stagedPositions: contextLength, storage: inklingStorage
                         )
                         stateLock.lock()
                         cachedInklingDevice = (
                             path: snapshotDir.path, contextLength: contextLength,
-                            executor: executor, workspace: workspace
+                            storage: inklingStorage, executor: executor, workspace: workspace
                         )
                         stateLock.unlock()
                         deviceHalf = (executor, workspace)
-                        inklingDeviceHalfStatus = "built at \(contextLength) positions"
+                        inklingDeviceHalfStatus = "built at \(contextLength) positions (\(inklingStorage.rawValue) KV)"
                     } catch {
                         inklingDeviceHalfStatus = "failed: \(error)"
                         DiagLog.warning(
@@ -12749,18 +12786,26 @@ if layer.attnGateProjTensor != nil,
     }
 
     /// Installs the loaded model snapshot; called from model load/switch.
+    ///
+    /// `shardFileOrigins` is where each mapped shard's buffer starts inside its
+    /// file: after segmentation a buffer's offsets are segment-relative, and a
+    /// reader that opens the file itself (an expert arena's `pread`) needs the
+    /// origin added back. Empty is correct for a model whose shards are whole
+    /// files.
     public func configure(
         summary: ModelSummary?,
         modelConfig: ModelConfig?,
         tokenizer: DynaMoeTokenizer?,
         shardBuffers: [UInt32: MTLBuffer],
-        activeLoadedModelPath: String?
+        activeLoadedModelPath: String?,
+        shardFileOrigins: [UInt32: UInt64] = [:]
     ) {
         stateLock.lock()
         self.summary = summary
         self.modelConfig = modelConfig
         self.tokenizer = tokenizer
         self.shardBuffers = shardBuffers
+        self.shardFileOrigins = shardFileOrigins
         self.activeLoadedModelPath = activeLoadedModelPath
         self.cachedPromptDialect = nil
         // A model switch retires the DeepSeek runtime with the checkpoint it was

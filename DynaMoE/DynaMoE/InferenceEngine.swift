@@ -1212,6 +1212,33 @@ public final class InferenceEngine {
             layers: summary.layers
         )
     }
+
+    /// The byte offset each segmented shard starts at inside the file it came
+    /// from, keyed by the segmented shard's index.
+    ///
+    /// Segmentation makes a tensor's offset relative to its SEGMENT, which is
+    /// right for a Metal buffer -- the buffer's base IS the segment's start --
+    /// and wrong for anything that addresses the FILE. An expert arena fills its
+    /// slots with `pread`, so handing it a segment-relative offset reads a
+    /// plausible range of the wrong bytes and reports no error; the origin has
+    /// to be added back. A segment's buffer starts `origin` bytes into the shard
+    /// it came from, so the two summaries' base addresses carry the answer, and
+    /// an unsplit shard's origin is zero.
+    public static func shardFileOrigins(
+        original: ModelSummary, segmented: ModelSummary
+    ) -> [UInt32: UInt64] {
+        var origins: [UInt32: UInt64] = [:]
+        for shard in original.shards {
+            for candidate in segmented.shards
+            where candidate.filename == shard.filename
+                || candidate.filename.hasPrefix(shard.filename + "#") {
+                origins[candidate.index] = candidate.baseAddress >= shard.baseAddress
+                    ? candidate.baseAddress - shard.baseAddress
+                    : 0
+            }
+        }
+        return origins
+    }
 }
 
 extension TensorMetadata {

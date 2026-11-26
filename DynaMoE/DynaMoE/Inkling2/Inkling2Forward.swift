@@ -135,10 +135,19 @@ nonisolated public struct Inkling2ForwardOptions: Sendable, Equatable {
     /// instead of a process that grows until it is killed. A ring visit is not
     /// affected: it holds at most its window.
     public var maxPositions: Int?
+    /// How every visit holds its KV rows. FP32 is the reference graph's own
+    /// form; `.int8` is the DynaMoE KV contract, and it must be chosen when the
+    /// turn is built (the device staging buffers are laid out for it).
+    public var kvStorage: Inkling2KVStorage
 
-    public init(activationProfile: Inkling2ActivationProfile = .hfReference, maxPositions: Int? = nil) {
+    public init(
+        activationProfile: Inkling2ActivationProfile = .hfReference,
+        maxPositions: Int? = nil,
+        kvStorage: Inkling2KVStorage = .float32
+    ) {
         self.activationProfile = activationProfile
         self.maxPositions = maxPositions
+        self.kvStorage = kvStorage
     }
 }
 
@@ -240,7 +249,15 @@ nonisolated public final class Inkling2CPUForward {
             kvWidth: kvWidth,
             hidden: config.hiddenSize,
             historyDepth: max(0, config.convKernelSize - 1),
-            maxPositions: options.maxPositions ?? config.maxPositionEmbeddings
+            maxPositions: options.maxPositions ?? config.maxPositionEmbeddings,
+            storage: options.kvStorage,
+            kvHeads: config.numKeyValueHeads,
+            // A local visit has its own head geometry, and an INT8 scale covers
+            // exactly one KV head: a single count for the whole sequence would
+            // put a sliding layer's scales over the wrong spans.
+            headsByVisit: plan.map {
+                $0.isFullAttention ? config.numKeyValueHeads : config.swaNumKeyValueHeads
+            }
         )
     }
 
@@ -1068,7 +1085,13 @@ nonisolated public final class Inkling2CPUForward {
             sinkLogits[head] = total
         }
         onInternal?(visitIndexForDebug, "sink", sinkLogits)
-        onInternal?(visitIndexForDebug, "bias_head0", (0..<state.keys.count).map { row in
+        // The cache read ONCE for the whole stage. In INT8 storage `keys` and
+        // `values` dequantize as they are asked for, so `state.keys[row]` inside
+        // these loops would decode every retained row again for every row of
+        // every head -- a quadratic copy of the whole window per position.
+        let cachedKeys = state.keys
+        let cachedValues = state.values
+        onInternal?(visitIndexForDebug, "bias_head0", (0..<cachedKeys.count).map { row in
             let distance = position - (state.windowStart + row)
             guard distance >= 0, distance < extent else { return 0 }
             var total: Float = 0
@@ -1082,10 +1105,10 @@ nonisolated public final class Inkling2CPUForward {
         var attentionOutput = [Float](repeating: 0, count: heads * headDim)
         for head in 0..<heads {
             let kvHead = head / groups
-            let count = state.keys.count
+            let count = cachedKeys.count
             var scores = [Float](repeating: 0, count: count)
             for row in 0..<count {
-                let keyRow = state.keys[row]
+                let keyRow = cachedKeys[row]
                 var dot: Float = 0
                 for dimension in 0..<headDim {
                     dot += query[head * headDim + dimension] * keyRow[kvHead * headDim + dimension]
@@ -1114,7 +1137,7 @@ nonisolated public final class Inkling2CPUForward {
             }
             for row in 0..<count {
                 let weight = exponentials[row] / denominator
-                let valueRow = state.values[row]
+                let valueRow = cachedValues[row]
                 for dimension in 0..<headDim {
                     attentionOutput[head * headDim + dimension] += weight * valueRow[kvHead * headDim + dimension]
                 }

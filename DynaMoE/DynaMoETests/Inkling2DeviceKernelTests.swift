@@ -73,6 +73,33 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         )
     }
 
+    /// An INT8 KV row block, as `inkling_attention_int8_f32` reads it.
+    private func bytes(_ device: MTLDevice, _ values: [Int8]) throws -> MTLBuffer {
+        try XCTUnwrap(
+            device.makeBuffer(bytes: values, length: values.count * MemoryLayout<Int8>.stride,
+                              options: .storageModeShared),
+            "could not make a byte buffer"
+        )
+    }
+
+    /// FP16 scale bits, which the kernel binds as `device const half*`.
+    private func bits(_ device: MTLDevice, _ values: [UInt16]) throws -> MTLBuffer {
+        try XCTUnwrap(
+            device.makeBuffer(bytes: values, length: values.count * MemoryLayout<UInt16>.stride,
+                              options: .storageModeShared),
+            "could not make a scale buffer"
+        )
+    }
+
+    /// A one-byte `constant bool`.
+    private func flag(_ device: MTLDevice, _ value: Bool) throws -> MTLBuffer {
+        var byte = value ? UInt8(1) : UInt8(0)
+        return try XCTUnwrap(
+            device.makeBuffer(bytes: &byte, length: 1, options: .storageModeShared),
+            "could not make a flag buffer"
+        )
+    }
+
     /// Dispatches a grid of THREADS (`dispatchThreads`) or of THREADGROUPS
     /// (`dispatchThreadgroups`). A kernel that indexes by
     /// `threadgroup_position_in_grid` needs the latter: with `dispatchThreads`
@@ -774,6 +801,210 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         }
     }
 
+    /// A REAL expert bank's slot, filled by `pread` from the checkpoint file,
+    /// byte for byte.
+    ///
+    /// The slot is filled from FILE offsets while the mixture reads SEGMENT
+    /// offsets: on a machine whose shard is split to fit `maxBufferLength` the
+    /// two differ by the segment's origin, and a slot filled without it holds a
+    /// plausible range of the wrong bytes -- no crash, no error, just a wrong
+    /// model. That is the failure this pins, so it is checked against the mmap
+    /// the mixture uses rather than against itself.
+    func testAPublishedBankFillsItsSlotWithTheBanksOwnBytes() throws {
+        let snapshot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(Inkling2PublishedTensorTests.snapshotRelativePath)
+        guard FileManager.default.fileExists(atPath: snapshot.path) else {
+            throw XCTSkip("Inkling 2 snapshot is not downloaded at \(snapshot.path)")
+        }
+        let (device, _, _) = try environment()
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let rawSummary = try engine.getSummary()
+        let summary = try inkling2MetalReadySummary(rawSummary)
+        let config = try Inkling2Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let catalog = Inkling2WeightCatalog(
+            mainFile: summary.tensors.map { Inkling2TensorRef(metadata: $0) },
+            layerCount: config.numHiddenLayers
+        )
+        let shardBuffers = try inkling2MetalShardBuffers(summary, device: device)
+        let origins = InferenceEngine.shardFileOrigins(original: rawSummary, segmented: summary)
+        let weights = Inkling2DeviceWeights(
+            config: config, catalog: catalog, shardBuffers: shardBuffers, fileOrigins: origins
+        )
+        let layer = 0, expert = 1
+        let gateUp = try weights.expertBank(.expertW13, layer: layer, expert: expert)
+        let down = try weights.expertBank(.expertW2, layer: layer, expert: expert)
+        let geometry = try XCTUnwrap(Inkling2ExpertSlotGeometry.make(
+            gateUpRows: 2 * config.moeIntermediateSize,
+            gateUpRowStride: gateUp.rowStride,
+            gateUpScaleRowStride: gateUp.scaleRowStride,
+            downRows: config.hiddenSize,
+            downRowStride: down.rowStride,
+            downScaleRowStride: down.scaleRowStride
+        ))
+
+        // A slot is a copy at FIXED strides, and the published checkpoint mixes
+        // layouts: layers 0...19 are NVFP4 (a 1,152-byte packed `w13` row) and
+        // the last four are MXFP8 (2,304 bytes). The arena must refuse the
+        // latter rather than copy the first half of each row into a slot.
+        XCTAssertTrue(geometry.holds(
+            weightRowStride: gateUp.rowStride, scaleRowStride: gateUp.scaleRowStride,
+            downWeightRowStride: down.rowStride, downScaleRowStride: down.scaleRowStride
+        ))
+        let lateGateUp = try weights.expertBank(
+            .expertW13, layer: config.numHiddenLayers - 1, expert: 0
+        )
+        let lateDown = try weights.expertBank(
+            .expertW2, layer: config.numHiddenLayers - 1, expert: 0
+        )
+        XCTAssertNotEqual(
+            lateGateUp.rowStride, gateUp.rowStride,
+            "the published checkpoint is expected to mix quantized layouts between layers"
+        )
+        XCTAssertFalse(geometry.holds(
+            weightRowStride: lateGateUp.rowStride, scaleRowStride: lateGateUp.scaleRowStride,
+            downWeightRowStride: lateDown.rowStride, downScaleRowStride: lateDown.scaleRowStride
+        ), "an MXFP8 bank must not be copied into an NVFP4 slot")
+
+
+        // The checkpoint's weights file: the largest safetensors beside the
+        // config, and the one the catalog's offsets are relative to.
+        let directory = snapshot.resolvingSymlinksInPath()
+        let files = try FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: [.fileSizeKey]
+        )
+        let shardURL = try XCTUnwrap(files.filter { $0.pathExtension == "safetensors" }.max { lhs, rhs in
+            let left = (try? lhs.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            let right = (try? rhs.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            return left < right
+        })
+        let reader = try Inkling2ArenaShardReader(url: shardURL)
+
+        let arena = Inkling2ExpertArena(capacity: 1, geometry: geometry)
+        let slotBuffer = try XCTUnwrap(device.makeBuffer(
+            length: geometry.slotBytes, options: .storageModeShared
+        ))
+        arena.attachSlotBuffer(slotBuffer)
+        let slot = try arena.slot(
+            layer: layer, expert: expert, reader: reader,
+            gateUpSourceOffset: gateUp.fileWeightOffset,
+            gateUpScaleSourceOffset: gateUp.fileScaleOffset,
+            downSourceOffset: down.fileWeightOffset,
+            downScaleSourceOffset: down.fileScaleOffset
+        )
+        let slotPointer = slotBuffer.contents().bindMemory(to: UInt8.self, capacity: geometry.slotBytes)
+
+        /// Every byte of a range, against the mmap the mixture reads.
+        func compare(
+            _ label: String, buffer: MTLBuffer, offset: UInt64, slotOffset: Int, length: Int
+        ) {
+            let source = buffer.contents().advanced(by: Int(offset))
+                .bindMemory(to: UInt8.self, capacity: length)
+            var differing = 0
+            var firstDifference = -1
+            for index in 0..<length where slotPointer[slot * geometry.slotBytes + slotOffset + index] != source[index] {
+                if firstDifference < 0 { firstDifference = index }
+                differing += 1
+            }
+            XCTAssertEqual(
+                differing, 0,
+                "\(label): \(differing) of \(length) bytes differ from the mmap"
+                    + (firstDifference >= 0 ? ", first at \(firstDifference)" : "")
+            )
+        }
+        compare(
+            "gate/up weight", buffer: gateUp.buffer, offset: gateUp.baseOffset + gateUp.expertOffset,
+            slotOffset: geometry.gateUpWeightOffset, length: geometry.gateUpWeightBytes
+        )
+        compare(
+            "gate/up scale", buffer: gateUp.scaleBuffer,
+            offset: gateUp.scaleBaseOffset + gateUp.scaleExpertOffset,
+            slotOffset: geometry.gateUpScaleOffset, length: geometry.gateUpScaleBytes
+        )
+        compare(
+            "down weight", buffer: down.buffer, offset: down.baseOffset + down.expertOffset,
+            slotOffset: geometry.downWeightOffset, length: geometry.downWeightBytes
+        )
+        compare(
+            "down scale", buffer: down.scaleBuffer,
+            offset: down.scaleBaseOffset + down.scaleExpertOffset,
+            slotOffset: geometry.downScaleOffset, length: geometry.downScaleBytes
+        )
+        // A slot of zeros would pass a comparison against another zeroed file,
+        // so the weight range is also required to be non-trivial.
+        XCTAssertGreaterThan(Set((0..<min(4096, geometry.gateUpWeightBytes))
+            .map { slotPointer[slot * geometry.slotBytes + $0] }).count, 8)
+
+        // And the PROJECTION, which is what the mixture actually consumes: the
+        // slot read through `inkling_expert_row_f32` must agree with the HOST
+        // rule (`Inkling2PackedExpertMatrix.project`), which is the oracle the
+        // checkpoint's own reference matches.
+        let (_, library, queue) = try environment()
+        let hostSource = Inkling2SnapshotWeights(
+            config: config, catalog: catalog, shardBuffers: shardBuffers
+        )
+        let host = try Inkling2CPUForward(config: config, weights: hostSource)
+        let metal = try Inkling2MetalForward(
+            device: device, library: library, queue: queue, weights: weights, host: host
+        )
+        let scalars = Inkling2ScalarArena(device: device)
+        defer { scalars.clear() }
+        for (isGateUp, rows, columns) in [
+            (true, 2 * config.moeIntermediateSize, config.hiddenSize),
+            (false, config.hiddenSize, config.moeIntermediateSize)
+        ] {
+            let input = values(columns, seed: isGateUp ? 61 : 62)
+            let inputBuffer = try buffer(device, input)
+            let fromSlot = try XCTUnwrap(device.makeBuffer(
+                length: rows * MemoryLayout<Float>.stride, options: .storageModeShared
+            ))
+            let bank = isGateUp ? gateUp : down
+            let outerScale: Float = bank.layout.requiresAmaxDenominator && bank.denominator > 0
+                ? bank.amax / bank.denominator : 1
+            let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+            let encoder = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
+            try metal.slotExpertRow(
+                encoder: encoder, slot: slotBuffer, slotBaseOffset: slot * geometry.slotBytes,
+                address: geometry.slotAddress, isGateUp: isGateUp,
+                input: inputBuffer, output: fromSlot, rows: rows, logicalColumns: columns,
+                layout: bank.layout, outerScale: outerScale, arena: scalars
+            )
+            encoder.endEncoding()
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            if let error = commandBuffer.error { throw error }
+
+            let resident = read(fromSlot, rows)
+            let hostMatrix = try hostSource.expertMatrix(
+                isGateUp ? .expertW13 : .expertW2, layer: layer, expert: expert
+            )
+            var worst: Float = 0
+            var worstRow = 0
+            var scale: Float = 0
+            for row in 0..<rows {
+                // A few rows through the host rule, not all of them: the host
+                // dequantizes 2,304 x 2,304 values per call, and the first rows
+                // already separate a wrong stride from an accumulation order.
+                let expected: Float = row < 8 ? hostMatrix.project(row: row, input: input) : resident[row]
+                scale = max(scale, abs(expected))
+                let delta = abs(resident[row] - expected)
+                if delta > worst { worst = delta; worstRow = row }
+            }
+            print(
+                String(
+                    format: "🔎 [inkling2 slot] %@: worst row %d of %d at %.2e absolute (scale %.2e)",
+                    isGateUp ? "gate/up" : "down", worstRow, rows, worst, scale
+                )
+            )
+            XCTAssertLessThanOrEqual(
+                worst, max(1e-5, scale * 1e-5),
+                "\(isGateUp ? "gate/up" : "down") row \(worstRow): a resident slot must project as the host rule"
+            )
+        }
+        withExtendedLifetime(engine) {}
+    }
+
     // MARK: Routing
 
     /// The router's selection and weighting against `Inkling2Math.route`.
@@ -946,7 +1177,7 @@ final class Inkling2DeviceKernelTests: XCTestCase {
 
         // The device: the same state staged, and the host's own captured
         // inputs (query, post-clip relative vector, sink) plus the same weights.
-        let rows = workspace.stage(state)
+        let rows = try workspace.stage(state)
         XCTAssertEqual(rows, state.keys.count)
 
         // The query goes into the WORKSPACE, which is the buffer the attention
@@ -1004,6 +1235,246 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         print("🔎 [inkling2 device] attention: worst head \(worstHead) at \(worstError) relative over \(rows) row(s)")
         XCTAssertLessThanOrEqual(worstError, 1e-4, "head \(worstHead) of the device attention against the host graph")
         withExtendedLifetime(engine) {}
+    }
+
+    // MARK: The INT8 KV attention
+
+    /// The INT8 attention over a cache the HOST quantized, against the host
+    /// rule's own dequantization (`stored * scale`), on a fixture where every
+    /// plausible bug is visible:
+    ///
+    ///   * `headDim = 8` and a 32-lane threadgroup, so the strided loops' tails
+    ///     run and a lane count assumed equal to the head width fails;
+    ///   * two KV heads over four query heads, so a wrong KV-head mapping is
+    ///     exact on every second head and wrong from the first one that shares;
+    ///   * per-(row, head) scales of DIFFERENT magnitudes, so a row-wide scale
+    ///     (or one read at the wrong stride) changes the score;
+    ///   * `position` one past `windowStart + rows`, so the last row is at a
+    ///     negative distance and its bias must be zero.
+    ///
+    /// The rows are quantized by `Inkling2KVQuantization.stored`, which is the
+    /// same contract the kernel reads, so this also pins the two sides to each
+    /// other rather than to a fixture of hand-written bytes.
+    func testTheInt8AttentionMatchesTheHostRule() throws {
+        let (device, _, _) = try environment()
+        let heads = 4, kvHeads = 2, headDim = 8
+        let kvWidth = kvHeads * headDim
+        let keyRows = 5, dRel = 3, extent = 6
+        let windowStart = 3, position = 6
+
+        let query = values(heads * headDim, seed: 71)
+        let keyRowsFloat: [[Float]] = (0..<keyRows).map { row in
+            values(kvWidth, seed: 72 + row)
+        }
+        let valueRowsFloat: [[Float]] = (0..<keyRows).map { row in
+            // A wider range than the keys: a dropped value scale is then a
+            // visible error rather than a rounding difference.
+            values(kvWidth, seed: 82 + row).map { $0 * 6 }
+        }
+        // The rows are quantized by the HOST cache, per (row, KV head), so this
+        // pins the kernel to the same contract the sequence writes rather than
+        // to a fixture of hand-written bytes.
+        let state = Inkling2VisitState(
+            isFullAttention: true, window: extent, stateWidths: [kvWidth, kvWidth, 64, 64],
+            historyDepth: 3, maxRows: keyRows, storage: .int8, heads: kvHeads
+        )
+        for row in 0..<keyRows {
+            _ = state.append(key: keyRowsFloat[row], value: valueRowsFloat[row])
+        }
+        let relative = values(heads * dRel, seed: 92)
+        let bank = values(dRel * extent, seed: 93)
+        let sink = values(heads, seed: 94)
+
+        var keyBytes = [Int8](repeating: 0, count: keyRows * kvWidth)
+        var valueBytes = [Int8](repeating: 0, count: keyRows * kvWidth)
+        var keyScaleBits = [UInt16](repeating: 0, count: keyRows * kvHeads)
+        var valueScaleBits = [UInt16](repeating: 0, count: keyRows * kvHeads)
+        for row in 0..<keyRows {
+            let key = try XCTUnwrap(state.quantizedKey(row))
+            let value = try XCTUnwrap(state.quantizedValue(row))
+            keyBytes.replaceSubrange((row * kvWidth)..<((row + 1) * kvWidth), with: key.stored)
+            valueBytes.replaceSubrange((row * kvWidth)..<((row + 1) * kvWidth), with: value.stored)
+            keyScaleBits.replaceSubrange((row * kvHeads)..<((row + 1) * kvHeads), with: key.scales)
+            valueScaleBits.replaceSubrange((row * kvHeads)..<((row + 1) * kvHeads), with: value.scales)
+        }
+
+        let queryBuffer = try buffer(device, query)
+        let keyBuffer = try bytes(device, keyBytes)
+        let valueBuffer = try bytes(device, valueBytes)
+        let keyScaleBuffer = try bits(device, keyScaleBits)
+        let valueScaleBuffer = try bits(device, valueScaleBits)
+        let relativeBuffer = try buffer(device, relative)
+        let bankBuffer = try buffer(device, bank)
+        let sinkBuffer = try buffer(device, sink)
+        let outputBuffer = try buffer(device, [Float](repeating: 0, count: heads * headDim))
+        let dumpBuffer = try buffer(device, [Float](repeating: 0, count: keyRows))
+        let constants = try [
+            UInt32(heads), UInt32(heads / kvHeads), UInt32(headDim), UInt32(kvWidth),
+            UInt32(keyRows), UInt32(windowStart), UInt32(position), UInt32(dRel), UInt32(extent)
+        ].map { try buffer(device, [$0]) }
+        let dumps = try flag(device, false)
+        try run(
+            "inkling_attention_int8_f32", threads: (heads, 1, 1), threadgroup: (32, 1, 1),
+            threadgroupMemory: (32 + keyRows) * MemoryLayout<Float>.stride, byThreadgroup: true
+        ) { encoder in
+            encoder.setBuffer(queryBuffer, offset: 0, index: 0)
+            encoder.setBuffer(keyBuffer, offset: 0, index: 1)
+            encoder.setBuffer(valueBuffer, offset: 0, index: 2)
+            encoder.setBuffer(keyScaleBuffer, offset: 0, index: 3)
+            encoder.setBuffer(valueScaleBuffer, offset: 0, index: 4)
+            encoder.setBuffer(relativeBuffer, offset: 0, index: 5)
+            encoder.setBuffer(bankBuffer, offset: 0, index: 6)
+            encoder.setBuffer(sinkBuffer, offset: 0, index: 7)
+            encoder.setBuffer(outputBuffer, offset: 0, index: 8)
+            for (index, constant) in constants.enumerated() {
+                encoder.setBuffer(constant, offset: 0, index: 9 + index)
+            }
+            encoder.setBuffer(dumpBuffer, offset: 0, index: 18)
+            encoder.setBuffer(dumps, offset: 0, index: 19)
+        }
+        let actual = read(outputBuffer, heads * headDim)
+
+        // The host rule, element by element: `stored * scale` per element, a
+        // softmax over the rows plus the sink, then the weighted value rows.
+        let scaling = 1 / Float(headDim).squareRoot()
+        var expected = [Float](repeating: 0, count: heads * headDim)
+        for head in 0..<heads {
+            let kvHead = head / (heads / kvHeads)
+            var scores = [Float](repeating: 0, count: keyRows)
+            for row in 0..<keyRows {
+                var dot: Float = 0
+                for dimension in 0..<headDim {
+                    let byte = keyBytes[row * kvWidth + kvHead * headDim + dimension]
+                    dot += query[head * headDim + dimension]
+                        * Inkling2KVQuantization.load(byte, scale: keyScaleBits[row * kvHeads + kvHead])
+                }
+                let distance = position - (windowStart + row)
+                var bias: Float = 0
+                if distance >= 0, distance < extent {
+                    for r in 0..<dRel { bias += relative[head * dRel + r] * bank[r * extent + distance] }
+                }
+                scores[row] = dot * scaling + bias
+            }
+            var combined = scores
+            combined.append(sink[head])
+            let maximum = combined.max() ?? 0
+            let exponentials = combined.map { exp($0 - maximum) }
+            let denominator = exponentials.reduce(0, +)
+            for row in 0..<keyRows {
+                let weight = exponentials[row] / denominator
+                for dimension in 0..<headDim {
+                    let byte = valueBytes[row * kvWidth + kvHead * headDim + dimension]
+                    expected[head * headDim + dimension] += weight
+                        * Inkling2KVQuantization.load(byte, scale: valueScaleBits[row * kvHeads + kvHead])
+                }
+            }
+        }
+        for index in actual.indices {
+            XCTAssertEqual(actual[index], expected[index], accuracy: 2e-5, "element \(index)")
+        }
+        // The fixture is not degenerate: the four heads disagree, and the
+        // output is not the sink-only zero vector a missing row would leave.
+        XCTAssertGreaterThan(Set((0..<heads).map { actual[$0 * headDim] }).count, 1)
+        XCTAssertGreaterThan(abs(actual[0]), 1e-4)
+    }
+
+    /// An INT8 visit stages its rows as BYTES plus a per-head scale block, and
+    /// a visit in the other storage is refused rather than misread.
+    ///
+    /// The workspace is where the storage choice is spent on memory: the INT8
+    /// staging buffer is a quarter of the FP32 one, and the scales are a small
+    /// block beside it rather than being decoded into the rows.
+    func testAnInt8VisitStagesItsCompactRows() throws {
+        let (device, _, _) = try environment()
+        let config = try Inkling2Config.decode(jsonData: Data(Inkling2ConfigTests.smallJSON.utf8))
+        let kvWidth = config.numKeyValueHeads * config.headDim
+        let capacity = 6
+        let quantized = try Inkling2DeviceWorkspace(
+            device: device, config: config, stagedPositions: capacity, storage: .int8
+        )
+        let reference = try Inkling2DeviceWorkspace(
+            device: device, config: config, stagedPositions: capacity, storage: .float32
+        )
+        XCTAssertEqual(quantized.stagedStorage, .int8)
+        XCTAssertEqual(reference.stagedStorage, .float32)
+        XCTAssertEqual(quantized.stagedKeys.length * 4, reference.stagedKeys.length)
+        XCTAssertEqual(quantized.stagedValues.length * 4, reference.stagedValues.length)
+
+        let state = Inkling2VisitState(
+            isFullAttention: true, window: 8, stateWidths: [kvWidth, kvWidth, 64, 64],
+            historyDepth: 3, maxRows: capacity, storage: .int8, heads: config.numKeyValueHeads
+        )
+        // The second KV head is two orders of magnitude larger than the first,
+        // so a row-wide scale (or a scale block read at the wrong stride) is a
+        // different set of numbers rather than a rounding difference.
+        let headWidth = kvWidth / config.numKeyValueHeads
+        func row(seed: Int) -> [Float] {
+            let base = values(kvWidth, seed: seed)
+            return (0..<kvWidth).map { index in
+                index < headWidth ? base[index] * 0.01 : base[index]
+            }
+        }
+        for index in 0..<3 {
+            _ = state.append(key: row(seed: 100 + index), value: row(seed: 110 + index))
+        }
+        let rows = try quantized.stage(state)
+        XCTAssertEqual(rows, 3)
+
+        let keyPointer = quantized.stagedKeys.contents().bindMemory(
+            to: Int8.self, capacity: rows * kvWidth
+        )
+        let valuePointer = quantized.stagedValues.contents().bindMemory(
+            to: Int8.self, capacity: rows * kvWidth
+        )
+        let keyScalePointer = quantized.stagedKeyScales.contents().bindMemory(
+            to: UInt16.self, capacity: rows * config.numKeyValueHeads
+        )
+        let valueScalePointer = quantized.stagedValueScales.contents().bindMemory(
+            to: UInt16.self, capacity: rows * config.numKeyValueHeads
+        )
+        for row in 0..<rows {
+            let key = try XCTUnwrap(state.quantizedKey(row))
+            let value = try XCTUnwrap(state.quantizedValue(row))
+            XCTAssertEqual(
+                Array(UnsafeBufferPointer(start: keyPointer + row * kvWidth, count: kvWidth)),
+                key.stored, "row \(row) key bytes"
+            )
+            XCTAssertEqual(
+                Array(UnsafeBufferPointer(start: valuePointer + row * kvWidth, count: kvWidth)),
+                value.stored, "row \(row) value bytes"
+            )
+            XCTAssertEqual(
+                Array(UnsafeBufferPointer(
+                    start: keyScalePointer + row * config.numKeyValueHeads,
+                    count: config.numKeyValueHeads
+                )),
+                key.scales, "row \(row) key scales"
+            )
+            XCTAssertEqual(
+                Array(UnsafeBufferPointer(
+                    start: valueScalePointer + row * config.numKeyValueHeads,
+                    count: config.numKeyValueHeads
+                )),
+                value.scales, "row \(row) value scales"
+            )
+            // The heads are scaled SEPARATELY; a row-wide scale would give the
+            // same bits for both.
+            XCTAssertNotEqual(Set(key.scales).count, 1, "row \(row) shares one scale across heads")
+        }
+
+        // A visit in the other storage is a wrong number, not an error the GPU
+        // would report, so staging must refuse it.
+        let plain = Inkling2VisitState(
+            isFullAttention: true, window: 8, stateWidths: [kvWidth, kvWidth, 64, 64],
+            historyDepth: 3, maxRows: capacity, storage: .float32, heads: config.numKeyValueHeads
+        )
+        _ = plain.append(key: values(kvWidth, seed: 7), value: values(kvWidth, seed: 8))
+        XCTAssertThrowsError(try quantized.stage(plain)) { error in
+            XCTAssertTrue(
+                "\(error)".contains("float32"),
+                "the refusal must name the storage it was handed, got: \(error)"
+            )
+        }
     }
 
     /// The whole attention half against the host's `attention`, on the real
@@ -1293,7 +1764,7 @@ final class Inkling2DeviceKernelTests: XCTestCase {
                 workspace.bank, [Float](repeating: 0.02, count: config.dRel * config.slidingWindowSize)
             )
             let sink = try staging(workspace.sinkLogits, [Float](repeating: 0.5, count: heads))
-            let rows = workspace.stage(state)
+            let rows = try workspace.stage(state)
             try metal.attention(
                 encoder: encoder, workspace: workspace, state: state, rows: rows,
                 position: 3, relative: relative, bank: bank, sink: sink,

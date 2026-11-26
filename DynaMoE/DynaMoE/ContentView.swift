@@ -9145,7 +9145,14 @@ struct ContentView: View {
                 // maxBufferLength, which is far below the shard size. Split any such
                 // shard into per-buffer segments, remapping tensor offsets so the
                 // rest of the engine keeps addressing tensors by (shardIndex, offset).
+                let unsegmentedSummary = loadedSummary
                 loadedSummary = try InferenceEngine.segmentShardsForMetal(loadedSummary, maxBufferLength: UInt64(device.maxBufferLength))
+                // Where each segment starts inside its file. A reader that opens
+                // the file itself (the expert arena) addresses it with these;
+                // without them a segmented model reads the wrong bytes silently.
+                let shardFileOrigins = InferenceEngine.shardFileOrigins(
+                    original: unsegmentedSummary, segmented: loadedSummary
+                )
                 var buffers: [UInt32: MTLBuffer] = [:]
                 var mappedGB: Double = 0.0
                 
@@ -9314,7 +9321,7 @@ struct ContentView: View {
                     self.activeLoadedModelPath = filePath
                     // Publish the installed model to the headless engine (chat UI
                     // and API server share this one runtime snapshot).
-                    CompletionEngine.shared.configure(summary: loadedSummary, modelConfig: cfg, tokenizer: tok, shardBuffers: buffers, activeLoadedModelPath: filePath)
+                    CompletionEngine.shared.configure(summary: loadedSummary, modelConfig: cfg, tokenizer: tok, shardBuffers: buffers, activeLoadedModelPath: filePath, shardFileOrigins: shardFileOrigins)
                     // The engine is actually installed now; this is what
                     // `ensureModelLoaded` verifies before an async send.
                     self.installedModelPath = filePath

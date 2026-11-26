@@ -192,6 +192,13 @@ final class Inkling2StageTimingTests: XCTestCase {
         // Cumulative on the arena's side: the latest snapshot wins, it does not sum.
         profile.recordArena(counters)
         XCTAssertEqual(profile.arena?.hits, 7)
+
+        // An expert the slot layout cannot hold never entered the arena, so it
+        // must be named rather than counted as a miss.
+        counters.incompatible = 2
+        profile.recordArena(counters)
+        let refused = profile.describe(label: "unit")
+        XCTAssertTrue(refused.contains("2 refused"), refused)
     }
 
     /// The stage list is the visit's own structure, and the three stages that
@@ -323,7 +330,8 @@ final class Inkling2VisitProfileTests: XCTestCase {
         let directory = try snapshot()
         let engine = try DynaMoeEngine(filePath: directory.path)
         self.engine = engine
-        let summary = try inkling2MetalReadySummary(try engine.getSummary())
+        let rawSummary = try engine.getSummary()
+        let summary = try inkling2MetalReadySummary(rawSummary)
         let config = try Inkling2Config.decode(
             contentsOf: directory.appendingPathComponent("config.json")
         )
@@ -345,7 +353,11 @@ final class Inkling2VisitProfileTests: XCTestCase {
             options: Inkling2ForwardOptions(maxPositions: stagedPositions)
         )
         let deviceWeights = Inkling2DeviceWeights(
-            config: config, catalog: catalog, shardBuffers: buffers
+            config: config, catalog: catalog, shardBuffers: buffers,
+            // A segmented shard's offsets are segment-relative while the arena
+            // reads the FILE: without these origins its slots would hold the
+            // wrong bytes and no error would be raised.
+            fileOrigins: InferenceEngine.shardFileOrigins(original: rawSummary, segmented: summary)
         )
         let metal = try Inkling2MetalForward(
             device: device, library: library, queue: queue, weights: deviceWeights, host: forward
@@ -556,5 +568,151 @@ final class Inkling2VisitProfileTests: XCTestCase {
             )
         }
         XCTAssertGreaterThan(profile.wallNanoseconds, 0)
+    }
+
+    // MARK: The cold/warm arena comparison
+
+
+    /// Does a bounded resident expert set pay on the published checkpoint?
+    ///
+    /// The pipeline streams ~1.75 GB of routed expert banks per position
+    /// (384 expert slices), and on a 16 GB machine the expert banks do not fit
+    /// the page cache beside the model, so the mmap path is re-reading them from
+    /// SSD. A resident arena trades RAM for those reads: a hit costs a slot
+    /// lookup, a miss costs the same `pread` the mmap path pays as page faults
+    /// plus a `memcpy` into the slot.
+    ///
+    /// `-O` only, and opt-in (`touch /tmp/dynamoe_inkling2_arena`), because it
+    /// reads gigabytes of banks per position. It REPORTS the comparison and
+    /// asserts only that its own numbers are not lies: the arena arm filled and
+    /// hit slots, and its logits are not degenerate. Fidelity is pinned where it
+    /// can be exact -- `testAPublishedBankFillsItsSlotWithTheBanksOwnBytes`
+    /// compares the slot against the HOST rule.
+    func testTheExpertArenaColdWarmComparisonOnThePublishedCheckpoint() throws {
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_arena"),
+            "opt-in arena measurement; touch /tmp/dynamoe_inkling2_arena to run"
+        )
+        // The snapshot directory, RESOLVED: the tests reach the checkpoint
+        // through a revision symlink, and a listing of a symlinked directory
+        // reports ENOTDIR rather than following it.
+        let directory = try snapshot().resolvingSymlinksInPath()
+        let harness = try harness()
+        let config = harness.config
+        let metal = harness.metal
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+
+        // The geometry is the checkpoint's own: every stride is taken from the
+        // stored bank shapes, so the slot is exactly the four ranges the mixture
+        // reads out of the mmap.
+        let gateUp = try metal.weights.expertBank(.expertW13, layer: 0, expert: 0)
+        let down = try metal.weights.expertBank(.expertW2, layer: 0, expert: 0)
+        let geometry = try XCTUnwrap(Inkling2ExpertSlotGeometry.make(
+            gateUpRows: 2 * config.moeIntermediateSize,
+            gateUpRowStride: gateUp.rowStride,
+            gateUpScaleRowStride: gateUp.scaleRowStride,
+            downRows: config.hiddenSize,
+            downRowStride: down.rowStride,
+            downScaleRowStride: down.scaleRowStride
+        ))
+        let capacity = 256
+        let arenaBytes = capacity * geometry.slotBytes
+        XCTAssertLessThanOrEqual(arenaBytes, Int(device.maxBufferLength))
+        print(
+            "🔎 [inkling2 arena] one slot \(String(format: "%.2f", Double(geometry.slotBytes) / 1_048_576)) MB, "
+                + "\(capacity) slot(s) = \(String(format: "%.2f", Double(arenaBytes) / 1_073_741_824)) GB"
+        )
+        XCTAssertLessThan(arenaBytes, Int(device.recommendedMaxWorkingSetSize) / 2)
+
+        // The shard file the arena reads. The checkpoint ships one weights file,
+        // so the largest `.safetensors` beside the config is it.
+        let files = try FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: [.fileSizeKey]
+        )
+        let shardURL = try XCTUnwrap(
+            files.filter { $0.pathExtension == "safetensors" }.max { lhs, rhs in
+                let left = (try? lhs.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                let right = (try? rhs.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                return left < right
+            },
+            "no safetensors file in \(directory.path)"
+        )
+        let reader = try Inkling2ArenaShardReader(url: shardURL)
+
+        /// One position from a RESET sequence: the logits, the wall, and the
+        /// mixture's own wall per visit.
+        func position(
+            _ index: Int, arena: Bool
+        ) throws -> (logits: [Float], ms: Double, mixtureMs: Double, stats: Inkling2ArenaCounters?) {
+            if arena {
+                try metal.installExpertArena(capacity: capacity, geometry: geometry, reader: reader)
+            } else {
+                metal.removeExpertArena()
+            }
+            harness.forward.reset()
+            metal.recordsVisitTiming = true
+            metal.visitProfile.reset()
+            let start = CFAbsoluteTimeGetCurrent()
+            let logits = try harness.forward.forwardToken(token: 0, position: index)
+            let ms = (CFAbsoluteTimeGetCurrent() - start) * 1_000
+            let visits = max(1, metal.visitProfile.visits)
+            let mixture = Double(metal.visitProfile.timing(.expertMixture).wallNanoseconds)
+                / Double(visits) / 1_000_000
+            return (logits, ms, mixture, metal.expertArena?.statistics)
+        }
+
+        // The arm order FLIPS every round: a first pass is slow for being cold
+        // (the page cache holds none of the banks) and a later one is fast for
+        // being warm, so a fixed order would decide the comparison by itself.
+        var mmapWalls: [Double] = []
+        var arenaWalls: [Double] = []
+        for (round, useArena) in [false, true, true, false].enumerated() {
+            let measured = try position(round, arena: useArena)
+            var line = "🔎 [inkling2 arena] round \(round) (\(useArena ? "arena" : "mmap")): "
+                + "\(String(format: "%.1f", measured.ms)) ms, "
+                + "mixture \(String(format: "%.2f", measured.mixtureMs)) ms/visit"
+            if let stats = measured.stats {
+                line += String(
+                    format: ", %d hit(s) / %d miss(es) / %d eviction(s), %.2f GB read in %.0f ms (%.1f%% hit)",
+                    stats.hits, stats.misses, stats.evictions,
+                    Double(stats.bytesRead) / 1_073_741_824,
+                    Double(stats.preadNanoseconds) / 1_000_000, 100 * stats.hitRate
+                )
+                arenaWalls.append(measured.ms)
+            } else {
+                mmapWalls.append(measured.ms)
+            }
+            print(line)
+        }
+        print(
+            "🔎 [inkling2 arena] median: mmap "
+                + "\(String(format: "%.1f", mmapWalls.sorted()[mmapWalls.count / 2])) ms, arena "
+                + "\(String(format: "%.1f", arenaWalls.sorted()[arenaWalls.count / 2])) ms"
+        )
+
+        // Correctness, on a POSITION both arms can share: the same token at the
+        // same index, after the timed rounds have warmed the page cache.
+        let streamed = try position(4, arena: false)
+        let resident = try position(4, arena: true)
+        metal.removeExpertArena()
+        XCTAssertEqual(resident.logits.count, config.unpaddedVocabSize)
+        // The two arms are REPORTED, not required to agree: on this machine the
+        // mmap arm is the suspect one (the mixture binds the layer's two 9+ GB
+        // bank segments at once, and that binding returns zeros here while each
+        // bank alone reads correctly -- see `testAPublishedBankFillsItsSlotWith
+        // TheBanksOwnBytes`, which pins the arena path against the HOST rule).
+        // An equality assertion here would therefore be asserting that the
+        // arena reproduces the broken arm.
+        let scale = streamed.logits.reduce(Float(0)) { max($0, abs($1)) }
+        let delta = zip(streamed.logits, resident.logits).reduce(Float(0)) { max($0, abs($1.0 - $1.1)) }
+        print(
+            "🔎 [inkling2 arena] arena logits vs mmap: \(scale > 0 ? delta / scale : delta) relative, "
+                + "worst element"
+        )
+        // What IS required: the arena arm is not degenerate (it read real expert
+        // bytes through its slots), and its mixture contributed.
+        let spread = (resident.logits.max() ?? 0) - (resident.logits.min() ?? 0)
+        XCTAssertGreaterThan(spread, 1, "the arena arm's logits collapsed")
+        XCTAssertGreaterThan(resident.logits.reduce(Float(0)) { max($0, abs($1)) }, 1)
     }
 }

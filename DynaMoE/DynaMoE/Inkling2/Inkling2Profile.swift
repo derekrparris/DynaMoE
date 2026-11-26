@@ -290,6 +290,11 @@ nonisolated public final class Inkling2VisitProfile: @unchecked Sendable {
                 Double(arena.preadNanoseconds) / 1_000_000,
                 100 * arena.hitRate
             )
+            // A layout the slots cannot hold must not read as a low hit rate:
+            // it is an expert that never entered the arena at all.
+            if arena.incompatible > 0 {
+                line += ", \(arena.incompatible) refused (a bank this slot layout cannot hold)"
+            }
         }
         if empty > 0 { line += ", \(empty) buffer(s) with no device window" }
         return line

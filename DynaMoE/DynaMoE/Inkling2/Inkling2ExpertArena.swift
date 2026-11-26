@@ -95,6 +95,25 @@ nonisolated public struct Inkling2ExpertSlotGeometry: Sendable, Equatable {
     public var gateUpLogicalRows: Int { gateUpWeightBytes / weightRowStride }
     public var downLogicalRows: Int { downWeightBytes / downWeightRowStride }
 
+    /// Whether slots laid out this way can hold a bank read at these strides.
+    ///
+    /// A slot is a byte copy of four regions at FIXED strides, so an expert
+    /// whose bank packs differently cannot be copied into it: the ranges come
+    /// out the wrong length and no read reports an error. The published
+    /// checkpoint is exactly this case -- NVFP4 for the first twenty layers
+    /// (`w13` rows 1,152 B with 144 scale columns) and MXFP8 for the last four
+    /// (2,304 B with 72) -- so the discriminating numbers are the strides; the
+    /// ROW counts are the config's and agree across layouts.
+    public func holds(
+        weightRowStride: Int, scaleRowStride: Int,
+        downWeightRowStride: Int, downScaleRowStride: Int
+    ) -> Bool {
+        weightRowStride == self.weightRowStride
+            && scaleRowStride == self.scaleRowStride
+            && downWeightRowStride == self.downWeightRowStride
+            && downScaleRowStride == self.downScaleRowStride
+    }
+
     /// The slot as the mixture kernel reads it.
     public var slotAddress: SlotAddress {
         SlotAddress(
@@ -160,6 +179,16 @@ nonisolated public struct Inkling2ArenaCounters: Sendable, Equatable {
     public var preadNanoseconds: UInt64 = 0
     /// Slots allocated so far.
     public var slotsAllocated = 0
+    /// Experts this arena could not hold at all: their bank's row strides are
+    /// not the ones its slots were laid out with.
+    ///
+    /// A checkpoint can mix quantized layouts between layers (the published one
+    /// is NVFP4 for the first twenty layers and MXFP8 for the last four, whose
+    /// packed rows are twice as wide with half the scale rows), and a slot is a
+    /// byte copy at FIXED strides. Counting the refusals keeps that visible:
+    /// without it a mixed checkpoint fills slots with the wrong byte ranges and
+    /// reports a hit rate over garbage.
+    public var incompatible = 0
 
     public var hitRate: Double {
         let total = hits + misses
@@ -515,6 +544,12 @@ nonisolated public final class Inkling2ExpertArena: @unchecked Sendable {
         order.removeAll()
     }
 
+    /// Records an expert whose bank this arena cannot hold (see
+    /// `Inkling2ArenaCounters.incompatible`). The caller falls back to the mmap.
+    public func recordIncompatible() {
+        counters.incompatible += 1
+    }
+
     /// One line for the load log / the profile.
     public func describe() -> String {
         let stats = statistics
@@ -526,5 +561,6 @@ nonisolated public final class Inkling2ExpertArena: @unchecked Sendable {
                      stats.preadNanoseconds > 0
                         ? gigabytes / (Double(stats.preadNanoseconds) / 1_000_000_000) : 0,
                      100 * stats.hitRate)
+            + (stats.incompatible > 0 ? ", \(stats.incompatible) refused (a bank this slot cannot hold)" : "")
     }
 }
