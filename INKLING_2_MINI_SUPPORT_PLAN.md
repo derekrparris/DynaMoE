@@ -1,6 +1,6 @@
 # Inkling 2 Mini: Full Native Inference Support Plan
 
-**Status:** phases 1-6 landed and validated on the published checkpoint; the device graph matches the host graph to 1e-6 on every one of the schedule's 48 visits, a full agent turn runs end to end on a 16 GB M1 Pro, and Phase 7's INT8 gate is measured on BOTH paths (the same greedy token at every tested length; the plan's literal elementwise bound is not met by an 8-bit cache and the record says so; the device arm's elementwise difference tracks the host arm's to within 5%)  
+**Status:** phases 1-6 landed and validated on the published checkpoint; the device graph matches the host graph to 1e-6 on every one of the schedule's 48 visits, a full agent turn runs end to end on a 16 GB M1 Pro, and Phase 7's INT8 gate is measured on BOTH paths (the same greedy token at every tested length; the plan's literal elementwise bound is not met by an 8-bit cache and the record says so; the device arm's elementwise difference tracks the host arm's to within 5%), and Phase 7's last item -- a device KV store kernel -- was measured at 0.2% of a position and deliberately not built  
 **Checkpoint under analysis:** `thinkingmachines/Inkling-2-Mini`  
 **Pinned checkpoint revision:** `c9d028302cd0f035fdf8e7e91f089a4ce94d2195` (the only revision the repository publishes; an earlier `ed40e7da...` pin resolved to nothing and silently skipped every checkpoint case)  
 **Local snapshot:** `~/.cache/huggingface/hub/models--thinkingmachines--Inkling-2-Mini/snapshots/c9d028302cd0f035fdf8e7e91f089a4ce94d2195`  
@@ -780,8 +780,22 @@ Slice 21 measured the host graph with an INT8 cache and left one Phase 7 item op
 
 **What the numbers say.** The device arm reproduces the host arm's INT8 behaviour rather than adding error of its own: the mean agrees to within 5% at every length (and is slightly BETTER at lengths 5 and 9, where the device's own reduction order rounds differently), the p99 to within 0.007, and the greedy token is identical to the FP32 device arm at all five lengths with margins of 0.76-5.27. That is the claim this case can support without an 18-minute host walk in the same run: quantization error is the quantizer's, so an arm that is materially noisier than the host's has a device defect. The pinned bar is therefore three-part, and the third part is the one that names that failure: the greedy token agrees at every length; the mean/p99 stay inside an envelope set from this run with ~2x headroom (mean 0.016/0.032/0.06/0.12/0.28, p99 0.051/0.101/0.192/0.38/0.88 at lengths 1/2/5/9/17); and the device mean stays under **1.5x the host's own measured mean** at each length. Device arithmetic is deterministic, so the ceilings are a fidelity bar rather than a noise estimate -- a dropped value scale, a row-wide scale, a wrong KV-head split or a row staged in the other form each move the mean by far more than the headroom.
 
-- **Not done in this slice:** no device KV *store* kernel is dispatched -- the host still quantizes in `Inkling2VisitState.append`, and `store_kv_cache_fp8` remains the contract's reference. That is the last item in Phase 7's "not done" list.
+- **Not done in this slice:** no device KV *store* kernel is dispatched -- the host still quantizes in `Inkling2VisitState.append`, and `store_kv_cache_fp8` remains the contract's reference. That is the last item in Phase 7's "not done" list. *(Measured in slice 23 and deliberately not built: the quantize is 0.2% of a position and the kernel could not remove the read-back.)*
 - **Verified:** `build-for-testing` at `-O`, the new case green twice with identical numbers (26.1 s, then 24.8 s after the envelope was tightened), and no production code touched, so the model-free set is unchanged from slice 21's 188/17/0.
+
+**Progress: slice 23, the device KV store kernel measured -- and not built (2026-11-26).**
+
+Phase 7's last open item was to dispatch `store_kv_cache_fp8` instead of quantizing a visited row on the host. Before building it, the work it would replace was measured. `Inkling2KvStoreCostTests.testWhatTheHostKvStoreCostsAPositionAtThePublishedWidth` (model-free, opt-in behind `/tmp/dynamoe_inkling2_profile`, 0.003 s) runs one position's worth of appends -- 48 visits, 8 KV heads x 128 = **1,024 floats a row and two rows a visit** -- best of three per arm, and checks the rows survive the round trip at exactly that width.
+
+| arm | 48 appends | share of a 118.1 ms position | resident bytes for those rows |
+|---|---|---|---|
+| FP32 | 0.005 ms | 0.004% | 393,216 B |
+| INT8 | 0.257 ms | 0.218% | 99,840 B |
+
+- **The kernel cannot remove what looks removable.** The host `append` runs inside `attentionHalf` after the front buffer has been waited on, and the device attention reads the convolved K and V back to push the convolution history and to append -- the host graph appends at exactly that point. A store kernel could therefore remove the QUANTIZE (0.26 ms a position) and not the read-back it would still need to reach the host. One dispatch plus a host-visible byte readback to save 0.2% of a position is a pessimistic trade, and the host quantizer is already pinned against the kernel's dequantize by `testTheInt8AttentionMatchesTheHostRule`.
+- **Decisions API, not taste:** build the kernel 0.001, against "record the measurement and close the item"; keep the measurement as a persistent opt-in case 0.98 (confidence 0.97).
+- **What the numbers did show:** the INT8 append is ~50x the FP32 one (0.257 vs 0.005 ms) because it scales per KV head in a scalar loop. Vectorizing that would be the cheap version of the same idea -- and at 0.2% of a position it is not worth a change either. The measurement is recorded so a later slice that makes a position much faster knows where this term sits.
+- **What is genuinely left here is a design change, not a kernel:** keeping the quantized rows resident on the DEVICE so a visit stops re-uploading its window (the `attentionState` staging copy, ~1 MB a visit at INT8). That trades away the host-side state a resume proves itself against, so it belongs to a plan-level decision rather than to Phase 7's checklists.
 
 ### Phase 7: Long context and DynaMoE FP8 (INT8) KV
 

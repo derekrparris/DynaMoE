@@ -760,3 +760,104 @@ final class Inkling2VisitProfileTests: XCTestCase {
         XCTAssertGreaterThan(resident.logits.reduce(Float(0)) { max($0, abs($1)) }, 1)
     }
 }
+
+// MARK: - What a device KV store kernel would buy
+
+/// Phase 7's last open item is to dispatch `store_kv_cache_fp8` instead of
+/// quantizing a visited row on the host, and this measures the thing it would
+/// replace BEFORE it is built.
+///
+/// The saving is bounded from both sides. What the host does per visit is two
+/// rows of `kvHeads * headDim` through the quantizer -- 2,048 floats at the
+/// published width. And the row still has to reach the host either way: the
+/// device attention reads the convolved K and V back to push the convolution
+/// history and to append (the host graph appends at exactly that point), so a
+/// store kernel could remove the QUANTIZE, not the read-back.
+///
+/// Model-free and cheap on purpose: 48 appends per arm at the published width,
+/// which is what one position's schedule does. Opt-in behind the profile marker
+/// because a printed share is machine-specific; the assertions are behavioural
+/// (every row lands, the compact form is the smaller one) and the timing is the
+/// diagnostic that decides whether a kernel is worth a dispatch.
+final class Inkling2KvStoreCostTests: XCTestCase {
+
+    func testWhatTheHostKvStoreCostsAPositionAtThePublishedWidth() throws {
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_profile"),
+            "opt-in measurement; touch /tmp/dynamoe_inkling2_profile to run"
+        )
+        // The published geometry: 8 KV heads of 128, 48 visits a position.
+        let kvWidth = 8 * 128
+        let heads = 8
+        let visits = 48
+        let window = 1_024
+        // The measured wall of a device visit with the mixture folded
+        // (`testWhereADecodePositionsTimeGoesOnThePublishedCheckpoint`), which is
+        // what the share is taken of.
+        let measuredVisitMilliseconds = 2.46
+        func row(seed: Int) -> [Float] {
+            (0..<kvWidth).map { index in
+                let mixed = (index &* 37 &+ seed &* 101) % 29
+                let sign: Float = (index &+ seed) % 4 == 0 ? -1 : 1
+                return sign * (Float(mixed) + 0.5) / 8
+            }
+        }
+        let rows = (0..<visits).map { row(seed: $0) }
+
+        func position(storage: Inkling2KVStorage) -> (best: Double, states: [Inkling2VisitState]) {
+            var best = Double.greatestFiniteMagnitude
+            var last: [Inkling2VisitState] = []
+            // Best of three: the first loop pays for allocation and the last one
+            // is what a turn's own loop would see.
+            for _ in 0..<3 {
+                let states = (0..<visits).map { _ in
+                    Inkling2VisitState(
+                        isFullAttention: true, window: window,
+                        stateWidths: [kvWidth, kvWidth, 64, 64], historyDepth: 3,
+                        storage: storage, heads: heads
+                    )
+                }
+                let started = CFAbsoluteTimeGetCurrent()
+                for (visit, state) in states.enumerated() {
+                    _ = state.append(key: rows[visit], value: rows[visit])
+                }
+                best = min(best, (CFAbsoluteTimeGetCurrent() - started) * 1_000)
+                last = states
+            }
+            return (best, last)
+        }
+
+        let exact = position(storage: .float32)
+        let compact = position(storage: .int8)
+        for state in exact.states + compact.states {
+            XCTAssertEqual(state.committedPositions, 1)
+            XCTAssertEqual(state.rowCount, 1)
+            XCTAssertEqual(state.rowWidth, kvWidth)
+        }
+        let exactBytes = exact.states.reduce(0) { $0 + $1.residentBytes }
+        let compactBytes = compact.states.reduce(0) { $0 + $1.residentBytes }
+        XCTAssertLessThan(compactBytes, exactBytes / 2, "the compact form must hold fewer bytes")
+        // The rows survive the round trip at the width the kernel reads.
+        let compactRow = try XCTUnwrap(compact.states[0].quantizedKey(0))
+        XCTAssertEqual(compactRow.stored.count, kvWidth)
+        XCTAssertEqual(compactRow.scales.count, heads)
+        XCTAssertEqual(compact.states[0].keys[0].count, kvWidth)
+
+        let perVisit = measuredVisitMilliseconds * Double(visits)
+        func share(_ milliseconds: Double) -> String {
+            String(format: "%.3f%% of a %.1f ms position", 100 * milliseconds / perVisit, perVisit)
+        }
+        print(
+            "\u{1F50E} [inkling2 kv store] 48 appends at \(kvWidth) wide: FP32 "
+                + String(format: "%.3f", exact.best) + " ms (" + share(exact.best) + "), INT8 "
+                + String(format: "%.3f", compact.best) + " ms (" + share(compact.best) + "), "
+                + "\(exactBytes) B vs \(compactBytes) B resident"
+        )
+        print(
+            "\u{1F50E} [inkling2 kv store] a device store kernel could remove the quantize "
+                + "and not the read-back: the convolved rows reach the host either way for "
+                + "the convolution history"
+        )
+    }
+}
+
