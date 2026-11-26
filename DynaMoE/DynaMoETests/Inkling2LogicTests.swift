@@ -1189,6 +1189,51 @@ final class Inkling2MemoryPlanTests: XCTestCase {
         XCTAssertTrue(arena.describe().contains("1 eviction(s)"), arena.describe())
     }
 
+    /// An arena smaller than one visit's routing ALIASES two experts onto one
+    /// slot, which is why `Inkling2ArenaCapacity` now floors the capacity at
+    /// `numExpertsPerToken` rather than trusting a budget that prices fewer.
+    ///
+    /// The hazard is here rather than assumed: the lost experts are not evicted
+    /// one at a time between dispatches, they are all filled BEFORE any of them
+    /// is bound, so a capacity of 2 asked for four experts hands back two slot
+    /// indices twice -- and the mixture would then read the later fill's bytes
+    /// for both, with no error from the arena or from Metal.
+    func testAnArenaSmallerThanOneRoutingAliasesItsSlots() throws {
+        let geometry = try XCTUnwrap(
+            Inkling2ExpertSlotGeometry.make(
+                gateUpRows: 4, gateUpRowStride: 4, gateUpScaleRowStride: 1,
+                downRows: 4, downRowStride: 4, downScaleRowStride: 1
+            )
+        )
+        let arena = Inkling2ExpertArena(capacity: 2, geometry: geometry)
+        // One visit's resolve pass: fill all four experts, then bind them.
+        var bases: [Int] = []
+        for expert in 0..<4 {
+            let slot = arena.slotForFill(layer: 0, expert: expert)
+            arena.didFill(
+                slot: slot, layer: 0, expert: expert,
+                gateUpSourceOffset: UInt64(expert), downSourceOffset: UInt64(expert),
+                bytes: UInt64(geometry.slotBytes), preadNanoseconds: 1
+            )
+            bases.append(slot * geometry.slotBytes)
+        }
+        XCTAssertEqual(bases.count, 4)
+        XCTAssertEqual(Set(bases).count, 2, "two slots carry four routed experts")
+        // Only the two most recent fills still resolve: the earlier pair was
+        // overwritten before the dispatch could read it.
+        XCTAssertNil(arena.resident(layer: 0, expert: 0))
+        XCTAssertNil(arena.resident(layer: 0, expert: 1))
+        XCTAssertNotNil(arena.resident(layer: 0, expert: 2))
+        XCTAssertNotNil(arena.resident(layer: 0, expert: 3))
+        // The floor is what keeps a SHIPPING arena out of this state.
+        XCTAssertGreaterThanOrEqual(
+            Inkling2ArenaCapacity.slots(
+                workingSet: 352, planned: 1, ceilingSlots: 2_839, minimum: 8
+            ),
+            8
+        )
+    }
+
     /// The slot's addressing is per region: `w13` and `w2` do not share a row
     /// width, so the address a kernel reads must carry both strides and both
     /// row counts. A single shared stride is the bug this pins -- it reads the
@@ -1295,6 +1340,41 @@ final class Inkling2MemoryPlanTests: XCTestCase {
         // would otherwise read as "install none".
         XCTAssertEqual(
             Inkling2ArenaCapacity.slots(workingSet: 0, planned: 0, ceilingSlots: 0), 1
+        )
+        // The floor is the visit's own routing width. One visit fills `topK`
+        // slots BEFORE it encodes them, so an arena under that size gives two
+        // routed experts the same slot index and the dispatch reads the later
+        // fill's bytes for both -- a wrong number with no error. Measured on the
+        // shipping path: a 1-slot MXFP8 arena left layers 20-23 reading one
+        // expert eight ways.
+        XCTAssertEqual(
+            Inkling2ArenaCapacity.slots(
+                workingSet: 352, planned: 1, ceilingSlots: 2_839, minimum: 8
+            ), 8
+        )
+        XCTAssertEqual(
+            Inkling2ArenaCapacity.slots(
+                workingSet: 352, planned: 7, ceilingSlots: 1_548, minimum: 8
+            ), 8
+        )
+        // An override below the routing width aliases just the same, so the
+        // floor holds there too; above it, the override wins as before.
+        XCTAssertEqual(
+            Inkling2ArenaCapacity.slots(
+                workingSet: 352, planned: 1_437, ceilingSlots: 2_839, override: 3, minimum: 8
+            ), 8
+        )
+        XCTAssertEqual(
+            Inkling2ArenaCapacity.slots(
+                workingSet: 352, planned: 1_437, ceilingSlots: 2_839, override: 704, minimum: 8
+            ), 704
+        )
+        // The ceiling is a hard limit, so a floor that cannot fit becomes the
+        // ceiling: the install then fails by name rather than aliasing.
+        XCTAssertEqual(
+            Inkling2ArenaCapacity.slots(
+                workingSet: 352, planned: 1_437, ceilingSlots: 4, minimum: 8
+            ), 4
         )
         XCTAssertEqual(Inkling2ArenaCapacity.overrideDefaultsKey, "dynamoe_inkling2_arena_slots")
     }

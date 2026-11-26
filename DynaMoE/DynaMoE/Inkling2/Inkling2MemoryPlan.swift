@@ -234,16 +234,27 @@ nonisolated public struct Inkling2MemoryPlan: Sendable, Equatable {
 /// positive slot count replaces the working-set cap without a rebuild, and is
 /// still held under the device ceiling, because an arena past it cannot be
 /// allocated at all. Zero means "no override", which is what ships.
+///
+/// `minimum` is the floor a working arena cannot go under: one visit routes
+/// `topK` experts and fills their slots BEFORE it encodes, so an arena with
+/// fewer slots than that hands two routed experts the SAME slot index, and the
+/// dispatch then reads the later fill's bytes for both. That is a wrong number
+/// with no error -- measured on the shipping path, a 1-slot MXFP8 arena left
+/// layers 20-23 reading one expert's bytes eight ways, which is why the turn
+/// answered a template token block instead of `Paris`'s continuation. The floor
+/// is `numExpertsPerToken`; a budget that cannot afford it is a refusal, not a
+/// smaller arena.
 nonisolated public enum Inkling2ArenaCapacity {
     /// `UserDefaults` key for the override, read on the turn's own task.
     public static let overrideDefaultsKey = "dynamoe_inkling2_arena_slots"
 
     public static func slots(
-        workingSet: Int, planned: Int, ceilingSlots: Int, override: Int = 0
+        workingSet: Int, planned: Int, ceilingSlots: Int, override: Int = 0, minimum: Int = 1
     ) -> Int {
         let ceiling = max(1, ceilingSlots)
-        if override > 0 { return max(1, min(override, ceiling)) }
-        return max(1, min(workingSet, planned, ceiling))
+        let floor = max(1, min(minimum, ceiling))
+        if override > 0 { return max(floor, min(override, ceiling)) }
+        return max(floor, min(workingSet, planned, ceiling))
     }
 }
 

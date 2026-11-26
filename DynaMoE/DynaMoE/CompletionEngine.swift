@@ -847,10 +847,26 @@ public final class CompletionEngine: @unchecked Sendable {
                         // all: the mmap path binds the segments a layer's bank
                         // and its scales live in, and those are past what the
                         // device will wire (see `installInklingExpertArenas`).
+                        //
+                        // The plan it is priced from is the one at the context
+                        // this turn PROVISIONS, not the checkpoint's declared
+                        // maximum. The maximum prices rows that will never exist
+                        // -- 64.3 GB of FP32 cache against a 9.6 GB expert
+                        // budget, so `affordableExpertSlots` returns 1 and the
+                        // install divides that one slot into 22 + 1 (0.10 GB)
+                        // across the two layouts. Measured at the provisioned
+                        // context it affords 7, which installs 160 + 7 (0.72 GB)
+                        // for the same budget rule: 7x residency for a term the
+                        // budget was already charging.
+                        let arenaPlan = Inkling2MemoryPlan.make(
+                            config: inklingConfig, catalog: catalog,
+                            contextLength: contextLength,
+                            kvElementBytes: inklingStorage.bytesPerElement
+                        )
                         let arenaStatus = Self.installInklingExpertArenas(
                             executor: executor, weights: deviceWeights,
                             summary: loadedSummary, snapshotDir: snapshotDir,
-                            config: inklingConfig, plan: memoryPlan, device: device
+                            config: inklingConfig, plan: arenaPlan, device: device
                         )
                         stateLock.lock()
                         cachedInklingDevice = (
@@ -868,7 +884,7 @@ public final class CompletionEngine: @unchecked Sendable {
                             "inkling2.plan",
                             "provisioned \(contextLength) position(s) at "
                                 + "\(inklingStorage.rawValue) KV: "
-                                + memoryPlan.describe(expertSlots: residentSlots)
+                                + arenaPlan.describe(expertSlots: residentSlots)
                         )
                     } catch {
                         inklingDeviceHalfStatus = "failed: \(error)"
@@ -13015,7 +13031,10 @@ extension CompletionEngine {
                     workingSet: workingSet,
                     planned: planned,
                     ceilingSlots: Int(ceiling / UInt64(slots)),
-                    override: arenaSlotOverride
+                    override: arenaSlotOverride,
+                    // One visit fills this many slots before it encodes, so a
+                    // smaller arena aliases two routed experts onto one slot.
+                    minimum: config.numExpertsPerToken
                 )
                 let reader = try Inkling2ArenaShardReader(url: url)
                 try executor.installExpertArena(

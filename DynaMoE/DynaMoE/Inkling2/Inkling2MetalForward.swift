@@ -560,16 +560,21 @@ nonisolated public final class Inkling2MetalForward {
     ///
     /// Nil in every production path -- this family's banks are the shard mmap
     /// until a residency policy is measured to pay. When it is set, the mixture
-    /// asks it for each routed expert and projects a RESIDENT slot on a hit,
-    /// falling back to the mmap bank on a miss; the arena's own counters then
-    /// reach the profile through `recordExperts`, so a cold/warm comparison is
-    /// read from the same line as the stage table rather than a second
-    /// instrument.
+    /// asks it for each routed expert and projects that expert's SLOT; a miss
+    /// preads the expert's four ranges into a slot before the dispatch encodes,
+    /// so the mmap is never bound while an arena holds the bank's geometry (it
+    /// is the binding of two whole segments that reads zeros here). The arena's
+    /// own counters then reach the profile through `recordExperts`, so a
+    /// cold/warm comparison is read from the same line as the stage table rather
+    /// than a second instrument.
     ///
     /// One slot is a byte copy at FIXED strides, so an arena serves one packed
     /// LAYOUT. The published checkpoint mixes two -- NVFP4 for the first twenty
     /// layers and MXFP8 for the last four -- and `installExpertArena` therefore
     /// may be called twice; a bank goes to the arena whose geometry holds it.
+    /// A capacity under the visit's own routing width (`numExpertsPerToken`)
+    /// would alias two experts onto one slot, which is why
+    /// `Inkling2ArenaCapacity` floors it there.
     public private(set) var expertArenas: [Inkling2InstalledExpertArena] = []
 
     /// The first installed arena. Callers that install one (every test) keep

@@ -4078,4 +4078,172 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         }
         withExtendedLifetime(engine) {}
     }
+
+    /// The app's own turn at INT8 KV, which is the last piece behind Phase 7
+    /// that no case covered.
+    ///
+    /// Slices 21-24 pinned the cache's arithmetic, the INT8 attention kernel,
+    /// the INT8 device walk and the arena seam -- every one of them BELOW
+    /// `launchTurn`. This case is the turn itself: the key the app reads
+    /// (`dynamoe_inkling_kv_storage`), the forward and device half the engine
+    /// CACHES per storage form, the arena a turn installs, the status the
+    /// window reports, and the answer.
+    ///
+    /// The two arms run ONE AFTER THE OTHER with the engine's caches cleared
+    /// between them (`configure` retires the forward and the device half), so
+    /// only one ~1.9 GB arena is ever wired on a 16 GB machine.
+    ///
+    /// What it asserts, and what it deliberately does not: the turn must build
+    /// the form it was asked for (the device status names it), produce tokens,
+    /// and place its FIRST token where the FP32 turn placed it -- the length at
+    /// which INT8 agreement is measured (`testTheDeviceInt8CacheKeepsIts...
+    /// ...GreedyTokenAndStaysInsideItsBand`). Later tokens are printed rather
+    /// than asserted: a 2-token greedy continuation at an 8-bit cache is the
+    /// band's own edge, not the wiring this case exists for.
+    ///
+    /// Opt-in: `touch /tmp/dynamoe_inkling2_engine_int8` (two device turns).
+    func testATurnAtInt8AnswersWhatTheFp32TurnAnswers() async throws {
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_engine_int8"),
+            "opt-in engine turn; touch /tmp/dynamoe_inkling2_engine_int8 to run"
+        )
+        let snapshot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(Inkling2PublishedTensorTests.snapshotRelativePath)
+        guard FileManager.default.fileExists(atPath: snapshot.path) else {
+            throw XCTSkip("Inkling 2 snapshot is not downloaded at \(snapshot.path)")
+        }
+        guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("No Metal GPU device") }
+
+        let tokenizer = try DynaMoeTokenizer(
+            tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+        )
+        let modelConfig = try XCTUnwrap(ModelConfig.load(from: snapshot))
+        XCTAssertTrue(modelConfig.isInkling2Model)
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let indexed = try engine.getSummary()
+        let summary = try InferenceEngine.segmentShardsForMetal(
+            indexed, maxBufferLength: UInt64(device.maxBufferLength)
+        )
+        var buffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            let length = Int(shard.length)
+            guard length > 0, length <= Int(device.maxBufferLength),
+                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)),
+                  let buffer = device.makeBuffer(
+                      bytesNoCopy: pointer, length: length, options: .storageModeShared, deallocator: nil
+                  ) else { continue }
+            buffers[shard.index] = buffer
+        }
+        let origins = InferenceEngine.shardFileOrigins(original: indexed, segmented: summary)
+        func load() {
+            CompletionEngine.shared.configure(
+                summary: summary, modelConfig: modelConfig, tokenizer: tokenizer,
+                shardBuffers: buffers, activeLoadedModelPath: snapshot.path,
+                shardFileOrigins: origins
+            )
+        }
+        defer {
+            CompletionEngine.shared.configure(
+                summary: nil, modelConfig: nil, tokenizer: nil,
+                shardBuffers: [:], activeLoadedModelPath: nil
+            )
+        }
+
+        let rendered = try Inkling2Prompt().render(
+            turns: [.user([.text("The capital of France is")])], effort: 0
+        )
+        let promptIds = try tokenizer.encode(text: rendered)
+        let request = CompletionTurnRequest(
+            promptTokenIds: promptIds,
+            formattedPrompt: rendered,
+            sessionId: nil,
+            sampling: TurnSampling(
+                temperature: 0, topP: 1, minP: 0, topK: 1,
+                repetitionPenalty: 1, maxTokens: 2
+            ),
+            memory: TurnMemorySettings(
+                executionMode: .residentRAM, budgetMode: .unrestricted, kvPrecision: .fp32
+            ),
+            agentToolsEnabled: false,
+            thinkingEnabled: false,
+            agentStep: 0,
+            forceSynthesis: false,
+            isSplicedContinuation: false,
+            stopSequences: [],
+            asOfDate: nil,
+            images: []
+        )
+        func answer() async throws -> (ids: [UInt32], text: String, status: String) {
+            var ids: [UInt32] = []
+            var text = ""
+            for await event in try CompletionEngine.shared.launchTurn(request).stream {
+                switch event {
+                case .finished(let result):
+                    ids = result.generatedTokenIds
+                    text = result.rawDecodedText
+                case .failedTurn(let failure):
+                    XCTFail("the turn failed: \(failure.message)")
+                default:
+                    break
+                }
+            }
+            return (ids, text, CompletionEngine.shared.inklingDeviceHalfStatus)
+        }
+
+        // The seams, restored afterwards: the storage key is the app's own
+        // setting, and `device_off` stays false so both arms use the GPU.
+        let defaults = UserDefaults.standard
+        let storageKey = "dynamoe_inkling_kv_storage"
+        let deviceKey = "dynamoe_inkling2_device_off"
+        let savedStorage = defaults.object(forKey: storageKey)
+        let savedDevice = defaults.object(forKey: deviceKey)
+        defer {
+            if let savedStorage { defaults.set(savedStorage, forKey: storageKey) }
+            else { defaults.removeObject(forKey: storageKey) }
+            if let savedDevice { defaults.set(savedDevice, forKey: deviceKey) }
+            else { defaults.removeObject(forKey: deviceKey) }
+        }
+        defaults.set(false, forKey: deviceKey)
+
+        defaults.set(Inkling2KVStorage.float32.rawValue, forKey: storageKey)
+        load()
+        var started = CFAbsoluteTimeGetCurrent()
+        let exact = try await answer()
+        let exactSeconds = CFAbsoluteTimeGetCurrent() - started
+        XCTAssertTrue(exact.status.contains("float32"), exact.status)
+
+        // Retire the first arm's forward, device half and arena before the
+        // second is built.
+        CompletionEngine.shared.configure(
+            summary: nil, modelConfig: nil, tokenizer: nil,
+            shardBuffers: [:], activeLoadedModelPath: nil
+        )
+        defaults.set(Inkling2KVStorage.int8.rawValue, forKey: storageKey)
+        load()
+        started = CFAbsoluteTimeGetCurrent()
+        let compact = try await answer()
+        let compactSeconds = CFAbsoluteTimeGetCurrent() - started
+        XCTAssertTrue(compact.status.contains("int8"), compact.status)
+        XCTAssertFalse(
+            compact.status.contains("cached"),
+            "the turn must BUILD the INT8 half, not reuse the FP32 one: \(compact.status)"
+        )
+
+        print(
+            "\u{1F50E} [inkling2 turn int8] fp32: \(exact.ids) \(exact.text.debugDescription) "
+                + "in \(String(format: "%.1f", exactSeconds)) s -- \(exact.status)"
+        )
+        print(
+            "\u{1F50E} [inkling2 turn int8] int8: \(compact.ids) \(compact.text.debugDescription) "
+                + "in \(String(format: "%.1f", compactSeconds)) s -- \(compact.status)"
+        )
+        XCTAssertFalse(exact.ids.isEmpty, "the FP32 turn produced no tokens")
+        XCTAssertFalse(compact.ids.isEmpty, "the INT8 turn produced no tokens")
+        XCTAssertEqual(
+            compact.ids.first, exact.ids.first,
+            "the INT8 turn's first token is the length INT8 agreement is measured at"
+        )
+        withExtendedLifetime(engine) {}
+    }
 }
+
