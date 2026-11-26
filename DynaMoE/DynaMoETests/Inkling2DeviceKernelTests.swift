@@ -3571,6 +3571,223 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         XCTAssertLessThanOrEqual(worst / scale, 3e-3, "the device visit against the host graph")
     }
 
+    // MARK: INT8 KV parity on the device
+
+    /// Phase 7's remaining item: the DEVICE graph with an INT8 KV cache against
+    /// the same device graph with FP32, at the lengths the host gate uses.
+    ///
+    /// The parts are pinned separately -- the staging byte copy by
+    /// `testAnInt8VisitStagesItsCompactRows`, the INT8 attention kernel against
+    /// a CPU reference, and the FP32 device visit against the host graph -- so
+    /// this case is about the WIRING they share: a sequence whose visit state
+    /// holds bytes, whose host writes them, and whose every visit is served by
+    /// the device attention at a length where a wrong scale stride, a stale row
+    /// or a row read in the wrong form would move the logits.
+    ///
+    /// The two arms are walked ONE AFTER THE OTHER: the storage belongs to the
+    /// host forward (it owns the visit state), so each arm needs its own
+    /// executor, and a resident expert arena is ~1.9 GB beside the checkpoint's
+    /// shard segments -- a concurrent pair would wire twice what the single-arm
+    /// cases already do on a 16 GB machine.
+    ///
+    /// The bar is the host gate's shape: the greedy token agrees at every
+    /// length, inside a measured mean/p99 envelope. Device arithmetic is
+    /// deterministic as well, so the ceilings are a fidelity bar rather than a
+    /// noise estimate, and the host's own INT8 envelope is recorded beside them
+    /// in the support plan: the claim this case supports on its own is "the
+    /// device cache is inside a band of this width", not "it meets the literal
+    /// Phase 2 bound", which an 8-bit cache cannot meet on either side.
+    ///
+    /// Opt-in: it is two device walks over the real checkpoint.
+    /// `touch /tmp/dynamoe_inkling2_device_int8` to run it.
+    func testTheDeviceInt8CacheKeepsItsGreedyTokenAndStaysInsideItsBand() throws {
+        guard FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_device_int8") else {
+            throw XCTSkip(
+                "opt-in: touch /tmp/dynamoe_inkling2_device_int8 (two device walks)"
+            )
+        }
+        let snapshot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(Inkling2PublishedTensorTests.snapshotRelativePath)
+        guard FileManager.default.fileExists(atPath: snapshot.path) else {
+            throw XCTSkip("Inkling 2 snapshot is not downloaded at \(snapshot.path)")
+        }
+        let (device, library, queue) = try environment()
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let rawSummary = try engine.getSummary()
+        let summary = try inkling2MetalReadySummary(rawSummary)
+        let config = try Inkling2Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let catalog = Inkling2WeightCatalog(
+            mainFile: summary.tensors.map { Inkling2TensorRef(metadata: $0) },
+            layerCount: config.numHiddenLayers
+        )
+        var shardBuffers: [UInt32: MTLBuffer] = [:]
+        shardBuffers = try inkling2MetalShardBuffers(summary, device: device)
+        let source = Inkling2SnapshotWeights(
+            config: config, catalog: catalog, shardBuffers: shardBuffers
+        )
+        let deviceWeights = Inkling2DeviceWeights(
+            config: config, catalog: catalog, shardBuffers: shardBuffers,
+            fileOrigins: InferenceEngine.shardFileOrigins(original: rawSummary, segmented: summary)
+        )
+
+        let tokenizer = try DynaMoeTokenizer(
+            tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+        )
+        let ids = try tokenizer.encode(
+            text: "The quick brown fox jumps over the lazy dog, and the dog does not mind it at all."
+        ).map { Int($0) }
+        let lengths = [1, 2, 5, 9, 17]
+        let longest = try XCTUnwrap(lengths.max())
+        XCTAssertGreaterThanOrEqual(ids.count, longest)
+        let positions = max(32, longest + 1)
+
+        // One arm: a host forward built for `storage` -- it owns the visit
+        // state, so it decides the form every visit holds -- its own executor,
+        // a workspace laid out for the same form, and the arena a turn installs
+        // (without it the mixture's mmap binding is refused by name).
+        func walk(_ storage: Inkling2KVStorage) throws -> (logits: [[Float]], stagingBytes: Int) {
+            let forward = try Inkling2CPUForward(
+                config: config, weights: source,
+                options: Inkling2ForwardOptions(maxPositions: positions, kvStorage: storage)
+            )
+            XCTAssertEqual(forward.sequence.storage, storage)
+            XCTAssertEqual(forward.states.first?.storage, storage)
+            let executor = try Inkling2MetalForward(
+                device: device, library: library, queue: queue,
+                weights: deviceWeights, host: forward
+            )
+            let workspace = try Inkling2DeviceWorkspace(
+                device: device, config: config,
+                stagedPositions: positions, storage: storage
+            )
+            XCTAssertEqual(workspace.stagedStorage, storage)
+            defer {
+                forward.visitRunner = nil
+                forward.headRunner = nil
+                executor.removeExpertArena()
+            }
+            let arenaLine = try inkling2InstallExpertArenas(
+                executor: executor, weights: deviceWeights, summary: summary,
+                snapshot: snapshot, config: config, catalog: catalog,
+                positions: positions, kvElementBytes: storage.bytesPerElement
+            )
+            XCTAssertFalse(arenaLine.contains("no arena"), arenaLine)
+            forward.visitRunner = { layer, pass, hidden, blockStates, messages, position in
+                try executor.runVisit(
+                    layer: layer, pass: pass, hidden: hidden, blockStates: &blockStates,
+                    messages: messages, position: position, workspace: workspace
+                )
+            }
+            forward.headRunner = { hidden in
+                try executor.headLogits(hidden: hidden, workspace: workspace)
+            }
+            var logits: [[Float]] = []
+            logits.reserveCapacity(longest)
+            for (position, id) in ids.prefix(longest).enumerated() {
+                logits.append(try forward.forwardToken(token: UInt32(id), position: position))
+            }
+            return (logits, workspace.stagedKeys.length + workspace.stagedValues.length)
+        }
+
+        let exact = try walk(.float32)
+        let compact = try walk(.int8)
+        XCTAssertEqual(
+            compact.stagingBytes * 4, exact.stagingBytes,
+            "the INT8 staging buffers must be a quarter of the FP32 ones"
+        )
+        // The arms are interleaved: the elementwise difference is meaningless if
+        // a stray arena or workspace survived the first walk.
+        XCTAssertEqual(exact.logits.count, longest)
+        XCTAssertEqual(compact.logits.count, longest)
+        print(
+            "\u{1F50E} [inkling2 device int8] staging "
+                + "\(exact.stagingBytes) B FP32 vs \(compact.stagingBytes) B INT8"
+        )
+
+        func ranked(_ logits: [Float], count: Int) -> [(id: Int, value: Float)] {
+            logits.enumerated()
+                .sorted { $0.element > $1.element }
+                .prefix(count)
+                .map { (id: $0.offset, value: $0.element) }
+        }
+
+        for length in lengths {
+            let exactRow = exact.logits[length - 1]
+            let compactRow = compact.logits[length - 1]
+            XCTAssertEqual(exactRow.count, compactRow.count, "length \(length)")
+            var violations = 0
+            var worstAbsolute: Float = 0
+            var worstIndex = 0
+            var worstRatio: Float = 0
+            var differences: [Float] = []
+            differences.reserveCapacity(exactRow.count)
+            for index in 0..<exactRow.count {
+                let reference = exactRow[index]
+                let allowed = 5e-4 + 5e-4 * abs(reference)
+                let difference = abs(compactRow[index] - reference)
+                if difference > allowed { violations += 1 }
+                differences.append(difference)
+                if difference > worstAbsolute { worstAbsolute = difference; worstIndex = index }
+                worstRatio = max(worstRatio, difference / (1 + abs(reference)))
+            }
+            let mean = differences.reduce(0, +) / Float(differences.count)
+            let p99 = differences.sorted()[Int(0.99 * Float(differences.count - 1))]
+            let exactTop = ranked(exactRow, count: 2)
+            let compactTop = ranked(compactRow, count: 2)
+            let margin = exactTop[0].value - exactTop[1].value
+            print(
+                "\u{1F50E} [inkling2 device int8] length \(length): \(violations) of "
+                    + "\(exactRow.count) logits past the Phase 2 bound; worst "
+                    + String(format: "%.3g", worstAbsolute)
+                    + " at id \(worstIndex) (|ref| "
+                    + String(format: "%.3g", abs(exactRow[worstIndex])) + "), mean "
+                    + String(format: "%.3g", mean)
+                    + ", p99 " + String(format: "%.3g", p99)
+                    + ", max diff/(1+|ref|) " + String(format: "%.3g", worstRatio)
+                    + ", greedy "
+                    + (exactTop[0].id == compactTop[0].id ? "agrees" : "DIFFERS")
+                    + " (\(exactTop[0].id) vs \(compactTop[0].id)), FP32 margin "
+                    + String(format: "%.4g", margin)
+            )
+            XCTAssertEqual(
+                compactTop[0].id, exactTop[0].id,
+                "length \(length): the device INT8 cache argues for a different token, at a "
+                    + String(format: "%.4g", margin) + " FP32 margin"
+            )
+            // The measured envelope, with roughly 2x headroom over the run that
+            // set it. The device arm quantizes on the host and reads bytes in
+            // the kernel, so a dropped scale, a row-wide scale, a wrong KV-head
+            // split or a row staged in the other form each move the mean by far
+            // more than the headroom.
+            //
+            // `hostMean` is the same comparison measured on the HOST graph in
+            // `testTheInt8CacheKeepsItsGreedyTokenAndStaysInsideItsBand`. The
+            // device is held to 1.5x it, which is the claim this case can make
+            // about the kernel rather than the quantizer: quantization error is
+            // the host's, so a device arm that is materially noisier than the
+            // host's has a device defect, not a cache form.
+            let ceilings: (mean: Float, p99: Float, hostMean: Float) = switch length {
+            case 1: (0.016, 0.051, 0.0076)
+            case 2: (0.032, 0.101, 0.0155)
+            case 5: (0.06, 0.192, 0.031)
+            case 9: (0.12, 0.38, 0.059)
+            default: (0.28, 0.88, 0.139)
+            }
+            XCTAssertLessThan(mean, ceilings.mean, "length \(length) mean absolute difference")
+            XCTAssertLessThan(p99, ceilings.p99, "length \(length) p99 absolute difference")
+            XCTAssertLessThan(
+                mean, 1.5 * ceilings.hostMean,
+                "length \(length): the device arm is materially noisier than the host's own INT8 arm"
+            )
+        }
+        print(
+            "\u{1F50E} [inkling2 device int8] the bar is greedy agreement plus the measured "
+                + "mean/p99 envelope; the literal Phase 2 bound is unmeetable by an 8-bit cache"
+        )
+    }
+
     // MARK: The app's own turn path
 
     /// The whole app path for this family, once on the host and once with the
