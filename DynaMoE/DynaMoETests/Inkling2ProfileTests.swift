@@ -626,6 +626,11 @@ final class Inkling2VisitProfileTests: XCTestCase {
         /// The arena arm installs the arenas a TURN installs -- one per packed
         /// layout, sized by the memory plan -- through the app's own helper, so
         /// this measures the path that ships rather than a one-layout stand-in.
+        /// It is priced at this harness's eight staged positions, which is the
+        /// WORKING SET (352 + 32 slots); a turn prices its plan at the context it
+        /// provisions and so installs far less -- [159, 8] on this machine, which
+        /// `testWhatTheArenasLastSlotsCostAndWhatChargingThemWouldCostTheContext`
+        /// measures against the floor.
         func position(
             _ index: Int, arena: Bool
         ) throws -> (logits: [Float], ms: Double, mixtureMs: Double, stats: Inkling2ArenaCounters?) {
@@ -822,6 +827,377 @@ final class Inkling2VisitProfileTests: XCTestCase {
                 + "\(overrideStats.evictions) eviction(s), "
                 + String(format: "%.2f", Double(overrideStats.bytesRead) / 1_073_741_824)
                 + " GB read (" + String(format: "%.1f%%", 100 * overrideStats.hitRate) + " hit)"
+        )
+    }
+
+    /// What the arena's last slots are worth, and what charging its bytes against
+    /// the KV budget would cost the context.
+    ///
+    /// The arena is NOT a term in `affordableContextLength`: the plan charges the
+    /// KV rows, the rings, the dense weights and the loop messages, and the arena
+    /// is allocated afterwards out of the same machine. The support plan carried
+    /// that as an unmeasured risk -- a wired arena on a machine whose KV provision
+    /// was priced as if the arena were free.
+    ///
+    /// Two numbers decide the policy, and both are measured rather than argued.
+    /// First, the FLOOR: the same position with `numExpertsPerToken` slots per
+    /// layout -- the smallest arena that cannot alias -- against the arena a turn
+    /// actually installs. Second, the positions the arena's bytes would cost if
+    /// they were charged, which the plan's own arithmetic answers exactly.
+    ///
+    /// The arena is installed at the context a TURN provisions, not at this
+    /// test's staging size. The plan's cache term is what shrinks the arena from
+    /// one position's working set to the budget's share, so installing at
+    /// `positions: 8` measures a configuration no turn runs: it reports 352 + 32
+    /// slots (1.71 GB) where a turn installs 159 + 8 (0.72 GB).
+    ///
+    /// The fidelity claim is CHECKED, not reported. An arena is a cache, so every
+    /// arm must answer the shipped arm's logits exactly; a difference there would
+    /// mean residency changed the arithmetic, which is the aliasing bug wearing a
+    /// different mask.
+    func testWhatTheArenasLastSlotsCostAndWhatChargingThemWouldCostTheContext() throws {
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_arena"),
+            "opt-in arena measurement; touch /tmp/dynamoe_inkling2_arena to run"
+        )
+        let harness = try harness()
+        let config = harness.config
+        let metal = harness.metal
+        let catalog = metal.weights.catalog
+        let physicalGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
+        let key = Inkling2ArenaCapacity.overrideDefaultsKey
+        let previousOverride = UserDefaults.standard.object(forKey: key)
+        addTeardownBlock {
+            metal.removeExpertArena()
+            if let previousOverride {
+                UserDefaults.standard.set(previousOverride, forKey: key)
+            } else {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+        }
+
+        /// The plan a turn prices its KV cache from, and the context it
+        /// provisions: the checkpoint's declared maximum against the engine's own
+        /// budget function, exactly as the launch path computes it.
+        func proposal(
+            _ storage: Inkling2KVStorage, _ mode: MemoryBudgetMode
+        ) -> (plan: Inkling2MemoryPlan, budgetGB: Double, positions: Int) {
+            let plan = Inkling2MemoryPlan.make(
+                config: config, catalog: catalog,
+                contextLength: config.maxPositionEmbeddings,
+                kvElementBytes: storage.bytesPerElement
+            )
+            let denseGB = Double(plan.denseWeightBytes) / 1_073_741_824
+            let budgetGB = KVCacheProvisioning.budgetGB(
+                physicalGB: physicalGB, modelFootprintGB: denseGB,
+                budgetMode: mode, residentFootprintGB: denseGB
+            )
+            return (plan, budgetGB, plan.affordableContextLength(budgetGB: budgetGB))
+        }
+        let turn = proposal(.float32, .unrestricted)
+        print(
+            "🔎 [inkling2 arena] a turn provisions \(turn.positions) position(s) at FP32 KV "
+                + "(budget \(String(format: "%.2f", turn.budgetGB)) GB); the arena is installed at "
+                + "that plan, as the engine installs it"
+        )
+
+        /// The arenas a turn installs, at `slots` per layout or at the shipped rule
+        /// when nil: their capacities and their total wired bytes.
+        func install(_ slots: Int?) throws -> (capacities: [Int], bytes: Int) {
+            if let slots {
+                UserDefaults.standard.set(slots, forKey: key)
+            } else {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+            metal.removeExpertArena()
+            let line = try inkling2InstallExpertArenas(
+                executor: metal, weights: metal.weights, summary: harness.summary,
+                snapshot: try snapshot(), config: config, catalog: metal.weights.catalog,
+                positions: turn.positions
+            )
+            if let slots { XCTAssertTrue(line.contains("[override \(slots)]"), line) }
+            let arenas = metal.expertArenas
+            return (
+                arenas.map { $0.arena.capacity },
+                arenas.reduce(0) { $0 + $1.arena.capacity * $1.arena.geometry.slotBytes }
+            )
+        }
+
+        /// One position from a reset sequence, with the mixture's own wall.
+        func position(
+            _ index: Int
+        ) throws -> (logits: [Float], ms: Double, mixtureMs: Double, stats: Inkling2ArenaCounters) {
+            harness.forward.reset()
+            metal.recordsVisitTiming = true
+            metal.visitProfile.reset()
+            let start = CFAbsoluteTimeGetCurrent()
+            let logits = try harness.forward.forwardToken(token: 0, position: index)
+            let ms = (CFAbsoluteTimeGetCurrent() - start) * 1_000
+            let visits = max(1, metal.visitProfile.visits)
+            let mixture = Double(metal.visitProfile.timing(.expertMixture).wallNanoseconds)
+                / Double(visits) / 1_000_000
+            let stats = Inkling2ArenaCounters.merged(metal.expertArenas.map { $0.arena.statistics })
+            return (logits, ms, mixture, stats)
+        }
+        func report(_ label: String, _ measured: (logits: [Float], ms: Double, mixtureMs: Double, stats: Inkling2ArenaCounters)) {
+            print(
+                "🔎 [inkling2 arena] \(label): \(String(format: "%.1f", measured.ms)) ms, mixture "
+                    + String(format: "%.2f", measured.mixtureMs) + " ms/visit, "
+                    + "\(measured.stats.hits) hit(s) / \(measured.stats.misses) miss(es) / "
+                    + "\(measured.stats.evictions) eviction(s), "
+                    + String(format: "%.2f", Double(measured.stats.bytesRead) / 1_073_741_824)
+                    + " GB read (" + String(format: "%.1f%%", 100 * measured.stats.hitRate) + " hit), "
+                    + String(format: "%.0f", Double(measured.stats.preadNanoseconds) / 1_000_000)
+                    + " ms in pread at "
+                    + String(format: "%.1f", Double(measured.stats.bytesRead)
+                        / max(Double(measured.stats.preadNanoseconds), 1))
+                    + " GB/s"
+            )
+        }
+
+        // Interleaved, and each round reinstalls its arm before running the same
+        // cold position, so neither the round's order nor a previous round's slot
+        // contents can decide the comparison. Four rounds, because the first one
+        // of a pair is also cold for the PAGE CACHE.
+        let floorSlots = config.numExpertsPerToken
+        typealias Measurement = (logits: [Float], ms: Double, mixtureMs: Double, stats: Inkling2ArenaCounters)
+        var shippedArm: (capacities: [Int], bytes: Int)?
+        var floorArm: (capacities: [Int], bytes: Int)?
+        var shippedSamples: [Measurement] = []
+        var floorSamples: [Measurement] = []
+        for round in 0..<4 {
+            let useShipped = round % 2 == 0
+            let arm = try install(useShipped ? nil : floorSlots)
+            if let known = useShipped ? shippedArm : floorArm {
+                XCTAssertEqual(arm.capacities, known.capacities, "the install is not deterministic")
+            }
+            if useShipped { shippedArm = arm } else { floorArm = arm }
+            let measured = try position(4)
+            report(
+                "round \(round), \(useShipped ? "shipped" : "floor") \(arm.capacities) "
+                    + "[\(String(format: "%.2f", Double(arm.bytes) / 1_073_741_824)) GB]",
+                measured
+            )
+            if useShipped { shippedSamples.append(measured) } else { floorSamples.append(measured) }
+        }
+        let shipped = try XCTUnwrap(shippedArm)
+        let floored = try XCTUnwrap(floorArm)
+        XCTAssertEqual(
+            floored.capacities, Array(repeating: floorSlots, count: floored.capacities.count),
+            "the floor is one routing width per layout, got \(floored.capacities)"
+        )
+        XCTAssertLessThan(floored.bytes, shipped.bytes)
+        for capacity in shipped.capacities {
+            XCTAssertGreaterThanOrEqual(
+                capacity, floorSlots, "an arena under one routing width aliases its slots"
+            )
+        }
+        // A cache cannot change what a position computes: every arm staged the
+        // same shard bytes through the same kernels, so every answer is the same.
+        let answers = (shippedSamples + floorSamples).map(\.logits)
+        for answer in answers.dropFirst() {
+            XCTAssertEqual(answer, answers[0], "the arena's capacity changed a logit")
+        }
+        XCTAssertGreaterThan(
+            (answers[0].max() ?? 0) - (answers[0].min() ?? 0), 1, "the logits collapsed"
+        )
+        let shippedBest = shippedSamples.map(\.ms).min() ?? 0
+        let floorBest = floorSamples.map(\.ms).min() ?? 0
+        print(
+            "🔎 [inkling2 arena] best of \(shippedSamples.count): shipped "
+                + "\(String(format: "%.1f", shippedBest)) ms ("
+                + String(format: "%.2f", Double(shipped.bytes) / 1_073_741_824) + " GB), floor "
+                + "\(String(format: "%.1f", floorBest)) ms ("
+                + String(format: "%.2f", Double(floored.bytes) / 1_073_741_824) + " GB); the floor is "
+                + String(format: "%.2fx", shippedBest / max(floorBest, 1)) + " the shipped wall"
+        )
+
+        // What the arena's bytes WOULD cost the context if they were charged: the
+        // engine's own budget function, the plan's own per-position price, and the
+        // arena's measured wired bytes taken off the same budget. The arena size is
+        // the one this machine installs at the FP32 unrestricted provision; a
+        // longer provision would install a SMALLER arena, because the cache term
+        // comes off the same fraction of RAM.
+        for storage in [Inkling2KVStorage.float32, Inkling2KVStorage.int8] {
+            for mode in [MemoryBudgetMode.balanced16GB, MemoryBudgetMode.unrestricted] {
+                let row = proposal(storage, mode)
+                let unpacked = row.positions
+                let withShipped = row.plan.affordableContextLength(
+                    budgetGB: row.budgetGB - Double(shipped.bytes) / 1_073_741_824
+                )
+                let withFloor = row.plan.affordableContextLength(
+                    budgetGB: row.budgetGB - Double(floored.bytes) / 1_073_741_824
+                )
+                print(
+                    "🔎 [inkling2 arena] \(storage.rawValue) KV, \(mode.rawValue): budget "
+                        + String(format: "%.2f", row.budgetGB) + " GB, arena "
+                        + String(format: "%.3f", Double(shipped.bytes) / 1_073_741_824) + " / "
+                        + String(format: "%.3f", Double(floored.bytes) / 1_073_741_824)
+                        + " GB -> positions \(unpacked) unchallenged, \(withShipped) if the shipped "
+                        + "arena is charged (\(withShipped - unpacked), "
+                        + String(format: "%.1f%%", 100 * Double(withShipped - unpacked) / Double(max(unpacked, 1)))
+                        + "), \(withFloor) at the floor (\(withFloor - unpacked))"
+                )
+                // Charging the arena can only cost positions, and the floor's
+                // smaller bill costs fewer of them. Both are the plan's own
+                // arithmetic, so neither may go the other way.
+                XCTAssertLessThanOrEqual(withShipped, unpacked)
+                XCTAssertGreaterThanOrEqual(withFloor, withShipped)
+                XCTAssertGreaterThan(withFloor, 0)
+            }
+        }
+    }
+
+    /// The same two arms where a TURN actually runs: the harness allocates the KV
+    /// cache and the device staging the launch path builds, so the arena competes
+    /// with the page cache at the footprint a turn makes it compete at. The
+    /// comparison above stages eight positions and a prompt of a few rows, so
+    /// every expert bank stays cached and the two arms differ only by their own
+    /// wired bytes.
+    ///
+    /// The shipped capacity was chosen on a measurement, so replacing it has to be
+    /// decided on one too -- and neither arm wins repeatably in either case, which
+    /// is itself the answer: the capacity is performance-neutral and the reads it
+    /// saves are about the bytes it costs.
+    func testWhatTheArenaFloorIsWorthAtTheTurnsOwnFootprint() throws {
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_arena"),
+            "opt-in arena measurement; touch /tmp/dynamoe_inkling2_arena to run"
+        )
+        // The provision comes first, from the checkpoint's own config and catalog,
+        // because the harness has to be built AT it: a harness built small and
+        // handed a big plan would measure an arena beside a staging buffer no turn
+        // allocates.
+        let directory = try snapshot()
+        let config = try Inkling2Config.decode(
+            contentsOf: directory.appendingPathComponent("config.json")
+        )
+        let probe = try DynaMoeEngine(filePath: directory.path)
+        let probeSummary = try inkling2MetalReadySummary(try probe.getSummary())
+        let catalog = Inkling2WeightCatalog(
+            mainFile: probeSummary.tensors.map { Inkling2TensorRef(metadata: $0) },
+            layerCount: config.numHiddenLayers
+        )
+        let physicalGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
+        let declared = Inkling2MemoryPlan.make(
+            config: config, catalog: catalog,
+            contextLength: config.maxPositionEmbeddings, kvElementBytes: 4
+        )
+        let denseGB = Double(declared.denseWeightBytes) / 1_073_741_824
+        let budgetGB = KVCacheProvisioning.budgetGB(
+            physicalGB: physicalGB, modelFootprintGB: denseGB,
+            budgetMode: .unrestricted, residentFootprintGB: denseGB
+        )
+        let provision = declared.affordableContextLength(budgetGB: budgetGB)
+        print(
+            "🔎 [inkling2 arena] turn footprint: \(provision) position(s) staged at FP32, budget "
+                + String(format: "%.2f", budgetGB) + " GB, staging "
+                + String(format: "%.2f", Double(provision * declared.kvStagingBytesPerPosition) / 1_073_741_824)
+                + " GB per buffer pair"
+        )
+
+        let harness = try harness(stagedPositions: provision)
+        let metal = harness.metal
+        let key = Inkling2ArenaCapacity.overrideDefaultsKey
+        let previousOverride = UserDefaults.standard.object(forKey: key)
+        addTeardownBlock {
+            metal.removeExpertArena()
+            if let previousOverride {
+                UserDefaults.standard.set(previousOverride, forKey: key)
+            } else {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+        }
+        func install(_ slots: Int?) throws -> (capacities: [Int], bytes: Int) {
+            if let slots {
+                UserDefaults.standard.set(slots, forKey: key)
+            } else {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+            metal.removeExpertArena()
+            let line = try inkling2InstallExpertArenas(
+                executor: metal, weights: metal.weights, summary: harness.summary,
+                snapshot: directory, config: config, catalog: metal.weights.catalog,
+                positions: provision
+            )
+            if let slots { XCTAssertTrue(line.contains("[override \(slots)]"), line) }
+            let arenas = metal.expertArenas
+            return (
+                arenas.map { $0.arena.capacity },
+                arenas.reduce(0) { $0 + $1.arena.capacity * $1.arena.geometry.slotBytes }
+            )
+        }
+        func position(
+            _ index: Int
+        ) throws -> (logits: [Float], ms: Double, mixtureMs: Double, stats: Inkling2ArenaCounters) {
+            harness.forward.reset()
+            metal.recordsVisitTiming = true
+            metal.visitProfile.reset()
+            let start = CFAbsoluteTimeGetCurrent()
+            let logits = try harness.forward.forwardToken(token: 0, position: index)
+            let ms = (CFAbsoluteTimeGetCurrent() - start) * 1_000
+            let visits = max(1, metal.visitProfile.visits)
+            let mixture = Double(metal.visitProfile.timing(.expertMixture).wallNanoseconds)
+                / Double(visits) / 1_000_000
+            let stats = Inkling2ArenaCounters.merged(metal.expertArenas.map { $0.arena.statistics })
+            return (logits, ms, mixture, stats)
+        }
+
+        let floorSlots = config.numExpertsPerToken
+        typealias Measurement = (logits: [Float], ms: Double, mixtureMs: Double, stats: Inkling2ArenaCounters)
+        var shippedArm: (capacities: [Int], bytes: Int)?
+        var floorArm: (capacities: [Int], bytes: Int)?
+        var shippedSamples: [Measurement] = []
+        var floorSamples: [Measurement] = []
+        for round in 0..<4 {
+            let useShipped = round % 2 == 0
+            let arm = try install(useShipped ? nil : floorSlots)
+            if let known = useShipped ? shippedArm : floorArm {
+                XCTAssertEqual(arm.capacities, known.capacities, "the install is not deterministic")
+            }
+            if useShipped { shippedArm = arm } else { floorArm = arm }
+            let measured = try position(4)
+            print(
+                "🔎 [inkling2 arena] turn footprint round \(round), "
+                    + "\(useShipped ? "shipped" : "floor") \(arm.capacities) "
+                    + "[\(String(format: "%.2f", Double(arm.bytes) / 1_073_741_824)) GB]: "
+                    + "\(String(format: "%.1f", measured.ms)) ms, mixture "
+                    + String(format: "%.2f", measured.mixtureMs) + " ms/visit, "
+                    + "\(measured.stats.hits) hit(s) / \(measured.stats.misses) miss(es) / "
+                    + "\(measured.stats.evictions) eviction(s), "
+                    + String(format: "%.2f", Double(measured.stats.bytesRead) / 1_073_741_824)
+                    + " GB read (" + String(format: "%.1f%%", 100 * measured.stats.hitRate) + " hit), "
+                    + String(format: "%.0f", Double(measured.stats.preadNanoseconds) / 1_000_000)
+                    + " ms in pread at "
+                    + String(format: "%.1f", Double(measured.stats.bytesRead)
+                        / max(Double(measured.stats.preadNanoseconds), 1))
+                    + " GB/s"
+            )
+            if useShipped { shippedSamples.append(measured) } else { floorSamples.append(measured) }
+        }
+        let shipped = try XCTUnwrap(shippedArm)
+        let floored = try XCTUnwrap(floorArm)
+        XCTAssertEqual(
+            floored.capacities, Array(repeating: floorSlots, count: floored.capacities.count),
+            "the floor is one routing width per layout, got \(floored.capacities)"
+        )
+        for capacity in shipped.capacities {
+            XCTAssertGreaterThanOrEqual(capacity, floorSlots)
+        }
+        // The same reason as above: a cache cannot change what a position computes.
+        let answers = (shippedSamples + floorSamples).map(\.logits)
+        for answer in answers.dropFirst() {
+            XCTAssertEqual(answer, answers[0], "the arena's capacity changed a logit")
+        }
+        let shippedBest = shippedSamples.map(\.ms).min() ?? 0
+        let floorBest = floorSamples.map(\.ms).min() ?? 0
+        print(
+            "🔎 [inkling2 arena] turn footprint, best of \(shippedSamples.count): shipped "
+                + "\(String(format: "%.1f", shippedBest)) ms ("
+                + String(format: "%.2f", Double(shipped.bytes) / 1_073_741_824) + " GB), floor "
+                + "\(String(format: "%.1f", floorBest)) ms ("
+                + String(format: "%.2f", Double(floored.bytes) / 1_073_741_824) + " GB); the floor is "
+                + String(format: "%.2fx", shippedBest / max(floorBest, 1)) + " the shipped wall"
         )
     }
 }
