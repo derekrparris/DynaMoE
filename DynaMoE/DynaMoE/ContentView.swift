@@ -431,6 +431,9 @@ struct ContentView: View {
     @AppStorage("dynamoe_memory_execution_mode") private var memoryExecutionModeRaw: String = MemoryExecutionMode.autoDetect.rawValue
     @AppStorage("dynamoe_memory_budget_mode") private var memoryBudgetModeRaw: String = MemoryBudgetMode.balanced16GB.rawValue
     @AppStorage("dynamoe_kv_cache_precision") private var kvCachePrecisionRaw: String = KVCachePrecision.fp16.rawValue
+    /// Inkling 2's KV storage form, which the turn reads at its own boundary:
+    /// both the sequence and the device staging buffers are built for one form.
+    @AppStorage("dynamoe_inkling_kv_storage") private var inklingKVStorageRaw: String = Inkling2KVStorage.float32.rawValue
     @AppStorage("dynamoe_speculative_prefetch_enabled") private var speculativePrefetchEnabled: Bool = true
     @AppStorage("dynamoe_prefetch_lookahead_depth") private var prefetchLookaheadDepth: Int = 1
     @AppStorage("dynamoe_pin_backbone_weights") private var pinBackboneWeights: Bool = true
@@ -446,6 +449,12 @@ struct ContentView: View {
         Binding(
             get: { KVCachePrecision(rawValue: kvCachePrecisionRaw) ?? .fp16 },
             set: { kvCachePrecisionRaw = $0.rawValue }
+        )
+    }
+    var inklingKVStorageBinding: Binding<Inkling2KVStorage> {
+        Binding(
+            get: { Inkling2KVStorage(rawValue: inklingKVStorageRaw) ?? .float32 },
+            set: { inklingKVStorageRaw = $0.rawValue }
         )
     }
     var memoryExecutionMode: MemoryExecutionMode {
@@ -2195,6 +2204,7 @@ struct ContentView: View {
             memoryExecutionMode: memoryExecutionModeBinding,
             memoryBudgetMode: memoryBudgetModeBinding,
             kvCachePrecision: kvCachePrecisionBinding,
+            inklingKVStorage: inklingKVStorageBinding,
             speculativePrefetchEnabled: $speculativePrefetchEnabled,
             prefetchLookaheadDepth: $prefetchLookaheadDepth,
             currentRssGB: currentRssGB,

@@ -218,6 +218,35 @@ nonisolated public struct Inkling2MemoryPlan: Sendable, Equatable {
     }
 }
 
+// MARK: - Arena capacity
+
+/// How many expert slots one packed layout's arena gets.
+///
+/// The shipped answer is one POSITION's working set -- the experts a position's
+/// schedule revisits -- because that is what measurement paid for: an arena
+/// sized to the plan's fraction of RAM (6.53 GB across both layouts) ran a
+/// position in 102-118 s with the mixture at 672-857 ms/visit, against
+/// 0.43-1.35 s and 5.8-22.9 ms/visit at 1.71 GB. Wired arena memory displaces
+/// the mmap's own pages, so over-sizing the arena is slower, not merely
+/// wasteful.
+///
+/// `override` is the measurement seam (`dynamoe_inkling2_arena_slots`): a
+/// positive slot count replaces the working-set cap without a rebuild, and is
+/// still held under the device ceiling, because an arena past it cannot be
+/// allocated at all. Zero means "no override", which is what ships.
+nonisolated public enum Inkling2ArenaCapacity {
+    /// `UserDefaults` key for the override, read on the turn's own task.
+    public static let overrideDefaultsKey = "dynamoe_inkling2_arena_slots"
+
+    public static func slots(
+        workingSet: Int, planned: Int, ceilingSlots: Int, override: Int = 0
+    ) -> Int {
+        let ceiling = max(1, ceilingSlots)
+        if override > 0 { return max(1, min(override, ceiling)) }
+        return max(1, min(workingSet, planned, ceiling))
+    }
+}
+
 // MARK: - Preflight
 
 /// A prompt this runtime cannot provision, refused BEFORE anything is

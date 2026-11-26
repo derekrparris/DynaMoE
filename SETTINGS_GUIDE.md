@@ -24,6 +24,7 @@ A comprehensive, practical guide to configuring, tuning, and operating DynaMoE o
    - [Memory Execution Modes (Auto, Full RAM, SSD Streaming)](#memory-execution-modes)
    - [Memory Budget Modes & Limits](#memory-budget-modes--limits)
    - [KV Cache Precision (FP32, FP16, FP8 E4M3/E5M2)](#kv-cache-precision)
+   - [Inkling 2 KV Format (FP32 / INT8)](#inkling-2-kv-format)
    - [Speculative MoE Lookahead Prefetching](#speculative-moe-lookahead-prefetching)
    - [Live Diagnostics & Working Set Metrics](#live-diagnostics--working-set-metrics)
    - [Cache Maintenance: Flush vs. Pre-Fault](#cache-maintenance-flush-vs-pre-fault)
@@ -344,6 +345,13 @@ Controls the floating-point representation of the autoregressive key-value cache
 - **FP8 (E4M3 / E5M2)**: 8-bit quantized KV cache with per-head dynamic scale factors. Reduces KV cache memory by 75%, enabling 32k+ token contexts on 16GB Macs without memory pressure.
 
 **Long context needs FP8 KV.** The row ceiling is now derived from the checkpoint's own `max_position_embeddings` (capped at 262,144 rows) instead of a flat 32,768, so a long-context model can be driven past 32k when the machine affords it — and the KV budget, not that ceiling, is what decides. The bytes are what bind. A 52-layer dense model with 8 KV heads of 128 costs 4 KB per layer per logical token at FP16 (1024 stride x 2 tensors x 2 bytes), i.e. about 208 KB per token across the 52 layers (52 slots x 1024 stride x 2 tensors x 2 bytes). So a 66 GB checkpoint on a 128 GB Mac leaves roughly 27 GB of KV budget in Unrestricted mode: about 130k rows at FP16, versus about 260k at FP8 (the FP8 cache also carries one scaling byte per 32 values, about 1.6% on top). That FP8 figure sits within a few percent of the 262,144-row policy ceiling, so at FP8 the KV budget stops being the binding constraint before the ceiling does. Past roughly 100k rows, switch the KV cache to FP8 E4M3; below that FP16 is the better trade.
+
+### Inkling 2 KV Format
+Shown only while an Inkling 2 Mini checkpoint is loaded. Inkling 2 keeps its own KV store rather than the generic FP8 cache above, because the sequence and the GPU staging buffers are built for one form per turn:
+- **FP32**: The reference graph's own form. Default, and what every parity test compares against.
+- **INT8**: One signed byte per element plus an FP16 scale per KV head and token, using DynaMoE's `scale = max(abs(x), 1e-7) / 127` rule. 75% less KV memory, which is what makes a long conversation affordable on a 16 GB Mac.
+
+The choice applies to the next turn: the cache, the device staging buffers, and the reported context budget are all priced at the form it selects. Switching mid-conversation re-prefills, because the pinned prefix's bytes are only valid in the form that wrote them.
 
 ### Speculative MoE Lookahead Prefetching
 When running sparse MoE models in SSD streaming mode:

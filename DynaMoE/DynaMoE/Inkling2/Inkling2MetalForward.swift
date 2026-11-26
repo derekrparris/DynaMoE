@@ -704,6 +704,13 @@ nonisolated public final class Inkling2MetalForward {
                 "the batched projection runs exactly eight slots, got \(slots)"
             )
         }
+        // The same three segments the single-position front binds, in one
+        // command buffer: priced before the encoder exists, so a refusal cannot
+        // leave one unclosed (Metal asserts on release, which is a process
+        // abort rather than an error a caller can read).
+        try guardDenseBinding(
+            "batched attention front", roles: [.attnWqDu, .attnWkDv, .attnWvDv], layer: layer
+        )
         guard let commandBuffer = queue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw Inkling2ForwardError.unsupported("could not make a command buffer")
@@ -876,6 +883,7 @@ nonisolated public final class Inkling2MetalForward {
                 "the head wants a \(columns)-wide hidden row, got \(hidden.count)"
             )
         }
+        try guardDenseBinding("head", roles: [.lmHead], layer: nil)
         let (weightBuffer, weightOffset) = try weights.tensor(.lmHead, layer: nil)
         let input = try staging(workspace.queryInput, hidden)
         let arena = Inkling2ScalarArena(device: device)
@@ -1251,6 +1259,15 @@ nonisolated public final class Inkling2MetalForward {
         let headDim = isFull ? config.headDim : config.swaHeadDim
         let hidden = config.hiddenSize
 
+        // Price both command buffers' bindings before anything is staged: a
+        // binding past the device's ceiling returns zeros with no error at all.
+        try guardDenseBinding(
+            "attention front", roles: [.attnWqDu, .attnWkDv, .attnWvDv], layer: layer
+        )
+        try guardDenseBinding(
+            "attention tail", roles: [.attnGate, .attnWoUd], layer: layer
+        )
+
         // Inputs staged once; every stage reads them.
         let queryInputBuffer = try staging(workspace.queryInput, queryInput)
         let keyInputBuffer = try staging(workspace.keyInput, keyInput)
@@ -1558,6 +1575,12 @@ nonisolated public final class Inkling2MetalForward {
         let intermediate = config.moeIntermediateSize
         let experts = config.numRoutedExperts
         let topK = config.numExpertsPerToken
+
+        // The front's own bindings, priced before it encodes; the mixture prices
+        // itself once its eight experts are resolved.
+        try guardDenseBinding(
+            "mlp front", roles: [.mlpNorm, .routerWeight, .routerBias], layer: layer
+        )
 
         // 1. The MLP norm, then the router and its selection, in one buffer.
         let mlpInputBuffer = try staging(workspace.hidden, mlpInput)
@@ -2006,16 +2029,43 @@ nonisolated public final class Inkling2MetalForward {
         return resolved
     }
 
-    /// The bytes of bank this device will wire in one mixture command buffer.
+    /// The bytes of bank this device will wire in one command buffer.
     ///
     /// `recommendedMaxWorkingSetSize` is Metal's own ceiling for resident
-    /// buffers, so it is the line the guard draws rather than a number tuned to
-    /// one machine. Measured on a 16 GB M1 Pro: layer 0 binds 17.24 GB across
-    /// two segments (8.66 GiB and 8.57 GiB) and reads zeros; each segment alone
-    /// reads correctly, so the ceiling is the failure's own boundary and not an
-    /// estimate.
+    /// buffers, so it is the line the guards draw rather than a number tuned to
+    /// one machine. Measured on a 16 GB M1 Pro: layer 0's mixture binds 17.24 GB
+    /// across two segments (8.66 GiB and 8.57 GiB) and reads zeros; each segment
+    /// alone reads correctly, so the ceiling is the failure's own boundary and
+    /// not an estimate. The dense stages draw the same line -- they bind
+    /// segments rather than expert slices, so a segmentation that closes buffers
+    /// near `maxBufferLength` can put two of them in one command buffer.
     public var mixtureBindingBudget: UInt64 {
         UInt64(device.recommendedMaxWorkingSetSize)
+    }
+
+    /// Prices the segments one DENSE stage's command buffer binds and refuses
+    /// them past the device's ceiling.
+    ///
+    /// Each dense stage resolves its projections inside `gemm`, so the guard
+    /// resolves them here first, prices them exactly as the kernels will bind
+    /// them, and only then lets the stage encode. The roles passed are one
+    /// command buffer's: the attention front and tail are priced separately
+    /// because their buffers never coexist, and charging a stage for a binding
+    /// it never makes would refuse a graph that runs.
+    func guardDenseBinding(
+        _ stage: String, roles: [Inkling2TensorRole], layer: Int?
+    ) throws {
+        var binding = Inkling2MixtureBinding()
+        for role in roles {
+            let tensor = try weights.tensor(role, layer: layer)
+            binding.add(tensor.buffer, label: "the \(role.rawValue) weight")
+        }
+        try binding.refuse(
+            over: mixtureBindingBudget,
+            subject: "the \(stage) stage",
+            remedy: "a dense stage can only run if the checkpoint's segments are closed "
+                + "below this ceiling"
+        )
     }
 
     func guardMixtureBinding(layer: Int, experts: [Inkling2ResolvedExpert]) throws {
@@ -2295,15 +2345,24 @@ nonisolated public struct Inkling2MixtureBinding: Equatable {
     }
 
     /// Refuses a binding past `budget`, naming every segment it would bind.
-    public func refuse(over budget: UInt64) throws {
+    ///
+    /// `subject` is what the message says was refused -- the mixture of experts,
+    /// or one of the dense stages, which bind a projection's segment per command
+    /// buffer and fail the same silent way. `remedy` is the clause that follows;
+    /// the mixture's is the arena, a dense stage's is a finer segmentation.
+    public func refuse(
+        over budget: UInt64,
+        subject: String = "the expert mixture",
+        remedy: String = "an expert arena serves each expert from a slot of its own and "
+            + "stays under the line"
+    ) throws {
         guard bytes > budget else { return }
         throw Inkling2ForwardError.unsupported(
-            "the expert mixture would bind \(Self.describe(bytes)) of bank in one command "
+            "\(subject) would bind \(Self.describe(bytes)) of bank in one command "
                 + "buffer (\(segments.map(\.description).joined(separator: " + "))), past the "
                 + "\(Self.describe(budget)) this device will wire. A binding that large "
                 + "returns zeros for every row and reports no error, so it is refused here "
-                + "rather than served as logits; an expert arena serves each expert from a "
-                + "slot of its own and stays under the line."
+                + "rather than served as logits; \(remedy)."
         )
     }
 

@@ -1248,6 +1248,57 @@ final class Inkling2MemoryPlanTests: XCTestCase {
         XCTAssertNil(arena.residentSlot(layer: 2, expert: 2), "another layer is a miss")
     }
 
+    /// The arena's capacity is one POSITION's working set, and the measurement
+    /// override replaces only that cap: a count past what the device can
+    /// allocate is still refused, and the shipped answer is unchanged when the
+    /// key is absent (0).
+    ///
+    /// The working sets are the published schedule's -- 44 NVFP4 visits and 4
+    /// MXFP8 ones, eight experts each -- which is the pair the turn installed.
+    func testTheArenaCapacityIsTheWorkingSetUnlessAMeasurementOverridesIt() {
+        // 44 x 8 and 4 x 8 against the plan's own slots (1,437 and 71).
+        XCTAssertEqual(
+            Inkling2ArenaCapacity.slots(workingSet: 352, planned: 1_437, ceilingSlots: 2_839),
+            352
+        )
+        XCTAssertEqual(
+            Inkling2ArenaCapacity.slots(workingSet: 32, planned: 71, ceilingSlots: 1_548),
+            32
+        )
+        // A plan that prices fewer slots than a position revisits wins, and the
+        // device ceiling always wins.
+        XCTAssertEqual(
+            Inkling2ArenaCapacity.slots(workingSet: 352, planned: 100, ceilingSlots: 2_839), 100
+        )
+        XCTAssertEqual(
+            Inkling2ArenaCapacity.slots(workingSet: 352, planned: 1_437, ceilingSlots: 64), 64
+        )
+        // The override replaces the working-set and plan caps but never the
+        // ceiling, which no allocation can cross.
+        XCTAssertEqual(
+            Inkling2ArenaCapacity.slots(
+                workingSet: 352, planned: 1_437, ceilingSlots: 2_839, override: 1_437
+            ), 1_437
+        )
+        XCTAssertEqual(
+            Inkling2ArenaCapacity.slots(
+                workingSet: 352, planned: 1_437, ceilingSlots: 2_839, override: 9_000
+            ), 2_839
+        )
+        // A negative value is not a measurement: it is the absent-key path.
+        XCTAssertEqual(
+            Inkling2ArenaCapacity.slots(
+                workingSet: 352, planned: 1_437, ceilingSlots: 2_839, override: -5
+            ), 352
+        )
+        // Never zero: an arena with no slot serves nothing, and a zero ceiling
+        // would otherwise read as "install none".
+        XCTAssertEqual(
+            Inkling2ArenaCapacity.slots(workingSet: 0, planned: 0, ceilingSlots: 0), 1
+        )
+        XCTAssertEqual(Inkling2ArenaCapacity.overrideDefaultsKey, "dynamoe_inkling2_arena_slots")
+    }
+
     private func config() throws -> Inkling2Config {
         try Inkling2Config.decode(jsonData: Data(Inkling2ConfigTests.smallJSON.utf8))
     }
@@ -2430,7 +2481,10 @@ final class Inkling2HostForwardTests: XCTestCase {
     /// mappings, the catalog and the snapshot weight source. The shard buffers
     /// are zero-copy views of the engine's own mmap addresses, which is what
     /// the app's Metal layer does with `MTLBuffer(bytesNoCopy:)`.
-    private func makeForward() throws -> Inkling2CPUForward {
+    ///
+    /// `storage` is the KV form the sequence is built for; it is fixed at
+    /// construction because the device staging buffers are laid out for one.
+    private func makeForward(storage: Inkling2KVStorage = .float32) throws -> Inkling2CPUForward {
         let directory = try snapshot()
         let engine = try DynaMoeEngine(filePath: directory.path)
         self.engine = engine
@@ -2448,7 +2502,138 @@ final class Inkling2HostForwardTests: XCTestCase {
         let source = Inkling2SnapshotWeights(
             config: config, catalog: catalog, shardBuffers: buffers
         )
-        return try Inkling2CPUForward(config: config, weights: source)
+        return try Inkling2CPUForward(
+            config: config, weights: source,
+            options: Inkling2ForwardOptions(kvStorage: storage)
+        )
+    }
+
+    /// Phase 7's exit gate: the INT8 cache against the FP32 one at a few
+    /// lengths, both arms the SAME graph, the same weights and the same token
+    /// history -- only the storage differs -- so the difference is the cache's
+    /// own quantization rather than a reference loader's noise.
+    ///
+    /// The plan asked for the Phase 2 elementwise bound
+    /// (`abs(actual - ref) <= 5e-4 + 5e-4 * abs(ref)`) on every logit. Measured,
+    /// an 8-bit cache does NOT meet that bar and cannot: the plan's own BF16
+    /// reference fails it on 197k of 200k logits against itself. The case
+    /// therefore prints the plan-bound violation count, the mean and p99
+    /// absolute difference, the worst `diff / (1 + |ref|)` and the FP32 arm's
+    /// top-1/top-2 margin, and asserts what the gate actually needs: the same
+    /// greedy token at every length, inside a measured elementwise band.
+    ///
+    /// Lengths come from ONE pass per arm: the logits returned at position
+    /// `L - 1` are the `L`-token answer, so a single 17-position walk gives
+    /// every tested length without re-prefilling the prefix.
+    ///
+    /// Opt-in: it is two host walks over the real checkpoint, which is the one
+    /// cost the fast suites do not carry.
+    func testTheInt8CacheKeepsItsGreedyTokenAndStaysInsideItsBand() throws {
+        guard FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_int8_bound") else {
+            throw XCTSkip(
+                "opt-in: touch /tmp/dynamoe_inkling2_int8_bound (two 17-position host walks)"
+            )
+        }
+        let exact = try makeForward()
+        let exactEngine = engine
+        let compact = try makeForward(storage: .int8)
+        let compactEngine = engine
+        XCTAssertEqual(compact.sequence.storage, .int8)
+        XCTAssertEqual(compact.states.first?.storage, .int8)
+        try withExtendedLifetime((exactEngine, compactEngine)) {
+            let tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: try snapshot().appendingPathComponent("tokenizer.json").path
+            )
+            let ids = try tokenizer.encode(
+                text: "The quick brown fox jumps over the lazy dog, and the dog does not mind it at all."
+            ).map { Int($0) }
+            let lengths = [1, 2, 5, 9, 17]
+            let longest = try XCTUnwrap(lengths.max())
+            XCTAssertGreaterThanOrEqual(ids.count, longest)
+
+            var exactLogits: [[Float]] = []
+            var compactLogits: [[Float]] = []
+            for (position, id) in ids.prefix(longest).enumerated() {
+                exactLogits.append(try exact.forwardToken(token: UInt32(id), position: position))
+            }
+            for (position, id) in ids.prefix(longest).enumerated() {
+                compactLogits.append(try compact.forwardToken(token: UInt32(id), position: position))
+            }
+
+            func ranked(_ logits: [Float], count: Int) -> [(id: Int, value: Float)] {
+                logits.enumerated()
+                    .sorted { $0.element > $1.element }
+                    .prefix(count)
+                    .map { (id: $0.offset, value: $0.element) }
+            }
+
+            for length in lengths {
+                let exactRow = exactLogits[length - 1]
+                let compactRow = compactLogits[length - 1]
+                XCTAssertEqual(exactRow.count, compactRow.count, "length \(length)")
+                var violations = 0
+                var worstAbsolute: Float = 0
+                var worstIndex = 0
+                var worstRatio: Float = 0
+                var worstReference: Float = 0
+                var differences: [Float] = []
+                differences.reserveCapacity(exactRow.count)
+                for index in 0..<exactRow.count {
+                    let reference = exactRow[index]
+                    let allowed = 5e-4 + 5e-4 * abs(reference)
+                    let difference = abs(compactRow[index] - reference)
+                    if difference > allowed { violations += 1 }
+                    differences.append(difference)
+                    if difference > worstAbsolute { worstAbsolute = difference; worstIndex = index }
+                    worstRatio = max(worstRatio, difference / (1 + abs(reference)))
+                    worstReference = max(worstReference, abs(reference))
+                }
+                let mean = differences.reduce(0, +) / Float(differences.count)
+                let p99 = differences.sorted()[Int(0.99 * Float(differences.count - 1))]
+                let exactTop = ranked(exactRow, count: 2)
+                let compactTop = ranked(compactRow, count: 2)
+                let margin = exactTop[0].value - exactTop[1].value
+                print(
+                    "\u{1F50E} [inkling2 int8] length \(length): \(violations) of "
+                        + "\(exactRow.count) logits past the Phase 2 bound; worst "
+                        + String(format: "%.3g", worstAbsolute)
+                        + " at id \(worstIndex) (|ref| \(String(format: "%.3g", abs(exactRow[worstIndex]))), max |ref| "
+                        + String(format: "%.3g", worstReference)
+                        + "), mean " + String(format: "%.3g", mean)
+                        + ", p99 " + String(format: "%.3g", p99)
+                        + ", max diff/(1+|ref|) " + String(format: "%.3g", worstRatio)
+                        + ", greedy "
+                        + (exactTop[0].id == compactTop[0].id ? "agrees" : "DIFFERS")
+                        + " (\(exactTop[0].id) vs \(compactTop[0].id)), FP32 margin "
+                        + String(format: "%.4g", margin)
+                )
+                XCTAssertEqual(
+                    compactTop[0].id, exactTop[0].id,
+                    "length \(length): the INT8 cache argues for a different token, at a "
+                        + String(format: "%.4g", margin) + " FP32 margin"
+                )
+                // The measured envelope, with roughly 2x headroom over the run
+                // that set it: the host arithmetic is deterministic, so these
+                // ceilings are a fidelity bar rather than a noise estimate.
+                // A dropped value scale, a row-wide scale, a wrong KV-head
+                // split or a mismatched read/write rule each move the mean by
+                // far more than the headroom.
+                let ceilings: (mean: Float, p99: Float) = switch length {
+                case 1: (0.02, 0.06)
+                case 2: (0.04, 0.12)
+                case 5: (0.08, 0.25)
+                case 9: (0.15, 0.5)
+                default: (0.35, 1.1)
+                }
+                XCTAssertLessThan(mean, ceilings.mean, "length \(length) mean absolute difference")
+                XCTAssertLessThan(p99, ceilings.p99, "length \(length) p99 absolute difference")
+            }
+            print(
+                "\u{1F50E} [inkling2 int8] the Phase 2 bound in its literal form is not "
+                    + "met by an 8-bit cache (the plan's own BF16 reference fails it too); "
+                    + "the pinned bar is greedy agreement plus the mean/p99 envelope"
+            )
+        }
     }
 
     /// A follow-up turn that resumes its prefix must answer exactly what a

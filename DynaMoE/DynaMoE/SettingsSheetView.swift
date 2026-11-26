@@ -466,6 +466,10 @@ struct SettingsSheetView: View {
     @Binding var memoryExecutionMode: MemoryExecutionMode
     @Binding var memoryBudgetMode: MemoryBudgetMode
     @Binding var kvCachePrecision: KVCachePrecision
+    /// Inkling 2's own KV storage form. It is not the generic precision above:
+    /// the sequence and the device staging buffers are built for one form per
+    /// turn, and the value is read back by the engine at that boundary.
+    @Binding var inklingKVStorage: Inkling2KVStorage
     @Binding var speculativePrefetchEnabled: Bool
     @Binding var prefetchLookaheadDepth: Int
     var currentRssGB: Double
@@ -1634,6 +1638,27 @@ struct SettingsSheetView: View {
                         }
                         .pickerStyle(.menu)
                         .labelsHidden()
+                    }
+                }
+                if detectedArchitecture == .inkling2Mini {
+                    SettingsRowDivider()
+
+                    SettingsRow(
+                        title: "Inkling 2 KV Format",
+                        subtitle: "How Inkling 2 holds its attention key/value history. INT8 stores one byte per element plus a per-head scale, which is what makes a long conversation fit on this machine."
+                    ) {
+                        HStack(spacing: 8) {
+                            SettingsStatusBadge(
+                                text: inklingKVStorage == .int8 ? "75% KV Reduction" : "Full Precision",
+                                tint: .indigo
+                            )
+                            Picker("Inkling KV Format", selection: $inklingKVStorage) {
+                                Text("FP32").tag(Inkling2KVStorage.float32)
+                                Text("INT8").tag(Inkling2KVStorage.int8)
+                            }
+                            .pickerStyle(.menu)
+                            .labelsHidden()
+                        }
                     }
                 }
             }

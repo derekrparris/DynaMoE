@@ -12953,6 +12953,13 @@ extension CompletionEngine {
         let budgetBytes = UInt64(max(1, plan.affordableExpertSlots(physicalGB: physicalGB)))
             * UInt64(max(1, plan.bytesPerExpertSlot))
         let ceiling = min(UInt64(device.maxBufferLength), UInt64(device.recommendedMaxWorkingSetSize))
+        // The measurement seam: a positive slot count replaces the working-set
+        // cap without a rebuild, and is still held under the ceiling, which no
+        // allocation can cross. Zero -- the default -- ships the measured
+        // capacity.
+        let arenaSlotOverride = UserDefaults.standard.integer(
+            forKey: Inkling2ArenaCapacity.overrideDefaultsKey
+        )
 
         var installed: [String] = []
         var refusals: [String] = []
@@ -13000,12 +13007,16 @@ extension CompletionEngine {
                 // against 0.72-0.79 s and 10.8 ms/visit at 1.07 GB. Wired arena
                 // memory displaces the mmap's own pages, so the capacity that
                 // pays is the set a position actually revisits and no more.
+                // `Inkling2ArenaCapacity` owns the rule and the override seam.
                 let workingSet = visits * config.numExpertsPerToken
                 let slots = max(1, geometry.slotBytes)
                 let planned = Int((budgetBytes * UInt64(visits) / UInt64(totalVisits)) / UInt64(slots))
-                let capacity = max(1, min(
-                    workingSet, planned, Int(ceiling / UInt64(slots))
-                ))
+                let capacity = Inkling2ArenaCapacity.slots(
+                    workingSet: workingSet,
+                    planned: planned,
+                    ceilingSlots: Int(ceiling / UInt64(slots)),
+                    override: arenaSlotOverride
+                )
                 let reader = try Inkling2ArenaShardReader(url: url)
                 try executor.installExpertArena(
                     capacity: capacity, geometry: geometry, reader: reader
@@ -13015,6 +13026,7 @@ extension CompletionEngine {
                     "\(capacity)×" + String(format: "%.2f MB", Double(slots) / 1_048_576)
                         + " (" + String(format: "%.2f GB", Double(bytes) / 1_073_741_824) + ") "
                         + layout.rawValue + " from layer \(layer)"
+                        + (arenaSlotOverride > 0 ? " [override \(arenaSlotOverride)]" : "")
                 )
                 DiagLog.info(
                     "inkling2.arena",
@@ -13022,6 +13034,9 @@ extension CompletionEngine {
                         + "\(slots) bytes = \(bytes) bytes, filled by pread from "
                         + "\(url.lastPathComponent), geometry from layer \(layer), "
                         + "\(visits) of \(totalVisits) visits"
+                        + (arenaSlotOverride > 0
+                            ? ", override \(arenaSlotOverride) slot(s)"
+                            : "")
                 )
             } catch {
                 refusals.append("\(layout.rawValue): \(error)")

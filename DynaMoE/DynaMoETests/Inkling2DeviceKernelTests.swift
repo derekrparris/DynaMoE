@@ -2188,6 +2188,48 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         }
     }
 
+    /// The dense stages bind segments too, and a refusal has to say WHICH stage
+    /// was refused: a head that silently returned zeros and a mixture that did
+    /// would read identically in a log.
+    ///
+    /// The default subject is the mixture's, so every existing call site's
+    /// message is unchanged; a dense stage passes its own subject and a remedy
+    /// that does not promise an arena it does not have.
+    func testADenseStageBindingNamesItsStageAndItsSegments() throws {
+        let (device, _, _) = try environment()
+        let gateWeight = try XCTUnwrap(device.makeBuffer(length: 5 << 20, options: .storageModeShared))
+        let downWeight = try XCTUnwrap(device.makeBuffer(length: 3 << 20, options: .storageModeShared))
+        var binding = Inkling2MixtureBinding()
+        binding.add(gateWeight, label: "the attnGate weight")
+        binding.add(downWeight, label: "the attnWoUd weight")
+
+        XCTAssertThrowsError(try binding.refuse(over: 4 << 20)) { error in
+            XCTAssertTrue("\(error)".contains("the expert mixture would bind"), "\(error)")
+            XCTAssertTrue("\(error)".contains("expert arena"), "\(error)")
+        }
+        XCTAssertThrowsError(
+            try binding.refuse(
+                over: 4 << 20,
+                subject: "the attention tail stage",
+                remedy: "a dense stage can only run if the checkpoint's segments are closed "
+                    + "below this ceiling"
+            )
+        ) { error in
+            let message = "\(error)"
+            XCTAssertTrue(message.contains("the attention tail stage would bind"), message)
+            XCTAssertTrue(message.contains("the attnGate weight"), message)
+            XCTAssertTrue(message.contains("the attnWoUd weight"), message)
+            XCTAssertTrue(message.contains("8.00 MB"), message)
+            XCTAssertTrue(message.contains("returns zeros"), message)
+            // A stage with no mixture in it is not offered a mixture's remedy.
+            XCTAssertFalse(message.contains("expert arena"), message)
+            XCTAssertTrue(message.contains("segments are closed"), message)
+        }
+        XCTAssertNoThrow(
+            try binding.refuse(over: 9 << 20, subject: "the attention tail stage")
+        )
+    }
+
     /// The unembedding, device against host: the last stage an engine TURN runs
     /// on the GPU, and the one that decides a greedy token.
     ///
@@ -2323,6 +2365,91 @@ final class Inkling2DeviceKernelTests: XCTestCase {
                 forLayer: config.numHiddenLayers - 1, config: config
             ), .mxfp8
         )
+        withExtendedLifetime(engine) {}
+    }
+
+    /// What the DENSE stages bind, per layer, on the published checkpoint: the
+    /// mixture's measurement repeated for the four command buffers that bind a
+    /// projection segment apiece.
+    ///
+    /// The mixture guard exists because it was measured failing here; this one
+    /// exists because the same segmentation applies to a projection. Printed for
+    /// the layers either side of the quantization boundary and asserted on every
+    /// layer, because the assertion is the contract -- a turn runs these three
+    /// stages on all 24 -- and the printout is what says how close the device is
+    /// to its ceiling on one machine.
+    func testWhatTheDenseStagesBindPerLayerOnThePublishedCheckpoint() throws {
+        let snapshot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(Inkling2PublishedTensorTests.snapshotRelativePath)
+        guard FileManager.default.fileExists(atPath: snapshot.path) else {
+            throw XCTSkip("Inkling 2 snapshot is not downloaded at \(snapshot.path)")
+        }
+        let (device, library, queue) = try environment()
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let summary = try inkling2MetalReadySummary(try engine.getSummary())
+        let config = try Inkling2Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let catalog = Inkling2WeightCatalog(
+            mainFile: summary.tensors.map { Inkling2TensorRef(metadata: $0) },
+            layerCount: config.numHiddenLayers
+        )
+        var shardBuffers: [UInt32: MTLBuffer] = [:]
+        shardBuffers = try inkling2MetalShardBuffers(summary, device: device)
+        let source = Inkling2SnapshotWeights(
+            config: config, catalog: catalog, shardBuffers: shardBuffers
+        )
+        let host = try Inkling2CPUForward(config: config, weights: source)
+        let weights = Inkling2DeviceWeights(
+            config: config, catalog: catalog, shardBuffers: shardBuffers
+        )
+        let metal = try Inkling2MetalForward(
+            device: device, library: library, queue: queue, weights: weights, host: host
+        )
+        let budget = metal.mixtureBindingBudget
+        let notable = [0, 9, config.numHiddenLayers - 5, config.numHiddenLayers - 1]
+        let stages: [(name: String, roles: [Inkling2TensorRole])] = [
+            ("attention front", [.attnWqDu, .attnWkDv, .attnWvDv]),
+            ("attention tail", [.attnGate, .attnWoUd]),
+            ("mlp front", [.mlpNorm, .routerWeight, .routerBias]),
+        ]
+        for layer in 0..<config.numHiddenLayers {
+            for stage in stages {
+                var binding = Inkling2MixtureBinding()
+                for role in stage.roles {
+                    let tensor = try weights.tensor(role, layer: layer)
+                    binding.add(tensor.buffer, label: "the \(role.rawValue) weight")
+                }
+                XCTAssertLessThanOrEqual(
+                    binding.bytes, budget,
+                    "layer \(layer) \(stage.name) binds past the device ceiling"
+                )
+                // The stage's own guard, i.e. the code a turn runs, resolves the
+                // same roles and lets this layer through.
+                XCTAssertNoThrow(
+                    try metal.guardDenseBinding(stage.name, roles: stage.roles, layer: layer)
+                )
+                guard notable.contains(layer) else { continue }
+                print(
+                    "\u{1F50E} [inkling2 binding] layer \(layer) \(stage.name): "
+                        + "\(binding.segments.count) segment(s), "
+                        + "\(Inkling2MixtureBinding.describe(binding.bytes)) vs a "
+                        + "\(Inkling2MixtureBinding.describe(budget)) budget"
+                )
+                for segment in binding.segments {
+                    print("\u{1F50E} [inkling2 binding]     \(segment.label): \(segment.bytes) bytes")
+                }
+            }
+        }
+        let head = try weights.tensor(.lmHead, layer: nil)
+        let headBytes = UInt64(head.buffer.length)
+        print(
+            "\u{1F50E} [inkling2 binding] head: 1 segment, "
+                + "\(Inkling2MixtureBinding.describe(headBytes)) vs a "
+                + "\(Inkling2MixtureBinding.describe(budget)) budget"
+        )
+        XCTAssertLessThanOrEqual(headBytes, budget, "the head's own segment is past the ceiling")
+        XCTAssertNoThrow(try metal.guardDenseBinding("head", roles: [.lmHead], layer: nil))
         withExtendedLifetime(engine) {}
     }
 
