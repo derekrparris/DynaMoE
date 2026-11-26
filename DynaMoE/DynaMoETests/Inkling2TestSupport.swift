@@ -6,6 +6,7 @@
 //
 
 import Metal
+import XCTest
 @testable import DynaMoE
 
 /// The summary the Metal side of a test must use: shards split to fit the GPU.
@@ -46,4 +47,37 @@ func inkling2MetalShardBuffers(_ summary: ModelSummary, device: MTLDevice) throw
         ) { buffers[shard.index] = buffer }
     }
     return buffers
+}
+
+/// The resident expert arenas a TURN installs, through the app's own path.
+///
+/// Every checkpoint-gated device case needs them for the same reason a turn
+/// does: the mixture's mmap path binds a whole bank segment and a whole scale
+/// segment per expert, and on a 16 GB machine that pair is past what the device
+/// will wire -- zeros for every row, with no Metal error. Calling the app's
+/// helper rather than reproducing it here is the point: a test that installed
+/// its own arenas would stop proving what a turn does.
+@discardableResult
+func inkling2InstallExpertArenas(
+    executor: Inkling2MetalForward,
+    weights: Inkling2DeviceWeights,
+    summary: ModelSummary,
+    snapshot: URL,
+    config: Inkling2Config,
+    catalog: Inkling2WeightCatalog,
+    positions: Int,
+    kvElementBytes: Int = 4
+) throws -> String {
+    guard let device = MTLCreateSystemDefaultDevice() else {
+        throw XCTSkip("No Metal GPU device")
+    }
+    let plan = Inkling2MemoryPlan.make(
+        config: config, catalog: catalog, contextLength: positions,
+        kvElementBytes: kvElementBytes
+    )
+    let line = CompletionEngine.installInklingExpertArenas(
+        executor: executor, weights: weights, summary: summary,
+        snapshotDir: snapshot, config: config, plan: plan, device: device
+    )
+    return line
 }

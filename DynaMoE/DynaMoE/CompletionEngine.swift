@@ -723,9 +723,22 @@ public final class CompletionEngine: @unchecked Sendable {
                 // ~1.5% of an INT8 record and deliberately not re-priced here.
                 kvElementBytes: inklingStorage.bytesPerElement
             )
-            let contextLength = memoryPlan.affordableContextLength(
-                budgetGB: request.memory.budgetMode.targetMaxRssGB
+            // The budget the plan is priced against, from the SAME function the
+            // generic engine uses: `unrestricted` is three quarters of this
+            // machine's RAM rather than its 36.6 GB constant, and the model's
+            // resident weights and a working reserve come off the top. Taking
+            // the mode's constant at face value on a 16 GB Mac provisioned
+            // 594,534 positions -- 64 GB of KV rows, which the executor's
+            // staging then tried to allocate and the GPU refused. This family
+            // streams its experts, so the charged footprint is the dense
+            // backbone the plan measured, not the checkpoint's file size.
+            let physicalGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
+            let denseGB = Double(memoryPlan.denseWeightBytes) / 1_073_741_824
+            let budgetGB = KVCacheProvisioning.budgetGB(
+                physicalGB: physicalGB, modelFootprintGB: denseGB,
+                budgetMode: request.memory.budgetMode, residentFootprintGB: denseGB
             )
+            let contextLength = memoryPlan.affordableContextLength(budgetGB: budgetGB)
 
             // Price the image expansion BEFORE the tower runs: one placeholder
             // per image becomes one marker per 40-pixel cell, and the tower is
@@ -829,6 +842,16 @@ public final class CompletionEngine: @unchecked Sendable {
                             device: device, config: inklingConfig,
                             stagedPositions: contextLength, storage: inklingStorage
                         )
+                        // The resident expert arena, sized by the plan. It is
+                        // what makes this family runnable on a 16 GB machine at
+                        // all: the mmap path binds the segments a layer's bank
+                        // and its scales live in, and those are past what the
+                        // device will wire (see `installInklingExpertArenas`).
+                        let arenaStatus = Self.installInklingExpertArenas(
+                            executor: executor, weights: deviceWeights,
+                            summary: loadedSummary, snapshotDir: snapshotDir,
+                            config: inklingConfig, plan: memoryPlan, device: device
+                        )
                         stateLock.lock()
                         cachedInklingDevice = (
                             path: snapshotDir.path, contextLength: contextLength,
@@ -836,7 +859,17 @@ public final class CompletionEngine: @unchecked Sendable {
                         )
                         stateLock.unlock()
                         deviceHalf = (executor, workspace)
-                        inklingDeviceHalfStatus = "built at \(contextLength) positions (\(inklingStorage.rawValue) KV)"
+                        let residentSlots = executor.expertArenas.reduce(0) {
+                            $0 + $1.arena.capacity
+                        }
+                        inklingDeviceHalfStatus = "built at \(contextLength) positions "
+                            + "(\(inklingStorage.rawValue) KV)\(arenaStatus)"
+                        DiagLog.info(
+                            "inkling2.plan",
+                            "provisioned \(contextLength) position(s) at "
+                                + "\(inklingStorage.rawValue) KV: "
+                                + memoryPlan.describe(expertSlots: residentSlots)
+                        )
                     } catch {
                         inklingDeviceHalfStatus = "failed: \(error)"
                         DiagLog.warning(
@@ -12849,5 +12882,168 @@ if layer.attnGateProjTensor != nil,
         cachedPromptDialect = resolved
         stateLock.unlock()
         return resolved
+    }
+}
+
+// MARK: - Inkling 2 expert arena
+
+extension CompletionEngine {
+    /// Installs the resident expert arena the Inkling 2 mixture reads, and
+    /// returns the phrase its load log carries (empty when nothing was set up).
+    ///
+    /// The reason this exists at all is a device limit, not a cache preference.
+    /// A mix of the mmap path binds the segments that the layer's fused bank and
+    /// its scales happen to live in, charged WHOLE: on a 16 GB M1 Pro the
+    /// published layer 0 binds its bank's segment (8.66 GiB) and its scales'
+    /// segment (8.57 GiB) in one dispatch -- 17.24 GB together -- and that binding
+    /// returns zeros for every row with no command-buffer error (the support
+    /// plan's Phase 6 slice 19). A slot is one expert's four packed ranges in one buffer
+    /// (4.27 MB), so a resident expert is three orders of magnitude cheaper to
+    /// bind and the projection out of it matches the host rule exactly.
+    ///
+    /// The capacity is the plan's own arithmetic rather than a constant: one slot
+    /// is `geometry.slotBytes`, and `affordableExpertSlots` has already taken the
+    /// KV cache and the dense weights out of the budget it divides. That budget
+    /// of BYTES is then split between the packed layouts in proportion to the
+    /// expert visits each one serves, so the arena that sees 44 of a position's
+    /// 48 visits gets most of it.
+    ///
+    /// One arena per LAYOUT, because one slot is a byte copy at fixed strides.
+    /// The published checkpoint's first twenty layers are NVFP4 and its last four
+    /// MXFP8, and installing only the NVFP4 geometry left those four layers (32
+    /// of a position's 384 expert visits) on the mmap -- which the guard now
+    /// refuses on this machine, so the arena has to cover both or the turn fails.
+    nonisolated static func installInklingExpertArenas(
+        executor: Inkling2MetalForward,
+        weights: Inkling2DeviceWeights,
+        summary: ModelSummary,
+        snapshotDir: URL,
+        config: Inkling2Config,
+        plan: Inkling2MemoryPlan,
+        device: MTLDevice
+    ) -> String {
+        // How many expert visits each layout serves, from the schedule rather
+        // than from a layer count: the loop core's layers run three times.
+        var visitsPerLayout: [Inkling2ExpertQuantLayout: Int] = [:]
+        var firstLayerPerLayout: [Inkling2ExpertQuantLayout: Int] = [:]
+        let schedule = (try? config.makeVisitPlan()) ?? []
+        if schedule.isEmpty {
+            for layer in 0..<config.numHiddenLayers {
+                let layout = Inkling2MemoryPlan.expertLayout(forLayer: layer, config: config)
+                visitsPerLayout[layout, default: 0] += 1
+                if firstLayerPerLayout[layout] == nil { firstLayerPerLayout[layout] = layer }
+            }
+        } else {
+            for visit in schedule {
+                let layout = Inkling2MemoryPlan.expertLayout(
+                    forLayer: visit.physicalLayer, config: config
+                )
+                visitsPerLayout[layout, default: 0] += 1
+                if firstLayerPerLayout[layout] == nil {
+                    firstLayerPerLayout[layout] = visit.physicalLayer
+                }
+            }
+        }
+        guard let totalVisits = visitsPerLayout.values.reduce(nil, { ($0 ?? 0) + $1 }),
+              totalVisits > 0 else {
+            return ", no arena (the schedule names no expert visit)"
+        }
+
+        let physicalGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
+        let budgetBytes = UInt64(max(1, plan.affordableExpertSlots(physicalGB: physicalGB)))
+            * UInt64(max(1, plan.bytesPerExpertSlot))
+        let ceiling = min(UInt64(device.maxBufferLength), UInt64(device.recommendedMaxWorkingSetSize))
+
+        var installed: [String] = []
+        var refusals: [String] = []
+        // Layouts in the checkpoint's own order, so the log line reads top down.
+        let layouts = firstLayerPerLayout.keys.sorted { lhs, rhs in
+            (firstLayerPerLayout[lhs] ?? 0) < (firstLayerPerLayout[rhs] ?? 0)
+        }
+        for layout in layouts {
+            let layer = firstLayerPerLayout[layout] ?? 0
+            let visits = visitsPerLayout[layout] ?? 0
+            do {
+                let gateUp = try weights.expertBank(.expertW13, layer: layer, expert: 0)
+                let down = try weights.expertBank(.expertW2, layer: layer, expert: 0)
+                guard let geometry = Inkling2ExpertSlotGeometry.make(
+                    gateUpRows: 2 * config.moeIntermediateSize,
+                    gateUpRowStride: gateUp.rowStride,
+                    gateUpScaleRowStride: gateUp.scaleRowStride,
+                    downRows: config.hiddenSize,
+                    downRowStride: down.rowStride,
+                    downScaleRowStride: down.scaleRowStride
+                ) else {
+                    refusals.append("\(layout.rawValue): no slot geometry")
+                    continue
+                }
+                guard let shard = weights.catalog.tensor(.expertW13, layer: layer)?.shardIndex,
+                      let namesake = summary.shards.first(where: { $0.index == shard }),
+                      let url = inklingArenaFile(named: namesake.filename, in: snapshotDir) else {
+                    refusals.append("\(layout.rawValue): no file to pread")
+                    continue
+                }
+                // Fail closed without the shard's FILE origin. A segmented
+                // tensor offset is segment-relative, and a load that did not pass
+                // `shardFileOrigins` would have this arena read the wrong bytes
+                // and report hits over them -- the exact failure the mmap path
+                // just stopped hiding.
+                guard weights.knowsFileOrigin(of: shard) else {
+                    refusals.append("\(layout.rawValue): shard \(shard)'s file origin is unknown")
+                    continue
+                }
+                // One POSITION's working set, not the plan's whole budget. The
+                // plan's fraction (0.6 of RAM) prices an arena the size of a
+                // small model, and measured, that pays a page-fault cost the
+                // small arena never did: 6.53 GB across both layouts ran a
+                // position in 102-118 s with the mixture at 672-857 ms/visit,
+                // against 0.72-0.79 s and 10.8 ms/visit at 1.07 GB. Wired arena
+                // memory displaces the mmap's own pages, so the capacity that
+                // pays is the set a position actually revisits and no more.
+                let workingSet = visits * config.numExpertsPerToken
+                let slots = max(1, geometry.slotBytes)
+                let planned = Int((budgetBytes * UInt64(visits) / UInt64(totalVisits)) / UInt64(slots))
+                let capacity = max(1, min(
+                    workingSet, planned, Int(ceiling / UInt64(slots))
+                ))
+                let reader = try Inkling2ArenaShardReader(url: url)
+                try executor.installExpertArena(
+                    capacity: capacity, geometry: geometry, reader: reader
+                )
+                let bytes = capacity * slots
+                installed.append(
+                    "\(capacity)×" + String(format: "%.2f MB", Double(slots) / 1_048_576)
+                        + " (" + String(format: "%.2f GB", Double(bytes) / 1_073_741_824) + ") "
+                        + layout.rawValue + " from layer \(layer)"
+                )
+                DiagLog.info(
+                    "inkling2.arena",
+                    "resident expert arena for \(layout.rawValue): \(capacity) slot(s) of "
+                        + "\(slots) bytes = \(bytes) bytes, filled by pread from "
+                        + "\(url.lastPathComponent), geometry from layer \(layer), "
+                        + "\(visits) of \(totalVisits) visits"
+                )
+            } catch {
+                refusals.append("\(layout.rawValue): \(error)")
+                DiagLog.warning(
+                    "inkling2.arena",
+                    "no \(layout.rawValue) arena, so those experts read the shard mmap: \(error)"
+                )
+            }
+        }
+        guard !installed.isEmpty else {
+            let why = refusals.isEmpty ? "nothing to install" : refusals.joined(separator: "; ")
+            return ", no arena (\(why))"
+        }
+        return ", arena " + installed.joined(separator: " + ")
+            + (refusals.isEmpty ? "" : " (refused " + refusals.joined(separator: "; ") + ")")
+    }
+
+    /// The file a shard's name refers to. A segmented shard is `file#k`, so the
+    /// name before the separator is the file the arena's `pread` opens.
+    private static func inklingArenaFile(named shardName: String, in directory: URL) -> URL? {
+        let file = shardName.split(separator: "#", maxSplits: 1).first.map(String.init) ?? shardName
+        let url = directory.appendingPathComponent(file)
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
     }
 }

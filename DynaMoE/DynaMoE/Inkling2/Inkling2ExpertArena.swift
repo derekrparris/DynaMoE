@@ -194,6 +194,22 @@ nonisolated public struct Inkling2ArenaCounters: Sendable, Equatable {
         let total = hits + misses
         return total == 0 ? 0 : Double(hits) / Double(total)
     }
+
+    /// One set of counters over several arenas, which is how a checkpoint that
+    /// mixes two packed layouts reaches the profile as ONE line: the NVFP4 slots
+    /// and the MXFP8 ones are separate caches, but a hit rate per layout would
+    /// be two numbers nobody wants to add up by hand mid-turn.
+    public static func merged(_ counters: [Inkling2ArenaCounters]) -> Inkling2ArenaCounters {
+        counters.reduce(into: Inkling2ArenaCounters()) { total, next in
+            total.hits += next.hits
+            total.misses += next.misses
+            total.evictions += next.evictions
+            total.bytesRead += next.bytesRead
+            total.preadNanoseconds += next.preadNanoseconds
+            total.slotsAllocated += next.slotsAllocated
+            total.incompatible += next.incompatible
+        }
+    }
 }
 
 // MARK: - Reading a shard

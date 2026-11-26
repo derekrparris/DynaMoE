@@ -35,6 +35,14 @@ nonisolated public struct Inkling2MemoryPlan: Sendable, Equatable {
     /// K+V bytes one token costs across every full-attention visit: the
     /// growing part of the cache, which is what a context budget is spent on.
     public let bytesPerPosition: Int
+    /// The DEVICE's copy of one sequence's K and V, per position: the
+    /// executor stages the rows an attention dispatch reads into two buffers of
+    /// its own, so the staging is a second copy of the growing cache at the same
+    /// element width. It is not per visit -- one buffer holds the sequence --
+    /// and a plan that ignored it priced a context the workspace could not
+    /// allocate: at the checkpoint's 1M declaration the two buffers are 15.8 GB
+    /// on their own, which is what an app turn tried to allocate on 16 GB.
+    public let kvStagingBytesPerPosition: Int
     /// Growing full-attention caches: eight visits x K+V x head_dim x kv heads.
     public let fullAttentionCacheBytes: Int
     /// Bounded rings: forty visits x K+V x head_dim x kv heads x window.
@@ -55,10 +63,13 @@ nonisolated public struct Inkling2MemoryPlan: Sendable, Equatable {
     /// Bytes of executor state at this context length.
     public var cacheBytes: Int { fullAttentionCacheBytes + localRingBytes + convolutionStateBytes }
 
-    /// Bytes needed with `expertSlots` resident (layer, expert) pairs.
+    /// Bytes needed with `expertSlots` resident (layer, expert) pairs, on a
+    /// DEVICE turn: the host caches, the executor's staging copy of the growing
+    /// K/V, the loop messages, the dense weights and the arena.
     public func requiredBytes(expertSlots: Int, chunkPositions: Int = 1) -> Int {
         let slots = max(1, expertSlots)
         return cacheBytes
+            + contextLength * kvStagingBytesPerPosition
             + loopMessageBytesPerPosition * max(1, chunkPositions)
             + denseWeightBytes
             + slots * bytesPerExpertSlot
@@ -94,7 +105,11 @@ nonisolated public struct Inkling2MemoryPlan: Sendable, Equatable {
         guard bytesPerPosition > 0, budgetGB.isFinite else { return contextLength }
         let budget = max(0.0, budgetGB * 1_073_741_824) - Double(localRingBytes)
         guard budget > 0 else { return 1 }
-        return max(1, min(contextLength, Int(budget / Double(bytesPerPosition))))
+        // Both copies are paid for: the sequence's own rows and the executor's
+        // staging of them. The rings came out above; the staging grows with the
+        // context exactly as the rows do.
+        let perPosition = max(1, bytesPerPosition + kvStagingBytesPerPosition)
+        return max(1, min(contextLength, Int(budget / Double(perPosition))))
     }
 
     /// One-line load-log summary.
@@ -189,6 +204,8 @@ nonisolated public struct Inkling2MemoryPlan: Sendable, Equatable {
             contextLength: context,
             kvElementBytes: max(1, kvElementBytes),
             bytesPerPosition: fullVisitCount * recordPerToken,
+            kvStagingBytesPerPosition: 2 * config.numKeyValueHeads * config.headDim
+                * max(1, kvElementBytes),
             fullAttentionCacheBytes: full,
             localRingBytes: rings,
             convolutionStateBytes: convolution,

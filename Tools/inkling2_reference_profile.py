@@ -43,7 +43,7 @@ SNAPSHOT = os.environ.get(
     "INKLING_SNAPSHOT",
     os.path.expanduser(
         "~/.cache/huggingface/hub/models--thinkingmachines--Inkling-2-Mini/"
-        "snapshots/ed40e7da625f594fc9c4990f5f66be24873c22d7"
+        "snapshots/c9d028302cd0f035fdf8e7e91f089a4ce94d2195"
     ),
 )
 PROMPT_PATH = os.environ.get("INKLING_PROMPT", "/tmp/inkling2_port_prompt.txt")

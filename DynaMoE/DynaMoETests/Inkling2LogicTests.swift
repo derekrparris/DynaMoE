@@ -1716,7 +1716,7 @@ final class Inkling2ToolPromptTests: XCTestCase {
 /// Facts about the REAL checkpoint's `config.json`, embedded verbatim so the
 /// decode is checked against the file rather than against a fixture that
 /// drifted from it. The JSON below is the published file (snapshot
-/// `ed40e7da...`) with no fields removed.
+/// `c9d02830...`) with no fields removed.
 final class Inkling2PublishedConfigTests: XCTestCase {
 
     static let publishedJSON = """
@@ -1942,25 +1942,39 @@ final class Inkling2PublishedConfigTests: XCTestCase {
         let config = try published()
         let plan = Inkling2MemoryPlan.make(config: config, catalog: nil, contextLength: 1_048_576)
         // One position is 8 full visits x K+V x 2,048-byte record.
-        XCTAssertEqual(plan.bytesPerPosition, 8 * 2 * config.numKeyValueHeads * config.headDim * 2)
-        // A 16 GB budget: (16 GiB - 0.168 GB of rings) / 32,768 bytes per
-        // position is ~519k positions, i.e. INSIDE the checkpoint's 1M ceiling.
-        // The budget is the authority here, not the declaration: an earlier
-        // version of this case asserted the ceiling won at 16 GB, which was
-        // wrong by the same arithmetic (and the loaded checkpoint's weights are
-        // not counted in it either, so the real budget is smaller still).
+        let record = 2 * config.numKeyValueHeads * config.headDim * 2
+        XCTAssertEqual(plan.bytesPerPosition, 8 * record)
+        // The DEVICE stages the sequence's K and V in two buffers of its own, so
+        // a position costs the rows plus that second copy. Leaving it out is how
+        // a plan priced 594,534 positions on a 16 GB machine -- 64 GB of rows,
+        // beside 7.8 GB of staging -- and the GPU answered OutOfMemory.
+        XCTAssertEqual(plan.kvStagingBytesPerPosition, record)
+        XCTAssertEqual(
+            plan.requiredBytes(expertSlots: 0) - plan.cacheBytes,
+            plan.contextLength * record
+                + plan.loopMessageBytesPerPosition + plan.denseWeightBytes
+        )
+        // A 16 GB budget buys (16 GiB - 0.168 GB of rings) / 40,960 bytes per
+        // position: both copies, inside the checkpoint's 1M ceiling. The budget
+        // is the authority here, not the declaration (and the loaded
+        // checkpoint's weights are not counted in it, so the real budget is
+        // smaller still).
+        let perPosition = 9 * record
         let sixteenGB = plan.affordableContextLength(budgetGB: 16)
         XCTAssertEqual(
             sixteenGB,
-            Int((Double(16) * 1_073_741_824 - Double(plan.localRingBytes)) / 32_768)
+            Int((Double(16) * 1_073_741_824 - Double(plan.localRingBytes)) / Double(perPosition))
         )
         XCTAssertLessThan(sixteenGB, 1_048_576)
         // Above the ceiling the declaration does win, because the plan has no
         // geometry past it.
         XCTAssertEqual(plan.affordableContextLength(budgetGB: 64), 1_048_576)
-        // 1 GiB: (1 GiB - rings) / 32,768, floored at one position.
+        // 1 GiB: (1 GiB - rings) / per-position bytes, floored at one position.
         let oneGB = plan.affordableContextLength(budgetGB: 1)
-        XCTAssertEqual(oneGB, Int((Double(1) * 1_073_741_824 - Double(plan.localRingBytes)) / 32_768))
+        XCTAssertEqual(
+            oneGB,
+            Int((Double(1) * 1_073_741_824 - Double(plan.localRingBytes)) / Double(perPosition))
+        )
         // A budget already smaller than the rings buys one position, not zero
         // or a negative -- a cache of nothing cannot run a turn at all.
         XCTAssertEqual(plan.affordableContextLength(budgetGB: 0.01), 1)
@@ -1989,9 +2003,15 @@ final class Inkling2PublishedConfigTests: XCTestCase {
 /// a role I invented would pass a fixture I also wrote.
 final class Inkling2PublishedTensorTests: XCTestCase {
 
+    /// The revision the checks were validated against, and the ONLY one the
+    /// repository publishes (`refs/main`). An earlier pin named `ed40e7da...`,
+    /// which resolves to nothing: every checkpoint-gated case below then SKIPPED,
+    /// and a suite that reports "0 failures" while the device parity cases were
+    /// reading zeros is how four real failures stayed hidden. A pin has to be a
+    /// path a download actually produces.
     static let snapshotRelativePath =
         ".cache/huggingface/hub/models--thinkingmachines--Inkling-2-Mini/snapshots/"
-        + "ed40e7da625f594fc9c4990f5f66be24873c22d7"
+        + "c9d028302cd0f035fdf8e7e91f089a4ce94d2195"
 
     private func snapshot() throws -> URL {
         let path = FileManager.default.homeDirectoryForCurrentUser

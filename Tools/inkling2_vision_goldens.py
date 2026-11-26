@@ -37,7 +37,7 @@ from transformers import Inkling2LoopForConditionalGeneration
 SNAPSHOT = (
     "/Users/derekparris/.cache/huggingface/hub/"
     "models--thinkingmachines--Inkling-2-Mini/snapshots/"
-    "ed40e7da625f594fc9c4990f5f66be24873c22d7"
+    "c9d028302cd0f035fdf8e7e91f089a4ce94d2195"
 )
 OUTPUT = "/tmp/inkling2_vision_goldens.json"
 

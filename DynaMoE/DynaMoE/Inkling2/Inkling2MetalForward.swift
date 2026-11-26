@@ -35,6 +35,21 @@ import Metal
 /// is missing, or whose shard is not mapped, is an error that names it -- the
 /// host weight source fails closed the same way.
 nonisolated public final class Inkling2DeviceWeights {
+    /// One expert's slice of a fused bank, as a kernel addresses it: the bank's
+    /// buffer and base offset, plus this expert's own byte offset, row strides
+    /// and outer scale.
+    ///
+    /// A tuple because every dispatch site binds the fields positionally; the
+    /// alias exists so the mixture can carry eight of them through a resolution
+    /// pass before encoding anything.
+    public typealias ExpertBank = (
+        buffer: MTLBuffer, baseOffset: UInt64, expertOffset: UInt64,
+        rowStride: Int, scaleBuffer: MTLBuffer, scaleBaseOffset: UInt64,
+        scaleExpertOffset: UInt64, scaleRowStride: Int,
+        layout: Inkling2ExpertQuantLayout, amax: Float, denominator: Float,
+        fileWeightOffset: UInt64, fileScaleOffset: UInt64
+    )
+
     public let config: Inkling2Config
     public let catalog: Inkling2WeightCatalog
     private let shardBuffers: [UInt32: MTLBuffer]
@@ -120,9 +135,19 @@ nonisolated public final class Inkling2DeviceWeights {
         return ref.dtype
     }
 
-    /// One expert's slice of a FUSED bank, as the kernel addresses it: the
-    /// bank's buffer and base offset, plus this expert's own byte offset, row
-    /// strides and outer scale.
+    /// Whether a shard's position inside its FILE is known.
+    ///
+    /// A reader that opens the file itself -- the expert arena's `pread` -- must
+    /// have it: segmentation rewrites a tensor's offset to be segment-relative,
+    /// so an empty origin set means "these buffers are whole shards", which a
+    /// segmented model is not. A caller that segmented has to pass
+    /// `fileOrigins`; an arena installed without one would fill its slots with
+    /// plausible wrong bytes and report hits over them.
+    public func knowsFileOrigin(of shard: UInt32) -> Bool {
+        fileOrigins[shard] != nil
+    }
+
+    /// One expert's slice of a FUSED bank, resolved.
     ///
     /// The catalog holds a bank whole (`[experts][rows][columns]`), so expert
     /// `e` starts at `e * rows * columns * width`; a tensor offset inside a
@@ -132,11 +157,7 @@ nonisolated public final class Inkling2DeviceWeights {
     /// the wrong layout dequantizes to plausible numbers, not to a crash.
     public func expertBank(
         _ role: Inkling2TensorRole, layer: Int, expert: Int
-    ) throws -> (buffer: MTLBuffer, baseOffset: UInt64, expertOffset: UInt64,
-                 rowStride: Int, scaleBuffer: MTLBuffer, scaleBaseOffset: UInt64,
-                 scaleExpertOffset: UInt64, scaleRowStride: Int,
-                 layout: Inkling2ExpertQuantLayout, amax: Float, denominator: Float,
-                 fileWeightOffset: UInt64, fileScaleOffset: UInt64) {
+    ) throws -> ExpertBank {
         let scaleRole: Inkling2TensorRole = role == .expertW13 ? .expertW13Scale : .expertW2Scale
         let ref = catalog.tensor(role, layer: layer)
         let scaleRef = catalog.tensor(scaleRole, layer: layer)
@@ -545,11 +566,15 @@ nonisolated public final class Inkling2MetalForward {
     /// read from the same line as the stage table rather than a second
     /// instrument.
     ///
-    /// `arenaReader` is what fills a slot: the shard's POSIX `pread`. Both are
-    /// set together by `installExpertArena`, which is also where the slot
-    /// buffer is attached -- an arena with no buffer records bookkeeping only.
-    public private(set) var expertArena: Inkling2ExpertArena?
-    public private(set) var arenaReader: Inkling2ArenaShardReader?
+    /// One slot is a byte copy at FIXED strides, so an arena serves one packed
+    /// LAYOUT. The published checkpoint mixes two -- NVFP4 for the first twenty
+    /// layers and MXFP8 for the last four -- and `installExpertArena` therefore
+    /// may be called twice; a bank goes to the arena whose geometry holds it.
+    public private(set) var expertArenas: [Inkling2InstalledExpertArena] = []
+
+    /// The first installed arena. Callers that install one (every test) keep
+    /// reading this; the mixture reads `expertArenas`.
+    public var expertArena: Inkling2ExpertArena? { expertArenas.first?.arena }
 
     /// Installs a bounded expert arena and the reader that fills it.
     ///
@@ -559,6 +584,10 @@ nonisolated public final class Inkling2MetalForward {
     /// buffer is allocated here at `capacity * slotBytes`, and a capacity the
     /// device refuses is thrown rather than silently reduced -- an arena that
     /// is smaller than asked for would change the hit rate under measurement.
+    ///
+    /// Installing the same geometry twice replaces the first arena of that
+    /// layout (a re-install is a resize, not a second cache); a different
+    /// geometry adds one beside it, because the two cannot share slots.
     public func installExpertArena(
         capacity: Int,
         geometry: Inkling2ExpertSlotGeometry,
@@ -573,15 +602,16 @@ nonisolated public final class Inkling2MetalForward {
         }
         let arena = Inkling2ExpertArena(capacity: capacity, geometry: geometry)
         arena.attachSlotBuffer(buffer)
-        expertArena = arena
-        arenaReader = reader
+        expertArenas.removeAll { $0.geometry == geometry }
+        expertArenas.append(Inkling2InstalledExpertArena(
+            geometry: geometry, arena: arena, reader: reader
+        ))
     }
 
-    /// Removes the arena, so the mixture goes back to the shard mmap.
+    /// Removes every arena, so the mixture goes back to the shard mmap.
     public func removeExpertArena() {
-        expertArena?.evictAll()
-        expertArena = nil
-        arenaReader = nil
+        for installed in expertArenas { installed.arena.evictAll() }
+        expertArenas.removeAll()
     }
 
     private let pipelines: [String: MTLComputePipelineState]
@@ -1596,6 +1626,11 @@ nonisolated public final class Inkling2MetalForward {
         //    reads a value back between experts -- eight separate buffers meant
         //    eight commits and eight waits for arithmetic the queue had already
         //    serialized.
+        //
+        //    The eight are RESOLVED first (banks, residency, and the binding
+        //    guard) so a mixture this device cannot wire is refused before any
+        //    of it is encoded -- and so a slot fill runs once per expert.
+        let mixture = try resolveMixture(layer: layer, experts: indices)
         let accumulatorPointer = workspace.residualAccumulator.contents()
             .bindMemory(to: Float.self, capacity: hiddenWidth)
         for index in 0..<hiddenWidth { accumulatorPointer[index] = 0 }
@@ -1608,18 +1643,16 @@ nonisolated public final class Inkling2MetalForward {
             if !mixtureEncoded { mixtureEncoder.endEncoding() }
             mixtureArena.clear()
         }
-        for (slot, expert) in indices.enumerated() {
-            let weight = routeWeights[slot]
-            let gateUp = try weights.expertBank(.expertW13, layer: layer, expert: expert)
-            let down = try weights.expertBank(.expertW2, layer: layer, expert: expert)
+        for (slot, expert) in mixture.enumerated() {
+            let routeWeight = routeWeights[slot]
+            let gateUp = expert.gateUp
+            let down = expert.down
             // A resident slot, when an arena is installed: one buffer holding
             // both banks, so the two projections read it at the slot's own
             // region offsets instead of the fused banks' expert offsets. The
             // layout comes from the MMAP banks (a slot is a byte copy of them),
             // so the two paths decode identically by construction.
-            let resident = try residentSlot(
-                layer: layer, expert: expert, gateUp: gateUp, down: down
-            )
+            let resident = expert.resident
             if prefaultsExpertBanks {
                 touchedChecksum &+= Self.touch(
                     gateUp.buffer, offset: gateUp.baseOffset + gateUp.expertOffset,
@@ -1696,7 +1729,7 @@ nonisolated public final class Inkling2MetalForward {
             }
             try weightedAccumulate(
                 encoder: mixtureEncoder, accumulator: workspace.residualAccumulator,
-                source: workspace.expertDown, weight: weight, count: hiddenWidth,
+                source: workspace.expertDown, weight: routeWeight, count: hiddenWidth,
                 arena: mixtureArena
             )
             if profile != nil {
@@ -1744,7 +1777,11 @@ nonisolated public final class Inkling2MetalForward {
                 buffers: billed
             )
             profile.recordExperts(count: indices.count, bytes: mixtureBytes)
-            if let expertArena { profile.recordArena(expertArena.statistics) }
+            if !expertArenas.isEmpty {
+                profile.recordArena(Inkling2ArenaCounters.merged(
+                    expertArenas.map { $0.arena.statistics }
+                ))
+            }
         }
         return zip(residual, convolved).map(+)
     }
@@ -1907,44 +1944,93 @@ nonisolated public final class Inkling2MetalForward {
 
     /// The slot holding (layer, expert) for the mixture, filling it on a miss.
     ///
-    /// Nil when no arena is installed -- the mixture then reads the shard
+    /// Nil when no arena packs this bank -- the mixture then reads the shard
     /// mmap exactly as it always did. A fill reads the expert's four ranges
     /// out of the fused banks by pread; the offsets are the banks' own, so a
     /// slot is a byte-for-byte copy of what the mmap path would have read.
     func residentSlot(
         layer: Int, expert: Int,
-        gateUp: (buffer: MTLBuffer, baseOffset: UInt64, expertOffset: UInt64,
-                 rowStride: Int, scaleBuffer: MTLBuffer, scaleBaseOffset: UInt64,
-                 scaleExpertOffset: UInt64, scaleRowStride: Int,
-                 layout: Inkling2ExpertQuantLayout, amax: Float, denominator: Float,
-                 fileWeightOffset: UInt64, fileScaleOffset: UInt64),
-        down: (buffer: MTLBuffer, baseOffset: UInt64, expertOffset: UInt64,
-               rowStride: Int, scaleBuffer: MTLBuffer, scaleBaseOffset: UInt64,
-               scaleExpertOffset: UInt64, scaleRowStride: Int,
-               layout: Inkling2ExpertQuantLayout, amax: Float, denominator: Float,
-               fileWeightOffset: UInt64, fileScaleOffset: UInt64)
+        gateUp: Inkling2DeviceWeights.ExpertBank,
+        down: Inkling2DeviceWeights.ExpertBank
     ) throws -> (buffer: MTLBuffer, baseOffset: Int, address: Inkling2ExpertSlotGeometry.SlotAddress)? {
-        guard let expertArena, let arenaReader else { return nil }
+        guard !expertArenas.isEmpty else { return nil }
         // A slot is a byte copy at FIXED strides, so a layer quantized another
-        // way cannot use this arena. The published checkpoint mixes NVFP4 and
+        // way needs an arena of its own. The published checkpoint mixes NVFP4 and
         // MXFP8 layers, and a copy at the wrong strides would report hits over
-        // the wrong bytes -- refuse and let the mmap path serve that layer.
-        guard expertArena.geometry.holds(
+        // the wrong bytes -- so the bank goes to the arena that HOLDS it, and a
+        // bank no arena holds is refused (counted) and left on the mmap.
+        for installed in expertArenas where installed.geometry.holds(
             weightRowStride: gateUp.rowStride, scaleRowStride: gateUp.scaleRowStride,
             downWeightRowStride: down.rowStride, downScaleRowStride: down.scaleRowStride
-        ) else {
-            expertArena.recordIncompatible()
-            return nil
+        ) {
+            let slot = try installed.arena.slot(
+                layer: layer, expert: expert, reader: installed.reader,
+                gateUpSourceOffset: gateUp.fileWeightOffset,
+                gateUpScaleSourceOffset: gateUp.fileScaleOffset,
+                downSourceOffset: down.fileWeightOffset,
+                downScaleSourceOffset: down.fileScaleOffset
+            )
+            guard let buffer = installed.arena.slotBuffer else { return nil }
+            return (
+                buffer, slot * installed.geometry.slotBytes, installed.geometry.slotAddress
+            )
         }
-        let slot = try expertArena.slot(
-            layer: layer, expert: expert, reader: arenaReader,
-            gateUpSourceOffset: gateUp.fileWeightOffset,
-            gateUpScaleSourceOffset: gateUp.fileScaleOffset,
-            downSourceOffset: down.fileWeightOffset,
-            downScaleSourceOffset: down.fileScaleOffset
-        )
-        guard let buffer = expertArena.slotBuffer else { return nil }
-        return (buffer, slot * expertArena.geometry.slotBytes, expertArena.geometry.slotAddress)
+        expertArenas[0].arena.recordIncompatible()
+        return nil
+    }
+
+    /// Every routed expert resolved, and the mixture's binding refused when this
+    /// device cannot wire it.
+    ///
+    /// The resolve pass is what makes the guard honest: a resident expert binds
+    /// its slot, not the two mmap segments its banks live in, so the two paths
+    /// are priced differently. Both are priced AFTER the arena has decided
+    /// residency, which is where a miss costs its `pread` -- so the guard never
+    /// reports a binding the mixture would not have made.
+    func resolveMixture(
+        layer: Int, experts: [Int]
+    ) throws -> [Inkling2ResolvedExpert] {
+        var resolved: [Inkling2ResolvedExpert] = []
+        resolved.reserveCapacity(experts.count)
+        for expert in experts {
+            let gateUp = try weights.expertBank(.expertW13, layer: layer, expert: expert)
+            let down = try weights.expertBank(.expertW2, layer: layer, expert: expert)
+            resolved.append(Inkling2ResolvedExpert(
+                gateUp: gateUp, down: down,
+                resident: try residentSlot(
+                    layer: layer, expert: expert, gateUp: gateUp, down: down
+                )
+            ))
+        }
+        try guardMixtureBinding(layer: layer, experts: resolved)
+        return resolved
+    }
+
+    /// The bytes of bank this device will wire in one mixture command buffer.
+    ///
+    /// `recommendedMaxWorkingSetSize` is Metal's own ceiling for resident
+    /// buffers, so it is the line the guard draws rather than a number tuned to
+    /// one machine. Measured on a 16 GB M1 Pro: layer 0 binds 17.24 GB across
+    /// two segments (8.66 GiB and 8.57 GiB) and reads zeros; each segment alone
+    /// reads correctly, so the ceiling is the failure's own boundary and not an
+    /// estimate.
+    public var mixtureBindingBudget: UInt64 {
+        UInt64(device.recommendedMaxWorkingSetSize)
+    }
+
+    func guardMixtureBinding(layer: Int, experts: [Inkling2ResolvedExpert]) throws {
+        var binding = Inkling2MixtureBinding()
+        for expert in experts {
+            if let resident = expert.resident {
+                binding.add(resident.buffer, label: "one resident slot bank")
+            } else {
+                binding.add(expert.gateUp.buffer, label: "the w13 bank of layer \(layer)")
+                binding.add(expert.gateUp.scaleBuffer, label: "the w13 scales of layer \(layer)")
+                binding.add(expert.down.buffer, label: "the w2 bank of layer \(layer)")
+                binding.add(expert.down.scaleBuffer, label: "the w2 scales of layer \(layer)")
+            }
+        }
+        try binding.refuse(over: mixtureBindingBudget)
     }
 
     // MARK: The whole visit
@@ -2126,5 +2212,105 @@ nonisolated public final class Inkling2MetalForward {
             index += page
         }
         return checksum
+    }
+}
+
+// MARK: - What a mixture binds
+
+/// One installed arena: its slot layout, the bookkeeping, and the reader that
+/// fills a slot from the shard file.
+nonisolated public struct Inkling2InstalledExpertArena {
+    public let geometry: Inkling2ExpertSlotGeometry
+    public let arena: Inkling2ExpertArena
+    public let reader: Inkling2ArenaShardReader
+
+    public init(
+        geometry: Inkling2ExpertSlotGeometry,
+        arena: Inkling2ExpertArena,
+        reader: Inkling2ArenaShardReader
+    ) {
+        self.geometry = geometry
+        self.arena = arena
+        self.reader = reader
+    }
+
+    /// Slots times one slot's bytes: the RAM this arena holds.
+    public var bytes: Int { arena.capacity * geometry.slotBytes }
+}
+
+/// One routed expert, resolved: its two mmap banks, and the resident slot that
+/// will serve it instead when an arena holds it.
+///
+/// Resolution happens for all eight routings BEFORE the mixture's encoder is
+/// used, because the binding guard has to price what the command buffer will
+/// bind and a slot fill must not run twice for the same expert.
+nonisolated public struct Inkling2ResolvedExpert {
+    public let gateUp: Inkling2DeviceWeights.ExpertBank
+    public let down: Inkling2DeviceWeights.ExpertBank
+    /// `(buffer, byte offset, region address)` of the slot holding this expert,
+    /// or nil when the mixture reads the shard mmap for it.
+    public let resident: (buffer: MTLBuffer, baseOffset: Int,
+                          address: Inkling2ExpertSlotGeometry.SlotAddress)?
+
+    public init(
+        gateUp: Inkling2DeviceWeights.ExpertBank,
+        down: Inkling2DeviceWeights.ExpertBank,
+        resident: (buffer: MTLBuffer, baseOffset: Int,
+                   address: Inkling2ExpertSlotGeometry.SlotAddress)?
+    ) {
+        self.gateUp = gateUp
+        self.down = down
+        self.resident = resident
+    }
+}
+
+/// What one mixture command buffer binds, priced the way the driver charges it:
+/// every distinct buffer WHOLE, not the slice of it an expert reads.
+///
+/// A dispatch that binds a bank and its scales binds two buffers, and on a
+/// segmented checkpoint those are two segments. The price is therefore the
+/// segments' own lengths -- 17.24 GB for layer 0 of the published checkpoint on
+/// a 16 GB M1 Pro, which is over `recommendedMaxWorkingSetSize` and, measured,
+/// returns ZEROS for every row with no command-buffer error at all (see the
+/// plan's Phase 6 slice 19). Segments are deduplicated by buffer identity, so an
+/// eight-expert mixture over one layer's two segments is priced once.
+nonisolated public struct Inkling2MixtureBinding: Equatable {
+    public struct Segment: Equatable, CustomStringConvertible {
+        public let label: String
+        public let bytes: UInt64
+        public var description: String { "\(label) \(Inkling2MixtureBinding.describe(bytes))" }
+    }
+
+    public private(set) var segments: [Segment] = []
+    private var seen: Set<ObjectIdentifier> = []
+
+    public init() {}
+
+    /// The segments' total, i.e. what the device is asked to wire.
+    public var bytes: UInt64 { segments.reduce(0) { $0 + $1.bytes } }
+
+    public mutating func add(_ buffer: MTLBuffer, label: String) {
+        guard seen.insert(ObjectIdentifier(buffer)).inserted else { return }
+        segments.append(Segment(label: label, bytes: UInt64(buffer.length)))
+    }
+
+    /// Refuses a binding past `budget`, naming every segment it would bind.
+    public func refuse(over budget: UInt64) throws {
+        guard bytes > budget else { return }
+        throw Inkling2ForwardError.unsupported(
+            "the expert mixture would bind \(Self.describe(bytes)) of bank in one command "
+                + "buffer (\(segments.map(\.description).joined(separator: " + "))), past the "
+                + "\(Self.describe(budget)) this device will wire. A binding that large "
+                + "returns zeros for every row and reports no error, so it is refused here "
+                + "rather than served as logits; an expert arena serves each expert from a "
+                + "slot of its own and stays under the line."
+        )
+    }
+
+    public static func describe(_ bytes: UInt64) -> String {
+        let gigabyte = Double(bytes) / 1_073_741_824
+        return gigabyte >= 1
+            ? String(format: "%.2f GB", gigabyte)
+            : String(format: "%.2f MB", Double(bytes) / 1_048_576)
     }
 }

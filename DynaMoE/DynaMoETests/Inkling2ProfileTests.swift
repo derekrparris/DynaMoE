@@ -320,6 +320,9 @@ final class Inkling2VisitProfileTests: XCTestCase {
         let forward: Inkling2CPUForward
         let metal: Inkling2MetalForward
         let workspace: Inkling2DeviceWorkspace
+        /// The segmented summary the buffers were made from: the arena install
+        /// maps a bank's shard index back to the FILE its `pread` opens.
+        let summary: ModelSummary
     }
 
     /// The engine's own arrangement: the executor's `host` IS the forward the
@@ -374,7 +377,9 @@ final class Inkling2VisitProfileTests: XCTestCase {
         forward.headRunner = { hidden in
             try metal.headLogits(hidden: hidden, workspace: workspace)
         }
-        return Harness(config: config, forward: forward, metal: metal, workspace: workspace)
+        return Harness(
+            config: config, forward: forward, metal: metal, workspace: workspace, summary: summary
+        )
     }
 
     /// The instrument is inert until it is turned on, then bills exactly one
@@ -593,14 +598,9 @@ final class Inkling2VisitProfileTests: XCTestCase {
             FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_arena"),
             "opt-in arena measurement; touch /tmp/dynamoe_inkling2_arena to run"
         )
-        // The snapshot directory, RESOLVED: the tests reach the checkpoint
-        // through a revision symlink, and a listing of a symlinked directory
-        // reports ENOTDIR rather than following it.
-        let directory = try snapshot().resolvingSymlinksInPath()
         let harness = try harness()
         let config = harness.config
         let metal = harness.metal
-        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
 
         // The geometry is the checkpoint's own: every stride is taken from the
         // stored bank shapes, so the slot is exactly the four ranges the mixture
@@ -615,37 +615,29 @@ final class Inkling2VisitProfileTests: XCTestCase {
             downRowStride: down.rowStride,
             downScaleRowStride: down.scaleRowStride
         ))
-        let capacity = 256
-        let arenaBytes = capacity * geometry.slotBytes
-        XCTAssertLessThanOrEqual(arenaBytes, Int(device.maxBufferLength))
         print(
-            "🔎 [inkling2 arena] one slot \(String(format: "%.2f", Double(geometry.slotBytes) / 1_048_576)) MB, "
-                + "\(capacity) slot(s) = \(String(format: "%.2f", Double(arenaBytes) / 1_073_741_824)) GB"
+            "🔎 [inkling2 arena] one NVFP4 slot is "
+                + "\(String(format: "%.2f", Double(geometry.slotBytes) / 1_048_576)) MB"
         )
-        XCTAssertLessThan(arenaBytes, Int(device.recommendedMaxWorkingSetSize) / 2)
-
-        // The shard file the arena reads. The checkpoint ships one weights file,
-        // so the largest `.safetensors` beside the config is it.
-        let files = try FileManager.default.contentsOfDirectory(
-            at: directory, includingPropertiesForKeys: [.fileSizeKey]
-        )
-        let shardURL = try XCTUnwrap(
-            files.filter { $0.pathExtension == "safetensors" }.max { lhs, rhs in
-                let left = (try? lhs.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-                let right = (try? rhs.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-                return left < right
-            },
-            "no safetensors file in \(directory.path)"
-        )
-        let reader = try Inkling2ArenaShardReader(url: shardURL)
 
         /// One position from a RESET sequence: the logits, the wall, and the
         /// mixture's own wall per visit.
+        ///
+        /// The arena arm installs the arenas a TURN installs -- one per packed
+        /// layout, sized by the memory plan -- through the app's own helper, so
+        /// this measures the path that ships rather than a one-layout stand-in.
         func position(
             _ index: Int, arena: Bool
         ) throws -> (logits: [Float], ms: Double, mixtureMs: Double, stats: Inkling2ArenaCounters?) {
             if arena {
-                try metal.installExpertArena(capacity: capacity, geometry: geometry, reader: reader)
+                if metal.expertArenas.isEmpty {
+                    let line = try inkling2InstallExpertArenas(
+                        executor: metal, weights: metal.weights, summary: harness.summary,
+                        snapshot: try snapshot(), config: config, catalog: metal.weights.catalog,
+                        positions: 8
+                    )
+                    print("🔎 [inkling2 arena] arenas:\(line)")
+                }
             } else {
                 metal.removeExpertArena()
             }
@@ -658,15 +650,49 @@ final class Inkling2VisitProfileTests: XCTestCase {
             let visits = max(1, metal.visitProfile.visits)
             let mixture = Double(metal.visitProfile.timing(.expertMixture).wallNanoseconds)
                 / Double(visits) / 1_000_000
-            return (logits, ms, mixture, metal.expertArena?.statistics)
+            let stats = metal.expertArenas.isEmpty
+                ? nil
+                : Inkling2ArenaCounters.merged(metal.expertArenas.map { $0.arena.statistics })
+            return (logits, ms, mixture, stats)
         }
+        // Whether the mmap arm can run at all here. A mixture binds the layer's
+        // fused bank and its scales as two WHOLE segment buffers; past what the
+        // device will wire that dispatch returns zeros with no error, so the
+        // guard refuses it by name and the arm becomes a refusal to record
+        // rather than a wall to time.
+        let layerZero = try metal.weights.expertBank(.expertW13, layer: 0, expert: 0)
+        let layerZeroDown = try metal.weights.expertBank(.expertW2, layer: 0, expert: 0)
+        var mmapBinding = Inkling2MixtureBinding()
+        mmapBinding.add(layerZero.buffer, label: "the w13 bank of layer 0")
+        mmapBinding.add(layerZero.scaleBuffer, label: "the w13 scales of layer 0")
+        mmapBinding.add(layerZeroDown.buffer, label: "the w2 bank of layer 0")
+        mmapBinding.add(layerZeroDown.scaleBuffer, label: "the w2 scales of layer 0")
+        let mmapRuns = mmapBinding.bytes <= metal.mixtureBindingBudget
+        print(
+            "🔎 [inkling2 arena] the mmap mixture binds "
+                + "\(Inkling2MixtureBinding.describe(mmapBinding.bytes)) against a "
+                + "\(Inkling2MixtureBinding.describe(metal.mixtureBindingBudget)) budget: "
+                + (mmapRuns ? "it can run" : "it is refused by name")
+        )
 
         // The arm order FLIPS every round: a first pass is slow for being cold
         // (the page cache holds none of the banks) and a later one is fast for
         // being warm, so a fixed order would decide the comparison by itself.
         var mmapWalls: [Double] = []
         var arenaWalls: [Double] = []
+        var mmapRefusals = 0
         for (round, useArena) in [false, true, true, false].enumerated() {
+            if !useArena && !mmapRuns {
+                XCTAssertThrowsError(try position(round, arena: false)) { error in
+                    XCTAssertTrue("\(error)".contains("returns zeros"), "\(error)")
+                }
+                mmapRefusals += 1
+                print(
+                    "🔎 [inkling2 arena] round \(round) (mmap): refused by name -- the layer's "
+                        + "two bank segments are past what this device will wire"
+                )
+                continue
+            }
             let measured = try position(round, arena: useArena)
             var line = "🔎 [inkling2 arena] round \(round) (\(useArena ? "arena" : "mmap")): "
                 + "\(String(format: "%.1f", measured.ms)) ms, "
@@ -684,15 +710,30 @@ final class Inkling2VisitProfileTests: XCTestCase {
             }
             print(line)
         }
-        print(
-            "🔎 [inkling2 arena] median: mmap "
-                + "\(String(format: "%.1f", mmapWalls.sorted()[mmapWalls.count / 2])) ms, arena "
-                + "\(String(format: "%.1f", arenaWalls.sorted()[arenaWalls.count / 2])) ms"
-        )
+        XCTAssertFalse(arenaWalls.isEmpty, "no arena arm ran")
+        if mmapRuns {
+            XCTAssertEqual(mmapWalls.count, 2)
+            print(
+                "🔎 [inkling2 arena] median: mmap "
+                    + "\(String(format: "%.1f", mmapWalls.sorted()[mmapWalls.count / 2])) ms, arena "
+                    + "\(String(format: "%.1f", arenaWalls.sorted()[arenaWalls.count / 2])) ms"
+            )
+        } else {
+            XCTAssertEqual(mmapRefusals, 2, "both mmap rounds must have been refused")
+            print(
+                "🔎 [inkling2 arena] median: arena "
+                    + "\(String(format: "%.1f", arenaWalls.sorted()[arenaWalls.count / 2])) ms "
+                    + "per position, with no mmap arm to compare against on this device"
+            )
+        }
 
-        // Correctness, on a POSITION both arms can share: the same token at the
-        // same index, after the timed rounds have warmed the page cache.
-        let streamed = try position(4, arena: false)
+        // Correctness, on a POSITION both arms can share when they both exist:
+        // the same token at the same index, after the timed rounds have warmed
+        // the page cache.
+        var streamedLogits: [Float]?
+        if mmapRuns {
+            streamedLogits = try position(4, arena: false).logits
+        }
         let resident = try position(4, arena: true)
         metal.removeExpertArena()
         XCTAssertEqual(resident.logits.count, config.unpaddedVocabSize)
@@ -703,12 +744,15 @@ final class Inkling2VisitProfileTests: XCTestCase {
         // TheBanksOwnBytes`, which pins the arena path against the HOST rule).
         // An equality assertion here would therefore be asserting that the
         // arena reproduces the broken arm.
-        let scale = streamed.logits.reduce(Float(0)) { max($0, abs($1)) }
-        let delta = zip(streamed.logits, resident.logits).reduce(Float(0)) { max($0, abs($1.0 - $1.1)) }
-        print(
-            "🔎 [inkling2 arena] arena logits vs mmap: \(scale > 0 ? delta / scale : delta) relative, "
-                + "worst element"
-        )
+        if let streamedLogits {
+            let scale = streamedLogits.reduce(Float(0)) { max($0, abs($1)) }
+            let delta = zip(streamedLogits, resident.logits)
+                .reduce(Float(0)) { max($0, abs($1.0 - $1.1)) }
+            print(
+                "🔎 [inkling2 arena] arena logits vs mmap: "
+                    + "\(scale > 0 ? delta / scale : delta) relative, worst element"
+            )
+        }
         // What IS required: the arena arm is not degenerate (it read real expert
         // bytes through its slots), and its mixture contributed.
         let spread = (resident.logits.max() ?? 0) - (resident.logits.min() ?? 0)
