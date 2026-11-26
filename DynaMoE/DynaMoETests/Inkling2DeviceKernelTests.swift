@@ -3788,6 +3788,237 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         )
     }
 
+    // MARK: Past the window
+
+    /// Phase 7 item 4's first named gate: the 1,024-ring ROLLOVER, in a real
+    /// device walk that crosses it.
+    ///
+    /// Nothing in this family had ever run past 17 positions, so the ring had
+    /// never dropped a row under the device attention and the full visits had
+    /// never staged more than a handful. Slice 27 priced the copy; this runs
+    /// it. The walk is `window + 8` positions, so every windowed visit drops
+    /// exactly eight rows and every full visit holds all of them.
+    ///
+    /// What is asserted, in the order a rollover bug would show up:
+    ///   * the ring holds exactly `window` rows and its `windowStart` advanced
+    ///     by the number of dropped rows -- a ring that never dropped would
+    ///     hold `positions`, and one that dropped from the wrong end would
+    ///     change `windowStart` without changing the count;
+    ///   * the full visits hold every position, so a ring that silently
+    ///     truncated them is caught by the same check in the other direction;
+    ///   * the staging copy at the boundary is exactly the ring's rows (the
+    ///     constant term slice 27 measured) and exactly every row for a full
+    ///     visit (the linear term);
+    ///   * the sequence stays CONSISTENT and its token history is complete,
+    ///     which is what makes a prefix past the rollover resumable at all;
+    ///   * every logit is finite, and the FP32 and INT8 arms argue for the
+    ///     same greedy token at all four sampled positions (1,024, 1,025,
+    ///     1,028, 1,032), with the elementwise width printed rather than
+    ///     asserted: it is position-dependent past the window, no envelope has
+    ///     been measured at this length, and inventing one would be a claim.
+    ///
+    /// Opt-in: two device walks of 1,032 positions.
+    /// `touch /tmp/dynamoe_inkling2_rollover` to run it.
+    func testAWalkPastTheWindowRollsTheRingAndKeepsEveryRowInOrder() throws {
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_rollover"),
+            "opt-in: touch /tmp/dynamoe_inkling2_rollover (two device walks past the window)"
+        )
+        let snapshot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(Inkling2PublishedTensorTests.snapshotRelativePath)
+        guard FileManager.default.fileExists(atPath: snapshot.path) else {
+            throw XCTSkip("Inkling 2 snapshot is not downloaded at \(snapshot.path)")
+        }
+        let (device, library, queue) = try environment()
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let rawSummary = try engine.getSummary()
+        let summary = try inkling2MetalReadySummary(rawSummary)
+        let config = try Inkling2Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let catalog = Inkling2WeightCatalog(
+            mainFile: summary.tensors.map { Inkling2TensorRef(metadata: $0) },
+            layerCount: config.numHiddenLayers
+        )
+        let shardBuffers = try inkling2MetalShardBuffers(summary, device: device)
+        let source = Inkling2SnapshotWeights(
+            config: config, catalog: catalog, shardBuffers: shardBuffers
+        )
+        let deviceWeights = Inkling2DeviceWeights(
+            config: config, catalog: catalog, shardBuffers: shardBuffers,
+            fileOrigins: InferenceEngine.shardFileOrigins(original: rawSummary, segmented: summary)
+        )
+        let tokenizer = try DynaMoeTokenizer(
+            tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+        )
+        let seed = try tokenizer.encode(
+            text: "The quick brown fox jumps over the lazy dog, and the dog does not mind it at all."
+        ).map { Int($0) }
+        XCTAssertFalse(seed.isEmpty)
+
+        let window = config.slidingWindowSize
+        XCTAssertEqual(window, 1_024)
+        let positions = window + 8
+        // A deterministic 1,032-token prompt out of repeated seed text.
+        let ids = (0..<positions).map { seed[$0 % seed.count] }
+
+        /// One arm: a host forward built for `storage` (it owns the visit
+        /// state, so it decides the form), its own executor, a workspace laid
+        /// out for the same form and the whole walk, and the arena a turn
+        /// installs. Returns the logits at the boundary and at the end, plus
+        /// the ring's shape and the staging counts at the boundary.
+        func walk(_ storage: Inkling2KVStorage) throws -> (
+            samples: [(position: Int, logits: [Float])], ringRows: Int, ringStart: Int,
+            fullRows: Int, windowedStaged: Int, fullStaged: Int
+        ) {
+            let forward = try Inkling2CPUForward(
+                config: config, weights: source,
+                options: Inkling2ForwardOptions(maxPositions: positions, kvStorage: storage)
+            )
+            let executor = try Inkling2MetalForward(
+                device: device, library: library, queue: queue,
+                weights: deviceWeights, host: forward
+            )
+            let workspace = try Inkling2DeviceWorkspace(
+                device: device, config: config, stagedPositions: positions, storage: storage
+            )
+            defer {
+                forward.visitRunner = nil
+                forward.headRunner = nil
+                executor.removeExpertArena()
+            }
+            let arenaLine = try inkling2InstallExpertArenas(
+                executor: executor, weights: deviceWeights, summary: summary,
+                snapshot: snapshot, config: config, catalog: catalog,
+                positions: positions, kvElementBytes: storage.bytesPerElement
+            )
+            XCTAssertFalse(arenaLine.contains("no arena"), arenaLine)
+            forward.visitRunner = { layer, pass, hidden, blockStates, messages, position in
+                try executor.runVisit(
+                    layer: layer, pass: pass, hidden: hidden, blockStates: &blockStates,
+                    messages: messages, position: position, workspace: workspace
+                )
+            }
+            forward.headRunner = { hidden in
+                try executor.headLogits(hidden: hidden, workspace: workspace)
+            }
+
+            // Four positions, so the elementwise width can be read as a trend
+            // rather than from one pair: the last one before the ring is full,
+            // the first one that dropped a row, and two more past it.
+            let sampled = [window - 1, window, window + 3, positions - 1]
+            var samples: [(position: Int, logits: [Float])] = []
+            for (position, id) in ids.enumerated() {
+                let logits = try forward.forwardToken(token: UInt32(id), position: position)
+                if sampled.contains(position) { samples.append((position, logits)) }
+            }
+            XCTAssertEqual(samples.count, sampled.count)
+            XCTAssertFalse(samples.first?.logits.isEmpty ?? true)
+
+            // The sequence's own account of the walk.
+            XCTAssertEqual(forward.sequence.committedPositions, positions)
+            XCTAssertTrue(
+                forward.sequence.isConsistent,
+                "every visit must have committed the same positions and the history must match"
+            )
+            XCTAssertEqual(forward.sequence.tokenHistory, ids)
+            // A resume past the rollover is evidence-backed: every position but
+            // the last matches, which is the most a caller may reuse.
+            XCTAssertEqual(
+                forward.sequence.reusablePrefix(proposedPrefix: positions, promptTokenIds: ids),
+                positions - 1
+            )
+
+            // The ring's shape, per visit kind.
+            let windowedVisits = forward.sequence.visits.filter { !$0.isFullAttention }
+            let fullVisits = forward.sequence.visits.filter { $0.isFullAttention }
+            XCTAssertEqual(windowedVisits.count, 40)
+            XCTAssertEqual(fullVisits.count, 8)
+            for visit in windowedVisits {
+                XCTAssertEqual(visit.rowCount, window, "a ring must hold exactly its window")
+                XCTAssertEqual(visit.windowStart, positions - window, "the ring must have dropped 8 rows")
+                XCTAssertEqual(visit.committedPositions, positions)
+            }
+            for visit in fullVisits {
+                XCTAssertEqual(visit.rowCount, positions, "a full visit must hold every position")
+                XCTAssertEqual(visit.windowStart, 0)
+                XCTAssertEqual(visit.committedPositions, positions)
+            }
+
+            // The staging copy at the boundary: constant for a ring, linear for
+            // a full visit (slice 27's two terms, measured in place).
+            let windowed = try XCTUnwrap(windowedVisits.first)
+            let full = try XCTUnwrap(fullVisits.first)
+            let windowedStaged = try workspace.stage(windowed)
+            let fullStaged = try workspace.stage(full)
+            XCTAssertEqual(windowedStaged, window)
+            XCTAssertEqual(fullStaged, positions)
+            return (
+                samples,
+                windowed.rowCount, windowed.windowStart,
+                full.rowCount, windowedStaged, fullStaged
+            )
+        }
+
+        let exact = try walk(.float32)
+        let compact = try walk(.int8)
+        XCTAssertEqual(exact.ringRows, compact.ringRows)
+        XCTAssertEqual(exact.ringStart, compact.ringStart)
+        XCTAssertEqual(exact.windowedStaged, compact.windowedStaged)
+        XCTAssertEqual(exact.fullStaged, compact.fullStaged)
+        print(
+            "\u{1F50E} [inkling2 rollover] past \(window): a ring holds \(exact.ringRows) rows from "
+                + "\(exact.ringStart), a full visit holds \(exact.fullRows); the staging copy is "
+                + "\(exact.windowedStaged) rows for the ring and \(exact.fullStaged) for the full visit"
+        )
+
+        func compare(_ label: String, _ exactRow: [Float], _ compactRow: [Float]) {
+            XCTAssertEqual(exactRow.count, compactRow.count)
+            var worst: Float = 0
+            var differences: [Float] = []
+            differences.reserveCapacity(exactRow.count)
+            var exactTop = (id: -1, value: -Float.infinity)
+            var compactTop = (id: -1, value: -Float.infinity)
+            var nonFinite = 0
+            for index in 0..<exactRow.count {
+                let reference = exactRow[index]
+                let other = compactRow[index]
+                if !reference.isFinite || !other.isFinite { nonFinite += 1 }
+                let difference = abs(other - reference)
+                worst = max(worst, difference)
+                differences.append(difference)
+                if reference > exactTop.value { exactTop = (index, reference) }
+                if other > compactTop.value { compactTop = (index, other) }
+            }
+            XCTAssertEqual(nonFinite, 0, "\(label): every logit must be finite")
+            let mean = differences.reduce(0, +) / Float(max(1, differences.count))
+            let p99 = differences.sorted()[Int(0.99 * Float(max(0, differences.count - 1)))]
+            print(
+                "\u{1F50E} [inkling2 rollover] \(label): worst " + String(format: "%.4g", worst)
+                    + ", mean " + String(format: "%.4g", mean)
+                    + ", p99 " + String(format: "%.4g", p99)
+                    + ", greedy " + (exactTop.id == compactTop.id ? "agrees" : "DIFFERS")
+                    + " (\(exactTop.id) vs \(compactTop.id)), FP32 margin "
+                    + String(format: "%.4g", exactTop.value - (exactRow.sorted().dropLast().last ?? 0))
+            )
+            // Greedy agreement is the bar at this length: no envelope has been
+            // measured past the window, and an invented one would be a claim.
+            XCTAssertEqual(
+                compactTop.id, exactTop.id,
+                "\(label): the INT8 cache argues for a different token past the window"
+            )
+        }
+        XCTAssertEqual(exact.samples.count, compact.samples.count)
+        for (left, right) in zip(exact.samples, compact.samples) {
+            XCTAssertEqual(left.position, right.position)
+            compare("at \(left.position + 1) positions", left.logits, right.logits)
+        }
+        print(
+            "\u{1F50E} [inkling2 rollover] the ring and the deep cache both run past "
+                + "\(window) positions; the elementwise width is printed, not asserted"
+        )
+    }
+
     // MARK: The app's own turn path
 
     /// The whole app path for this family, once on the host and once with the
