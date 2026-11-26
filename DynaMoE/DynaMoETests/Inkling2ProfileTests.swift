@@ -1302,3 +1302,203 @@ final class Inkling2KvStoreCostTests: XCTestCase {
     }
 }
 
+// MARK: - What a long context costs the staging copy
+
+/// Past the window, a local visit stages `window` rows into the device before
+/// its attention, and a FULL visit stages every row the position has. The
+/// visit state stays host-side on purpose -- it is what lets a resume prove
+/// itself against the token history -- so that copy is the price of the
+/// decision, and it is the one term in a visit that grows with context.
+///
+/// Nothing had measured it: every number this family has recorded for a
+/// position was taken at position 0-17, where a full visit stages 17 rows and
+/// the term is invisible. This case prices it at the window and past it.
+///
+/// Model-free: a synthetic state at the published width and a workspace built
+/// for the row counts measured, so no checkpoint is needed. Opt-in behind the
+/// profile marker because the printed wall is machine-specific and this is a
+/// copy -- its rate depends on the machine's memory bandwidth. The assertions
+/// are structural (the rows staged, the storage's own bytes) and the timing is
+/// the diagnostic that decides whether a device-resident cache is worth its
+/// memory.
+final class Inkling2StagingCostTests: XCTestCase {
+
+    private func row(width: Int, seed: Int) -> [Float] {
+        (0..<width).map { index in
+            let mixed = (index &* 37 &+ seed &* 101) % 29
+            let sign: Float = (index &+ seed) % 4 == 0 ? -1 : 1
+            return sign * (Float(mixed) + 0.5) / 8
+        }
+    }
+
+    /// One visit's cache, and the best of `rounds` stagings of it into a
+    /// workspace built for `rows` rows.
+    ///
+    /// `appends` is how many positions the cache has received: equal to `rows`
+    /// for a full-attention visit (whose cache grows with the position), larger
+    /// for a windowed one (whose cache stops at the window), which is the whole
+    /// difference this case prices.
+    private func staging(
+        device: MTLDevice,
+        config: Inkling2Config,
+        storage: Inkling2KVStorage,
+        rows: Int,
+        appends: Int? = nil,
+        isFullAttention: Bool = true,
+        rounds: Int = 5
+    ) throws -> (best: Double, staged: Int, bufferBytes: Int, residentBytes: Int, readBack: Double) {
+        let width = config.numKeyValueHeads * config.headDim
+        let workspace = try Inkling2DeviceWorkspace(
+            device: device, config: config, stagedPositions: rows, storage: storage
+        )
+        let state = Inkling2VisitState(
+            isFullAttention: isFullAttention, window: config.slidingWindowSize,
+            stateWidths: [width, width, config.hiddenSize, config.hiddenSize],
+            historyDepth: max(0, config.convKernelSize - 1),
+            storage: storage, heads: config.numKeyValueHeads
+        )
+        for position in 0..<(appends ?? rows) {
+            let values = row(width: width, seed: position)
+            _ = state.append(key: values, value: values)
+        }
+        // A windowed visit's cache must have stopped at the window, or the
+        // copy would grow with the position exactly as a full visit's does.
+        XCTAssertEqual(state.rowCount, rows, "the cache must hold exactly the rows measured")
+        var best = Double.greatestFiniteMagnitude
+        var staged = 0
+        for _ in 0..<rounds {
+            let started = CFAbsoluteTimeGetCurrent()
+            staged = try workspace.stage(state)
+            best = min(best, (CFAbsoluteTimeGetCurrent() - started) * 1_000)
+        }
+        XCTAssertEqual(staged, rows, "every retained row of the cache must reach the staging buffer")
+        XCTAssertEqual(state.storage, workspace.stagedStorage)
+        // The reader's own cost, which the host attention pays once a visit:
+        // FP32 hands back the stored rows, INT8 dequantizes them per read.
+        var readBack = Double.greatestFiniteMagnitude
+        for _ in 0..<rounds {
+            let started = CFAbsoluteTimeGetCurrent()
+            let keys = state.keys
+            _ = keys.count
+            readBack = min(readBack, (CFAbsoluteTimeGetCurrent() - started) * 1_000)
+        }
+        XCTAssertEqual(state.keys.count, rows)
+        // Keys AND values are staged, so the bytes one visit moves are twice
+        // the key buffer's length.
+        return (best, staged, workspace.stagedKeys.length * 2, state.residentBytes, readBack)
+    }
+
+    func testWhatAWindowOfRowsCostsToStageAndWhatAPastWindowFullVisitAdds() throws {
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_profile"),
+            "opt-in measurement; touch /tmp/dynamoe_inkling2_profile to run"
+        )
+        let config = try Inkling2Config.decode(
+            jsonData: Data(Inkling2PublishedConfigTests.publishedJSON.utf8)
+        )
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("no Metal device")
+        }
+        let plan = try config.makeVisitPlan()
+        let localVisits = plan.filter { !$0.isFullAttention }.count
+        let fullVisits = plan.count - localVisits
+        // The schedule this is priced on: 48 visits, 40 of them over the
+        // window and 8 over the whole cache (local layers 0,1,2,3,4,6..10,12..16,
+        // 18..22; full layers 5, 11, 17, 23 with 11 and 17 run three times).
+        XCTAssertEqual(plan.count, 48)
+        XCTAssertEqual(localVisits, 40)
+        XCTAssertEqual(fullVisits, 8)
+        let window = config.slidingWindowSize
+        XCTAssertEqual(window, 1_024)
+        let width = config.numKeyValueHeads * config.headDim
+        /// The measured wall of a device position at position 0
+        /// (`testWhereADecodePositionsTimeGoesOnThePublishedCheckpoint`), which
+        /// is what a share is taken of. Nothing here is part of it: at position
+        /// 0 a visit stages one row.
+        let measuredPositionMilliseconds = 118.1
+
+        // The windowed arm is a REAL windowed visit: 76 appends past the window,
+        // whose cache stops at 1,024 rows and stages the same count. That the
+        // copy stays constant is what makes a local visit cheap at any length.
+        let overWindow = window + 76
+        let exactWindow = try staging(
+            device: device, config: config, storage: .float32, rows: window,
+            appends: overWindow, isFullAttention: false
+        )
+        let compactWindow = try staging(
+            device: device, config: config, storage: .int8, rows: window,
+            appends: overWindow, isFullAttention: false
+        )
+        // The past-window arm: what a FULL visit stages once the cache is
+        // longer than the window. 8,192 is the log-scaling floor, so it is the
+        // first length where the schedule's own log scale is active too.
+        let exactDeep = try staging(device: device, config: config, storage: .float32, rows: 8_192)
+        let compactDeep = try staging(device: device, config: config, storage: .int8, rows: 8_192)
+
+        // The compact form must be the smaller one, or INT8 buys nothing here.
+        XCTAssertEqual(
+            compactWindow.bufferBytes * 4, exactWindow.bufferBytes,
+            "the INT8 staging buffer must be a quarter of the FP32 one"
+        )
+        XCTAssertLessThan(compactWindow.residentBytes, exactWindow.residentBytes / 2)
+        // And the past-window arm must be the larger one: this term grows with
+        // the rows a full visit reads, which is the whole point of the case.
+        XCTAssertGreaterThan(exactDeep.bufferBytes, exactWindow.bufferBytes)
+        XCTAssertGreaterThan(compactDeep.bufferBytes, compactWindow.bufferBytes)
+
+        func megabytes(_ bytes: Int) -> String { String(format: "%.1f MB", Double(bytes) / 1e6) }
+        func perPosition(_ visitMilliseconds: Double, _ visits: Int) -> Double {
+            visitMilliseconds * Double(visits)
+        }
+        func share(_ milliseconds: Double) -> String {
+            String(format: "%.1f%% of a %.1f ms position", 100 * milliseconds / measuredPositionMilliseconds,
+                   measuredPositionMilliseconds)
+        }
+        print(
+            "\u{1F50E} [inkling2 staging] one over-window visit (\(window) rows, \(width) wide): "
+                + "FP32 " + String(format: "%.3f", exactWindow.best) + " ms into "
+                + megabytes(exactWindow.bufferBytes) + " (read back "
+                + String(format: "%.3f", exactWindow.readBack) + " ms), INT8 "
+                + String(format: "%.3f", compactWindow.best) + " ms into "
+                + megabytes(compactWindow.bufferBytes) + " (read back "
+                + String(format: "%.3f", compactWindow.readBack) + " ms)"
+        )
+        print(
+            "\u{1F50E} [inkling2 staging] one 8,192-row visit: FP32 "
+                + String(format: "%.3f", exactDeep.best) + " ms into "
+                + megabytes(exactDeep.bufferBytes) + " (read back "
+                + String(format: "%.3f", exactDeep.readBack) + " ms), INT8 "
+                + String(format: "%.3f", compactDeep.best) + " ms into "
+                + megabytes(compactDeep.bufferBytes) + " (read back "
+                + String(format: "%.3f", compactDeep.readBack) + " ms)"
+        )
+        let windowed = perPosition(exactWindow.best, localVisits)
+        let deep = perPosition(exactDeep.best, fullVisits) + windowed
+        let compactDeepPosition = perPosition(compactDeep.best, fullVisits)
+            + perPosition(compactWindow.best, localVisits)
+        print(
+            "\u{1F50E} [inkling2 staging] a position past the window copies "
+                + String(format: "%.1f", windowed) + " ms for its \(localVisits) windowed visits ("
+                + share(windowed) + "), and at 8,192 it copies "
+                + String(format: "%.1f", deep) + " ms in total (" + share(deep) + ") because its "
+                + "\(fullVisits) full visits stage the whole cache; INT8 makes that "
+                + String(format: "%.1f", compactDeepPosition) + " ms"
+        )
+        // Linear beyond the measurement, which is what makes it the term that
+        // decides whether a long-context turn is run at FP32 or INT8.
+        let rowsAt = 32_768
+        let linear = exactDeep.best / 8_192 * Double(rowsAt)
+        let deepPosition = perPosition(linear, fullVisits) + windowed
+        let compactPosition = perPosition(compactDeep.best / 8_192 * Double(rowsAt), fullVisits)
+            + perPosition(compactWindow.best, localVisits)
+        print(
+            "\u{1F50E} [inkling2 staging] the copy is linear in rows and per visit, so a "
+                + "\(rowsAt)-row position copies " + String(format: "%.1f", deepPosition)
+                + " ms at FP32 and " + String(format: "%.1f", compactPosition) + " ms at INT8 ("
+                + String(format: "%.1f", deepPosition / measuredPositionMilliseconds)
+                + "x and " + String(format: "%.2f", compactPosition / measuredPositionMilliseconds)
+                + "x the shortest position's whole wall)"
+        )
+    }
+}
+
