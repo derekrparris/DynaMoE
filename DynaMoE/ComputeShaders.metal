@@ -14655,6 +14655,232 @@ kernel void inkling_expert_row_block_f32(
     if (tid == 0) { outVector[row] = total; }
 }
 
+// `inkling_expert_row_block_f32` re-reads the activation block once per output
+// ROW, which is the other half of the L1 traffic slice 35 named: a projection
+// 2,304 rows wide by 2,304 columns reads 21 MB of activations against 3 MB of
+// weights, and a mixture does that eight times over.
+//
+// This kernel gives a threadgroup ROWS output rows instead of one and hoists
+// the activation block above the row loop, so the same four `float4` loads pay
+// for ROWS weight loads instead of one: six loads per block per row becomes
+// `2 + 4 / ROWS`. The columns a lane owns and the order a row's values add in
+// are the block kernel's, and the reduction is the same `simd_sum` over the
+// same 32 lanes, so a row's output is the block kernel's up to which rows a
+// warp happens to hold.
+//
+// `simd_sum` is warp-scoped, so the threadgroup is ONE warp and ROWS is how
+// many rows that warp holds. `rows` travels as a constant because the last
+// group is usually partial (2,304 gate/up rows is a multiple of 4, but a
+// projection is not a multiple of every width a caller might test).
+//
+// Slice 37 measured this family at the published slot shape on an eight-expert
+// mixture, GPU-timed with the arms interleaved: width 1 is 1.005 ms, two rows
+// 1.034, four 1.064, eight 1.077, and every width's output is the width-1
+// output to the bit. So activation reuse does NOT pay here, and width 1 is what
+// ships -- 0.960 ms against the block kernel's 1.000 for the same sums, because
+// it reduces with a bare `simd_sum` instead of `threadgroup_reduce_sum`'s three
+// barriers. The wider widths stay as the record of that measurement.
+inline float inkling_maybe_round(bool round, float value) {
+    return round ? inkling_round_bf16(value) : value;
+}
+
+template <uint ROWS, bool ROUND>
+inline void inkling_expert_row_group_body(
+    device const uchar* weight,
+    device const uchar* scales,
+    device const float* input,
+    device float* outVector,
+    uint logicalColumns,
+    uint weightRowStride,
+    uint scaleRowStride,
+    uint blockSize,
+    bool layoutIsNVFP4,
+    float outerScale,
+    uint64_t weightOffset,
+    uint64_t scaleOffset,
+    uint tid,
+    uint group,
+    uint rows
+) {
+    uint baseRow = group * ROWS;
+    if (baseRow >= rows) { return; }
+    uint groupRows = min(ROWS, rows - baseRow);
+    uint blockCount = (logicalColumns + blockSize - 1) / blockSize;
+    // A packed load needs every row it reads 8-byte aligned, and the group reads
+    // ONE activation block for all of them, so it takes the vector path only
+    // when the stride keeps every row of the group aligned as well.
+    bool vectorLoads = ((weightOffset + (uint64_t)baseRow * weightRowStride) & 7u) == 0
+        && (weightRowStride & 7u) == 0;
+    uint64_t firstScale = scaleOffset + (uint64_t)baseRow * scaleRowStride;
+    float sums[ROWS];
+    #pragma unroll
+    for (uint row = 0; row < ROWS; row++) { sums[row] = 0.0f; }
+
+    for (uint block = tid; block < blockCount; block += 32) {
+        uint first = block * blockSize;
+        device const float* in = input + first;
+        if (layoutIsNVFP4 && vectorLoads && blockSize == 16 && first + 16 <= logicalColumns) {
+            // Above the row loop on purpose: this is the traffic the group
+            // exists to stop repeating.
+            float4 act0 = *((device const float4*)(in));
+            float4 act1 = *((device const float4*)(in + 4));
+            float4 act2 = *((device const float4*)(in + 8));
+            float4 act3 = *((device const float4*)(in + 12));
+            #pragma unroll
+            for (uint row = 0; row < ROWS; row++) {
+                if (row >= groupRows) { break; }
+                uint64_t weightBase = weightOffset
+                    + (uint64_t)(baseRow + row) * weightRowStride;
+                float scale = inkling_e4m3_bits(scales[firstScale + row * scaleRowStride + block])
+                    * outerScale;
+                ulong packed = *((device const ulong*)(weight + weightBase + (first >> 1)));
+                sums[row] += inkling_maybe_round(ROUND,
+                    inkling_e2m1_bits((uint)(packed & 0xFu)) * scale) * act0.x;
+                sums[row] += inkling_maybe_round(ROUND,
+                    inkling_e2m1_bits((uint)((packed >> 4) & 0xFu)) * scale) * act0.y;
+                sums[row] += inkling_maybe_round(ROUND,
+                    inkling_e2m1_bits((uint)((packed >> 8) & 0xFu)) * scale) * act0.z;
+                sums[row] += inkling_maybe_round(ROUND,
+                    inkling_e2m1_bits((uint)((packed >> 12) & 0xFu)) * scale) * act0.w;
+                sums[row] += inkling_maybe_round(ROUND,
+                    inkling_e2m1_bits((uint)((packed >> 16) & 0xFu)) * scale) * act1.x;
+                sums[row] += inkling_maybe_round(ROUND,
+                    inkling_e2m1_bits((uint)((packed >> 20) & 0xFu)) * scale) * act1.y;
+                sums[row] += inkling_maybe_round(ROUND,
+                    inkling_e2m1_bits((uint)((packed >> 24) & 0xFu)) * scale) * act1.z;
+                sums[row] += inkling_maybe_round(ROUND,
+                    inkling_e2m1_bits((uint)((packed >> 28) & 0xFu)) * scale) * act1.w;
+                sums[row] += inkling_maybe_round(ROUND,
+                    inkling_e2m1_bits((uint)((packed >> 32) & 0xFu)) * scale) * act2.x;
+                sums[row] += inkling_maybe_round(ROUND,
+                    inkling_e2m1_bits((uint)((packed >> 36) & 0xFu)) * scale) * act2.y;
+                sums[row] += inkling_maybe_round(ROUND,
+                    inkling_e2m1_bits((uint)((packed >> 40) & 0xFu)) * scale) * act2.z;
+                sums[row] += inkling_maybe_round(ROUND,
+                    inkling_e2m1_bits((uint)((packed >> 44) & 0xFu)) * scale) * act2.w;
+                sums[row] += inkling_maybe_round(ROUND,
+                    inkling_e2m1_bits((uint)((packed >> 48) & 0xFu)) * scale) * act3.x;
+                sums[row] += inkling_maybe_round(ROUND,
+                    inkling_e2m1_bits((uint)((packed >> 52) & 0xFu)) * scale) * act3.y;
+                sums[row] += inkling_maybe_round(ROUND,
+                    inkling_e2m1_bits((uint)((packed >> 56) & 0xFu)) * scale) * act3.z;
+                sums[row] += inkling_maybe_round(ROUND,
+                    inkling_e2m1_bits((uint)((packed >> 60) & 0xFu)) * scale) * act3.w;
+            }
+        } else if (!layoutIsNVFP4 && vectorLoads && blockSize == 32
+                   && first + 32 <= logicalColumns) {
+            float4 act0 = *((device const float4*)(in));
+            float4 act1 = *((device const float4*)(in + 4));
+            float4 act2 = *((device const float4*)(in + 8));
+            float4 act3 = *((device const float4*)(in + 12));
+            float4 act4 = *((device const float4*)(in + 16));
+            float4 act5 = *((device const float4*)(in + 20));
+            float4 act6 = *((device const float4*)(in + 24));
+            float4 act7 = *((device const float4*)(in + 28));
+            #pragma unroll
+            for (uint row = 0; row < ROWS; row++) {
+                if (row >= groupRows) { break; }
+                uint64_t weightBase = weightOffset
+                    + (uint64_t)(baseRow + row) * weightRowStride;
+                float scale = inkling_e8m0_bits(scales[firstScale + row * scaleRowStride + block]);
+                device const uchar* w = weight + weightBase + first;
+                #pragma unroll
+                for (uint chunk = 0; chunk < 4; chunk++) {
+                    ulong packed = *((device const ulong*)(w + 8 * chunk));
+                    float4 lo = chunk == 0 ? act0 : (chunk == 1 ? act2 : (chunk == 2 ? act4 : act6));
+                    float4 hi = chunk == 0 ? act1 : (chunk == 1 ? act3 : (chunk == 2 ? act5 : act7));
+                    sums[row] += inkling_maybe_round(ROUND,
+                        inkling_e4m3_bits((uint)(packed & 0xFFu)) * scale) * lo.x;
+                    sums[row] += inkling_maybe_round(ROUND,
+                        inkling_e4m3_bits((uint)((packed >> 8) & 0xFFu)) * scale) * lo.y;
+                    sums[row] += inkling_maybe_round(ROUND,
+                        inkling_e4m3_bits((uint)((packed >> 16) & 0xFFu)) * scale) * lo.z;
+                    sums[row] += inkling_maybe_round(ROUND,
+                        inkling_e4m3_bits((uint)((packed >> 24) & 0xFFu)) * scale) * lo.w;
+                    sums[row] += inkling_maybe_round(ROUND,
+                        inkling_e4m3_bits((uint)((packed >> 32) & 0xFFu)) * scale) * hi.x;
+                    sums[row] += inkling_maybe_round(ROUND,
+                        inkling_e4m3_bits((uint)((packed >> 40) & 0xFFu)) * scale) * hi.y;
+                    sums[row] += inkling_maybe_round(ROUND,
+                        inkling_e4m3_bits((uint)((packed >> 48) & 0xFFu)) * scale) * hi.z;
+                    sums[row] += inkling_maybe_round(ROUND,
+                        inkling_e4m3_bits((uint)((packed >> 56) & 0xFFu)) * scale) * hi.w;
+                }
+            }
+        } else {
+            // A partial last block, or a group a packed load cannot address. The
+            // row loop goes OUTER here so each row's values still add in column
+            // order, which is the block kernel's fallback exactly.
+            uint extent = min(blockSize, logicalColumns - first);
+            #pragma unroll
+            for (uint row = 0; row < ROWS; row++) {
+                if (row >= groupRows) { break; }
+                uint64_t weightBase = weightOffset
+                    + (uint64_t)(baseRow + row) * weightRowStride;
+                uint scaleByte = scales[firstScale + row * scaleRowStride + block];
+                float scale = layoutIsNVFP4 ? inkling_e4m3_bits(scaleByte) * outerScale
+                                            : inkling_e8m0_bits(scaleByte);
+                if (layoutIsNVFP4) {
+                    device const uchar* w = weight + weightBase + (first >> 1);
+                    for (uint k = 0; k < extent; k++) {
+                        uchar byte = w[k >> 1];
+                        uint nibble = (k & 1u) == 0 ? (byte & 0xF) : (byte >> 4);
+                        sums[row] += inkling_maybe_round(ROUND, inkling_e2m1_bits(nibble) * scale) * in[k];
+                    }
+                } else {
+                    device const uchar* w = weight + weightBase + first;
+                    for (uint k = 0; k < extent; k++) {
+                        sums[row] += inkling_maybe_round(ROUND, inkling_e4m3_bits(w[k]) * scale) * in[k];
+                    }
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (uint row = 0; row < ROWS; row++) {
+        if (row >= groupRows) { break; }
+        float total = simd_sum(sums[row]);
+        if (tid == 0) { outVector[baseRow + row] = total; }
+    }
+}
+
+#define INKLING_EXPERT_ROW_GROUP_KERNEL(NAME, ROWS, ROUND)                     \
+kernel void NAME(                                                             \
+    device const uchar* weight [[buffer(0)]],                                 \
+    device const uchar* scales [[buffer(1)]],                                 \
+    device const float* input [[buffer(2)]],                                  \
+    device float* outVector [[buffer(3)]],                                    \
+    constant uint32_t& logicalColumns [[buffer(4)]],                          \
+    constant uint32_t& weightRowStride [[buffer(5)]],                         \
+    constant uint32_t& scaleRowStride [[buffer(6)]],                          \
+    constant uint32_t& blockSize [[buffer(7)]],                               \
+    constant bool& layoutIsNVFP4 [[buffer(8)]],                               \
+    constant float& outerScale [[buffer(9)]],                                 \
+    constant uint64_t& weightOffset [[buffer(10)]],                           \
+    constant uint64_t& scaleOffset [[buffer(11)]],                            \
+    constant uint32_t& rows [[buffer(12)]],                                   \
+    uint tid [[thread_position_in_threadgroup]],                              \
+    uint group [[threadgroup_position_in_grid]]                               \
+) {                                                                           \
+    if (tid >= 32u) { return; }                                               \
+    inkling_expert_row_group_body<ROWS, ROUND>(                               \
+        weight, scales, input, outVector, logicalColumns, weightRowStride,    \
+        scaleRowStride, blockSize, layoutIsNVFP4, outerScale, weightOffset,   \
+        scaleOffset, tid, group, rows);                                       \
+}
+
+INKLING_EXPERT_ROW_GROUP_KERNEL(inkling_expert_row_group2_f32, 2, true)
+INKLING_EXPERT_ROW_GROUP_KERNEL(inkling_expert_row_group4_f32, 4, true)
+INKLING_EXPERT_ROW_GROUP_KERNEL(inkling_expert_row_group8_f32, 8, true)
+// Two more instantiations of the same body. `group1` is the width-1 shape the
+// shipped kernel is, so it is the arm that says the instrument is fair, and
+// `noround` is that shape with `inkling_round_bf16` dropped -- the CONTROL that
+// says what the rounding costs now that the loads are cheap. Neither is a
+// dispatch: `noround` computes a different number on purpose.
+INKLING_EXPERT_ROW_GROUP_KERNEL(inkling_expert_row_group1_f32, 1, true)
+INKLING_EXPERT_ROW_GROUP_KERNEL(inkling_expert_row_noround_f32, 1, false)
+#undef INKLING_EXPERT_ROW_GROUP_KERNEL
+
 // Inkling 2's router selection: sigmoid every expert score, add the bias ONLY
 // to steer which experts are chosen, then renormalize the SELECTED raw scores
 // and scale. The bias never weights the output -- a softmax over the steered

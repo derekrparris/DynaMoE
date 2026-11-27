@@ -2018,6 +2018,7 @@ nonisolated public final class Inkling2MetalForward {
         input: MTLBuffer, output: MTLBuffer, rows: Int, logicalColumns: Int,
         layout: Inkling2ExpertQuantLayout, outerScale: Float,
         weightRowStride: Int, scaleRowStride: Int,
+        rowsPerGroup: Int = Inkling2ExpertRowDispatch.rowsPerThreadgroup,
         arena: Inkling2ScalarArena
     ) throws {
         encoder.setComputePipelineState(try pipeline(Inkling2ExpertRowDispatch.kernelName))
@@ -2034,8 +2035,9 @@ nonisolated public final class Inkling2MetalForward {
         encoder.setBuffer(arena.make(weightOffset), offset: 0, index: 10)
         encoder.setBuffer(arena.make(scaleOffset), offset: 0, index: 11)
         encoder.setThreadgroupMemoryLength(32 * MemoryLayout<Float>.stride, index: 0)
+        encoder.setBuffer(arena.make(UInt32(rows)), offset: 0, index: 12)
         encoder.dispatchThreadgroups(
-            MTLSize(width: rows, height: 1, depth: 1),
+            MTLSize(width: (rows + rowsPerGroup - 1) / rowsPerGroup, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(
                 width: Inkling2ExpertRowDispatch.threadgroup, height: 1, depth: 1
             )
@@ -2067,7 +2069,9 @@ nonisolated public final class Inkling2MetalForward {
             encoder: encoder, slot: slot, slotBaseOffset: slotBaseOffset,
             address: address, isGateUp: isGateUp,
             input: input, output: output, rows: rows, logicalColumns: logicalColumns,
-            layout: layout, outerScale: outerScale, arena: arena
+            layout: layout, outerScale: outerScale,
+            rowsPerGroup: Inkling2ExpertRowDispatch.rowsPerThreadgroup,
+            arena: arena
         )
     }
 

@@ -480,16 +480,41 @@ nonisolated private final class Inkling2ReadFailure: @unchecked Sendable {
 
 /// Which expert-row kernel the mixture dispatches, and how wide.
 ///
-/// One warp per output row, a BLOCK of sixteen values per lane iteration. Slice
-/// 35 priced it over the published slot shape against the row kernel it
-/// replaced, on the same eight-slot mixture the forward pass encodes: 1.00 ms
-/// against 3.30 ms (3.3x, 35.8 GB/s against 10.8), with every decode identical
-/// and the output 2.1e-7 from the row kernel's. The width matters less than the
-/// shape -- 64 lanes measured 1.07 ms and 128 measured 1.16 -- but a warp is
-/// the reduction's own unit, so it needs no threadgroup memory at all.
+/// One warp per output row, a BLOCK of sixteen values per lane iteration, and a
+/// warp-scoped reduction. Slice 35 priced the shape over the published slot
+/// shape against the row kernel it replaced: 1.00 ms against 3.30 ms (3.3x,
+/// 35.8 GB/s against 10.8), with every decode identical.
+///
+/// Slice 37 priced the last lever the shape left -- one threadgroup per row
+/// re-reads the row's whole activation vector per row -- by giving a warp
+/// several rows and hoisting the activation block above the row loop. It LOSES,
+/// monotonically: width 1 measured 1.005 ms, two rows 1.034, four 1.064, eight
+/// 1.077, all bit-identical. The activation stream is therefore NOT what limits
+/// this kernel, which is what the shape table says on its own; the same probe's
+/// control, the width-1 shape with `inkling_round_bf16` dropped, measures
+/// 0.728 ms, so that one required per-value step is a quarter of the leg.
+///
+/// The same probe found that the width-1 GROUP body, which computes the same
+/// sums with the same lane map and reduces with a bare `simd_sum` instead of
+/// `threadgroup_reduce_sum`'s three barriers, measured 0.967 ms against the
+/// block kernel's 1.005 -- 4% for a bit-identical output (worst relative
+/// 0.00e+00 over the mixture's 2,304 outputs). That is what ships.
 nonisolated public enum Inkling2ExpertRowDispatch {
-    public static let kernelName = "inkling_expert_row_block_f32"
+    public static let kernelName = "inkling_expert_row_group1_f32"
     public static let threadgroup = 32
+    /// Output rows one threadgroup projects. More than 1 is the priced shape
+    /// that lost; it stays available so the table can be re-measured.
+    public static let rowsPerThreadgroup = 1
+    /// The group-family kernel of a given width.
+    public static func groupKernelName(rowsPerGroup: Int) -> String? {
+        switch rowsPerGroup {
+        case 1: return "inkling_expert_row_group1_f32"
+        case 2: return "inkling_expert_row_group2_f32"
+        case 4: return "inkling_expert_row_group4_f32"
+        case 8: return "inkling_expert_row_group8_f32"
+        default: return nil
+        }
+    }
 }
 
 /// One expert projection straight out of a RESIDENT slot: the arena's packed
@@ -517,6 +542,7 @@ nonisolated public enum Inkling2SlotProjection {
         rows: Int, logicalColumns: Int,
         layout: Inkling2ExpertQuantLayout, outerScale: Float,
         threadgroup: Int = Inkling2ExpertRowDispatch.threadgroup,
+        rowsPerGroup: Int = 1,
         arena: Inkling2ScalarArena
     ) {
         let region = address.projection(isGateUp: isGateUp)
@@ -538,8 +564,13 @@ nonisolated public enum Inkling2SlotProjection {
             arena.make(UInt64(slotBaseOffset + region.scaleOffset)), offset: 0, index: 11
         )
         encoder.setThreadgroupMemoryLength(32 * MemoryLayout<Float>.stride, index: 0)
+        // The group kernels take the row count so their last group can be
+        // partial. It is bound whatever the pipeline is: an index a pipeline
+        // does not declare is ignored, which is what lets a caller pass a
+        // width-1 group kernel here without having to say so.
+        encoder.setBuffer(arena.make(UInt32(rows)), offset: 0, index: 12)
         encoder.dispatchThreadgroups(
-            MTLSize(width: rows, height: 1, depth: 1),
+            MTLSize(width: (rows + rowsPerGroup - 1) / rowsPerGroup, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: threadgroup, height: 1, depth: 1)
         )
     }

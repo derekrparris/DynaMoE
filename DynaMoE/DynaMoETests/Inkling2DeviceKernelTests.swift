@@ -731,8 +731,11 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         /// an 8-byte-aligned row takes the packed loads, an unaligned one the
         /// byte loop (a shard's tensor offset is not buffer-aligned, so both are
         /// production), and the odd stride is the one that catches a stride bug.
-        func check(_ name: String, _ layout: Inkling2ExpertQuantLayout, aligned: Bool) throws {
-            let rows = 2, logicalColumns = 40
+        func check(
+            _ name: String, _ layout: Inkling2ExpertQuantLayout, aligned: Bool,
+            rows: Int = 2, rowsPerGroup: Int = 1
+        ) throws {
+            let logicalColumns = 40
             let blockSize = layout.blockSize
             let valuesPerByte = layout == .nvfp4 ? 2 : 1
             let packedColumns = (logicalColumns + valuesPerByte - 1) / valuesPerByte
@@ -793,10 +796,14 @@ final class Inkling2DeviceKernelTests: XCTestCase {
             let outerBuffer = try buffer(device, [outerScale])
             let weightOffsetBuffer = try buffer(device, [UInt64(weightPad)])
             let scaleOffsetBuffer = try buffer(device, [UInt64(scalePad)])
+            let rowsBuffer = try buffer(device, [UInt32(rows)])
 
-            try run(name, threads: (rows, 1, 1),
-                    threadgroup: (Inkling2ExpertRowDispatch.threadgroup, 1, 1),
-                    threadgroupMemory: 32 * MemoryLayout<Float>.stride, byThreadgroup: true) { encoder in
+            try run(
+                name, threads: ((rows + rowsPerGroup - 1) / rowsPerGroup, 1, 1),
+                threadgroup: (Inkling2ExpertRowDispatch.threadgroup, 1, 1),
+                threadgroupMemory: rowsPerGroup > 1 ? 0 : 32 * MemoryLayout<Float>.stride,
+                byThreadgroup: true
+            ) { encoder in
                 encoder.setBuffer(weightBuffer, offset: 0, index: 0)
                 encoder.setBuffer(scaleBuffer, offset: 0, index: 1)
                 encoder.setBuffer(inputBuffer, offset: 0, index: 2)
@@ -806,6 +813,7 @@ final class Inkling2DeviceKernelTests: XCTestCase {
                 encoder.setBuffer(outerBuffer, offset: 0, index: 9)
                 encoder.setBuffer(weightOffsetBuffer, offset: 0, index: 10)
                 encoder.setBuffer(scaleOffsetBuffer, offset: 0, index: 11)
+                encoder.setBuffer(rowsBuffer, offset: 0, index: 12)
             }
             let actual = read(outputBuffer, rows)
             for row in 0..<rows {
@@ -817,13 +825,30 @@ final class Inkling2DeviceKernelTests: XCTestCase {
             }
         }
 
-        for name in [
-            "inkling_expert_row_f32", "inkling_expert_row_bits_f32",
-            Inkling2ExpertRowDispatch.kernelName
+        // One row per threadgroup from three kernels that differ only in their
+        // decodes, then the group kernels at their own widths. Every group case
+        // runs at 2 rows as well, which is a PARTIAL group for every width
+        // above it, and at 5 rows, which is a full group plus a partial one --
+        // the tail is where a group kernel indexes past its row count.
+        for (name, rowsPerGroup) in [
+            ("inkling_expert_row_f32", 1), ("inkling_expert_row_bits_f32", 1),
+            ("inkling_expert_row_block_f32", 1), ("inkling_expert_row_group1_f32", 1),
+            ("inkling_expert_row_group2_f32", 2), ("inkling_expert_row_group4_f32", 4),
+            ("inkling_expert_row_group8_f32", 8)
         ] {
             for layout in [Inkling2ExpertQuantLayout.nvfp4, .mxfp8] {
-                try check(name, layout, aligned: true)
-                try check(name, layout, aligned: false)
+                for aligned in [true, false] {
+                    try check(
+                        name, layout, aligned: aligned, rows: 2, rowsPerGroup: rowsPerGroup
+                    )
+                }
+                if rowsPerGroup > 1 {
+                    for aligned in [true, false] {
+                        try check(
+                            name, layout, aligned: aligned, rows: 5, rowsPerGroup: rowsPerGroup
+                        )
+                    }
+                }
             }
         }
     }
@@ -5948,6 +5973,220 @@ final class Inkling2DeviceKernelTests: XCTestCase {
             }
         }
         withExtendedLifetime(downInput) {}
+    }
+    /// Whether holding four output rows per warp pays for the activation loads
+    /// it saves, priced at the published slot shape on the same eight-expert
+    /// mixture the forward pass encodes.
+    ///
+    /// Slice 35 established that the expert row was LOAD-ISSUE bound, not
+    /// decode or traffic bound, and left one lever unpriced: one threadgroup per
+    /// output row re-reads the whole activation row per row, so a 2,304-column
+    /// projection reads 21 MB of activations against 3 MB of weights. A group
+    /// kernel hoists the activation block above the row loop, turning six loads
+    /// per block per row into `2 + 4 / ROWS`.
+    ///
+    /// The control is the shipped block kernel at its shipped width, so every
+    /// arm is a comparison against what the visit actually pays. The parity
+    /// assertion is what makes an arm a real number: a group that read the
+    /// wrong activation block would be fast and wrong.
+    func testWhatTheMixturePaysForReReadingItsActivationRows() throws {
+        let marker = "/tmp/dynamoe_inkling2_mixture_rows"
+        guard FileManager.default.fileExists(atPath: marker) else {
+            throw XCTSkip("touch \(marker) to price a multi-row expert kernel")
+        }
+        let (device, library, queue) = try environment()
+        let hidden = 2_304, intermediate = 1_152, mixture = 8
+
+        let geometry = try XCTUnwrap(Inkling2ExpertSlotGeometry.make(
+            gateUpRows: 2 * intermediate, gateUpRowStride: hidden / 2,
+            gateUpScaleRowStride: hidden / 16,
+            downRows: hidden, downRowStride: intermediate / 2,
+            downScaleRowStride: intermediate / 16
+        ))
+        let address = geometry.slotAddress
+        let slotBytes = geometry.slotBytes
+
+        let slotBuffer = try XCTUnwrap(
+            device.makeBuffer(length: mixture * slotBytes, options: .storageModeShared)
+        )
+        let slotBytesPointer = slotBuffer.contents()
+            .bindMemory(to: UInt8.self, capacity: mixture * slotBytes)
+        for index in 0..<(mixture * slotBytes) {
+            let inSlot = index % slotBytes
+            let isScale = (inSlot >= geometry.gateUpScaleOffset && inSlot < geometry.downWeightOffset)
+                || inSlot >= geometry.downScaleOffset
+            slotBytesPointer[index] = isScale
+                ? UInt8(56 + (index &* 7) % 5)
+                : UInt8(1 + (index &* 37) % 0x7E)
+        }
+
+        let swigluPipeline = try XCTUnwrap(try device.makeComputePipelineState(
+            function: XCTUnwrap(library.makeFunction(name: "inkling_softcapped_swiglu_interleaved_f32"))
+        ))
+        let accumulatePipeline = try XCTUnwrap(try device.makeComputePipelineState(
+            function: XCTUnwrap(library.makeFunction(name: "inkling_weighted_accumulate_f32"))
+        ))
+
+        let input = try buffer(device, values(hidden, seed: 41))
+        let gateUpOut = try buffer(device, [Float](repeating: 0, count: 2 * intermediate))
+        let intermediateOut = try buffer(device, [Float](repeating: 0, count: intermediate))
+        let downOut = try buffer(device, [Float](repeating: 0, count: hidden))
+        let accumulator = try buffer(device, [Float](repeating: 0, count: hidden))
+        let intermediateConstant = try buffer(device, [UInt32(intermediate)])
+        let gateCapConstant = try buffer(device, [Float(30)])
+        let upCapConstant = try buffer(device, [Float(30)])
+        let routeWeight = try buffer(device, [Float(0.125)])
+        let countConstant = try buffer(device, [UInt32(hidden)])
+        let outerScale: Float = 0.05
+
+        func mixtureArm(
+            _ label: String, pipeline: MTLComputePipelineState, rowsPerGroup: Int,
+            rounds: Int
+        ) throws -> (millis: Double, output: [Float]) {
+            let arena = Inkling2ScalarArena(device: device)
+            var best = Double.greatestFiniteMagnitude
+            var result: [Float] = []
+            for round in 0..<rounds {
+                let accumulatorPointer = accumulator.contents()
+                    .bindMemory(to: Float.self, capacity: hidden)
+                for index in 0..<hidden { accumulatorPointer[index] = 0 }
+                let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+                let encoder = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
+                for expert in 0..<mixture {
+                    let base = expert * slotBytes
+                    Inkling2SlotProjection.encode(
+                        pipeline: pipeline, encoder: encoder,
+                        slot: slotBuffer, slotBaseOffset: base,
+                        address: address, isGateUp: true,
+                        input: input, output: gateUpOut,
+                        rows: 2 * intermediate, logicalColumns: hidden,
+                        layout: .nvfp4, outerScale: outerScale,
+                        rowsPerGroup: rowsPerGroup, arena: arena
+                    )
+                    encoder.setComputePipelineState(swigluPipeline)
+                    encoder.setBuffer(gateUpOut, offset: 0, index: 0)
+                    encoder.setBuffer(intermediateOut, offset: 0, index: 1)
+                    encoder.setBuffer(intermediateConstant, offset: 0, index: 2)
+                    encoder.setBuffer(gateCapConstant, offset: 0, index: 3)
+                    encoder.setBuffer(upCapConstant, offset: 0, index: 4)
+                    encoder.dispatchThreads(
+                        MTLSize(width: intermediate, height: 1, depth: 1),
+                        threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
+                    )
+                    Inkling2SlotProjection.encode(
+                        pipeline: pipeline, encoder: encoder,
+                        slot: slotBuffer, slotBaseOffset: base,
+                        address: address, isGateUp: false,
+                        input: intermediateOut, output: downOut,
+                        rows: hidden, logicalColumns: intermediate,
+                        layout: .nvfp4, outerScale: outerScale,
+                        rowsPerGroup: rowsPerGroup, arena: arena
+                    )
+                    encoder.setComputePipelineState(accumulatePipeline)
+                    encoder.setBuffer(accumulator, offset: 0, index: 0)
+                    encoder.setBuffer(downOut, offset: 0, index: 1)
+                    encoder.setBuffer(routeWeight, offset: 0, index: 2)
+                    encoder.setBuffer(countConstant, offset: 0, index: 3)
+                    encoder.dispatchThreads(
+                        MTLSize(width: hidden, height: 1, depth: 1),
+                        threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
+                    )
+                }
+                encoder.endEncoding()
+                let began = DispatchTime.now().uptimeNanoseconds
+                commandBuffer.commit()
+                commandBuffer.waitUntilCompleted()
+                if let error = commandBuffer.error { throw error }
+                let cpu = Double(DispatchTime.now().uptimeNanoseconds - began) / 1_000_000
+                let deviceMillis = commandBuffer.gpuEndTime > commandBuffer.gpuStartTime
+                    ? (commandBuffer.gpuEndTime - commandBuffer.gpuStartTime) * 1_000 : cpu
+                if round > 0 { best = min(best, deviceMillis) }
+                result = read(accumulator, hidden)
+                arena.clear()
+            }
+            return (best, result)
+        }
+
+        /// One arm per kernel, each with the row count its pipeline reads. The
+        /// block kernel is the dispatch this slice replaced, so it is the arm
+        /// every other row is measured against.
+        var specs: [(String, String, Int)] = [
+            ("block", "inkling_expert_row_block_f32", 1)
+        ]
+        for rowsPerGroup in [1, 2, 4, 8] {
+            specs.append((
+                "group \(rowsPerGroup)",
+                try XCTUnwrap(
+                    Inkling2ExpertRowDispatch.groupKernelName(rowsPerGroup: rowsPerGroup)
+                ),
+                rowsPerGroup
+            ))
+        }
+        // Dropping `inkling_round_bf16` from the shipped shape: the control
+        // that says what the mixture's GPU leg is bound by NOW that the loads
+        // are cheap. Not a candidate -- it computes a different number.
+        specs.append(("no round", "inkling_expert_row_noround_f32", 1))
+
+        // INTERLEAVED on purpose. Three runs of the arms in card order landed
+        // the same kernel at 1.32, 1.96 and 2.18 ms, and the arms that ran
+        // later were consistently the faster ones -- clock ramp, not the
+        // kernels. Every pass now walks every arm, and an arm keeps its best
+        // across passes, so all of them see the same states.
+        var pipelines: [(String, Int, MTLComputePipelineState)] = []
+        for (label, kernelName, rowsPerGroup) in specs {
+            pipelines.append((label, rowsPerGroup, try XCTUnwrap(
+                try device.makeComputePipelineState(
+                    function: XCTUnwrap(library.makeFunction(name: kernelName))
+                )
+            )))
+        }
+        var bests = [String: Double]()
+        var outputs = [String: [Float]]()
+        for _ in 0..<3 {
+            for (label, rowsPerGroup, pipeline) in pipelines {
+                let (millis, output) = try mixtureArm(
+                    label, pipeline: pipeline, rowsPerGroup: rowsPerGroup, rounds: 8
+                )
+                bests[label] = min(bests[label] ?? .greatestFiniteMagnitude, millis)
+                outputs[label] = output
+            }
+        }
+        let arms: [(String, Double, [Float])] = specs.map {
+            ($0.0, bests[$0.0] ?? .greatestFiniteMagnitude, outputs[$0.0] ?? [])
+        }
+
+        let bytes = Double(mixture * slotBytes)
+        let reference = try XCTUnwrap(arms.first)
+        print("📊 [inkling2 mixture rows] \(bytes / 1e6) MB of slots per mixture")
+        for (label, millis, output) in arms {
+            var worst = 0.0
+            for index in 0..<hidden {
+                let scale = max(abs(reference.2[index]), 1e-6)
+                worst = max(worst, Double(abs(output[index] - reference.2[index]) / scale))
+            }
+            print(
+                "📊 [inkling2 mixture rows] \(label): "
+                    + "\(String(format: "%.3f", millis)) ms, "
+                    + "\(String(format: "%.1f", bytes / (millis / 1_000) / 1e9)) GB/s, "
+                    + "worst relative vs control \(String(format: "%.2e", worst))"
+            )
+        }
+
+        // A group only changes which rows share a threadgroup and where the
+        // activation load happens, so it must not move a value: a group that
+        // read its neighbour's activation block would still be a number. The
+        // rounding control is exempt on purpose -- dropping a required step is
+        // the whole point of it, and its number is a cost, not a result.
+        for (label, _, output) in arms where label != reference.0 && label != "no round" {
+            for index in 0..<hidden {
+                let expected = reference.2[index]
+                let scale = max(abs(expected), 1e-6)
+                XCTAssertLessThanOrEqual(
+                    Double(abs(output[index] - expected) / scale), 1e-5,
+                    "\(label) column \(index)"
+                )
+            }
+        }
     }
 }
 
