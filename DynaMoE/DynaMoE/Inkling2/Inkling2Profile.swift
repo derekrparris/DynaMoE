@@ -299,4 +299,36 @@ nonisolated public final class Inkling2VisitProfile: @unchecked Sendable {
         if empty > 0 { line += ", \(empty) buffer(s) with no device window" }
         return line
     }
+
+    /// The same table cut four ways per stage.
+    ///
+    /// `describe` answers "which stage", which is only half of where a visit's
+    /// time goes: a stage is a host encode, a wait, and whatever its own wall
+    /// leaves over, and each of the three is a different fix. `host` is the
+    /// residue the stage spent between its stamps -- on `expertMixture` that is
+    /// where a slot fill's `pread` lands, because the fill is host-serial
+    /// between the router's read-back and the encode. The buckets recompose the
+    /// wall whenever the bills fit inside it (`wall == encode + drain + host`),
+    /// and a `drain` that is not accounted for by its own window is what the
+    /// `device` and `queue` columns are for.
+    public func describeTiming(label: String = "turn") -> String {
+        func milli(_ nanoseconds: UInt64) -> String {
+            guard visits > 0 else { return "0.00" }
+            return String(format: "%.2f", Double(nanoseconds) / Double(visits) / 1_000_000)
+        }
+        var parts: [String] = []
+        for stage in Inkling2VisitStage.allCases {
+            guard let time = stages[stage] else { continue }
+            parts.append(
+                "\(stage.rawValue) \(milli(time.wallNanoseconds)) ="
+                    + " encode \(milli(time.encodeNanoseconds))"
+                    + " + drain \(milli(time.drainNanoseconds))"
+                    + " (device \(milli(time.deviceNanoseconds)),"
+                    + " queue \(milli(time.queueWaitNanoseconds)))"
+                    + " + host \(milli(time.hostNanoseconds))"
+            )
+        }
+        return "inkling2 profile timing [\(label)] per visit, ms: "
+            + parts.joined(separator: " | ")
+    }
 }

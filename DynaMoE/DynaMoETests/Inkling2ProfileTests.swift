@@ -201,6 +201,67 @@ final class Inkling2StageTimingTests: XCTestCase {
         XCTAssertTrue(refused.contains("2 refused"), refused)
     }
 
+    /// The four-way line reports each stage's wall as the three things that
+    /// actually spend it, and the three recompose the wall exactly.
+    ///
+    /// It exists because a stage wall alone cannot be acted on: `expertMixture
+    /// 10.59` is a pread, an encode and a wait at once, and only one of those
+    /// moves with the expert arena. The buckets are pinned here so a reader of
+    /// the line can subtract rather than hope.
+    func testTheTimingLineCutsEveryStageFourWays() {
+        let profile = Inkling2VisitProfile()
+        var mixture = Inkling2StageTiming()
+        mixture.add(
+            Inkling2BufferClock(
+                encodeNanoseconds: 1_000_000, queueWaitNanoseconds: 2_000_000,
+                deviceNanoseconds: 3_000_000, windowed: true
+            ),
+            drainNanoseconds: 5_000_000
+        )
+        // A wall larger than the bills: the remainder is the host residue, and
+        // on the mixture that residue is where a slot fill's pread lands.
+        profile.record(stage: .expertMixture, wallNanoseconds: 10_000_000, buffers: mixture)
+        var front = Inkling2StageTiming()
+        front.add(
+            Inkling2BufferClock(
+                encodeNanoseconds: 500_000, queueWaitNanoseconds: 0,
+                deviceNanoseconds: 500_000, windowed: true
+            ),
+            drainNanoseconds: 500_000
+        )
+        profile.record(stage: .mlpFront, wallNanoseconds: 1_000_000, buffers: front)
+        profile.closeVisit(wallNanoseconds: 11_000_000, attentionQueries: 1)
+
+        let line = profile.describeTiming(label: "unit")
+        XCTAssertTrue(
+            line.contains(
+                "expertMixture 10.00 = encode 1.00 + drain 5.00 "
+                    + "(device 3.00, queue 2.00) + host 4.00"
+            ),
+            line
+        )
+        XCTAssertTrue(
+            line.contains(
+                "mlpFront 1.00 = encode 0.50 + drain 0.50 (device 0.50, queue 0.00) + host 0.00"
+            ),
+            line
+        )
+        // Unmeasured stages stay out for the same reason they do in `describe`:
+        // a zero reads as "free" rather than "not measured".
+        XCTAssertFalse(line.contains("hostPrep"), line)
+
+        // The recomposition is the line's contract, not a coincidence of the
+        // figures above: for every stage the three buckets are its wall.
+        for stage in Inkling2VisitStage.allCases {
+            guard let time = profile.stages[stage] else { continue }
+            XCTAssertEqual(
+                time.encodeNanoseconds + time.drainNanoseconds + time.hostNanoseconds,
+                time.wallNanoseconds,
+                "\(stage.rawValue) must recompose its wall"
+            )
+        }
+    }
+
     /// The stage list is the visit's own structure, and the three stages that
     /// commit nothing are marked as such: a caller summing `commits` over every
     /// stage must get four per visit, not seven.

@@ -4684,6 +4684,10 @@ final class Inkling2DeviceKernelTests: XCTestCase {
             )
         )
         print("\u{1F50E} [inkling2 where] " + executor.visitProfile.describe(label: "past the window"))
+        print(
+            "\u{1F50E} [inkling2 where] "
+                + executor.visitProfile.describeTiming(label: "past the window")
+        )
 
         // Every visit's attention, timed in place on its own staged rows, in
         // both forms. Per POSITION, because that is the unit the walk's total is
