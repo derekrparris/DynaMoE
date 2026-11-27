@@ -359,17 +359,30 @@ nonisolated private final class Inkling2ReadFailure: @unchecked Sendable {
     }
 }
 
+/// Which expert-row kernel the mixture dispatches, and how wide.
+///
+/// One warp per output row, a BLOCK of sixteen values per lane iteration. Slice
+/// 35 priced it over the published slot shape against the row kernel it
+/// replaced, on the same eight-slot mixture the forward pass encodes: 1.00 ms
+/// against 3.30 ms (3.3x, 35.8 GB/s against 10.8), with every decode identical
+/// and the output 2.1e-7 from the row kernel's. The width matters less than the
+/// shape -- 64 lanes measured 1.07 ms and 128 measured 1.16 -- but a warp is
+/// the reduction's own unit, so it needs no threadgroup memory at all.
+nonisolated public enum Inkling2ExpertRowDispatch {
+    public static let kernelName = "inkling_expert_row_block_f32"
+    public static let threadgroup = 32
+}
+
 /// One expert projection straight out of a RESIDENT slot: the arena's packed
 /// buffer, with each region addressed from the slot's own base.
 ///
-/// This is the same `inkling_expert_row_f32` dispatch the mmap path makes, with
-/// two differences and no third: the weight and scale are the SAME buffer (a
-/// slot is packed), and each region's offset is the slot's base plus the
-/// geometry's region offset rather than a fused bank's expert offset. The row
-/// strides are per region -- `w13` rows are `packedHidden` wide, `w2` rows
-/// `packedIntermediate` -- so a caller passing the gate/up stride for both would
-/// read the down projection's scales off by the width ratio, which is a
-/// plausible number rather than a crash.
+/// This is the same dispatch the mmap path makes, with two differences and no
+/// third: the weight and scale are the SAME buffer (a slot is packed), and each
+/// region's offset is the slot's base plus the geometry's region offset rather
+/// than a fused bank's expert offset. The row strides are per region -- `w13`
+/// rows are `packedHidden` wide, `w2` rows `packedIntermediate` -- so a caller
+/// passing the gate/up stride for both would read the down projection's scales
+/// off by the width ratio, which is a plausible number rather than a crash.
 ///
 /// It lives here rather than beside the other dispatch helpers because the
 /// packed-slot layout is the arena's own, and this way the binding can be run
@@ -384,6 +397,7 @@ nonisolated public enum Inkling2SlotProjection {
         input: MTLBuffer, output: MTLBuffer,
         rows: Int, logicalColumns: Int,
         layout: Inkling2ExpertQuantLayout, outerScale: Float,
+        threadgroup: Int = Inkling2ExpertRowDispatch.threadgroup,
         arena: Inkling2ScalarArena
     ) {
         let region = address.projection(isGateUp: isGateUp)
@@ -407,7 +421,7 @@ nonisolated public enum Inkling2SlotProjection {
         encoder.setThreadgroupMemoryLength(32 * MemoryLayout<Float>.stride, index: 0)
         encoder.dispatchThreadgroups(
             MTLSize(width: rows, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
+            threadsPerThreadgroup: MTLSize(width: threadgroup, height: 1, depth: 1)
         )
     }
 }

@@ -691,6 +691,7 @@ nonisolated public final class Inkling2MetalForward {
         "inkling_attention_split_int8_f32",
         "inkling_attention_split_combine_f32",
         "inkling_expert_row_f32",
+        Inkling2ExpertRowDispatch.kernelName,
         "inkling_router_topk_f32",
         "bf16_gemv_rows8",
         "bf16_gemv_rows",
@@ -1998,7 +1999,7 @@ nonisolated public final class Inkling2MetalForward {
         weightRowStride: Int, scaleRowStride: Int,
         arena: Inkling2ScalarArena
     ) throws {
-        encoder.setComputePipelineState(try pipeline("inkling_expert_row_f32"))
+        encoder.setComputePipelineState(try pipeline(Inkling2ExpertRowDispatch.kernelName))
         encoder.setBuffer(weight, offset: 0, index: 0)
         encoder.setBuffer(scales, offset: 0, index: 1)
         encoder.setBuffer(input, offset: 0, index: 2)
@@ -2014,7 +2015,9 @@ nonisolated public final class Inkling2MetalForward {
         encoder.setThreadgroupMemoryLength(32 * MemoryLayout<Float>.stride, index: 0)
         encoder.dispatchThreadgroups(
             MTLSize(width: rows, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
+            threadsPerThreadgroup: MTLSize(
+                width: Inkling2ExpertRowDispatch.threadgroup, height: 1, depth: 1
+            )
         )
     }
 
@@ -2039,7 +2042,7 @@ nonisolated public final class Inkling2MetalForward {
         arena: Inkling2ScalarArena
     ) throws {
         Inkling2SlotProjection.encode(
-            pipeline: try pipeline("inkling_expert_row_f32"),
+            pipeline: try pipeline(Inkling2ExpertRowDispatch.kernelName),
             encoder: encoder, slot: slot, slotBaseOffset: slotBaseOffset,
             address: address, isGateUp: isGateUp,
             input: input, output: output, rows: rows, logicalColumns: logicalColumns,

@@ -14450,6 +14450,211 @@ kernel void inkling_expert_row_f32(
     if (tid == 0) { outVector[row] = total; }
 }
 
+// The same two decodes as float BIT PATTERNS, for the kernel below.
+//
+// `inkling_e4m3` and `inkling_e2m1` build their magnitude out of `exp2` and two
+// branches each, and the row kernel calls one of them per COLUMN: a block scale
+// is decoded once per value even though a block holds sixteen, and every FP4
+// nibble costs a transcendental. Both codes ARE bit patterns -- an E4M3 normal
+// is `(1 + m/8) * 2^(e-7)`, whose exponent field is `e + 120` and whose top
+// three mantissa bits are `m` -- so the fast form is integer arithmetic plus a
+// select for the subnormal/zero blocks. The values are IDENTICAL, not
+// approximate: every step is exact in the original too (an integer power of two
+// and a k/8 mantissa are representable), which is what lets the row kernel
+// below produce the shipped kernel's bytes.
+inline float inkling_e4m3_bits(uint byte) {
+    // E4M3 has no infinity: exp=15, mant=7 is its only NaN. The original
+    // returns NAN for it, and an unchecked bit pattern would return a number.
+    if ((byte & 0x7Fu) == 0x7Fu) { return NAN; }
+    uint exponent = (byte >> 3) & 0xF;
+    uint mantissa = byte & 0x7;
+    float magnitude = exponent == 0
+        ? (float)mantissa * 0.001953125f                       // m * 2^-9
+        : as_type<float>(((exponent + 120u) << 23) | (mantissa << 20));
+    return (byte & 0x80u) != 0 ? -magnitude : magnitude;
+}
+
+inline float inkling_e2m1_bits(uint nibble) {
+    uint code = nibble & 0xF;
+    uint exponent = (code >> 1) & 0x3;
+    uint mantissa = code & 0x1;
+    // The eight magnitudes are 0, .5, 1, 1.5, 2, 3, 4, 6: 0 and .5 are the
+    // subnormal block, and the rest are `(1 + m/2) * 2^(e-1)`, whose exponent
+    // field is `126 + e` and whose top mantissa bit is `m`.
+    uint bits = exponent == 0
+        ? (mantissa == 0 ? 0u : 0x3F000000u)
+        : (((126u + exponent) << 23) | (mantissa << 22));
+    float magnitude = as_type<float>(bits);
+    return (code & 0x8u) != 0 ? -magnitude : magnitude;
+}
+
+// An E8M0 block scale, which is already an exponent: `exp2(byte - 127)` is the
+// bit pattern of that exponent. Zero is the one byte the trick gets wrong (a
+// zero field reads as 0.0, while `exp2(-127)` is the smallest subnormal).
+inline float inkling_e8m0_bits(uint byte) {
+    return byte == 0 ? exp2(-127.0f) : as_type<float>(byte << 23);
+}
+
+// `inkling_expert_row_f32` with the decodes above and nothing else moved: the
+// column-to-lane map, the accumulation order and the tree reduction are the
+// shipped kernel's, so its output is bit-identical and no downstream bar moves.
+//
+// It is the CONTROL for the measurement below, not a dispatch: it isolates what
+// the decodes cost (a scale per column is 16x the work its block needs) from
+// what the load pattern costs. Slice 35 measured it at 3.05 ms per mixture
+// against the row kernel's 3.30, so the decode was 8% and the loads were the
+// rest -- which is why the shipped kernel is the block form, not this one.
+kernel void inkling_expert_row_bits_f32(
+    device const uchar* weight [[buffer(0)]],
+    device const uchar* scales [[buffer(1)]],
+    device const float* input [[buffer(2)]],
+    device float* outVector [[buffer(3)]],
+    constant uint32_t& logicalColumns [[buffer(4)]],
+    constant uint32_t& weightRowStride [[buffer(5)]],
+    constant uint32_t& scaleRowStride [[buffer(6)]],
+    constant uint32_t& blockSize [[buffer(7)]],
+    constant bool& layoutIsNVFP4 [[buffer(8)]],
+    constant float& outerScale [[buffer(9)]],
+    constant uint64_t& weightOffset [[buffer(10)]],
+    constant uint64_t& scaleOffset [[buffer(11)]],
+    threadgroup float* shared [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgSize [[threads_per_threadgroup]],
+    uint row [[threadgroup_position_in_grid]]
+) {
+    uint64_t weightBase = weightOffset + (uint64_t)row * weightRowStride;
+    uint64_t scaleBase = scaleOffset + (uint64_t)row * scaleRowStride;
+    float localSum = 0.0f;
+    for (uint column = tid; column < logicalColumns; column += tgSize) {
+        uint block = column / blockSize;
+        uint scaleByte = scales[scaleBase + block];
+        float scale = layoutIsNVFP4 ? inkling_e4m3_bits(scaleByte) * outerScale
+                                    : inkling_e8m0_bits(scaleByte);
+        float value;
+        if (layoutIsNVFP4) {
+            uchar byte = weight[weightBase + column / 2];
+            value = inkling_e2m1_bits((column & 1u) == 0 ? (byte & 0xF) : (byte >> 4)) * scale;
+        } else {
+            value = inkling_e4m3_bits(weight[weightBase + column]) * scale;
+        }
+        localSum += inkling_round_bf16(value) * input[column];
+    }
+    float total = threadgroup_reduce_sum(localSum, shared, tid, tgSize);
+    if (tid == 0) { outVector[row] = total; }
+}
+
+// One threadgroup per row, but a LANE OWNS WHOLE BLOCKS: sixteen values
+// (NVFP4, eight packed bytes) or thirty-two (MXFP8) per iteration, so one
+// scale decode, one packed weight load and four vector loads of the activation
+// pay for a whole block.
+//
+// Slice 35 measured the two kernels above at the LOAD-ISSUE limit, not the
+// memory system's: per output row each lane issues 36 weight loads, 36 scale
+// loads and 36 activation loads for 36 multiply-adds, and a mixture issues
+// 255M of them in 3.3 ms (~76 G loads/s, which is what the GPU can issue at
+// all). It also re-reads the activation row once per output row -- 21 MB of L1
+// traffic per projection against the 3 MB of weights. A block per lane turns
+// those 108 loads into 6.
+//
+// The summation ORDER is therefore not the row kernel's: a lane adds a block's
+// values in order and blocks round-robin, so this is bounded against the host
+// rule rather than bit-exact. Every decode is `inkling_expert_row_bits_f32`'s.
+kernel void inkling_expert_row_block_f32(
+    device const uchar* weight [[buffer(0)]],
+    device const uchar* scales [[buffer(1)]],
+    device const float* input [[buffer(2)]],
+    device float* outVector [[buffer(3)]],
+    constant uint32_t& logicalColumns [[buffer(4)]],
+    constant uint32_t& weightRowStride [[buffer(5)]],
+    constant uint32_t& scaleRowStride [[buffer(6)]],
+    constant uint32_t& blockSize [[buffer(7)]],
+    constant bool& layoutIsNVFP4 [[buffer(8)]],
+    constant float& outerScale [[buffer(9)]],
+    constant uint64_t& weightOffset [[buffer(10)]],
+    constant uint64_t& scaleOffset [[buffer(11)]],
+    threadgroup float* shared [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgSize [[threads_per_threadgroup]],
+    uint row [[threadgroup_position_in_grid]]
+) {
+    uint64_t weightBase = weightOffset + (uint64_t)row * weightRowStride;
+    uint64_t scaleBase = scaleOffset + (uint64_t)row * scaleRowStride;
+    uint blockCount = (logicalColumns + blockSize - 1) / blockSize;
+    // A packed load needs the row's first byte 8-byte aligned. The arena's
+    // slots and the packing strides are; a shard's tensor offset need not be,
+    // so an unaligned row falls back to bytes instead of faulting.
+    bool vectorLoads = (weightBase & 7u) == 0;
+    float localSum = 0.0f;
+    for (uint block = tid; block < blockCount; block += tgSize) {
+        uint first = block * blockSize;
+        uint scaleByte = scales[scaleBase + block];
+        float scale = layoutIsNVFP4 ? inkling_e4m3_bits(scaleByte) * outerScale
+                                    : inkling_e8m0_bits(scaleByte);
+        device const float* in = input + first;
+        if (layoutIsNVFP4 && vectorLoads && blockSize == 16 && first + 16 <= logicalColumns) {
+            ulong packed = *((device const ulong*)(weight + weightBase + (first >> 1)));
+            #pragma unroll
+            for (uint quad = 0; quad < 4; quad++) {
+                float4 act = *((device const float4*)(in + 4 * quad));
+                uint shift = 16 * quad;
+                localSum += inkling_round_bf16(
+                    inkling_e2m1_bits((uint)((packed >> shift) & 0xFu)) * scale) * act.x;
+                localSum += inkling_round_bf16(
+                    inkling_e2m1_bits((uint)((packed >> (shift + 4)) & 0xFu)) * scale) * act.y;
+                localSum += inkling_round_bf16(
+                    inkling_e2m1_bits((uint)((packed >> (shift + 8)) & 0xFu)) * scale) * act.z;
+                localSum += inkling_round_bf16(
+                    inkling_e2m1_bits((uint)((packed >> (shift + 12)) & 0xFu)) * scale) * act.w;
+            }
+        } else if (!layoutIsNVFP4 && vectorLoads && blockSize == 32
+                   && first + 32 <= logicalColumns) {
+            device const uchar* w = weight + weightBase + first;
+            // Eight values per packed load: a 32-value MXFP8 block is four of
+            // them, each with two vector loads of the activation.
+            #pragma unroll
+            for (uint chunk = 0; chunk < 4; chunk++) {
+                ulong packed = *((device const ulong*)(w + 8 * chunk));
+                float4 act0 = *((device const float4*)(in + 8 * chunk));
+                float4 act1 = *((device const float4*)(in + 8 * chunk + 4));
+                localSum += inkling_round_bf16(
+                    inkling_e4m3_bits((uint)(packed & 0xFFu)) * scale) * act0.x;
+                localSum += inkling_round_bf16(
+                    inkling_e4m3_bits((uint)((packed >> 8) & 0xFFu)) * scale) * act0.y;
+                localSum += inkling_round_bf16(
+                    inkling_e4m3_bits((uint)((packed >> 16) & 0xFFu)) * scale) * act0.z;
+                localSum += inkling_round_bf16(
+                    inkling_e4m3_bits((uint)((packed >> 24) & 0xFFu)) * scale) * act0.w;
+                localSum += inkling_round_bf16(
+                    inkling_e4m3_bits((uint)((packed >> 32) & 0xFFu)) * scale) * act1.x;
+                localSum += inkling_round_bf16(
+                    inkling_e4m3_bits((uint)((packed >> 40) & 0xFFu)) * scale) * act1.y;
+                localSum += inkling_round_bf16(
+                    inkling_e4m3_bits((uint)((packed >> 48) & 0xFFu)) * scale) * act1.z;
+                localSum += inkling_round_bf16(
+                    inkling_e4m3_bits((uint)((packed >> 56) & 0xFFu)) * scale) * act1.w;
+            }
+        } else {
+            // A partial last block, or a row a packed load cannot address.
+            uint extent = min(blockSize, logicalColumns - first);
+            if (layoutIsNVFP4) {
+                device const uchar* w = weight + weightBase + (first >> 1);
+                for (uint k = 0; k < extent; k++) {
+                    uchar byte = w[k >> 1];
+                    uint nibble = (k & 1u) == 0 ? (byte & 0xF) : (byte >> 4);
+                    localSum += inkling_round_bf16(inkling_e2m1_bits(nibble) * scale) * in[k];
+                }
+            } else {
+                device const uchar* w = weight + weightBase + first;
+                for (uint k = 0; k < extent; k++) {
+                    localSum += inkling_round_bf16(inkling_e4m3_bits(w[k]) * scale) * in[k];
+                }
+            }
+        }
+    }
+    float total = threadgroup_reduce_sum(localSum, shared, tid, tgSize);
+    if (tid == 0) { outVector[row] = total; }
+}
+
 // Inkling 2's router selection: sigmoid every expert score, add the bias ONLY
 // to steer which experts are chosen, then renormalize the SELECTED raw scores
 // and scale. The bias never weights the output -- a softmax over the steered
