@@ -4305,6 +4305,330 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         )
     }
 
+    // MARK: The log-scale onset
+
+    /// Phase 7 item 4's next named length: 8,192, where the full-attention
+    /// layers stop attending with `tau == 1`.
+    ///
+    /// `tau = 1 + alpha * log(max((position + 1) / log_scaling_n_floor, 1))`
+    /// is applied on full layers only (`Inkling2Primitives.swift:444`,
+    /// `Inkling2MetalForward.swift:1099`), so index 8,191 is the last position
+    /// whose full layers run unscaled and index 8,192 is the first that does
+    /// not. Nothing else in the graph changes there: the ring has been full
+    /// since position 1,024 and the full visits grow one row per position, so
+    /// anything that breaks at this length breaks for a length reason and not
+    /// because a boundary moved.
+    ///
+    /// **The walk.** 8,200 positions, so the onset is crossed and seven
+    /// positions past it. This is the first run of the device graph at a
+    /// length where the things that scale with the position actually matter:
+    /// the full visits' caches (537 MB FP32 / 134 MB INT8 at 8,200 rows), the
+    /// staging copy slice 27 priced (25 ms FP32 / 8 ms INT8 per position over
+    /// the eight full visits), and the full visits' attention over eight
+    /// times the rows slice 28's walk attended.
+    ///
+    /// **What is asserted**, in the order a length bug would show up:
+    ///   * the ring still holds exactly 1,024 rows with `windowStart` at
+    ///     `positions - 1,024`, and the full visits hold every position -- a
+    ///     ring that started dropping from the wrong end, or a full visit that
+    ///     hit a cap, shows up here and nowhere else;
+    ///   * the staging copy is 1,024 rows for a ring and `positions` for a full
+    ///     visit, which is slice 27's two terms in place at eight times the
+    ///     length slice 27's deep arm measured;
+    ///   * the sequence is consistent, its history is complete, and
+    ///     `reusablePrefix` is `positions - 1`, so a resume at this length is
+    ///     evidence-backed;
+    ///   * every sampled logit is finite and the two KV forms argue for the
+    ///     same greedy token at all four sampled positions (8,190, 8,191,
+    ///     8,192, 8,199), with the elementwise width printed rather than
+    ///     asserted -- slice 29 showed the width is a property of the token
+    ///     being predicted, so an absolute ceiling here would be an artefact;
+    ///   * **the onset itself**: `Inkling2Math.logScale` is exactly 1 at 8,191
+    ///     and above 1 at 8,192, and the DEVICE's full-layer relative states at
+    ///     those two positions differ by exactly that `tau` -- the same query
+    ///     input, the same weights, the same kernel, only the scale changed.
+    ///     That is the arithmetic check the length walk cannot make by itself,
+    ///     because `tau - 1` is 1.2e-5 at this length and no greedy token
+    ///     could ever see it.
+    ///
+    /// Opt-in: `touch /tmp/dynamoe_inkling2_logscale` walks the INT8 arm, which
+    /// is the form Phase 7 names at this length (~2.5-3 h at the measured
+    /// 0.64-0.83 s/position and climbing). `touch /tmp/dynamoe_inkling2_logscale_fp32`
+    /// on top adds the FP32 comparison arm, roughly doubling it -- there for
+    /// the greedy check, not needed for the structural gate.
+    func testAWalkAcrossTheLogScaleOnsetAtEightThousandPositions() throws {
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_logscale"),
+            "opt-in: touch /tmp/dynamoe_inkling2_logscale (two device walks of 8,200 positions)"
+        )
+        let snapshot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(Inkling2PublishedTensorTests.snapshotRelativePath)
+        guard FileManager.default.fileExists(atPath: snapshot.path) else {
+            throw XCTSkip("Inkling 2 snapshot is not downloaded at \(snapshot.path)")
+        }
+        let (device, library, queue) = try environment()
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let rawSummary = try engine.getSummary()
+        let summary = try inkling2MetalReadySummary(rawSummary)
+        let config = try Inkling2Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let catalog = Inkling2WeightCatalog(
+            mainFile: summary.tensors.map { Inkling2TensorRef(metadata: $0) },
+            layerCount: config.numHiddenLayers
+        )
+        let shardBuffers = try inkling2MetalShardBuffers(summary, device: device)
+        let source = Inkling2SnapshotWeights(
+            config: config, catalog: catalog, shardBuffers: shardBuffers
+        )
+        let deviceWeights = Inkling2DeviceWeights(
+            config: config, catalog: catalog, shardBuffers: shardBuffers,
+            fileOrigins: InferenceEngine.shardFileOrigins(original: rawSummary, segmented: summary)
+        )
+        let tokenizer = try DynaMoeTokenizer(
+            tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+        )
+        let seed = try tokenizer.encode(
+            text: "The quick brown fox jumps over the lazy dog, and the dog does not mind it at all."
+        ).map { Int($0) }
+        XCTAssertFalse(seed.isEmpty)
+
+        let window = config.slidingWindowSize
+        let floor = config.logScalingNFloor
+        XCTAssertEqual(window, 1_024)
+        XCTAssertEqual(floor, 8_192)
+        XCTAssertEqual(config.logScalingAlpha, 0.1, accuracy: 1e-6)
+
+        // Eight positions past the onset, so index 8,192 is crossed and the
+        // ring keeps dropping rows afterwards.
+        let positions = floor + 8
+        let ids = (0..<positions).map { seed[$0 % seed.count] }
+
+        let before = floor - 1
+        let onset = floor
+        let sampled = [floor - 2, before, onset, positions - 1]
+        let isSampled = Set(sampled)
+
+        /// The published rule, pinned before the walk so a `tau` that never
+        /// leaves 1 is caught by arithmetic rather than by a token.
+        XCTAssertEqual(Inkling2Math.logScale(position: before, alpha: config.logScalingAlpha, floor: floor), 1)
+        XCTAssertGreaterThan(
+            Inkling2Math.logScale(position: onset, alpha: config.logScalingAlpha, floor: floor), 1
+        )
+
+        func walk(_ storage: Inkling2KVStorage) throws -> (
+            samples: [(position: Int, logits: [Float])], ringRows: Int, ringStart: Int,
+            fullRows: Int, windowedStaged: Int, fullStaged: Int,
+            relativeRatio: Float, onsetScale: Float
+        ) {
+            let forward = try Inkling2CPUForward(
+                config: config, weights: source,
+                options: Inkling2ForwardOptions(maxPositions: positions, kvStorage: storage)
+            )
+            let executor = try Inkling2MetalForward(
+                device: device, library: library, queue: queue,
+                weights: deviceWeights, host: forward
+            )
+            let workspace = try Inkling2DeviceWorkspace(
+                device: device, config: config, stagedPositions: positions, storage: storage
+            )
+            defer {
+                forward.visitRunner = nil
+                forward.headRunner = nil
+                executor.removeExpertArena()
+            }
+            let arenaLine = try inkling2InstallExpertArenas(
+                executor: executor, weights: deviceWeights, summary: summary,
+                snapshot: snapshot, config: config, catalog: catalog,
+                positions: positions, kvElementBytes: storage.bytesPerElement
+            )
+            XCTAssertFalse(arenaLine.contains("no arena"), arenaLine)
+            forward.visitRunner = { layer, pass, hidden, blockStates, messages, position in
+                try executor.runVisit(
+                    layer: layer, pass: pass, hidden: hidden, blockStates: &blockStates,
+                    messages: messages, position: position, workspace: workspace
+                )
+            }
+            forward.headRunner = { hidden in
+                try executor.headLogits(hidden: hidden, workspace: workspace)
+            }
+
+            // The onset on the device, before a single position runs: one full
+            // layer, one fixed input, the two positions that straddle the
+            // floor. `tau` multiplies AFTER the L2 clip and nothing else in
+            // `relativeStates` reads the position, so every element must move
+            // by exactly that factor.
+            let probe = (0..<config.hiddenSize).map { sin(Float($0) * 0.017) }
+            let unscaled = try executor.relativeStates(
+                layer: 5, queryInput: probe, position: before, isFull: true
+            )
+            let scaled = try executor.relativeStates(
+                layer: 5, queryInput: probe, position: onset, isFull: true
+            )
+            XCTAssertEqual(unscaled.count, scaled.count)
+            let onsetScale = Inkling2Math.logScale(
+                position: onset, alpha: config.logScalingAlpha, floor: floor
+            )
+            var ratioSum: Double = 0
+            var ratioCount = 0
+            for index in 0..<min(unscaled.count, scaled.count) {
+                let expected = unscaled[index] * onsetScale
+                XCTAssertEqual(
+                    scaled[index], expected,
+                    accuracy: Swift.max(1e-9, abs(expected) * 1e-6),
+                    "the onset must scale the relative state by tau and only by tau"
+                )
+                guard abs(unscaled[index]) > 1e-6 else { continue }
+                ratioSum += Double(scaled[index] / unscaled[index])
+                ratioCount += 1
+            }
+            let relativeRatio = ratioCount > 0 ? Float(ratioSum / Double(ratioCount)) : 0
+
+            var samples: [(position: Int, logits: [Float])] = []
+            let started = Date()
+            for (position, id) in ids.enumerated() {
+                let logits = try forward.forwardToken(token: UInt32(id), position: position)
+                if isSampled.contains(position) { samples.append((position, logits)) }
+                if position % 512 == 511 {
+                    let elapsed = -started.timeIntervalSinceNow
+                    print(
+                        "\u{1F50E} [inkling2 logscale] \(storage) arm: \(position + 1) of "
+                            + "\(positions) positions, " + String(format: "%.0f", elapsed)
+                            + " s, " + String(format: "%.3f", elapsed / Double(position + 1))
+                            + " s/position"
+                    )
+                }
+            }
+            XCTAssertEqual(samples.count, sampled.count)
+            XCTAssertFalse(samples.first?.logits.isEmpty ?? true)
+
+            XCTAssertEqual(forward.sequence.committedPositions, positions)
+            XCTAssertTrue(
+                forward.sequence.isConsistent,
+                "every visit must have committed the same positions and the history must match"
+            )
+            XCTAssertEqual(forward.sequence.tokenHistory, ids)
+            XCTAssertEqual(
+                forward.sequence.reusablePrefix(proposedPrefix: positions, promptTokenIds: ids),
+                positions - 1
+            )
+
+            let windowedVisits = forward.sequence.visits.filter { !$0.isFullAttention }
+            let fullVisits = forward.sequence.visits.filter { $0.isFullAttention }
+            XCTAssertEqual(windowedVisits.count, 40)
+            XCTAssertEqual(fullVisits.count, 8)
+            for visit in windowedVisits {
+                XCTAssertEqual(visit.rowCount, window, "a ring must hold exactly its window")
+                XCTAssertEqual(
+                    visit.windowStart, positions - window,
+                    "the ring must have dropped \(positions - window) rows at this length"
+                )
+                XCTAssertEqual(visit.committedPositions, positions)
+            }
+            for visit in fullVisits {
+                XCTAssertEqual(visit.rowCount, positions, "a full visit must hold every position")
+                XCTAssertEqual(visit.windowStart, 0)
+                XCTAssertEqual(visit.committedPositions, positions)
+            }
+
+            let windowed = try XCTUnwrap(windowedVisits.first)
+            let full = try XCTUnwrap(fullVisits.first)
+            let windowedStaged = try workspace.stage(windowed)
+            let fullStaged = try workspace.stage(full)
+            XCTAssertEqual(windowedStaged, window)
+            XCTAssertEqual(fullStaged, positions)
+            return (
+                samples, windowed.rowCount, windowed.windowStart, full.rowCount,
+                windowedStaged, fullStaged, relativeRatio, onsetScale
+            )
+        }
+
+        // The plan's prescribed form: slice 27 priced FP32 at this length as
+        // dominated by the staging copy, and a walk here is hours, so the INT8
+        // arm is the gate and it stands on its own. The FP32 comparison is a
+        // second, separate opt-in so a long run can be stopped after the arm
+        // that Phase 7 names without leaving nothing behind.
+        let compact = try walk(.int8)
+        print(
+            "\u{1F50E} [inkling2 logscale] int8 arm complete at \(positions) positions: a ring holds "
+                + "\(compact.ringRows) rows from \(compact.ringStart), a full visit holds "
+                + "\(compact.fullRows); the staging copy is \(compact.windowedStaged) rows for the "
+                + "ring and \(compact.fullStaged) for the full visit; the device's full-layer "
+                + "relative state scales by " + String(format: "%.9g", compact.relativeRatio)
+                + " at the onset (rule says " + String(format: "%.9g", compact.onsetScale) + ")"
+        )
+        XCTAssertEqual(
+            compact.relativeRatio, compact.onsetScale,
+            accuracy: compact.onsetScale * 1e-5,
+            "the device's full-layer relative state must scale by the published tau at the onset"
+        )
+
+        guard FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_logscale_fp32") else {
+            print(
+                "\u{1F50E} [inkling2 logscale] FP32 arm skipped -- touch "
+                    + "/tmp/dynamoe_inkling2_logscale_fp32 to add it; the INT8 arm above is the "
+                    + "gate Phase 7 names at this length"
+            )
+            return
+        }
+
+        let exact = try walk(.float32)
+        XCTAssertEqual(exact.ringRows, compact.ringRows)
+        XCTAssertEqual(exact.ringStart, compact.ringStart)
+        XCTAssertEqual(exact.windowedStaged, compact.windowedStaged)
+        XCTAssertEqual(exact.fullStaged, compact.fullStaged)
+
+        func compare(_ label: String, _ exactRow: [Float], _ compactRow: [Float]) {
+            XCTAssertEqual(exactRow.count, compactRow.count)
+            var worst: Float = 0
+            var differences: [Float] = []
+            differences.reserveCapacity(exactRow.count)
+            var exactTop = (id: -1, value: -Float.infinity)
+            var compactTop = (id: -1, value: -Float.infinity)
+            var nonFinite = 0
+            for index in 0..<exactRow.count {
+                let reference = exactRow[index]
+                let other = compactRow[index]
+                if !reference.isFinite || !other.isFinite { nonFinite += 1 }
+                let difference = abs(other - reference)
+                worst = Swift.max(worst, difference)
+                differences.append(difference)
+                if reference > exactTop.value { exactTop = (index, reference) }
+                if other > compactTop.value { compactTop = (index, other) }
+            }
+            XCTAssertEqual(nonFinite, 0, "\(label): every logit must be finite")
+            let mean = differences.reduce(0, +) / Float(Swift.max(1, differences.count))
+            let p99 = differences.sorted()[Int(0.99 * Float(Swift.max(0, differences.count - 1)))]
+            let margin = exactTop.value - (exactRow.sorted().dropLast().last ?? 0)
+            print(
+                "\u{1F50E} [inkling2 logscale] \(label): worst " + String(format: "%.4g", worst)
+                    + ", mean " + String(format: "%.4g", mean)
+                    + ", p99 " + String(format: "%.4g", p99)
+                    + ", greedy " + (exactTop.id == compactTop.id ? "agrees" : "DIFFERS")
+                    + " (\(exactTop.id) vs \(compactTop.id)), FP32 margin "
+                    + String(format: "%.4g", margin)
+                    + ", mean over margin " + String(format: "%.3g", mean / Swift.max(margin, 1e-6))
+            )
+            XCTAssertEqual(
+                compactTop.id, exactTop.id,
+                "\(label): the INT8 cache argues for a different token at \(label)"
+            )
+        }
+        XCTAssertEqual(exact.samples.count, compact.samples.count)
+        for (left, right) in zip(exact.samples, compact.samples) {
+            XCTAssertEqual(left.position, right.position)
+            let scale = Inkling2Math.logScale(
+                position: left.position, alpha: config.logScalingAlpha, floor: floor
+            )
+            compare("at \(left.position + 1) positions (tau \(String(format: "%.9g", scale)))",
+                    left.logits, right.logits)
+        }
+        print(
+            "\u{1F50E} [inkling2 logscale] the walk crosses the onset at \(floor) positions; "
+                + "the elementwise width is printed, not asserted"
+        )
+    }
+
     // MARK: The app's own turn path
 
     /// The whole app path for this family, once on the host and once with the
