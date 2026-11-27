@@ -625,6 +625,18 @@ nonisolated public final class Inkling2MetalForward {
     /// `Inkling2ArenaCapacity` floors it there.
     public private(set) var expertArenas: [Inkling2InstalledExpertArena] = []
 
+    /// Every arena's counters as they stand now. The profile reads the same
+    /// snapshot per visit; this is what a walk takes once, at the end, when it
+    /// wants the whole run's figures for a replay to reproduce.
+    public var arenaStatistics: [Inkling2ArenaCounters] {
+        expertArenas.map { $0.arena.statistics }
+    }
+
+    /// The routed experts a walk asked the arenas for, when a caller wants the
+    /// routing to price an eviction policy offline (slice 36). Nil -- the
+    /// shipping default -- records nothing.
+    public var routingTrace: Inkling2RoutingTrace?
+
     /// The first installed arena. Callers that install one (every test) keep
     /// reading this; the mixture reads `expertArenas`.
     public var expertArena: Inkling2ExpertArena? { expertArenas.first?.arena }
@@ -644,16 +656,25 @@ nonisolated public final class Inkling2MetalForward {
     public func installExpertArena(
         capacity: Int,
         geometry: Inkling2ExpertSlotGeometry,
-        reader: Inkling2ArenaShardReader
+        reader: Inkling2ArenaShardReader,
+        admission: Inkling2ArenaAdmission = .byFrequency
     ) throws {
-        let bytes = capacity * geometry.slotBytes
+        // A bypassed miss is READ and thrown away, so it still needs a slot that
+        // outlives the fill -- and one fill carries a whole visit's routing.
+        // Those slots sit on top of `capacity`, because the admission rule must
+        // not cost the residency slice 26 priced.
+        let scratch = admission == .byFrequency ? config.numExpertsPerToken : 0
+        let bytes = (capacity + scratch) * geometry.slotBytes
         guard bytes > 0, bytes <= device.maxBufferLength,
               let buffer = device.makeBuffer(length: bytes, options: .storageModeShared) else {
             throw Inkling2ForwardError.shapeMismatch(
                 "an expert arena of \(capacity) slot(s) needs \(bytes) bytes, which this device will not allocate"
             )
         }
-        let arena = Inkling2ExpertArena(capacity: capacity, geometry: geometry)
+        let arena = Inkling2ExpertArena(
+            capacity: capacity, geometry: geometry,
+            scratchSlots: scratch, admission: admission
+        )
         arena.attachSlotBuffer(buffer)
         expertArenas.removeAll { $0.geometry == geometry }
         expertArenas.append(Inkling2InstalledExpertArena(
@@ -2084,7 +2105,7 @@ nonisolated public final class Inkling2MetalForward {
         // MXFP8 layers, and a copy at the wrong strides would report hits over
         // the wrong bytes -- so each bank goes to the arena that HOLDS it, and a
         // bank no arena holds is refused (counted) and left on the mmap.
-        for installed in expertArenas {
+        for (arenaIndex, installed) in expertArenas.enumerated() {
             var indices: [Int] = []
             var requests: [Inkling2ExpertArena.FillRequest] = []
             for (index, bank) in banks.enumerated() where !held[index]
@@ -2105,6 +2126,11 @@ nonisolated public final class Inkling2MetalForward {
             }
             guard !requests.isEmpty else { continue }
             for index in indices { held[index] = true }
+            if let routingTrace {
+                routingTrace.record(
+                    arena: arenaIndex, layer: layer, experts: indices.map { experts[$0] }
+                )
+            }
             let slots = try installed.arena.fill(requests, reader: installed.reader)
             // A bookkeeping-only arena has nowhere to put the bytes: the caller
             // then fills the slots itself, exactly as the serial path allowed.
@@ -2119,6 +2145,12 @@ nonisolated public final class Inkling2MetalForward {
         }
         for index in experts.indices where !held[index] {
             expertArenas[0].arena.recordIncompatible()
+        }
+        if let routingTrace, held.contains(false) {
+            // A bank no arena packs: the mixture reads the shard mmap, which no
+            // policy can change, so it is recorded and counted, not simulated.
+            let bypassed = experts.indices.filter { !held[$0] }.map { experts[$0] }
+            routingTrace.record(arena: -1, layer: layer, experts: bypassed)
         }
         return residents
     }

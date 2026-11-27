@@ -4775,6 +4775,15 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         )
         XCTAssertFalse(arenaLine.contains("no arena"), arenaLine)
 
+        // Slice 36: the routing the walk actually asks the arenas for, recorded
+        // so the eviction policy can be priced on it offline. Armed separately
+        // from the profile because a policy needs the WHOLE walk's routing and
+        // the profile is billed for the last 24 positions only.
+        let captureMarker = "/tmp/dynamoe_inkling2_route_capture"
+        if FileManager.default.fileExists(atPath: captureMarker) {
+            executor.routingTrace = Inkling2RoutingTrace()
+        }
+
         // The profile is billed only for the last 24 positions: the per-visit
         // dictionary work would otherwise ride 1,032 positions of a run whose
         // point is what the position costs.
@@ -4803,6 +4812,21 @@ final class Inkling2DeviceKernelTests: XCTestCase {
                 positions, seconds, seconds * 1_000 / Double(positions), positions - profiledFrom
             )
         )
+        if let trace = executor.routingTrace {
+            var header = Inkling2RoutingTrace.Header()
+            header.capacities = executor.expertArenas.map(\.arena.capacity)
+            header.slotBytes = executor.expertArenas.map(\.geometry.slotBytes)
+            header.counters = executor.arenaStatistics
+            header.admission = executor.expertArenas.map(\.arena.admission)
+            header.scratchSlots = executor.expertArenas.map(\.arena.scratchSlots)
+            let url = URL(fileURLWithPath: "/tmp/dynamoe_inkling2_route_trace")
+            try trace.write(to: url, header: header)
+            print(
+                "\u{1F50E} [inkling2 where] routing trace: \(trace.requests.count) request(s), "
+                    + "\(trace.unheld) on the mmap, capacities \(header.capacities), "
+                    + "hits \(header.counters.map(\.hits)) misses \(header.counters.map(\.misses))"
+            )
+        }
         print("\u{1F50E} [inkling2 where] " + executor.visitProfile.describe(label: "past the window"))
         print(
             "\u{1F50E} [inkling2 where] "

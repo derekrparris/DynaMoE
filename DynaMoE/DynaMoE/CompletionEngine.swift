@@ -13040,17 +13040,23 @@ extension CompletionEngine {
                 try executor.installExpertArena(
                     capacity: capacity, geometry: geometry, reader: reader
                 )
-                let bytes = capacity * slots
+                // The allocation is the residents PLUS the scratch slots an
+                // admission bypass is read through -- one per expert of a
+                // visit's routing, since a fill carries the whole visit.
+                let scratch = config.numExpertsPerToken
+                let bytes = (capacity + scratch) * slots
                 installed.append(
                     "\(capacity)×" + String(format: "%.2f MB", Double(slots) / 1_048_576)
-                        + " (" + String(format: "%.2f GB", Double(bytes) / 1_073_741_824) + ") "
+                        + " + \(scratch) scratch ("
+                        + String(format: "%.2f GB", Double(bytes) / 1_073_741_824) + ") "
                         + layout.rawValue + " from layer \(layer)"
                         + (arenaSlotOverride > 0 ? " [override \(arenaSlotOverride)]" : "")
                 )
                 DiagLog.info(
                     "inkling2.arena",
-                    "resident expert arena for \(layout.rawValue): \(capacity) slot(s) of "
-                        + "\(slots) bytes = \(bytes) bytes, filled by pread from "
+                    "resident expert arena for \(layout.rawValue): \(capacity) slot(s) + "
+                        + "\(scratch) scratch of \(slots) bytes = \(bytes) bytes, "
+                        + "admission by frequency, filled by pread from "
                         + "\(url.lastPathComponent), geometry from layer \(layer), "
                         + "\(visits) of \(totalVisits) visits"
                         + (arenaSlotOverride > 0

@@ -292,6 +292,12 @@ nonisolated public final class Inkling2VisitProfile: @unchecked Sendable {
             )
             // A layout the slots cannot hold must not read as a low hit rate:
             // it is an expert that never entered the arena at all.
+            // A bypassed miss is a read that was deliberately not kept, so it
+            // must not be confused with an eviction (a resident made way) or
+            // with a hit: it is the admission rule's own count.
+            if arena.bypassed > 0 {
+                line += ", \(arena.bypassed) bypassed (read, not kept)"
+            }
             if arena.incompatible > 0 {
                 line += ", \(arena.incompatible) refused (a bank this slot layout cannot hold)"
             }

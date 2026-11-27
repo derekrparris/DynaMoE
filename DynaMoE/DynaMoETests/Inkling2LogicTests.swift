@@ -1165,9 +1165,18 @@ final class Inkling2MemoryPlanTests: XCTestCase {
         // the serial sequence's, and the batch reads only the slots that survive
         // (the serial path reads, and wastes, the ones it evicts in the same run).
         try compare(capacity: 3, experts: 6, slotsRead: 3)
+        // Under the admission rule a batch also decides BYPASSES, which take
+        // scratch slots: two experts install, four are read and dropped, and the
+        // scratch cursor has to advance identically in both shapes or the two
+        // disagree about which slot holds what. One scratch slot per bypass,
+        // which is what production provisions (a visit's own routing width).
+        try compare(capacity: 2, experts: 6, slotsRead: 6, admission: .byFrequency, scratch: 4)
     }
 
-    private func compare(capacity: Int, experts: Int, slotsRead: Int) throws {
+    private func compare(
+        capacity: Int, experts: Int, slotsRead: Int,
+        admission: Inkling2ArenaAdmission = .always, scratch: Int = 0
+    ) throws {
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice(), "no Metal device")
         let geometry = try XCTUnwrap(
             Inkling2ExpertSlotGeometry.make(
@@ -1192,10 +1201,14 @@ final class Inkling2MemoryPlanTests: XCTestCase {
         let reader = try Inkling2ArenaShardReader(url: file)
 
         func arena() throws -> (Inkling2ExpertArena, MTLBuffer) {
+            let slots = capacity + scratch
             let buffer = try XCTUnwrap(
-                device.makeBuffer(length: capacity * slotBytes, options: .storageModeShared)
+                device.makeBuffer(length: slots * slotBytes, options: .storageModeShared)
             )
-            let arena = Inkling2ExpertArena(capacity: capacity, geometry: geometry)
+            let arena = Inkling2ExpertArena(
+                capacity: capacity, geometry: geometry,
+                scratchSlots: scratch, admission: admission
+            )
             arena.attachSlotBuffer(buffer)
             return (arena, buffer)
         }
@@ -1233,6 +1246,7 @@ final class Inkling2MemoryPlanTests: XCTestCase {
         XCTAssertEqual(afterBatch.misses, afterSerial.misses, "capacity \(capacity)")
         XCTAssertEqual(afterBatch.evictions, afterSerial.evictions, "capacity \(capacity)")
         XCTAssertEqual(afterBatch.slotsAllocated, afterSerial.slotsAllocated, "capacity \(capacity)")
+        XCTAssertEqual(afterBatch.bypassed, afterSerial.bypassed, "capacity \(capacity): bypasses")
         // The serial path reads every miss; the batch reads only the slots that
         // are still resident when the fan-out runs, and here that is the ones
         // that survived eviction.
@@ -4568,5 +4582,558 @@ final class Inkling2ExpertFillShapeTests: XCTestCase {
         print("\u{1F50E} [inkling2 fill] " + lines.joined(separator: "\n\u{1F50E} [inkling2 fill] "))
         XCTAssertGreaterThan(serialBest, 0)
         XCTAssertGreaterThan(batchBest, 0)
+    }
+}
+
+// MARK: - The arena's eviction policy
+
+/// Which expert stays resident, priced on the routing the model actually
+/// produced.
+///
+/// Slices 16 and 26 left the policy question open on purpose: the working set is
+/// far past any 16 GB machine's arena, so a rule that keeps the RIGHT slots is
+/// the only lever left on the fill. A synthetic trace cannot answer it -- the
+/// answer depends on how this checkpoint's router reuses experts across a
+/// position's three passes and across positions -- so the profiled walk records
+/// the routing (`Inkling2RoutingTrace`) and these cases replay it.
+///
+/// The replay drives the SHIPPED arena for the shipped policy and asserts its
+/// counters are the walk's own, which is what makes the other rules comparable:
+/// same requests, same capacity, same bookkeeping, one different victim choice.
+final class Inkling2ArenaPolicyTests: XCTestCase {
+    private let tracePath = "/tmp/dynamoe_inkling2_route_trace"
+
+    private func loadTrace() throws -> (Inkling2RoutingTrace.Header, [Inkling2RoutingTrace.Request]) {
+        guard FileManager.default.fileExists(atPath: tracePath) else {
+            throw XCTSkip(
+                "opt-in: run testWhereAPastTheWindowPositionSpendsItsTime with "
+                    + "/tmp/dynamoe_inkling2_route_capture touched"
+            )
+        }
+        return try Inkling2RoutingTrace.read(from: URL(fileURLWithPath: tracePath))
+    }
+
+    /// The requests one arena saw, as `layer * 128 + expert` (the checkpoint has
+    /// 128 routed experts, so the key is unique).
+    private func keys(
+        _ requests: [Inkling2RoutingTrace.Request], arena: Int
+    ) -> [Int] {
+        requests.lazy.filter { $0.arena == arena }.map { $0.layer * 128 + $0.expert }
+    }
+
+    private struct Tally {
+        var hits = 0
+        var misses = 0
+        var evictions = 0
+        var hitRate: Double {
+            let total = hits + misses
+            return total == 0 ? 0 : Double(hits) / Double(total)
+        }
+    }
+
+    private enum Rule {
+        case leastRecentlyUsed
+        case firstInFirstOut
+        case leastFrequentlyUsed
+        /// Halve every resident's count every `every` requests, so a rule that
+        /// counts the whole run cannot ossify on the first position's routing.
+        case leastFrequentlyUsedAging(every: Int)
+    }
+
+    /// One arena's requests through one rule.
+    ///
+    /// `order` is most-recently-used first, as the shipped arena keeps it, so a
+    /// least-recently-used victim is `order.last`; the counted rules evict by
+    /// count with recency as the tie-break, and FIFO by install order.
+    private func simulate(_ requests: [Int], capacity: Int, rule: Rule) -> Tally {
+        guard capacity > 0 else { return Tally() }
+        var tally = Tally()
+        var order: [Int] = []
+        var installedAt: [Int: Int] = [:]
+        var count: [Int: Int] = [:]
+        var tick = 0
+        for key in requests {
+            tick += 1
+            if let index = order.firstIndex(of: key) {
+                tally.hits += 1
+                order.remove(at: index)
+                order.insert(key, at: 0)
+                count[key, default: 0] += 1
+                continue
+            }
+            tally.misses += 1
+            if order.count == capacity {
+                tally.evictions += 1
+                let victim: Int
+                switch rule {
+                case .leastRecentlyUsed:
+                    victim = order[order.count - 1]
+                case .firstInFirstOut:
+                    victim = order.min { installedAt[$0]! < installedAt[$1]! }!
+                case .leastFrequentlyUsed, .leastFrequentlyUsedAging:
+                    // The least used, and the least recently used among equals:
+                    // scanning from the tail picks the least recent one first.
+                    var chosen = order[order.count - 1]
+                    for candidate in order.reversed() {
+                        if count[candidate, default: 0] < count[chosen, default: 0] {
+                            chosen = candidate
+                        }
+                    }
+                    victim = chosen
+                }
+                order.removeAll { $0 == victim }
+                installedAt[victim] = nil
+                count[victim] = nil
+            }
+            order.insert(key, at: 0)
+            installedAt[key] = tick
+            count[key, default: 0] += 1
+            if case let .leastFrequentlyUsedAging(every) = rule, every > 0, tick % every == 0 {
+                for resident in order { count[resident] = max(1, count[resident, default: 1] / 2) }
+            }
+        }
+        return tally
+    }
+
+    /// The floor: evicting the resident whose next use is farthest away, which
+    /// needs the whole trace and is therefore a bound rather than a policy. No
+    /// policy is claimed against anything under it.
+    private func clairvoyant(_ requests: [Int], capacity: Int) -> Tally {
+        guard capacity > 0 else { return Tally() }
+        var future: [Int: [Int]] = [:]
+        for (index, key) in requests.enumerated() { future[key, default: []].append(index) }
+        var cursor: [Int: Int] = [:]
+        var tally = Tally()
+        var order: [Int] = []
+        func nextUse(_ key: Int) -> Int {
+            let index = cursor[key, default: 0]
+            let list = future[key] ?? []
+            return index < list.count ? list[index] : Int.max
+        }
+        for key in requests {
+            cursor[key, default: 0] += 1
+            if let index = order.firstIndex(of: key) {
+                tally.hits += 1
+                order.remove(at: index)
+                order.append(key)
+                continue
+            }
+            tally.misses += 1
+            if order.count == capacity {
+                tally.evictions += 1
+                let victim = order.max { nextUse($0) < nextUse($1) }!
+                order.removeAll { $0 == victim }
+            }
+            order.append(key)
+        }
+        return tally
+    }
+
+    /// The shipped policy, replayed through the shipped arena. Its counters are
+    /// the walk's own or the comparison below is fiction.
+    func testTheShippedPolicyReplaysToTheWalksOwnCounters() throws {
+        let (header, requests) = try loadTrace()
+        let geometry = try XCTUnwrap(Inkling2ExpertSlotGeometry.make(
+            gateUpRows: 1, gateUpRowStride: 1, gateUpScaleRowStride: 1,
+            downRows: 1, downRowStride: 1, downScaleRowStride: 1
+        ))
+        // The arena the WALK ran, not a default: a replay under another rule
+        // would be a different experiment that reads like the same one.
+        let arenas = header.capacities.indices.map { index in
+            Inkling2ExpertArena(
+                capacity: header.capacities[index], geometry: geometry,
+                scratchSlots: header.scratchSlots.count > index ? header.scratchSlots[index] : 0,
+                admission: header.admission.count > index ? header.admission[index] : .always
+            )
+        }
+        XCTAssertFalse(arenas.isEmpty, "the trace has no arena")
+        var bypassed = 0
+        for request in requests {
+            guard request.arena >= 0, request.arena < arenas.count else {
+                bypassed += 1
+                continue
+            }
+            // `resident` / `slotForFill` / `didFill` are the three steps `fill`
+            // takes for a single expert, so this is the shipped state machine.
+            let arena = arenas[request.arena]
+            if arena.resident(layer: request.layer, expert: request.expert) != nil { continue }
+            let slot = arena.slotForFill(layer: request.layer, expert: request.expert)
+            arena.didFill(
+                slot: slot, layer: request.layer, expert: request.expert,
+                gateUpSourceOffset: 0, downSourceOffset: 0, bytes: 0, preadNanoseconds: 0,
+                kept: !arena.isScratch(slot: slot)
+            )
+        }
+        print(
+            "\u{1F50E} [inkling2 policy] replayed \(requests.count) request(s), \(bypassed) bypassed; "
+                + "policies \(header.admission.map { $0 == .byFrequency ? "byFrequency" : "always" })"
+        )
+        for (index, arena) in arenas.enumerated() {
+            let replay = arena.statistics
+            let walk = header.counters[index]
+            print(
+                "\u{1F50E} [inkling2 policy] arena \(index) (\(header.capacities[index]) slots): "
+                    + "walk \(walk.hits)/\(walk.misses)/\(walk.evictions), "
+                    + "replay \(replay.hits)/\(replay.misses)/\(replay.evictions)"
+            )
+            XCTAssertEqual(replay.hits, walk.hits, "arena \(index) hits")
+            XCTAssertEqual(replay.misses, walk.misses, "arena \(index) misses")
+            XCTAssertEqual(replay.evictions, walk.evictions, "arena \(index) evictions")
+            // Under the admission rule a miss either installs or bypasses, and
+            // an install takes an empty slot or reuses an evicted one -- so the
+            // three counters imply the fourth, and it is asserted rather than
+            // stored, which keeps this replay independent of a header field.
+            XCTAssertEqual(
+                replay.bypassed, replay.misses - replay.slotsAllocated - replay.evictions,
+                "arena \(index): bypasses are the misses that did not install"
+            )
+        }
+    }
+
+    /// LFU with admission control: a miss is only allowed to replace a resident
+    /// when the incoming expert has been asked for more often than the resident
+    /// it would displace, and one slot is held back as the scratch the mixture
+    /// reads a bypassed expert through.
+    ///
+    /// This is the shape the frequency question actually wants -- plain LFU
+    /// cannot do it, because its arena is always full of whatever it happened to
+    /// install first -- and it is what TinyLFU's admission filter is for on a
+    /// skewed workload like a router's.
+    private func simulateAdmission(
+        _ requests: [Int], capacity: Int, scratchSlots: Int, agingEvery: Int?
+    ) -> Tally {
+        let residentCapacity = max(1, capacity)
+        var tally = Tally()
+        var order: [Int] = []
+        var count: [Int: Int] = [:]
+        var tick = 0
+        for key in requests {
+            tick += 1
+            count[key, default: 0] += 1
+            if let index = order.firstIndex(of: key) {
+                tally.hits += 1
+                order.remove(at: index)
+                order.insert(key, at: 0)
+            } else {
+                tally.misses += 1
+                if order.count < residentCapacity {
+                    order.insert(key, at: 0)
+                } else if order.count == residentCapacity {
+                    // The victim is the least requested, with the least recent
+                    // as the tie-break -- the shipped `take`'s choice.
+                    var victim = order[order.count - 1]
+                    for candidate in order.reversed() {
+                        if count[candidate, default: 0] < count[victim, default: 0] {
+                            victim = candidate
+                        }
+                    }
+                    // Without a scratch slot there is nowhere to read a bypassed
+                    // expert, so the miss has to install.
+                    if scratchSlots == 0 || count[key, default: 0] > count[victim, default: 0] {
+                        tally.evictions += 1
+                        order.removeAll { $0 == victim }
+                        order.insert(key, at: 0)
+                    }
+                }
+            }
+            if let agingEvery, agingEvery > 0, tick % agingEvery == 0 {
+                for resident in order { count[resident] = max(1, count[resident, default: 1] / 2) }
+            }
+        }
+        return tally
+    }
+
+    /// How the frequency rules move with their decay horizon, which is the one
+    /// number that decides whether they are worth shipping.
+    func testWhatTheFrequencyRulesWouldMissAtEveryHorizon() throws {
+        let (header, requests) = try loadTrace()
+        for arena in header.capacities.indices {
+            let capacity = header.capacities[arena]
+            let arenaKeys = keys(requests, arena: arena)
+            guard !arenaKeys.isEmpty else { continue }
+            let floor = clairvoyant(arenaKeys, capacity: capacity)
+            var lines: [String] = [
+                "arena \(arena): \(capacity) slot(s), \(arenaKeys.count) request(s); "
+                    + "clairvoyant floor \(floor.misses) miss(es)"
+            ]
+            // The horizons worth reading: a fixed ladder, and the principled
+            // ones -- a decay per ARENA's worth of requests, which is one
+            // position's routing at this checkpoint for both sizes.
+            for every in [128, 256, 512, 1_024, 2_048, 4_096, 8_192, 16_384]
+                + [capacity, 2 * capacity, 3 * capacity] {
+                let aged = simulate(
+                    arenaKeys, capacity: capacity,
+                    rule: .leastFrequentlyUsedAging(every: every)
+                )
+                let admission = simulateAdmission(
+                    arenaKeys, capacity: capacity, scratchSlots: 1, agingEvery: every
+                )
+                lines.append(
+                    String(
+                        format: "decay %d: aged LFU %d miss(es) (%.1f%%), "
+                            + "admission %d miss(es) (%.1f%%)",
+                        every, aged.misses, 100 * aged.hitRate,
+                        admission.misses, 100 * admission.hitRate
+                    )
+                )
+            }
+            let lru = simulate(arenaKeys, capacity: capacity, rule: .leastRecentlyUsed)
+            lines.append(
+                String(
+                    format: "shipped LRU: %d miss(es) (%.1f%%)",
+                    lru.misses, 100 * lru.hitRate
+                )
+            )
+            print("\u{1F50E} [inkling2 policy] " + lines.joined(separator: "\n\u{1F50E} [inkling2 policy] "))
+        }
+    }
+
+    /// The SHIPPED arena under the admission rule reproduces the prototype's
+    /// counts on the walk's routing, to the miss.
+    ///
+    /// This is what makes the shipping decision rest on the shipped code: the
+    /// 25% is not a simulator's number, it is this arena's, and a change to the
+    /// victim choice, the scratch cursor or the bypass condition that moved it
+    /// would fail here.
+    func testTheAdmittedArenaReproducesThePrototypeOnTheWalksRouting() throws {
+        let (header, requests) = try loadTrace()
+        let geometry = try XCTUnwrap(Inkling2ExpertSlotGeometry.make(
+            gateUpRows: 1, gateUpRowStride: 1, gateUpScaleRowStride: 1,
+            downRows: 1, downRowStride: 1, downScaleRowStride: 1
+        ))
+        let scratch = 8
+        let arenas = header.capacities.map {
+            Inkling2ExpertArena(
+                capacity: $0, geometry: geometry,
+                scratchSlots: scratch, admission: .byFrequency
+            )
+        }
+        for request in requests where request.arena >= 0 && request.arena < arenas.count {
+            let arena = arenas[request.arena]
+            if arena.resident(layer: request.layer, expert: request.expert) != nil { continue }
+            let slot = arena.slotForFill(layer: request.layer, expert: request.expert)
+            // The serial path's `slot()` does this; a bypassed slot must not
+            // become a resident, and its bytes are still billed.
+            arena.didFill(
+                slot: slot, layer: request.layer, expert: request.expert,
+                gateUpSourceOffset: 0, downSourceOffset: 0, bytes: 0, preadNanoseconds: 0,
+                kept: slot < arena.capacity
+            )
+        }
+        for (index, arena) in arenas.enumerated() {
+            let shipped = arena.statistics
+            let prototype = simulateAdmission(
+                keys(requests, arena: index), capacity: header.capacities[index],
+                scratchSlots: scratch, agingEvery: nil
+            )
+            let recency = simulate(
+                keys(requests, arena: index), capacity: header.capacities[index],
+                rule: .leastRecentlyUsed
+            )
+            print(
+                String(
+                    format: "\u{1F50E} [inkling2 policy] arena %d: LRU %d miss(es), "
+                        + "prototype %d, shipped %d (%d bypassed of %d)",
+                    index, recency.misses, prototype.misses, shipped.misses,
+                    shipped.bypassed, shipped.hits + shipped.misses
+                )
+            )
+            XCTAssertEqual(shipped.misses, prototype.misses, "arena \(index): misses")
+            XCTAssertEqual(shipped.hits, prototype.hits, "arena \(index): hits")
+            XCTAssertLessThan(
+                shipped.misses, recency.misses,
+                "arena \(index): the admission rule must read fewer experts than recency"
+            )
+        }
+    }
+
+    /// The rule's own fixture: a hot expert keeps its slot, a cold one is read
+    /// through scratch and never becomes a hit.
+    func testAColdExpertIsReadThroughScratchAndDoesNotStay() throws {
+        let geometry = try XCTUnwrap(Inkling2ExpertSlotGeometry.make(
+            gateUpRows: 2, gateUpRowStride: 4, gateUpScaleRowStride: 2,
+            downRows: 2, downRowStride: 3, downScaleRowStride: 2
+        ))
+        let arena = Inkling2ExpertArena(
+            capacity: 2, geometry: geometry, scratchSlots: 2, admission: .byFrequency
+        )
+        XCTAssertEqual(arena.slotCount, 4)
+        /// One request, as `slot(...)` makes it: a hit is checked first, and only
+        /// a miss takes a slot (`slotForFill` is the "already known to miss"
+        /// step, and calling it for a resident would count a miss that never
+        /// happened).
+        func ask(_ expert: Int) {
+            if arena.resident(layer: 0, expert: expert) != nil { return }
+            let slot = arena.slotForFill(layer: 0, expert: expert)
+            arena.didFill(
+                slot: slot, layer: 0, expert: expert,
+                gateUpSourceOffset: 0, downSourceOffset: 0, bytes: 1, preadNanoseconds: 0,
+                kept: slot < arena.capacity
+            )
+        }
+        // Two experts fill the arena, a third is asked for once: it has neither
+        // more requests than either resident nor a free slot, so it is read into
+        // a scratch slot and is a miss again next time.
+        ask(0)
+        ask(1)
+        // One ask for a third expert has neither a free slot nor more requests
+        // than either resident: it is read through scratch and does not stay.
+        ask(2)
+        var stats = arena.statistics
+        XCTAssertEqual(stats.hits, 0, "a bypassed expert must not become a hit")
+        XCTAssertEqual(stats.bypassed, 1, "the cold ask went through scratch")
+        XCTAssertEqual(stats.evictions, 0, "nothing was displaced for a cold expert")
+        XCTAssertEqual(stats.slotsAllocated, 2)
+        XCTAssertTrue(arena.isResident(layer: 0, expert: 0))
+        XCTAssertTrue(arena.isResident(layer: 0, expert: 1))
+        XCTAssertFalse(arena.isResident(layer: 0, expert: 2), "a bypass leaves no residency")
+        // The SECOND ask gives it two requests against the residents' one, which
+        // is the moment admission lets it in -- over the coldest resident.
+        ask(2)
+        XCTAssertTrue(arena.isResident(layer: 0, expert: 2), "a twice-wanted expert installs")
+        stats = arena.statistics
+        XCTAssertEqual(stats.evictions, 1, "exactly one resident made way")
+        XCTAssertEqual(stats.bypassed, 1, "only the first ask was dropped")
+        // And now it is a resident, so the next ask is a hit.
+        ask(2)
+        XCTAssertEqual(arena.statistics.hits, 1, "the installed expert is a hit")
+    }
+
+    /// Whether the rule that beat recency on BOTH arenas does so for a reason
+    /// or because of where the walk happened to end.
+    ///
+    /// Admission control is the only rule in the table above that improves both
+    /// arenas, and its decay ladder is not monotone -- which is the shape of a
+    /// horizon tuned to one walk rather than to the workload. The same ladder is
+    /// therefore read on each HALF of the walk: a horizon that wins on both
+    /// halves is a property of the routing, and one that only wins on the whole
+    /// is the walk.
+    func testWhetherTheAdmissionRuleSurvivesTheWalkBeingCutInHalf() throws {
+        let (header, requests) = try loadTrace()
+        for arena in header.capacities.indices {
+            let capacity = header.capacities[arena]
+            let arenaKeys = keys(requests, arena: arena)
+            guard arenaKeys.count > 1 else { continue }
+            let middle = arenaKeys.count / 2
+            var lines: [String] = [
+                "arena \(arena): \(capacity) slot(s), halves of \(middle) request(s)"
+            ]
+            for (index, half) in [Array(arenaKeys[..<middle]), Array(arenaKeys[middle...])].enumerated() {
+                let lru = simulate(half, capacity: capacity, rule: .leastRecentlyUsed)
+                var row = String(
+                    format: "half %d: LRU %d miss(es)", index, lru.misses
+                )
+                for every in [1_024, 4_096, 16_384, 32_768, nil] {
+                    let admission = simulateAdmission(
+                        half, capacity: capacity, scratchSlots: 1, agingEvery: every
+                    )
+                    row += String(
+                        format: ", admission/%@ %d (%+.1f%%)",
+                        every.map(String.init) ?? "never", admission.misses,
+                        100 * Double(lru.misses - admission.misses) / Double(max(1, lru.misses))
+                    )
+                }
+                // A bypassed expert still has to land somewhere for the mixture
+                // to read it, and one fill carries a whole visit's routing: the
+                // honest form of the rule holds EIGHT slots back as scratch, not
+                // one. (`capacity - 7` here because the simulator reserves one
+                // itself.)
+                let scratch = simulateAdmission(
+                    half, capacity: capacity, scratchSlots: 8, agingEvery: 16_384
+                )
+                row += String(
+                    format: ", +8 scratch slots %d (%+.1f%%)",
+                    scratch.misses,
+                    100 * Double(lru.misses - scratch.misses) / Double(max(1, lru.misses))
+                )
+                lines.append(row)
+            }
+            print(
+                "\u{1F50E} [inkling2 policy] "
+                    + lines.joined(separator: "\n\u{1F50E} [inkling2 policy] ")
+            )
+        }
+    }
+
+    /// What the other rules would have missed on the same routing.
+    func testWhatTheOtherPoliciesWouldMissOnTheWalksRouting() throws {
+        let (header, requests) = try loadTrace()
+        for arena in header.capacities.indices {
+            let capacity = header.capacities[arena]
+            let arenaKeys = keys(requests, arena: arena)
+            guard !arenaKeys.isEmpty else { continue }
+            let distinct = Set(arenaKeys).count
+
+            let lru = simulate(arenaKeys, capacity: capacity, rule: .leastRecentlyUsed)
+            let fifo = simulate(arenaKeys, capacity: capacity, rule: .firstInFirstOut)
+            let lfu = simulate(arenaKeys, capacity: capacity, rule: .leastFrequentlyUsed)
+            let aged = simulate(
+                arenaKeys, capacity: capacity, rule: .leastFrequentlyUsedAging(every: 4_096)
+            )
+            // A per-layer quota: the arena split evenly across the layers it
+            // serves, each layer a least-recently-used cache of its own. A
+            // position's three passes over layers 6-18 are the reuse a global
+            // rule can lose to a later layer's misses.
+            let layers = Set(arenaKeys.map { $0 / 128 })
+            let quota = max(1, capacity / max(1, layers.count))
+            var partitioned = Tally()
+            for layer in layers {
+                let slice = arenaKeys.filter { $0 / 128 == layer }
+                let tally = simulate(slice, capacity: quota, rule: .leastRecentlyUsed)
+                partitioned.hits += tally.hits
+                partitioned.misses += tally.misses
+                partitioned.evictions += tally.evictions
+            }
+            let floor = clairvoyant(arenaKeys, capacity: capacity)
+            // The best a rule that only ranks experts could do: pin the arena's
+            // `capacity` most-requested experts for the whole run, with the
+            // frequency known in advance. If this is not better than recency,
+            // no frequency rule can be, whatever its horizon.
+            var frequency: [Int: Int] = [:]
+            for key in arenaKeys { frequency[key, default: 0] += 1 }
+            let pinned = frequency.values.sorted(by: >).prefix(capacity).reduce(0, +)
+            let pinnedShare = Double(pinned) / Double(arenaKeys.count)
+
+            var lines: [String] = [
+                String(
+                    format: "arena %d: %d slot(s), %d request(s), %d distinct, "
+                        + "%.1f%% compulsory (a floor of %d misses)",
+                    arena, capacity, arenaKeys.count, distinct,
+                    100 * Double(distinct) / Double(arenaKeys.count),
+                    distinct
+                )
+            ]
+            lines.append(
+                String(
+                    format: "an oracle pinning the %d most-requested experts would hit %.1f%%",
+                    capacity, 100 * pinnedShare
+                )
+            )
+            for (label, tally) in [
+                ("shipped LRU", lru), ("FIFO", fifo), ("LFU", lfu),
+                ("LFU aged 4,096", aged),
+                ("per-layer quota \(quota)/layer", partitioned),
+                ("clairvoyant floor", floor)
+            ] {
+                lines.append(
+                    String(
+                        format: "%@: %d hits / %d misses / %d evictions = %.1f%% hit rate",
+                        label, tally.hits, tally.misses, tally.evictions, 100 * tally.hitRate
+                    )
+                )
+            }
+            print("\u{1F50E} [inkling2 policy] " + lines.joined(separator: "\n\u{1F50E} [inkling2 policy] "))
+
+            // The floor is a floor: no rule can miss fewer bytes than the
+            // clairvoyant one, and every first touch is a miss.
+            XCTAssertLessThanOrEqual(floor.misses, lru.misses, "arena \(arena): LRU misses the floor")
+            XCTAssertLessThanOrEqual(floor.misses, lfu.misses, "arena \(arena): LFU misses the floor")
+            XCTAssertLessThanOrEqual(floor.misses, aged.misses, "arena \(arena): aged LFU misses the floor")
+            XCTAssertLessThanOrEqual(
+                floor.misses, partitioned.misses, "arena \(arena): the quota misses the floor"
+            )
+            XCTAssertLessThanOrEqual(distinct, floor.misses, "arena \(arena): first touches are misses")
+            XCTAssertEqual(lru.hits + lru.misses, arenaKeys.count, "arena \(arena): every request lands")
+        }
     }
 }
