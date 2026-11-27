@@ -4216,3 +4216,59 @@ final class Inkling2SyntheticForwardTests: XCTestCase {
         XCTAssertLessThanOrEqual(worst, 2e-2, "final logits")
     }
 }
+
+/// The split plan's own rules, pure arithmetic: every split owns at least one
+/// row (the kernels write their slot unconditionally, so an empty split would
+/// leave a stale max behind), and the chunk stays inside the device's
+/// threadgroup memory at every length the checkpoint declares.
+final class Inkling2AttentionSplitTests: XCTestCase {
+
+    func testEverySplitOwnsAtLeastOneRowAndNoneIsUnused() {
+        for rows in 1...600 {
+            let plan = Inkling2AttentionSplit.plan(rowCount: rows)
+            XCTAssertGreaterThanOrEqual(plan.splits, 1, "\(rows) rows")
+            XCTAssertLessThanOrEqual(plan.splits, rows, "\(rows) rows: an empty split")
+            XCTAssertLessThanOrEqual(plan.splits, Inkling2AttentionSplit.maximumSplits)
+            XCTAssertGreaterThanOrEqual(plan.splits * plan.chunk, rows, "\(rows) rows: rows left over")
+            // No trailing split that would get no rows: the split count is the
+            // smallest that covers the rows at this chunk.
+            XCTAssertLessThan(
+                (plan.splits - 1) * plan.chunk, rows,
+                "\(rows) rows: split \(plan.splits - 1) would already cover every row"
+            )
+        }
+    }
+
+    /// The measured arms, pinned: moving the policy has to move these numbers
+    /// deliberately. Each chunk is the one the split was timed at.
+    func testThePublishedLengthsLandOnTheMeasuredChunks() {
+        let window = Inkling2AttentionSplit.plan(rowCount: 1_024)
+        XCTAssertEqual(window.splits, 16)
+        XCTAssertEqual(window.chunk, 64)
+
+        let middle = Inkling2AttentionSplit.plan(rowCount: 4_096)
+        XCTAssertEqual(middle.splits, 64)
+        XCTAssertEqual(middle.chunk, 64)
+
+        let floor = Inkling2AttentionSplit.plan(rowCount: 8_192)
+        XCTAssertEqual(floor.splits, 128)
+        XCTAssertEqual(floor.chunk, 64)
+    }
+
+    /// The shipped single-threadgroup form stages EVERY row, so it is capped at
+    /// 8,160 rows by a 32,768 B budget; the split stages its chunk and holds at
+    /// the checkpoint's whole declared length.
+    func testTheSplitStaysInsideTheThreadgroupBudgetWhereTheShippedFormCannot() {
+        XCTAssertGreaterThan(
+            (32 + 8_192) * MemoryLayout<Float>.stride,
+            32_768,
+            "the shipped form already overflows the budget inside the window's own arm"
+        )
+        for rows in [1_024, 8_192, 32_768, 262_144, 1_048_576] {
+            let plan = Inkling2AttentionSplit.plan(rowCount: rows)
+            XCTAssertLessThanOrEqual(
+                (32 + plan.chunk) * MemoryLayout<Float>.stride, 32_768, "\(rows) rows"
+            )
+        }
+    }
+}

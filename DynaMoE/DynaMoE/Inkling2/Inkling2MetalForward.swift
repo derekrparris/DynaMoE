@@ -223,6 +223,42 @@ nonisolated public final class Inkling2DeviceWeights {
 
 // MARK: - Workspace
 
+/// How a visit's attention rows are split across threadgroups.
+///
+/// The single-threadgroup kernel gives one visit `numAttentionHeads`
+/// threadgroups of 32 lanes and walks every row serially, so its cost is one
+/// reduction and three barriers per row. Splitting the rows measured 13.5x at
+/// 1,024 rows, 15.2x at 4,096 and 35.2x at 8,192, with a one-split control at
+/// 1.00x -- the split, not the rewrite, is the win
+/// (`Inkling2DeviceKernelTests.testWhatSplittingALongVisitRowsCostsAndWhetherItAgrees`).
+///
+/// The chunk target is 64 rows because 64 was the best chunk at every length
+/// measured (1,024 rows: 16 splits at 13.53x; 4,096: 64 splits at 15.17x;
+/// 8,192: 128 splits at 35.16x), and a finer chunk starts losing to the
+/// per-split partial traffic (8,192 rows: 128 splits 1.202 ms, chunk 32 would
+/// be 256 splits). `maximumSplits` bounds the partials buffer: past
+/// `maximumSplits * targetChunk` rows the chunk grows instead, which keeps the
+/// threadgroup staging request under `maximumChunk` at every length the
+/// checkpoint declares.
+///
+/// Every plan gives every split at least one row, which is what lets the kernel
+/// write its slot unconditionally.
+public enum Inkling2AttentionSplit {
+    public static let maximumSplits = 256
+    public static let targetChunk = 64
+    /// The device's 32,768 B of threadgroup memory, less the 32 reduction slots.
+    public static let maximumChunk = 8_160
+
+    public static func plan(rowCount: Int) -> (splits: Int, chunk: Int) {
+        let rows = max(1, rowCount)
+        let wanted = (rows + targetChunk - 1) / targetChunk
+        let splits = min(maximumSplits, max(1, wanted))
+        let chunk = (rows + splits - 1) / splits
+        precondition(chunk <= maximumChunk, "a chunk of \(chunk) rows cannot be staged")
+        return (splits, chunk)
+    }
+}
+
 /// The device buffers a visit's stages share.
 ///
 /// Sized for ONE position and one visit: the staging vectors are
@@ -286,6 +322,11 @@ nonisolated public final class Inkling2DeviceWorkspace {
     public let bank: MTLBuffer
     /// The attention's per-row scores, for a parity check of the stage inside.
     public let scoreDump: MTLBuffer
+    /// One split's local max, denominator and unnormalized value fold, for every
+    /// (split, head) pair the widest visit can dispatch. Laid out
+    /// `[split][head][headDim + 2]` and sized for `maximumSplits` on the wider
+    /// of the two head geometries.
+    public let attentionPartials: MTLBuffer
     /// The unembedding's output: one FP32 logit per vocab row, so it is the one
     /// workspace buffer sized by the vocabulary rather than by the width.
     public let headLogits: MTLBuffer
@@ -359,6 +400,13 @@ nonisolated public final class Inkling2DeviceWorkspace {
             "relative bank"
         )
         scoreDump = try make(config.maxPositionEmbeddings * MemoryLayout<Float>.stride, "score dump")
+        let partialHeads = max(config.numAttentionHeads, config.swaNumAttentionHeads)
+        let partialHeadDim = max(config.headDim, config.swaHeadDim)
+        attentionPartials = try make(
+            Inkling2AttentionSplit.maximumSplits * partialHeads * (partialHeadDim + 2)
+                * MemoryLayout<Float>.stride,
+            "attention split partials"
+        )
         headLogits = try make(
             config.unpaddedVocabSize * MemoryLayout<Float>.stride, "head logits"
         )
@@ -639,6 +687,9 @@ nonisolated public final class Inkling2MetalForward {
         "inkling_block_read_f32",
         "inkling_attention_f32",
         "inkling_attention_int8_f32",
+        "inkling_attention_split_f32",
+        "inkling_attention_split_int8_f32",
+        "inkling_attention_split_combine_f32",
         "inkling_expert_row_f32",
         "inkling_router_topk_f32",
         "bf16_gemv_rows8",
@@ -1505,32 +1556,42 @@ nonisolated public final class Inkling2MetalForward {
                     + "holds \(state.storage.rawValue)"
             )
         }
+        // The rows are split across threadgroups rather than walked serially in
+        // one: one threadgroup per (head, split), then a combine pass. The
+        // single-threadgroup kernels (`inkling_attention_f32` and its INT8
+        // twin) stay in the shader as the reference this path is checked
+        // against, and their per-head form is what the split was measured
+        // against -- 24 threadgroups of 32 lanes, a reduction and three
+        // barriers per row.
+        let plan = Inkling2AttentionSplit.plan(rowCount: rows)
         let values: [UInt32] = [
             UInt32(heads), UInt32(heads / kvHeads), UInt32(headDim), UInt32(kvWidth),
             UInt32(rows), UInt32(state.windowStart), UInt32(position),
-            UInt32(config.dRel), UInt32(isFull ? config.relExtent : config.slidingWindowSize)
+            UInt32(config.dRel), UInt32(isFull ? config.relExtent : config.slidingWindowSize),
+            UInt32(plan.chunk), UInt32(plan.splits)
         ]
         switch state.storage {
         case .float32:
-            encoder.setComputePipelineState(try pipeline("inkling_attention_f32"))
+            encoder.setComputePipelineState(try pipeline("inkling_attention_split_f32"))
             encoder.setBuffer(workspace.query, offset: 0, index: 0)
             encoder.setBuffer(workspace.stagedKeys, offset: 0, index: 1)
             encoder.setBuffer(workspace.stagedValues, offset: 0, index: 2)
             encoder.setBuffer(relative, offset: 0, index: 3)
             encoder.setBuffer(bank, offset: 0, index: 4)
             encoder.setBuffer(sink, offset: 0, index: 5)
-            encoder.setBuffer(output, offset: 0, index: 6)
+            encoder.setBuffer(workspace.attentionPartials, offset: 0, index: 6)
             for (index, value) in values.enumerated() {
                 encoder.setBuffer(arena.make(value), offset: 0, index: 7 + index)
             }
             // An optional score dump, into the CALLER's workspace buffer: the host
             // captures `scores_head0`, and comparing them is what separates the bias
             // from the softmax from the value fold. It has to outlive this call for
-            // the caller to read it, so it cannot be the arena's.
-            encoder.setBuffer(workspace.scoreDump, offset: 0, index: 16)
-            encoder.setBuffer(arena.make(dumpsScores), offset: 0, index: 17)
+            // the caller to read it, so it cannot be the arena's. Each split writes
+            // its own row range, so head 0's slots are filled exactly once.
+            encoder.setBuffer(workspace.scoreDump, offset: 0, index: 18)
+            encoder.setBuffer(arena.make(dumpsScores), offset: 0, index: 19)
         case .int8:
-            encoder.setComputePipelineState(try pipeline("inkling_attention_int8_f32"))
+            encoder.setComputePipelineState(try pipeline("inkling_attention_split_int8_f32"))
             encoder.setBuffer(workspace.query, offset: 0, index: 0)
             encoder.setBuffer(workspace.stagedKeys, offset: 0, index: 1)
             encoder.setBuffer(workspace.stagedValues, offset: 0, index: 2)
@@ -1539,16 +1600,32 @@ nonisolated public final class Inkling2MetalForward {
             encoder.setBuffer(relative, offset: 0, index: 5)
             encoder.setBuffer(bank, offset: 0, index: 6)
             encoder.setBuffer(sink, offset: 0, index: 7)
-            encoder.setBuffer(output, offset: 0, index: 8)
+            encoder.setBuffer(workspace.attentionPartials, offset: 0, index: 8)
             for (index, value) in values.enumerated() {
                 encoder.setBuffer(arena.make(value), offset: 0, index: 9 + index)
             }
-            encoder.setBuffer(workspace.scoreDump, offset: 0, index: 18)
-            encoder.setBuffer(arena.make(dumpsScores), offset: 0, index: 19)
+            encoder.setBuffer(workspace.scoreDump, offset: 0, index: 20)
+            encoder.setBuffer(arena.make(dumpsScores), offset: 0, index: 21)
         }
+        // A split stages only its own chunk, so this is 1.2 KB at the widest
+        // arm instead of the whole row count -- which is what let the shipped
+        // form's 8,160-row threadgroup-memory ceiling disappear.
         encoder.setThreadgroupMemoryLength(
-            (32 + rows) * MemoryLayout<Float>.stride, index: 0
+            (32 + plan.chunk) * MemoryLayout<Float>.stride, index: 0
         )
+        encoder.dispatchThreadgroups(
+            MTLSize(width: heads * plan.splits, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+        // The combine runs in the same encoder: compute dispatches on one
+        // encoder execute in order, so it reads the splits this encoder just
+        // wrote.
+        encoder.setComputePipelineState(try pipeline("inkling_attention_split_combine_f32"))
+        encoder.setBuffer(workspace.attentionPartials, offset: 0, index: 0)
+        encoder.setBuffer(output, offset: 0, index: 1)
+        encoder.setBuffer(arena.make(UInt32(heads)), offset: 0, index: 2)
+        encoder.setBuffer(arena.make(UInt32(headDim)), offset: 0, index: 3)
+        encoder.setBuffer(arena.make(UInt32(plan.splits)), offset: 0, index: 4)
         encoder.dispatchThreadgroups(
             MTLSize(width: heads, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)

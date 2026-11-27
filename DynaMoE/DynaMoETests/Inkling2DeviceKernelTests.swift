@@ -455,6 +455,263 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         XCTAssertLessThan(position - (windowStart + Int(keyRows) - 1), 0)
     }
 
+    // MARK: What a long visit's attention costs, and what splitting its rows buys
+
+    /// The full-attention visit is the only per-position cost that grows with
+    /// context length: slice 30's cost curve put the eight full visits at
+    /// ~0.75 GFLOP/position at 7,680 rows and named them, not the KV staging
+    /// copy, as the growth term. The shipped kernel gives each visit 24
+    /// threadgroups of 32 lanes -- 768 lanes -- and walks its rows serially, so
+    /// every one of ~8,192 rows pays a warp reduction and three barriers before
+    /// the next row starts.
+    ///
+    /// This case prices that shape at the published geometry and runs the
+    /// shipped split-K pair (`inkling_attention_split_f32` +
+    /// `inkling_attention_split_combine_f32`) over the same rows, so "split the
+    /// rows" gets a number and a parity check instead of an argument. The
+    /// single-threadgroup kernel is the oracle: it is what the split replaced,
+    /// so a disagreement here is a defect in the split and not a tolerance
+    /// question about the model.
+    ///
+    /// No checkpoint is touched. The geometry is the published one (24 query
+    /// heads over 8 KV heads, 128-wide heads, 16 relative taps, a 1,024-row
+    /// bias extent); the data is synthetic and wide-ranging, so a wrong stride
+    /// or a dropped tap cannot cancel. Timing is printed, never asserted: it is
+    /// machine-dependent, while parity and finiteness are not.
+    func testWhatSplittingALongVisitRowsCostsAndWhetherItAgrees() throws {
+        let (device, library, queue) = try environment()
+        let heads = 24, kvHeads = 8, headDim = 128
+        let groups = heads / kvHeads
+        let kvWidth = kvHeads * headDim
+        let dRel = 16, extent = 1_024
+        let shippedPipeline = try XCTUnwrap(
+            try device.makeComputePipelineState(
+                function: XCTUnwrap(library.makeFunction(name: "inkling_attention_f32"))
+            )
+        )
+        // The split is the app's own kernel pair, not a copy: the case measures
+        // what ships against the single-threadgroup kernel it replaced.
+        let splitPipeline = try XCTUnwrap(
+            try device.makeComputePipelineState(
+                function: XCTUnwrap(library.makeFunction(name: "inkling_attention_split_f32"))
+            )
+        )
+        let combinePipeline = try XCTUnwrap(
+            try device.makeComputePipelineState(
+                function: XCTUnwrap(
+                    library.makeFunction(name: "inkling_attention_split_combine_f32")
+                )
+            )
+        )
+
+        let lanes = heads * shippedPipeline.threadExecutionWidth
+        print(
+            "inkling2 attention shape: \(heads) threadgroups x "
+                + "\(shippedPipeline.threadExecutionWidth) lanes = \(lanes) lanes; "
+                + "threadgroup memory \(device.maxThreadgroupMemoryLength) B admits "
+                + "\(device.maxThreadgroupMemoryLength / MemoryLayout<Float>.stride - 32) score rows"
+        )
+
+        func scalars(_ values: [UInt32]) throws -> [MTLBuffer] {
+            try values.map { value in try buffer(device, [value]) }
+        }
+        func gpuMilliseconds(_ commandBuffer: MTLCommandBuffer, cpu: Double) -> Double {
+            let device = commandBuffer.gpuEndTime - commandBuffer.gpuStartTime
+            return device > 0 ? device * 1_000 : cpu
+        }
+
+        // The query, relative vector, bank and sink are the same at every arm;
+        // only the KV rows and the position grow, which is the axis the cost
+        // curve is about.
+        let query = try buffer(device, values(heads * headDim, seed: 21))
+        let relative = try buffer(device, values(heads * dRel, seed: 24))
+        let bank = try buffer(device, values(dRel * extent, seed: 25))
+        let sink = try buffer(device, values(heads, seed: 26))
+        var dumpFlag = false
+        let dumpsScores = try XCTUnwrap(
+            device.makeBuffer(bytes: &dumpFlag, length: MemoryLayout<Bool>.stride,
+                              options: .storageModeShared)
+        )
+
+        /// One arm of the shipped kernel: `rows` KV rows at `position = rows - 1`,
+        /// which puts the newest 1,024 rows inside the bias extent and every
+        /// older row outside it -- the production shape of a full visit.
+        func shipped(
+            rows: Int, keys: MTLBuffer, vals: MTLBuffer, rounds: Int = 5
+        ) throws -> (millis: Double, output: [Float]) {
+            let output = try buffer(device, [Float](repeating: 0, count: heads * headDim))
+            let scoreDump = try buffer(device, [Float](repeating: 0, count: rows))
+            let constants = try scalars([
+                UInt32(heads), UInt32(groups), UInt32(headDim), UInt32(kvWidth), UInt32(rows),
+                UInt32(0), UInt32(rows - 1), UInt32(dRel), UInt32(extent)
+            ])
+            var best = Double.greatestFiniteMagnitude
+            var result: [Float] = []
+            for round in 0..<rounds {
+                let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+                let encoder = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
+                encoder.setComputePipelineState(shippedPipeline)
+                encoder.setThreadgroupMemoryLength(
+                    (32 + rows) * MemoryLayout<Float>.stride, index: 0
+                )
+                encoder.setBuffer(query, offset: 0, index: 0)
+                encoder.setBuffer(keys, offset: 0, index: 1)
+                encoder.setBuffer(vals, offset: 0, index: 2)
+                encoder.setBuffer(relative, offset: 0, index: 3)
+                encoder.setBuffer(bank, offset: 0, index: 4)
+                encoder.setBuffer(sink, offset: 0, index: 5)
+                encoder.setBuffer(output, offset: 0, index: 6)
+                for (index, constant) in constants.enumerated() {
+                    encoder.setBuffer(constant, offset: 0, index: 7 + index)
+                }
+                encoder.setBuffer(scoreDump, offset: 0, index: 16)
+                encoder.setBuffer(dumpsScores, offset: 0, index: 17)
+                encoder.dispatchThreadgroups(
+                    MTLSize(width: heads, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(
+                        width: shippedPipeline.threadExecutionWidth, height: 1, depth: 1
+                    )
+                )
+                encoder.endEncoding()
+                let began = DispatchTime.now().uptimeNanoseconds
+                commandBuffer.commit()
+                commandBuffer.waitUntilCompleted()
+                if let error = commandBuffer.error { throw error }
+                let cpu = Double(DispatchTime.now().uptimeNanoseconds - began) / 1_000_000
+                if round > 0 { best = min(best, gpuMilliseconds(commandBuffer, cpu: cpu)) }
+                result = read(output, heads * headDim)
+            }
+            return (best, result)
+        }
+
+        /// The same rows as `splits` threadgroups per head plus a combine pass.
+        func split(
+            rows: Int, keys: MTLBuffer, vals: MTLBuffer, splits: Int, rounds: Int = 5
+        ) throws -> (millis: Double, output: [Float]) {
+            let chunk = (rows + splits - 1) / splits
+            let output = try buffer(device, [Float](repeating: 0, count: heads * headDim))
+            let stride = headDim + 2
+            let partials = try buffer(
+                device, [Float](repeating: 0, count: splits * heads * stride)
+            )
+            let scoreDump = try buffer(device, [Float](repeating: 0, count: rows))
+            let constants = try scalars([
+                UInt32(heads), UInt32(groups), UInt32(headDim), UInt32(kvWidth), UInt32(rows),
+                UInt32(0), UInt32(rows - 1), UInt32(dRel), UInt32(extent),
+                UInt32(chunk), UInt32(splits)
+            ])
+            let combineConstants = try scalars([UInt32(heads), UInt32(headDim), UInt32(splits)])
+            var best = Double.greatestFiniteMagnitude
+            var result: [Float] = []
+            for round in 0..<rounds {
+                let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+                let encoder = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
+                encoder.setComputePipelineState(splitPipeline)
+                encoder.setBuffer(query, offset: 0, index: 0)
+                encoder.setBuffer(keys, offset: 0, index: 1)
+                encoder.setBuffer(vals, offset: 0, index: 2)
+                encoder.setBuffer(relative, offset: 0, index: 3)
+                encoder.setBuffer(bank, offset: 0, index: 4)
+                encoder.setBuffer(sink, offset: 0, index: 5)
+                encoder.setBuffer(partials, offset: 0, index: 6)
+                for (index, constant) in constants.enumerated() {
+                    encoder.setBuffer(constant, offset: 0, index: 7 + index)
+                }
+                encoder.setBuffer(scoreDump, offset: 0, index: 18)
+                encoder.setBuffer(dumpsScores, offset: 0, index: 19)
+                encoder.setThreadgroupMemoryLength(
+                    (32 + chunk) * MemoryLayout<Float>.stride, index: 0
+                )
+                encoder.dispatchThreadgroups(
+                    MTLSize(width: heads * splits, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(
+                        width: splitPipeline.threadExecutionWidth, height: 1, depth: 1
+                    )
+                )
+                encoder.endEncoding()
+
+                let combiner = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
+                combiner.setComputePipelineState(combinePipeline)
+                combiner.setBuffer(partials, offset: 0, index: 0)
+                combiner.setBuffer(output, offset: 0, index: 1)
+                for (index, constant) in combineConstants.enumerated() {
+                    combiner.setBuffer(constant, offset: 0, index: 2 + index)
+                }
+                combiner.dispatchThreadgroups(
+                    MTLSize(width: heads, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(
+                        width: combinePipeline.threadExecutionWidth, height: 1, depth: 1
+                    )
+                )
+                combiner.endEncoding()
+
+                let began = DispatchTime.now().uptimeNanoseconds
+                commandBuffer.commit()
+                commandBuffer.waitUntilCompleted()
+                if let error = commandBuffer.error { throw error }
+                let cpu = Double(DispatchTime.now().uptimeNanoseconds - began) / 1_000_000
+                if round > 0 { best = min(best, gpuMilliseconds(commandBuffer, cpu: cpu)) }
+                result = read(output, heads * headDim)
+            }
+            return (best, result)
+        }
+
+        func disagreement(_ left: [Float], _ right: [Float]) -> (abs: Float, relative: Float) {
+            var worstAbs: Float = 0
+            var scale: Float = 0
+            for index in 0..<left.count {
+                worstAbs = max(worstAbs, abs(left[index] - right[index]))
+                scale = max(scale, abs(left[index]))
+            }
+            return (worstAbs, scale > 0 ? worstAbs / scale : worstAbs)
+        }
+
+        // The published row counts: the window, a mid length, and the log-scale
+        // floor -- the last is the arm slice 30's cost curve is about. The KV
+        // rows are built once per arm and both kernels read the same buffers,
+        // so the comparison is the shape and not the data.
+        for rows in [1_024, 4_096, 8_192] {
+            let keys = try buffer(device, values(rows * kvWidth, seed: 22))
+            let vals = try buffer(device, values(rows * kvWidth, seed: 23))
+            let baseline = try shipped(rows: rows, keys: keys, vals: vals)
+            for value in baseline.output {
+                XCTAssertTrue(value.isFinite, "\(rows) rows: shipped output must be finite")
+            }
+            let useful = Double(rows * heads * 4 * headDim) / 1e9   // dot + fold, both 2*headDim
+            print(
+                String(
+                    format: "inkling2 attention shipped: %5d rows  %8.3f ms  %6.2f GFLOP/s",
+                    rows, baseline.millis, useful / (baseline.millis / 1_000)
+                )
+            )
+            for splits in [1, 4, 8, 16, 32, 64, 128] {
+                let candidate = try split(rows: rows, keys: keys, vals: vals, splits: splits)
+                for value in candidate.output {
+                    XCTAssertTrue(value.isFinite, "\(rows)/\(splits): split output must be finite")
+                }
+                let delta = disagreement(baseline.output, candidate.output)
+                print(
+                    String(
+                        format: "inkling2 attention split:   %5d rows  %8.3f ms  %5.2fx  "
+                            + "%6.2f GFLOP/s  splits %2d (chunk %4d)  |diff| %.2e rel %.2e",
+                        rows, candidate.millis, baseline.millis / candidate.millis,
+                        useful / (candidate.millis / 1_000), splits,
+                        (rows + splits - 1) / splits, delta.abs, delta.relative
+                    )
+                )
+                // Parity is the assertion: the combination is the shipped
+                // expression associated differently, so the bar is the measured
+                // reassociation, not bit equality.
+                XCTAssertLessThan(
+                    delta.abs, 1e-4, "\(rows) rows, \(splits) splits: \(delta.abs) absolute"
+                )
+                XCTAssertLessThan(
+                    delta.relative, 1e-5, "\(rows) rows, \(splits) splits: \(delta.relative) relative"
+                )
+            }
+        }
+    }
+
     // MARK: Experts
 
     /// The block-scaled expert row against `Inkling2PackedExpertMatrix.project`,
@@ -3869,7 +4126,7 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         /// the ring's shape and the staging counts at the boundary.
         func walk(_ storage: Inkling2KVStorage) throws -> (
             samples: [(position: Int, logits: [Float])], ringRows: Int, ringStart: Int,
-            fullRows: Int, windowedStaged: Int, fullStaged: Int
+            fullRows: Int, windowedStaged: Int, fullStaged: Int, seconds: Double
         ) {
             let forward = try Inkling2CPUForward(
                 config: config, weights: source,
@@ -3908,10 +4165,14 @@ final class Inkling2DeviceKernelTests: XCTestCase {
             // the first one that dropped a row, and two more past it.
             let sampled = [window - 1, window, window + 3, positions - 1]
             var samples: [(position: Int, logits: [Float])] = []
+            // The walk's own wall, so the attention's share can be compared
+            // across a change to the attention path without a second instrument.
+            let began = DispatchTime.now().uptimeNanoseconds
             for (position, id) in ids.enumerated() {
                 let logits = try forward.forwardToken(token: UInt32(id), position: position)
                 if sampled.contains(position) { samples.append((position, logits)) }
             }
+            let seconds = Double(DispatchTime.now().uptimeNanoseconds - began) / 1e9
             XCTAssertEqual(samples.count, sampled.count)
             XCTAssertFalse(samples.first?.logits.isEmpty ?? true)
 
@@ -3956,7 +4217,7 @@ final class Inkling2DeviceKernelTests: XCTestCase {
             return (
                 samples,
                 windowed.rowCount, windowed.windowStart,
-                full.rowCount, windowedStaged, fullStaged
+                full.rowCount, windowedStaged, fullStaged, seconds
             )
         }
 
@@ -3971,6 +4232,12 @@ final class Inkling2DeviceKernelTests: XCTestCase {
                 + "\(exact.ringStart), a full visit holds \(exact.fullRows); the staging copy is "
                 + "\(exact.windowedStaged) rows for the ring and \(exact.fullStaged) for the full visit"
         )
+        print(String(
+            format: "\u{1F50E} [inkling2 rollover] %d positions: FP32 %.1f s (%.1f ms/position), "
+                + "INT8 %.1f s (%.1f ms/position)",
+            positions, exact.seconds, exact.seconds * 1_000 / Double(positions),
+            compact.seconds, compact.seconds * 1_000 / Double(positions)
+        ))
 
         func compare(_ label: String, _ exactRow: [Float], _ compactRow: [Float]) {
             XCTAssertEqual(exactRow.count, compactRow.count)
@@ -4302,6 +4569,220 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         XCTAssertTrue(
             flips.isEmpty,
             "the INT8 cache changes the greedy token at positions \(flips)"
+        )
+    }
+
+    // MARK: Where a past-the-window position spends its time
+
+    /// `testAWalkPastTheWindowRollsTheRingAndKeepsEveryRowInOrder` measures the
+    /// position's TOTAL, and slice 32's split attention cut the long-row
+    /// attention kernel 13.5x at this row count while that total did not move
+    /// (754 ms per position against the recorded 720). A kernel six times
+    /// faster whose effect is invisible says the position is not paid at the
+    /// attention kernel -- so this case splits the position instead of arguing
+    /// about it.
+    ///
+    /// Two measurements at the same walk, no checkpoint math beyond loading the
+    /// graphs: the executor's own stage profile over the last 24 positions, and
+    /// one windowed visit's attention timed in place, through the shipped
+    /// `attention(_:)` call and through the single-threadgroup kernel it
+    /// replaced, on the visit's own staged rows. Everything else the walk
+    /// asserts is inherited from the rollover case.
+    ///
+    /// Opt-in: one FP32 walk of 1,032 positions, ~13 minutes.
+    /// `touch /tmp/dynamoe_inkling2_rollover_profile` to run it.
+    func testWhereAPastTheWindowPositionSpendsItsTime() throws {
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_rollover_profile"),
+            "opt-in: touch /tmp/dynamoe_inkling2_rollover_profile (one profiled walk)"
+        )
+        let snapshot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(Inkling2PublishedTensorTests.snapshotRelativePath)
+        guard FileManager.default.fileExists(atPath: snapshot.path) else {
+            throw XCTSkip("Inkling 2 snapshot is not downloaded at \(snapshot.path)")
+        }
+        let (device, library, queue) = try environment()
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let rawSummary = try engine.getSummary()
+        let summary = try inkling2MetalReadySummary(rawSummary)
+        let config = try Inkling2Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let catalog = Inkling2WeightCatalog(
+            mainFile: summary.tensors.map { Inkling2TensorRef(metadata: $0) },
+            layerCount: config.numHiddenLayers
+        )
+        let shardBuffers = try inkling2MetalShardBuffers(summary, device: device)
+        let source = Inkling2SnapshotWeights(
+            config: config, catalog: catalog, shardBuffers: shardBuffers
+        )
+        let deviceWeights = Inkling2DeviceWeights(
+            config: config, catalog: catalog, shardBuffers: shardBuffers,
+            fileOrigins: InferenceEngine.shardFileOrigins(original: rawSummary, segmented: summary)
+        )
+        let tokenizer = try DynaMoeTokenizer(
+            tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+        )
+        let seed = try tokenizer.encode(
+            text: "The quick brown fox jumps over the lazy dog, and the dog does not mind it at all."
+        ).map { Int($0) }
+
+        let window = config.slidingWindowSize
+        XCTAssertEqual(window, 1_024)
+        let positions = window + 8
+        let ids = (0..<positions).map { seed[$0 % seed.count] }
+
+        let forward = try Inkling2CPUForward(
+            config: config, weights: source,
+            options: Inkling2ForwardOptions(maxPositions: positions, kvStorage: .float32)
+        )
+        let executor = try Inkling2MetalForward(
+            device: device, library: library, queue: queue,
+            weights: deviceWeights, host: forward
+        )
+        let workspace = try Inkling2DeviceWorkspace(
+            device: device, config: config, stagedPositions: positions, storage: .float32
+        )
+        defer {
+            forward.visitRunner = nil
+            forward.headRunner = nil
+            executor.removeExpertArena()
+        }
+        let arenaLine = try inkling2InstallExpertArenas(
+            executor: executor, weights: deviceWeights, summary: summary,
+            snapshot: snapshot, config: config, catalog: catalog,
+            positions: positions, kvElementBytes: Inkling2KVStorage.float32.bytesPerElement
+        )
+        XCTAssertFalse(arenaLine.contains("no arena"), arenaLine)
+
+        // The profile is billed only for the last 24 positions: the per-visit
+        // dictionary work would otherwise ride 1,032 positions of a run whose
+        // point is what the position costs.
+        let profiledFrom = positions - 24
+        forward.visitRunner = { layer, pass, hidden, blockStates, messages, position in
+            executor.recordsVisitTiming = position >= profiledFrom
+            return try executor.runVisit(
+                layer: layer, pass: pass, hidden: hidden, blockStates: &blockStates,
+                messages: messages, position: position, workspace: workspace
+            )
+        }
+        forward.headRunner = { hidden in
+            try executor.headLogits(hidden: hidden, workspace: workspace)
+        }
+
+        let began = DispatchTime.now().uptimeNanoseconds
+        for (position, id) in ids.enumerated() {
+            _ = try forward.forwardToken(token: UInt32(id), position: position)
+        }
+        let seconds = Double(DispatchTime.now().uptimeNanoseconds - began) / 1e9
+        executor.recordsVisitTiming = false
+        print(
+            String(
+                format: "\u{1F50E} [inkling2 where] %d positions in %.1f s = %.1f ms/position "
+                    + "(profile on for the last %d)",
+                positions, seconds, seconds * 1_000 / Double(positions), positions - profiledFrom
+            )
+        )
+        print("\u{1F50E} [inkling2 where] " + executor.visitProfile.describe(label: "past the window"))
+
+        // Every visit's attention, timed in place on its own staged rows, in
+        // both forms. Per POSITION, because that is the unit the walk's total is
+        // in: the stage profile above says what share the attention kernel could
+        // possibly be, and this says it in milliseconds the walk can be read
+        // against.
+        let position = positions - 1
+        func best(_ rounds: Int = 3, _ encode: (MTLComputeCommandEncoder) throws -> Void) throws -> Double {
+            var best = Double.greatestFiniteMagnitude
+            for round in 0..<rounds {
+                let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+                let encoder = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
+                try encode(encoder)
+                encoder.endEncoding()
+                let start = DispatchTime.now().uptimeNanoseconds
+                commandBuffer.commit()
+                commandBuffer.waitUntilCompleted()
+                if let error = commandBuffer.error { throw error }
+                let cpu = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+                let gpu = (commandBuffer.gpuEndTime - commandBuffer.gpuStartTime) * 1_000
+                if round > 0 { best = min(best, gpu > 0 ? gpu : cpu) }
+            }
+            return best
+        }
+        let singlePipeline = try XCTUnwrap(
+            try device.makeComputePipelineState(
+                function: XCTUnwrap(library.makeFunction(name: "inkling_attention_f32"))
+            )
+        )
+        var splitPosition = 0.0
+        var singlePosition = 0.0
+        var windowedRows = 0
+        for visit in forward.sequence.visits {
+            let rows = try workspace.stage(visit)
+            let isFull = visit.isFullAttention
+            if !isFull { windowedRows = rows }
+            let heads = isFull ? config.numAttentionHeads : config.swaNumAttentionHeads
+            let kvHeads = isFull ? config.numKeyValueHeads : config.swaNumKeyValueHeads
+            let headDim = isFull ? config.headDim : config.swaHeadDim
+            let extent = isFull ? config.relExtent : config.slidingWindowSize
+            splitPosition += try best { encoder in
+                let arena = Inkling2ScalarArena(device: device)
+                defer { arena.clear() }
+                try executor.attention(
+                    encoder: encoder, workspace: workspace, state: visit, rows: rows,
+                    position: position, relative: workspace.relativeStates, bank: workspace.bank,
+                    sink: workspace.sinkLogits, output: workspace.attentionOutput, arena: arena
+                )
+            }
+            singlePosition += try best { encoder in
+                let arena = Inkling2ScalarArena(device: device)
+                defer { arena.clear() }
+                encoder.setComputePipelineState(singlePipeline)
+                encoder.setBuffer(workspace.query, offset: 0, index: 0)
+                encoder.setBuffer(workspace.stagedKeys, offset: 0, index: 1)
+                encoder.setBuffer(workspace.stagedValues, offset: 0, index: 2)
+                encoder.setBuffer(workspace.relativeStates, offset: 0, index: 3)
+                encoder.setBuffer(workspace.bank, offset: 0, index: 4)
+                encoder.setBuffer(workspace.sinkLogits, offset: 0, index: 5)
+                encoder.setBuffer(workspace.attentionOutput, offset: 0, index: 6)
+                let scalars: [UInt32] = [
+                    UInt32(heads), UInt32(heads / kvHeads), UInt32(headDim),
+                    UInt32(kvHeads * headDim), UInt32(rows), UInt32(visit.windowStart),
+                    UInt32(position), UInt32(config.dRel), UInt32(extent)
+                ]
+                for (index, value) in scalars.enumerated() {
+                    encoder.setBuffer(arena.make(value), offset: 0, index: 7 + index)
+                }
+                encoder.setBuffer(workspace.scoreDump, offset: 0, index: 16)
+                encoder.setBuffer(arena.make(false), offset: 0, index: 17)
+                encoder.setThreadgroupMemoryLength(
+                    (32 + rows) * MemoryLayout<Float>.stride, index: 0
+                )
+                encoder.dispatchThreadgroups(
+                    MTLSize(width: heads, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+                )
+            }
+        }
+        print(String(
+            format: "\u{1F50E} [inkling2 where] all %d visits' attention at %d windowed rows: "
+                + "split %.1f ms/position (%.2f ms/visit), single-threadgroup %.1f ms/position "
+                + "(%.2f ms/visit), %.2fx",
+            forward.sequence.visits.count, windowedRows, splitPosition,
+            splitPosition / Double(forward.sequence.visits.count), singlePosition,
+            singlePosition / Double(forward.sequence.visits.count),
+            singlePosition / splitPosition
+        ))
+        XCTAssertLessThan(
+            splitPosition, singlePosition,
+            "the split must be the faster form at this row count"
+        )
+        // The share the profile can see: the attention kernel is one piece of
+        // `attentionTail`, so a visit's tail must be at least it.
+        let tail = executor.visitProfile.timing(.attentionTail).wallNanoseconds
+        XCTAssertGreaterThan(
+            Double(tail) / Double(max(1, executor.visitProfile.visits)) / 1_000_000,
+            splitPosition / Double(forward.sequence.visits.count) / 2,
+            "the profile's attention tail must be at least the attention kernel it bills"
         )
     }
 

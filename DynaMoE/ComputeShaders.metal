@@ -14096,6 +14096,269 @@ kernel void inkling_attention_int8_f32(
     }
 }
 
+// `inkling_attention_f32` with its row loop SPLIT across threadgroups.
+//
+// One threadgroup per (head, split) pair over `chunk` consecutive rows writes
+// that split's local max, local denominator and unnormalized value fold into
+// `partials`; `inkling_attention_split_combine_f32` rescales the splits by
+// their own max and produces the vector the single-threadgroup kernel would
+// have produced. The arithmetic inside a split is the shipped kernel's own,
+// which is why the two agree to ~1e-5 relative rather than bit for bit: only
+// the softmax's association across splits differs.
+//
+// Why it exists (Inkling 2 slice 31, measured): the shipped kernel is one
+// 32-lane threadgroup per head with a serial row loop -- 24 threadgroups, 768
+// lanes, a warp reduction and three barriers per row. Over the same rows and
+// the same math, splitting measured 13.6x at 1,024 rows, 12.9x at 8,192 at 16
+// splits and 24x at 8,192 at 32, with a ONE-SPLIT control at 1.00x, so the
+// speedup is the split itself. It also removes the shipped form's staging
+// ceiling: that kernel stages every score in threadgroup memory, so 32,768 B
+// of it admits only 8,160 rows, while a split stages its chunk.
+//
+// `partials` is laid out [split][head][headDim + 2]: max, denominator, fold.
+// Every (head, split) the caller dispatches has at least one row, so every slot
+// is written; the combine still tolerates a -inf max by writing zeros.
+kernel void inkling_attention_split_f32(
+    device const float* query [[buffer(0)]],
+    device const float* keys [[buffer(1)]],
+    device const float* values [[buffer(2)]],
+    device const float* relative [[buffer(3)]],
+    device const float* bank [[buffer(4)]],
+    device const float* sinkLogits [[buffer(5)]],
+    device float* partials [[buffer(6)]],
+    constant uint32_t& heads [[buffer(7)]],
+    constant uint32_t& groups [[buffer(8)]],
+    constant uint32_t& headDim [[buffer(9)]],
+    constant uint32_t& kvWidth [[buffer(10)]],
+    constant uint32_t& keyRows [[buffer(11)]],
+    constant uint32_t& windowStart [[buffer(12)]],
+    constant uint32_t& position [[buffer(13)]],
+    constant uint32_t& dRel [[buffer(14)]],
+    constant uint32_t& extent [[buffer(15)]],
+    constant uint32_t& chunk [[buffer(16)]],
+    constant uint32_t& splits [[buffer(17)]],
+    device float* scoreDump [[buffer(18)]],
+    constant bool& dumpsScores [[buffer(19)]],
+    threadgroup float* shared [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgSize [[threads_per_threadgroup]],
+    uint group [[threadgroup_position_in_grid]]
+) {
+    // Metal wants every thread-position attribute scalar or the same vector
+    // width, so the (head, split) grid is flattened with the head fastest.
+    uint head = group % heads;
+    uint split = group / heads;
+    if (head >= heads || split >= splits) { return; }
+    uint firstRow = split * chunk;
+    if (firstRow >= keyRows) { return; }
+    uint lastRow = min(firstRow + chunk, keyRows);
+    uint kvHead = head / groups;
+    device const float* q = query + ((uint64_t)head * headDim);
+    device const float* rel = relative + ((uint64_t)head * dRel);
+    device float* mine = partials + ((uint64_t)split * heads + head) * (headDim + 2);
+    float scaling = rsqrt((float)headDim);
+    threadgroup float* scores = shared + 32;
+
+    // The sink joins split 0's max and denominator so it enters the softmax
+    // exactly once, which is the single-threadgroup kernel's `maximum`.
+    float localMax = split == 0 ? sinkLogits[head] : -INFINITY;
+    for (uint row = firstRow; row < lastRow; row++) {
+        device const float* key = keys + ((uint64_t)row * kvWidth) + ((uint64_t)kvHead * headDim);
+        float localDot = 0.0f;
+        for (uint d = tid; d < headDim; d += tgSize) { localDot += q[d] * key[d]; }
+        float dot = threadgroup_reduce_sum(localDot, shared, tid, tgSize);
+        int distance = (int)position - (int)(windowStart + row);
+        float bias = 0.0f;
+        if (distance >= 0 && distance < (int)extent) {
+            for (uint r = 0; r < dRel; r++) { bias += rel[r] * bank[r * extent + (uint)distance]; }
+        }
+        float score = dot * scaling + bias;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) { scores[row - firstRow] = score; }
+        // The dump stays head 0 only and now covers head 0's rows across every
+        // split, i.e. the same slots the single-threadgroup kernel fills.
+        if (dumpsScores && head == 0 && tid == 0) { scoreDump[row] = score; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        localMax = max(localMax, score);
+    }
+
+    float denominator = split == 0 ? exp(sinkLogits[head] - localMax) : 0.0f;
+    for (uint row = firstRow; row < lastRow; row++) {
+        denominator += exp(scores[row - firstRow] - localMax);
+    }
+
+    uint64_t column = (uint64_t)kvHead * headDim;
+    for (uint d = tid; d < headDim; d += tgSize) {
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        uint row = firstRow;
+        for (; row + 4 <= lastRow; row += 4) {
+            a0 += exp(scores[row - firstRow] - localMax)
+                * values[(uint64_t)row * kvWidth + column + d];
+            a1 += exp(scores[row + 1 - firstRow] - localMax)
+                * values[(uint64_t)(row + 1) * kvWidth + column + d];
+            a2 += exp(scores[row + 2 - firstRow] - localMax)
+                * values[(uint64_t)(row + 2) * kvWidth + column + d];
+            a3 += exp(scores[row + 3 - firstRow] - localMax)
+                * values[(uint64_t)(row + 3) * kvWidth + column + d];
+        }
+        for (; row < lastRow; row++) {
+            a0 += exp(scores[row - firstRow] - localMax)
+                * values[(uint64_t)row * kvWidth + column + d];
+        }
+        mine[2 + d] = (a0 + a1) + (a2 + a3);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        mine[0] = localMax;
+        mine[1] = denominator;
+    }
+}
+
+// `inkling_attention_split_f32` over the INT8 cache: the same split, the same
+// sink placement and the same four-chain fold, with each row read as a signed
+// byte times its per-(row, KV head) scale -- the storage form's only difference
+// from the FP32 twin, exactly as `inkling_attention_int8_f32` is to
+// `inkling_attention_f32`.
+kernel void inkling_attention_split_int8_f32(
+    device const float* query [[buffer(0)]],
+    device const char* keys [[buffer(1)]],
+    device const char* values [[buffer(2)]],
+    device const half* keyScales [[buffer(3)]],
+    device const half* valueScales [[buffer(4)]],
+    device const float* relative [[buffer(5)]],
+    device const float* bank [[buffer(6)]],
+    device const float* sinkLogits [[buffer(7)]],
+    device float* partials [[buffer(8)]],
+    constant uint32_t& heads [[buffer(9)]],
+    constant uint32_t& groups [[buffer(10)]],
+    constant uint32_t& headDim [[buffer(11)]],
+    constant uint32_t& kvWidth [[buffer(12)]],
+    constant uint32_t& keyRows [[buffer(13)]],
+    constant uint32_t& windowStart [[buffer(14)]],
+    constant uint32_t& position [[buffer(15)]],
+    constant uint32_t& dRel [[buffer(16)]],
+    constant uint32_t& extent [[buffer(17)]],
+    constant uint32_t& chunk [[buffer(18)]],
+    constant uint32_t& splits [[buffer(19)]],
+    device float* scoreDump [[buffer(20)]],
+    constant bool& dumpsScores [[buffer(21)]],
+    threadgroup float* shared [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgSize [[threads_per_threadgroup]],
+    uint group [[threadgroup_position_in_grid]]
+) {
+    uint head = group % heads;
+    uint split = group / heads;
+    if (head >= heads || split >= splits || groups == 0) { return; }
+    uint firstRow = split * chunk;
+    if (firstRow >= keyRows) { return; }
+    uint lastRow = min(firstRow + chunk, keyRows);
+    uint kvHeads = heads / groups;
+    uint kvHead = head / groups;
+    device const float* q = query + ((uint64_t)head * headDim);
+    device const float* rel = relative + ((uint64_t)head * dRel);
+    device float* mine = partials + ((uint64_t)split * heads + head) * (headDim + 2);
+    float scaling = rsqrt((float)headDim);
+    threadgroup float* scores = shared + 32;
+
+    float localMax = split == 0 ? sinkLogits[head] : -INFINITY;
+    for (uint row = firstRow; row < lastRow; row++) {
+        uint keyBase = (uint64_t)row * kvWidth + (uint64_t)kvHead * headDim;
+        float currentScale = float(keyScales[(uint64_t)row * kvHeads + kvHead]);
+        float localDot = 0.0f;
+        for (uint d = tid; d < headDim; d += tgSize) {
+            localDot += q[d] * (float(keys[keyBase + d]) * currentScale);
+        }
+        float dot = threadgroup_reduce_sum(localDot, shared, tid, tgSize);
+        int distance = (int)position - (int)(windowStart + row);
+        float bias = 0.0f;
+        if (distance >= 0 && distance < (int)extent) {
+            for (uint r = 0; r < dRel; r++) { bias += rel[r] * bank[r * extent + (uint)distance]; }
+        }
+        float score = dot * scaling + bias;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) { scores[row - firstRow] = score; }
+        if (dumpsScores && head == 0 && tid == 0) { scoreDump[row] = score; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        localMax = max(localMax, score);
+    }
+
+    float denominator = split == 0 ? exp(sinkLogits[head] - localMax) : 0.0f;
+    for (uint row = firstRow; row < lastRow; row++) {
+        denominator += exp(scores[row - firstRow] - localMax);
+    }
+
+    uint64_t column = (uint64_t)kvHead * headDim;
+    for (uint d = tid; d < headDim; d += tgSize) {
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        uint row = firstRow;
+        for (; row + 4 <= lastRow; row += 4) {
+            float w0 = exp(scores[row - firstRow] - localMax)
+                * float(valueScales[(uint64_t)row * kvHeads + kvHead]);
+            float w1 = exp(scores[row + 1 - firstRow] - localMax)
+                * float(valueScales[(uint64_t)(row + 1) * kvHeads + kvHead]);
+            float w2 = exp(scores[row + 2 - firstRow] - localMax)
+                * float(valueScales[(uint64_t)(row + 2) * kvHeads + kvHead]);
+            float w3 = exp(scores[row + 3 - firstRow] - localMax)
+                * float(valueScales[(uint64_t)(row + 3) * kvHeads + kvHead]);
+            a0 += w0 * float(values[(uint64_t)row * kvWidth + column + d]);
+            a1 += w1 * float(values[(uint64_t)(row + 1) * kvWidth + column + d]);
+            a2 += w2 * float(values[(uint64_t)(row + 2) * kvWidth + column + d]);
+            a3 += w3 * float(values[(uint64_t)(row + 3) * kvWidth + column + d]);
+        }
+        for (; row < lastRow; row++) {
+            float weight = exp(scores[row - firstRow] - localMax)
+                * float(valueScales[(uint64_t)row * kvHeads + kvHead]);
+            a0 += weight * float(values[(uint64_t)row * kvWidth + column + d]);
+        }
+        mine[2 + d] = (a0 + a1) + (a2 + a3);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        mine[0] = localMax;
+        mine[1] = denominator;
+    }
+}
+
+// The splits of one head, rescaled by the largest local max and divided by the
+// rescaled denominator. The sink is already inside split 0's denominator, so
+// nothing is added here.
+kernel void inkling_attention_split_combine_f32(
+    device const float* partials [[buffer(0)]],
+    device float* outVector [[buffer(1)]],
+    constant uint32_t& heads [[buffer(2)]],
+    constant uint32_t& headDim [[buffer(3)]],
+    constant uint32_t& splits [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgSize [[threads_per_threadgroup]],
+    uint head [[threadgroup_position_in_grid]]
+) {
+    if (head >= heads) { return; }
+    uint stride = headDim + 2;
+    float maximum = -INFINITY;
+    for (uint split = 0; split < splits; split++) {
+        maximum = max(maximum, partials[((uint64_t)split * heads + head) * stride]);
+    }
+    device float* out = outVector + ((uint64_t)head * headDim);
+    if (!isfinite(maximum)) {
+        for (uint d = tid; d < headDim; d += tgSize) { out[d] = 0.0f; }
+        return;
+    }
+    float denominator = 0.0f;
+    for (uint split = 0; split < splits; split++) {
+        device const float* mine = partials + ((uint64_t)split * heads + head) * stride;
+        denominator += exp(mine[0] - maximum) * mine[1];
+    }
+    for (uint d = tid; d < headDim; d += tgSize) {
+        float numerator = 0.0f;
+        for (uint split = 0; split < splits; split++) {
+            device const float* mine = partials + ((uint64_t)split * heads + head) * stride;
+            numerator += exp(mine[0] - maximum) * mine[2 + d];
+        }
+        out[d] = numerator / denominator;
+    }
+}
+
 // E2M1 (FP4) decode of one nibble, and BF16 rounding, both matching
 // Inkling2Element.decodeE2M1 / roundToBF16 exactly -- the host rule the expert
 // kernel is checked against rounds each dequantized product to BF16 before it
