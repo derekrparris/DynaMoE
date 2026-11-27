@@ -4019,6 +4019,292 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         )
     }
 
+    // MARK: Where the INT8 width comes from
+
+    /// Slice 28 recorded a step in the INT8-versus-FP32 logit width between
+    /// 1,025 and 1,028 positions and refused to fit a ceiling to four points.
+    /// This walks the same prompt once more and reads EVERY position across
+    /// the boundary (1,012 through 1,032, so the regime before the ring is
+    /// full is in the same table), and puts the three quantities that could
+    /// move together side by side:
+    ///
+    ///   * the width, absolutely and relative to the FP32 row's own standard
+    ///     deviation, range and top-1-over-top-2 margin -- a CONSTANT relative
+    ///     width means the cache's error is a fixed fraction of whatever the
+    ///     row is doing, which is exactly what a per-token scale implies;
+    ///   * the FP32 row's own sharpness (std, range, margin), which moves if
+    ///     the model's distribution sharpens;
+    ///   * the KV rows' magnitude (per-head max abs over the newest row of
+    ///     every visit, split by kind), which is the quantity that SETS the
+    ///     INT8 step: `scale = max(abs(x)) / 127` per token per head.
+    ///
+    /// The distinction this is built to settle: if the absolute width steps
+    /// while `/std`, `/range` and `/margin` stay flat and the KV magnitude
+    /// steps, the cache is faithful and the model's state simply got bigger
+    /// -- a measurement of the model, not a cache bug. If a relative column
+    /// steps too, the cache itself changed behaviour at that position.
+    ///
+    /// Asserted: every logit finite, the ring's shape at the boundary, and
+    /// greedy agreement at every sampled position. The table is printed and
+    /// no ceiling is asserted, because the open question is what the width is
+    /// a function of.
+    ///
+    /// Opt-in: two device walks of 1,032 positions (~25 min).
+    /// `touch /tmp/dynamoe_inkling2_widthstep` to run it.
+    func testWhichPositionTheInt8WidthStepsAtAndWhatMovesWithIt() throws {
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_widthstep"),
+            "opt-in: touch /tmp/dynamoe_inkling2_widthstep (two device walks, ~25 min)"
+        )
+        let snapshot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(Inkling2PublishedTensorTests.snapshotRelativePath)
+        guard FileManager.default.fileExists(atPath: snapshot.path) else {
+            throw XCTSkip("Inkling 2 snapshot is not downloaded at \(snapshot.path)")
+        }
+        let (device, library, queue) = try environment()
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let rawSummary = try engine.getSummary()
+        let summary = try inkling2MetalReadySummary(rawSummary)
+        let config = try Inkling2Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let catalog = Inkling2WeightCatalog(
+            mainFile: summary.tensors.map { Inkling2TensorRef(metadata: $0) },
+            layerCount: config.numHiddenLayers
+        )
+        let shardBuffers = try inkling2MetalShardBuffers(summary, device: device)
+        let source = Inkling2SnapshotWeights(
+            config: config, catalog: catalog, shardBuffers: shardBuffers
+        )
+        let deviceWeights = Inkling2DeviceWeights(
+            config: config, catalog: catalog, shardBuffers: shardBuffers,
+            fileOrigins: InferenceEngine.shardFileOrigins(original: rawSummary, segmented: summary)
+        )
+        let tokenizer = try DynaMoeTokenizer(
+            tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+        )
+        let seed = try tokenizer.encode(
+            text: "The quick brown fox jumps over the lazy dog, and the dog does not mind it at all."
+        ).map { Int($0) }
+        XCTAssertFalse(seed.isEmpty)
+
+        let window = config.slidingWindowSize
+        XCTAssertEqual(window, 1_024)
+        let positions = window + 8
+        // The same prompt slice 28 walked, so the two tables are comparable.
+        let ids = (0..<positions).map { seed[$0 % seed.count] }
+
+        /// Twenty positions: eight before the ring is full, the last one that
+        /// is not, and every position past the rollover. A step is only a step
+        /// if the positions on either side of it are on a line.
+        let sampled = Array((window - 12)..<positions)
+        XCTAssertEqual(sampled.count, 20)
+        XCTAssertEqual(sampled.first, 1_012)
+        XCTAssertEqual(sampled.last, 1_031)
+        let isSampled = Set(sampled)
+
+        /// Per-head max abs of a visit's newest row. In FP32 storage that is
+        /// the row itself; in INT8 it is reconstructed from the stored scale
+        /// (`round(FP16(maxAbs)) * 127`), so the two arms report the SAME
+        /// quantity and the number is also the step size the quantizer used.
+        func headMaxima(_ visit: Inkling2VisitState) -> [Float] {
+            let row = visit.rowCount - 1
+            guard row >= 0 else { return [] }
+            if let quantized = visit.quantizedKey(row) {
+                return quantized.scales.map { Float(Float16(bitPattern: $0)) * 127 }
+            }
+            guard let keys = visit.keys.last else { return [] }
+            let width = visit.headWidth
+            var maxima: [Float] = []
+            maxima.reserveCapacity(visit.heads)
+            for head in 0..<visit.heads {
+                let range = (head * width)..<min(keys.count, (head + 1) * width)
+                maxima.append(range.reduce(0) { Swift.max($0, abs(keys[$1])) })
+            }
+            return maxima
+        }
+
+        func magnitudes(_ visits: [Inkling2VisitState]) -> (mean: Float, worst: Float) {
+            var sum: Float = 0
+            var count = 0
+            var worst: Float = 0
+            for visit in visits {
+                for value in headMaxima(visit) {
+                    sum += value
+                    count += 1
+                    worst = Swift.max(worst, value)
+                }
+            }
+            return (count > 0 ? sum / Float(count) : 0, worst)
+        }
+
+        struct Sample {
+            let position: Int
+            let logits: [Float]
+            let ringRows: Int
+            let ringStart: Int
+            let fullRows: Int
+            let windowedMagnitude: (mean: Float, worst: Float)
+            let fullMagnitude: (mean: Float, worst: Float)
+        }
+
+        func walk(_ storage: Inkling2KVStorage) throws -> [Sample] {
+            let forward = try Inkling2CPUForward(
+                config: config, weights: source,
+                options: Inkling2ForwardOptions(maxPositions: positions, kvStorage: storage)
+            )
+            let executor = try Inkling2MetalForward(
+                device: device, library: library, queue: queue,
+                weights: deviceWeights, host: forward
+            )
+            let workspace = try Inkling2DeviceWorkspace(
+                device: device, config: config, stagedPositions: positions, storage: storage
+            )
+            defer {
+                forward.visitRunner = nil
+                forward.headRunner = nil
+                executor.removeExpertArena()
+            }
+            let arenaLine = try inkling2InstallExpertArenas(
+                executor: executor, weights: deviceWeights, summary: summary,
+                snapshot: snapshot, config: config, catalog: catalog,
+                positions: positions, kvElementBytes: storage.bytesPerElement
+            )
+            XCTAssertFalse(arenaLine.contains("no arena"), arenaLine)
+            forward.visitRunner = { layer, pass, hidden, blockStates, messages, position in
+                try executor.runVisit(
+                    layer: layer, pass: pass, hidden: hidden, blockStates: &blockStates,
+                    messages: messages, position: position, workspace: workspace
+                )
+            }
+            forward.headRunner = { hidden in
+                try executor.headLogits(hidden: hidden, workspace: workspace)
+            }
+
+            var samples: [Sample] = []
+            for (position, id) in ids.enumerated() {
+                let logits = try forward.forwardToken(token: UInt32(id), position: position)
+                guard isSampled.contains(position) else { continue }
+                let visits = forward.sequence.visits
+                let ring = visits.first { !$0.isFullAttention }
+                let full = visits.first { $0.isFullAttention }
+                samples.append(
+                    Sample(
+                        position: position, logits: logits,
+                        ringRows: ring?.rowCount ?? -1, ringStart: ring?.windowStart ?? -1,
+                        fullRows: full?.rowCount ?? -1,
+                        windowedMagnitude: magnitudes(visits.filter { !$0.isFullAttention }),
+                        fullMagnitude: magnitudes(visits.filter { $0.isFullAttention })
+                    )
+                )
+            }
+            XCTAssertEqual(samples.count, sampled.count)
+            XCTAssertEqual(forward.sequence.committedPositions, positions)
+            XCTAssertTrue(forward.sequence.isConsistent)
+            // The ring's shape, so a table row is never read from a visit that
+            // silently stopped dropping: before the boundary it is filling, at
+            // and past it every windowed visit holds exactly the window.
+            for sample in samples {
+                let expected = Swift.min(sample.position + 1, window)
+                XCTAssertEqual(sample.ringRows, expected, "position \(sample.position + 1): ring rows")
+                XCTAssertEqual(sample.ringStart, Swift.max(0, sample.position + 1 - window))
+                XCTAssertEqual(sample.fullRows, sample.position + 1)
+            }
+            return samples
+        }
+
+        struct Shape {
+            let std: Float
+            let range: Float
+            let margin: Float
+            let top: Int
+        }
+
+        func shape(_ row: [Float]) -> Shape {
+            var sum: Float = 0
+            var squares: Float = 0
+            var lowest = Float.infinity
+            var highest = -Float.infinity
+            var top = (id: -1, value: -Float.infinity)
+            var second = -Float.infinity
+            for (index, value) in row.enumerated() {
+                sum += value
+                squares += value * value
+                lowest = Swift.min(lowest, value)
+                highest = Swift.max(highest, value)
+                if value > top.value {
+                    second = top.value
+                    top = (index, value)
+                } else if value > second {
+                    second = value
+                }
+            }
+            let count = Float(Swift.max(1, row.count))
+            let mean = sum / count
+            let variance = Swift.max(0, squares / count - mean * mean)
+            return Shape(
+                std: variance.squareRoot(), range: highest - lowest,
+                margin: top.value - second, top: top.id
+            )
+        }
+
+        func formatted(_ value: Float) -> String { String(format: "%.4g", value) }
+
+        let exact = try walk(.float32)
+        let compact = try walk(.int8)
+        XCTAssertEqual(exact.count, compact.count)
+
+        print(
+            "\u{1F50E} [inkling2 width] columns: absolute width (mean/worst), the same mean "
+                + "divided by the FP32 row's std / range / decision margin, then the FP32 "
+                + "row's own std, range and margin, then the newest KV row's per-head max abs "
+                + "(which sets the INT8 step) for a windowed and a full visit"
+        )
+        var flips: [Int] = []
+        for (reference, other) in zip(exact, compact) {
+            XCTAssertEqual(reference.position, other.position)
+            XCTAssertEqual(other.ringStart, reference.ringStart)
+            XCTAssertEqual(other.ringRows, reference.ringRows)
+            let left = shape(reference.logits)
+            let right = shape(other.logits)
+            var worst: Float = 0
+            var differences: [Float] = []
+            differences.reserveCapacity(reference.logits.count)
+            var nonFinite = 0
+            for index in 0..<reference.logits.count {
+                let a = reference.logits[index]
+                let b = other.logits[index]
+                if !a.isFinite || !b.isFinite { nonFinite += 1 }
+                let difference = abs(b - a)
+                worst = Swift.max(worst, difference)
+                differences.append(difference)
+            }
+            XCTAssertEqual(nonFinite, 0, "position \(reference.position + 1): every logit must be finite")
+            let mean = differences.reduce(0, +) / Float(Swift.max(1, differences.count))
+            let agrees = left.top == right.top
+            if !agrees { flips.append(reference.position + 1) }
+            print(
+                "\u{1F50E} [inkling2 width] \(reference.position + 1) pos"
+                    + " | width " + formatted(mean) + "/" + formatted(worst)
+                    + " | /std " + formatted(mean / Swift.max(left.std, 1e-6))
+                    + " /range " + formatted(mean / Swift.max(left.range, 1e-6))
+                    + " /margin " + formatted(mean / Swift.max(left.margin, 1e-6))
+                    + " | fp32 std " + formatted(left.std) + " range " + formatted(left.range)
+                    + " margin " + formatted(left.margin)
+                    + " | kv win " + formatted(reference.windowedMagnitude.mean)
+                    + "/" + formatted(reference.windowedMagnitude.worst)
+                    + " full " + formatted(reference.fullMagnitude.mean)
+                    + "/" + formatted(reference.fullMagnitude.worst)
+                    + " | ring " + String(reference.ringRows) + "@" + String(reference.ringStart)
+                    + " | " + (agrees ? "agrees" : "FLIPS")
+            )
+        }
+        XCTAssertTrue(
+            flips.isEmpty,
+            "the INT8 cache changes the greedy token at positions \(flips)"
+        )
+    }
+
     // MARK: The app's own turn path
 
     /// The whole app path for this family, once on the host and once with the
