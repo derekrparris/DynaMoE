@@ -1145,6 +1145,123 @@ final class Inkling2MemoryPlanTests: XCTestCase {
         }
     }
 
+    /// A batched fill is the serial path's bookkeeping with a wider read: the
+    /// same slots for the same requests, the same victims, the same counters and
+    /// the same bytes in the same places.
+    ///
+    /// Slice 34 measured the shape at 1.6x on this machine and the mixture now
+    /// calls the batch, so this is the case that would fail if the batch ever
+    /// resolved residency differently from asking for one expert at a time --
+    /// which is exactly what an eviction sequence or a hit/miss split can do
+    /// while still producing plausible arithmetic.
+    func testABatchedFillResolvesTheSameSlotsAsAskingForEachExpertInTurn() throws {
+        // The mixture's own regime first: one visit's routing fits the arena, so
+        // every reservation lands on a slot no other reservation took, and the
+        // batch must be the serial sequence exactly -- slots, victims, counters
+        // and bytes.
+        try compare(capacity: 8, experts: 6, slotsRead: 6)
+        // And the degenerate shape, where the batch is wider than the arena: the
+        // final residency and every counter except the byte count must still be
+        // the serial sequence's, and the batch reads only the slots that survive
+        // (the serial path reads, and wastes, the ones it evicts in the same run).
+        try compare(capacity: 3, experts: 6, slotsRead: 3)
+    }
+
+    private func compare(capacity: Int, experts: Int, slotsRead: Int) throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice(), "no Metal device")
+        let geometry = try XCTUnwrap(
+            Inkling2ExpertSlotGeometry.make(
+                gateUpRows: 4, gateUpRowStride: 3, gateUpScaleRowStride: 1,
+                downRows: 2, downRowStride: 5, downScaleRowStride: 1
+            )
+        )
+        let slotBytes = geometry.slotBytes
+        // Six experts' worth of distinct bytes, each expert's four ranges laid
+        // out at a base of its own so a slot filled from the wrong expert is a
+        // different byte, not a plausible one.
+        let base: UInt64 = 64
+        var contents = [UInt8](repeating: 0xEE, count: Int(base))
+        for expert in 0..<experts {
+            let seed = UInt8(expert &* 3 &+ 1)
+            contents += (0..<slotBytes).map { UInt8(seed &+ UInt8($0 % 97)) }
+        }
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("inkling2-arena-batch-\(UUID().uuidString).bin")
+        try Data(contents).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let reader = try Inkling2ArenaShardReader(url: file)
+
+        func arena() throws -> (Inkling2ExpertArena, MTLBuffer) {
+            let buffer = try XCTUnwrap(
+                device.makeBuffer(length: capacity * slotBytes, options: .storageModeShared)
+            )
+            let arena = Inkling2ExpertArena(capacity: capacity, geometry: geometry)
+            arena.attachSlotBuffer(buffer)
+            return (arena, buffer)
+        }
+        let (serial, serialBuffer) = try arena()
+        let (batched, batchedBuffer) = try arena()
+
+        let requests = (0..<experts).map { expert in
+            Inkling2ExpertArena.FillRequest(
+                layer: 2, expert: expert,
+                gateUpSourceOffset: base + UInt64(expert * slotBytes),
+                gateUpScaleSourceOffset: base + UInt64(expert * slotBytes)
+                    + UInt64(geometry.gateUpWeightBytes),
+                downSourceOffset: base + UInt64(expert * slotBytes)
+                    + UInt64(geometry.gateUpWeightBytes + geometry.gateUpScaleBytes),
+                downScaleSourceOffset: base + UInt64(expert * slotBytes)
+                    + UInt64(slotBytes - geometry.downScaleBytes)
+            )
+        }
+        var serialSlots: [Int] = []
+        for request in requests {
+            serialSlots.append(try serial.slot(
+                layer: request.layer, expert: request.expert, reader: reader,
+                gateUpSourceOffset: request.gateUpSourceOffset,
+                gateUpScaleSourceOffset: request.gateUpScaleSourceOffset,
+                downSourceOffset: request.downSourceOffset,
+                downScaleSourceOffset: request.downScaleSourceOffset
+            ))
+        }
+        let batchedSlots = try batched.fill(requests, reader: reader)
+        XCTAssertEqual(batchedSlots, serialSlots, "capacity \(capacity): the batch must resolve the same slots")
+
+        let afterSerial = serial.statistics
+        let afterBatch = batched.statistics
+        XCTAssertEqual(afterBatch.hits, afterSerial.hits, "capacity \(capacity)")
+        XCTAssertEqual(afterBatch.misses, afterSerial.misses, "capacity \(capacity)")
+        XCTAssertEqual(afterBatch.evictions, afterSerial.evictions, "capacity \(capacity)")
+        XCTAssertEqual(afterBatch.slotsAllocated, afterSerial.slotsAllocated, "capacity \(capacity)")
+        // The serial path reads every miss; the batch reads only the slots that
+        // are still resident when the fan-out runs, and here that is the ones
+        // that survived eviction.
+        XCTAssertEqual(afterSerial.bytesRead, UInt64(experts * slotBytes))
+        XCTAssertEqual(afterBatch.bytesRead, UInt64(slotsRead * slotBytes))
+        XCTAssertGreaterThan(afterSerial.preadNanoseconds, 0)
+        XCTAssertGreaterThan(afterBatch.preadNanoseconds, 0)
+
+        // The slots hold the same bytes, in the same order, under both shapes.
+        let serialBytes = serialBuffer.contents().bindMemory(
+            to: UInt8.self, capacity: capacity * slotBytes
+        )
+        let batchedBytes = batchedBuffer.contents().bindMemory(
+            to: UInt8.self, capacity: capacity * slotBytes
+        )
+        var compared = 0
+        for slot in 0..<capacity {
+            for offset in 0..<slotBytes {
+                XCTAssertEqual(
+                    batchedBytes[slot * slotBytes + offset],
+                    serialBytes[slot * slotBytes + offset],
+                    "capacity \(capacity) slot \(slot) offset \(offset)"
+                )
+                compared += 1
+            }
+        }
+        XCTAssertEqual(compared, capacity * slotBytes)
+    }
+
     /// The arena's residency sequence: a hit, then fills until the capacity is
     /// spent, then the least recently used pair is the one evicted.
     ///
@@ -4270,5 +4387,186 @@ final class Inkling2AttentionSplitTests: XCTestCase {
                 (32 + plan.chunk) * MemoryLayout<Float>.stride, 32_768, "\(rows) rows"
             )
         }
+    }
+}
+
+// MARK: - What the expert fill's fan-out depth delivers
+
+/// Prices the SHAPE of one mixture's slot fills on this machine's SSD, through
+/// the shipped arena and the shipped reader.
+///
+/// Slice 33 measured what the fill costs in place: 164 misses a position,
+/// 4.48 MB each, 1.63 ms per fill, 266 ms of a 756 ms position at 2.9 GB/s. The
+/// shipped reader fans ONE expert's four ranges out over four lanes, and the
+/// mixture used to fill its eight routed experts one call at a time -- so the
+/// device was never asked for more than four concurrent reads when all
+/// thirty-two were known before the first one was issued.
+///
+/// Model-free. The file is written and read with `F_GLOBAL_NOCACHE` on, so every
+/// read is a device read: without it the same base's second arm would be
+/// answered from the page cache and the comparison would measure memory. The
+/// two arms are `slot(...)` in a loop (the shipped shape, depth 4) and
+/// `fill(...)` (one fan-out, depth 32), over the same bases in the same order,
+/// and their slot bytes are compared so a faster arm cannot be a wrong one.
+final class Inkling2ExpertFillShapeTests: XCTestCase {
+
+    /// The published slot's four ranges, in the arena's own order
+    /// (`Inkling2ExpertSlotGeometry`): `w13` weight and scales, then `w2`. They
+    /// sum to the 4,478,976-byte slot the checkpoint's arena line prints.
+    private static let rangeLengths = [2_654_208, 331_776, 1_327_104, 165_888]
+    private static let slotBytes = 4_478_976
+
+    private func write(
+        _ path: String, bytes: Int, chunk: Int
+    ) -> Int32 {
+        let descriptor = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0o600)
+        guard descriptor >= 0 else { return -1 }
+        _ = fcntl(descriptor, F_GLOBAL_NOCACHE, 1)
+        let buffer = UnsafeMutableRawPointer.allocate(byteCount: chunk, alignment: 16_384)
+        defer { buffer.deallocate() }
+        var written = 0
+        while written < bytes {
+            let length = min(chunk, bytes - written)
+            memset(buffer, Int32((written / chunk) % 251), length)
+            var sent = 0
+            while sent < length {
+                let got = pwrite(descriptor, buffer.advanced(by: sent), length - sent, off_t(written + sent))
+                if got <= 0 { close(descriptor); return -1 }
+                sent += got
+            }
+            written += length
+        }
+        fsync(descriptor)
+        return descriptor
+    }
+
+    /// The four source offsets a random base puts this expert's ranges at.
+    private func request(layer: Int, expert: Int, base: Int) -> Inkling2ExpertArena.FillRequest {
+        var offset = base
+        var offsets: [UInt64] = []
+        for length in Self.rangeLengths {
+            offsets.append(UInt64(offset))
+            offset += length
+        }
+        return Inkling2ExpertArena.FillRequest(
+            layer: layer, expert: expert,
+            gateUpSourceOffset: offsets[0], gateUpScaleSourceOffset: offsets[1],
+            downSourceOffset: offsets[2], downScaleSourceOffset: offsets[3]
+        )
+    }
+
+    private func arena(_ device: MTLDevice) throws -> (Inkling2ExpertArena, MTLBuffer) {
+        let geometry = try XCTUnwrap(
+            Inkling2ExpertSlotGeometry.make(
+                gateUpRows: 2_304, gateUpRowStride: 1_152, gateUpScaleRowStride: 144,
+                downRows: 2_304, downRowStride: 576, downScaleRowStride: 72
+            )
+        )
+        XCTAssertEqual(geometry.slotBytes, Self.slotBytes)
+        let experts = 8
+        let buffer = try XCTUnwrap(
+            device.makeBuffer(length: experts * Self.slotBytes, options: .storageModeShared)
+        )
+        let arena = Inkling2ExpertArena(capacity: experts, geometry: geometry)
+        arena.attachSlotBuffer(buffer)
+        return (arena, buffer)
+    }
+
+    func testWhatTheShippedFillShapeDeliversAndWhatOneFanOutBuys() throws {
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_fillshape"),
+            "opt-in: touch /tmp/dynamoe_inkling2_fillshape"
+        )
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice(), "no Metal device")
+        let fileBytes = 1_024 * 1_048_576
+        let chunk = 16 * 1_048_576
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("inkling2-fillshape-\(UUID().uuidString).bin")
+        // The descriptor is kept open for the whole case: `F_GLOBAL_NOCACHE` is a
+        // flag on the file, and the arena's reader opens its own descriptor.
+        let nocache = write(url.path, bytes: fileBytes, chunk: chunk)
+        XCTAssertGreaterThanOrEqual(nocache, 0)
+        defer {
+            close(nocache)
+            try? FileManager.default.removeItem(at: url)
+        }
+        let reader = try Inkling2ArenaShardReader(url: url)
+        defer { reader.closeNow() }
+
+        let (serial, serialBuffer) = try arena(device)
+        let (batched, batchedBuffer) = try arena(device)
+        let experts = 8
+        let slots = fileBytes / Self.slotBytes
+        var generator = SystemRandomNumberGenerator()
+
+        var serialBest = UInt64.max
+        var batchBest = UInt64.max
+        for round in 0..<24 {
+            var bases: [Int] = []
+            while bases.count < experts {
+                let candidate = Int.random(in: 0..<slots, using: &generator) * Self.slotBytes
+                if !bases.contains(candidate) { bases.append(candidate) }
+            }
+            // A layer of its own per round keeps every request a miss, which is
+            // the shape being priced; a hit reads nothing in either form.
+            let requests = (0..<experts).map { expert in
+                request(layer: round, expert: expert, base: bases[expert])
+            }
+            let serialStart = DispatchTime.now().uptimeNanoseconds
+            for fill in requests {
+                _ = try serial.slot(
+                    layer: fill.layer, expert: fill.expert, reader: reader,
+                    gateUpSourceOffset: fill.gateUpSourceOffset,
+                    gateUpScaleSourceOffset: fill.gateUpScaleSourceOffset,
+                    downSourceOffset: fill.downSourceOffset,
+                    downScaleSourceOffset: fill.downScaleSourceOffset
+                )
+            }
+            serialBest = min(serialBest, DispatchTime.now().uptimeNanoseconds - serialStart)
+
+            let batchStart = DispatchTime.now().uptimeNanoseconds
+            _ = try batched.fill(requests, reader: reader)
+            batchBest = min(batchBest, DispatchTime.now().uptimeNanoseconds - batchStart)
+        }
+
+        // One fan-out is the serial shape's bookkeeping: same slots, same
+        // counters, same bytes.
+        XCTAssertEqual(batched.statistics.hits, serial.statistics.hits)
+        XCTAssertEqual(batched.statistics.misses, serial.statistics.misses)
+        XCTAssertEqual(batched.statistics.evictions, serial.statistics.evictions)
+        XCTAssertEqual(batched.statistics.bytesRead, serial.statistics.bytesRead)
+        let serialBytes = serialBuffer.contents().bindMemory(
+            to: UInt8.self, capacity: experts * Self.slotBytes
+        )
+        let batchedBytes = batchedBuffer.contents().bindMemory(
+            to: UInt8.self, capacity: experts * Self.slotBytes
+        )
+        for offset in 0..<(experts * Self.slotBytes) {
+            XCTAssertEqual(batchedBytes[offset], serialBytes[offset], "byte \(offset)")
+        }
+
+        let mixtureBytes = Double(experts * Self.slotBytes)
+        var lines: [String] = []
+        for (label, best) in [("shipped, one expert at a time", serialBest), ("one fan-out", batchBest)] {
+            let seconds = Double(best) / 1e9
+            lines.append(
+                String(
+                    format: "%@: %.2f ms per mixture = %.2f GB/s, %.2f ms per fill; "
+                        + "at 164 misses a position: %.0f ms",
+                    label, seconds * 1_000, mixtureBytes / seconds / 1e9,
+                    seconds * 1_000 / Double(experts),
+                    seconds * 1_000 / Double(experts) * 164
+                )
+            )
+        }
+        lines.append(
+            String(
+                format: "one fan-out over the shipped shape: %.2fx",
+                Double(serialBest) / Double(batchBest)
+            )
+        )
+        print("\u{1F50E} [inkling2 fill] " + lines.joined(separator: "\n\u{1F50E} [inkling2 fill] "))
+        XCTAssertGreaterThan(serialBest, 0)
+        XCTAssertGreaterThan(batchBest, 0)
     }
 }

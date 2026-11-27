@@ -477,6 +477,55 @@ nonisolated public final class Inkling2ExpertArena: @unchecked Sendable {
         counters.preadNanoseconds += preadNanoseconds
     }
 
+    /// Takes a slot for (layer, expert) and records the residency NOW, before its
+    /// bytes are read.
+    ///
+    /// This is what a batch needs and what a single fill does not: with nothing
+    /// written into `residents` between two reservations, every miss of one batch
+    /// would pick the same first empty slot. Recording the residency at
+    /// reservation time also makes a pair asked for twice in one batch behave as
+    /// the serial path would -- the second ask is a hit on the first one's slot
+    /// -- and keeps the eviction order identical, because the recency insert
+    /// happens in request order either way.
+    ///
+    /// The source offsets are the caller's to record with `recordFill` once the
+    /// bytes are in; until then they are zero, which is distinguishable from a
+    /// real offset only in that it can never match a bank.
+    private func reserve(layer: Int, expert: Int) -> Int {
+        counters.misses += 1
+        let slot: Int
+        if let empty = residents.firstIndex(where: { $0 == nil }) {
+            slot = empty
+        } else {
+            counters.evictions += 1
+            let victim = order.removeLast()
+            slot = residents.firstIndex {
+                $0?.layer == victim.layer && $0?.expert == victim.expert
+            } ?? 0
+        }
+        residents[slot] = Inkling2ResidentExpert(
+            layer: layer, expert: expert, slot: slot,
+            gateUpSourceOffset: 0, downSourceOffset: 0
+        )
+        order.insert((layer, expert), at: 0)
+        return slot
+    }
+
+    /// Records a reserved slot's true source offsets and what its read cost.
+    private func recordFill(
+        slot: Int, gateUpSourceOffset: UInt64, downSourceOffset: UInt64,
+        bytes: UInt64, preadNanoseconds: UInt64
+    ) {
+        if let entry = residents[slot] {
+            residents[slot] = Inkling2ResidentExpert(
+                layer: entry.layer, expert: entry.expert, slot: slot,
+                gateUpSourceOffset: gateUpSourceOffset, downSourceOffset: downSourceOffset
+            )
+        }
+        counters.bytesRead += bytes
+        counters.preadNanoseconds += preadNanoseconds
+    }
+
     /// The slot buffers, when the arena was given memory to fill. One buffer
     /// holds every slot, `geometry.slotBytes` apart.
     public private(set) var slotBuffer: MTLBuffer?
@@ -553,6 +602,140 @@ nonisolated public final class Inkling2ExpertArena: @unchecked Sendable {
             bytes: UInt64(read), preadNanoseconds: elapsed
         )
         return slot
+    }
+
+    /// One expert whose slot this arena is asked to hold, with the four source
+    /// offsets its banks put it at.
+    public struct FillRequest: Sendable, Equatable {
+        public let layer: Int
+        public let expert: Int
+        public let gateUpSourceOffset: UInt64
+        public let gateUpScaleSourceOffset: UInt64
+        public let downSourceOffset: UInt64
+        public let downScaleSourceOffset: UInt64
+
+        public init(
+            layer: Int, expert: Int,
+            gateUpSourceOffset: UInt64, gateUpScaleSourceOffset: UInt64,
+            downSourceOffset: UInt64, downScaleSourceOffset: UInt64
+        ) {
+            self.layer = layer
+            self.expert = expert
+            self.gateUpSourceOffset = gateUpSourceOffset
+            self.gateUpScaleSourceOffset = gateUpScaleSourceOffset
+            self.downSourceOffset = downSourceOffset
+            self.downScaleSourceOffset = downScaleSourceOffset
+        }
+    }
+
+    /// Fills every miss among `requests` in ONE fan-out, and returns the slots
+    /// in request order.
+    ///
+    /// The mixture knows all of a visit's routed experts before it reads any of
+    /// them, so filling them one call at a time asks this SSD for four
+    /// concurrent reads when thirty-two are available. Slice 34 measured the
+    /// difference at 1.6x on this machine (5.2 GB/s at the shipped depth of 4,
+    /// 8.2 GB/s at 32), which is why the mixture calls this rather than `slot`
+    /// in a loop.
+    ///
+    /// The residency bookkeeping is the serial path's, step for step: the same
+    /// requests in the same order mark hits, reserve slots and evict the same
+    /// victims, so the batch is a shape change and not a policy change. Time in
+    /// `pread` is split evenly across the misses, because every miss reads the
+    /// same `slotBytes`.
+    @discardableResult
+    public func fill(
+        _ requests: [FillRequest], reader: Inkling2ArenaShardReader
+    ) throws -> [Int] {
+        guard !requests.isEmpty else { return [] }
+        var slots: [Int] = []
+        slots.reserveCapacity(requests.count)
+        var misses: [(request: FillRequest, slot: Int)] = []
+        for request in requests {
+            if let hit = resident(layer: request.layer, expert: request.expert) {
+                slots.append(hit)
+            } else {
+                let slot = reserve(layer: request.layer, expert: request.expert)
+                slots.append(slot)
+                misses.append((request, slot))
+            }
+        }
+        guard !misses.isEmpty else { return slots }
+        guard let buffer = slotBuffer else {
+            // Bookkeeping only: the caller fills the slots itself, so there is no
+            // read to race and every reservation is recorded.
+            for miss in misses {
+                recordFill(
+                    slot: miss.slot,
+                    gateUpSourceOffset: miss.request.gateUpSourceOffset,
+                    downSourceOffset: miss.request.downSourceOffset,
+                    bytes: 0, preadNanoseconds: 0
+                )
+            }
+            return slots
+        }
+        // A batch larger than the arena -- which the mixture cannot produce,
+        // because it asks for one visit's routing and the arena's floor is that
+        // width -- can reserve the same slot twice. Keep the later request, which
+        // is the state the serial sequence ends in, and skip the bytes it evicted:
+        // reading both into one slot would be a race whose winner is the order the
+        // fan-out happened to run in.
+        var lastReservation: [Int: Int] = [:]
+        for (index, miss) in misses.enumerated() { lastReservation[miss.slot] = index }
+        misses = misses.enumerated()
+            .filter { lastReservation[$0.element.slot] == $0.offset }
+            .map(\.element)
+        var ranges: [Inkling2ArenaShardReader.Range] = []
+        ranges.reserveCapacity(misses.count * 4)
+        for miss in misses {
+            let base = buffer.contents().advanced(by: miss.slot * geometry.slotBytes)
+            let request = miss.request
+            ranges.append(Inkling2ArenaShardReader.Range(
+                fileOffset: Int(request.gateUpSourceOffset),
+                destination: base.advanced(by: geometry.gateUpWeightOffset),
+                length: geometry.gateUpWeightBytes
+            ))
+            ranges.append(Inkling2ArenaShardReader.Range(
+                fileOffset: Int(request.gateUpScaleSourceOffset),
+                destination: base.advanced(by: geometry.gateUpScaleOffset),
+                length: geometry.gateUpScaleBytes
+            ))
+            ranges.append(Inkling2ArenaShardReader.Range(
+                fileOffset: Int(request.downSourceOffset),
+                destination: base.advanced(by: geometry.downWeightOffset),
+                length: geometry.downWeightBytes
+            ))
+            ranges.append(Inkling2ArenaShardReader.Range(
+                fileOffset: Int(request.downScaleSourceOffset),
+                destination: base.advanced(by: geometry.downScaleOffset),
+                length: geometry.downScaleBytes
+            ))
+        }
+        let started = DispatchTime.now().uptimeNanoseconds
+        let read: Int
+        do {
+            read = try reader.read(ranges)
+        } catch {
+            // A reservation whose bytes never arrived must not read as a
+            // resident expert: the next call would hit a slot holding another
+            // expert's weights, which is a plausible number rather than a crash.
+            // The counters keep the misses; only the residency is dropped.
+            evictAll()
+            throw error
+        }
+        let elapsed = DispatchTime.now().uptimeNanoseconds - started
+        let share = elapsed / UInt64(misses.count)
+        let remainder = elapsed - share * UInt64(misses.count)
+        for (index, miss) in misses.enumerated() {
+            recordFill(
+                slot: miss.slot,
+                gateUpSourceOffset: miss.request.gateUpSourceOffset,
+                downSourceOffset: miss.request.downSourceOffset,
+                bytes: UInt64(read) / UInt64(misses.count),
+                preadNanoseconds: index == 0 ? share + remainder : share
+            )
+        }
+        return slots
     }
 
     public func evictAll() {
