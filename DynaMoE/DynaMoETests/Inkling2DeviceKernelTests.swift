@@ -18,6 +18,7 @@
 //      still passes a fixture whose bytes happen to be symmetric.
 //
 
+import Accelerate
 import Metal
 import XCTest
 @testable import DynaMoE
@@ -4857,6 +4858,13 @@ final class Inkling2DeviceKernelTests: XCTestCase {
             "\u{1F50E} [inkling2 where] "
                 + executor.visitProfile.describeTiming(label: "past the window")
         )
+        // The host-only stage is the one bucket a kernel change cannot touch, so
+        // its pieces are cut: which of them the 1.9 ms is decides whether the
+        // next slice is bytes, a kernel or the cache.
+        print(
+            "\u{1F50E} [inkling2 where] "
+                + executor.visitProfile.describeDetails(label: "past the window")
+        )
 
         // Every visit's attention, timed in place on its own staged rows, in
         // both forms. Per POSITION, because that is the unit the walk's total is
@@ -5974,6 +5982,127 @@ final class Inkling2DeviceKernelTests: XCTestCase {
         }
         withExtendedLifetime(downInput) {}
     }
+
+    /// What the KV row staging copy costs, and whether it is its bytes, its
+    /// call shape or its coldness.
+    ///
+    /// The walk's detail line bills `rowStaging` at 1.54 ms of `attentionState`'s
+    /// 1.90 -- 74 ms of a 462 ms position -- so the copy IS that stage. The
+    /// shipped form copies one row at a time out of `[[Float]]` with a vDSP
+    /// move: 1,024 rows of 4 KB, twice, per visit.
+    ///
+    /// The same bytes are priced three ways, each WARM (one tile reused, the
+    /// rows hot in cache, which is what a microbenchmark defaults to) and COLD
+    /// (twenty-four tiles cycled, one per layer, which is what a position walks
+    /// -- 200 MB of rows, so no tile is still resident when it comes round
+    /// again). The gap between the two is the answer to "is 1.5 ms the copy or
+    /// the cache", and the contiguous arm is the ceiling a visit state that held
+    /// its rows in one buffer would reach.
+    func testWhatTheKVRowStagingCostsAndWhetherTheCallShapeIsTheCost() throws {
+        let marker = "/tmp/dynamoe_inkling2_rowstage"
+        guard FileManager.default.fileExists(atPath: marker) else {
+            throw XCTSkip("touch \(marker) to price the KV row staging copy")
+        }
+        let (device, _, queue) = try environment()
+        let rows = 1_024, width = 1_024, tiles = 24
+        let bytes = rows * width * MemoryLayout<Float>.stride
+
+        var keyTiles = [[[Float]]]()
+        var valueTiles = [[[Float]]]()
+        var flatKeyTiles = [[Float]]()
+        var flatValueTiles = [[Float]]()
+        for tile in 0..<tiles {
+            var keys = [[Float]]()
+            var values = [[Float]]()
+            for row in 0..<rows {
+                keys.append(self.values(width, seed: tile &* 977 &+ row))
+                values.append(self.values(width, seed: tile &* 131 &+ row))
+            }
+            keyTiles.append(keys)
+            valueTiles.append(values)
+            flatKeyTiles.append(keys.flatMap { $0 })
+            flatValueTiles.append(values.flatMap { $0 })
+        }
+
+        let keys = try XCTUnwrap(device.makeBuffer(length: bytes, options: .storageModeShared))
+        let values = try XCTUnwrap(device.makeBuffer(length: bytes, options: .storageModeShared))
+        let keyPointer = keys.contents().bindMemory(to: Float.self, capacity: rows * width)
+        let valuePointer = values.contents().bindMemory(to: Float.self, capacity: rows * width)
+
+        /// Best of `rounds` copies over `tileCount` tiles, host-timed.
+        func best(
+            _ label: String, tileCount: Int, rounds: Int,
+            _ copy: (Int) -> Void
+        ) -> Double {
+            var best = Double.greatestFiniteMagnitude
+            for round in 0..<rounds {
+                let began = DispatchTime.now().uptimeNanoseconds
+                for tile in 0..<tileCount { copy(tile) }
+                let millis = Double(DispatchTime.now().uptimeNanoseconds - began)
+                    / 1_000_000 / Double(tileCount)
+                if round > 0 { best = min(best, millis) }
+            }
+            print(
+                "\u{1F4CA} [inkling2 row stage] \(label): "
+                    + "\(String(format: "%.3f", best)) ms, "
+                    + "\(String(format: "%.1f", 2 * Double(bytes) / (best / 1_000) / 1e9)) GB/s"
+            )
+            return best
+        }
+
+        func vdsp(_ tile: Int) {
+            let keyRows = keyTiles[tile], valueRows = valueTiles[tile]
+            for row in 0..<rows {
+                keyRows[row].withUnsafeBufferPointer { source in
+                    vDSP_mmov(
+                        source.baseAddress!, keyPointer + row * width,
+                        vDSP_Length(width), 1, vDSP_Length(width), vDSP_Length(width)
+                    )
+                }
+                valueRows[row].withUnsafeBufferPointer { source in
+                    vDSP_mmov(
+                        source.baseAddress!, valuePointer + row * width,
+                        vDSP_Length(width), 1, vDSP_Length(width), vDSP_Length(width)
+                    )
+                }
+            }
+        }
+        func rowMemcpy(_ tile: Int) {
+            let keyRows = keyTiles[tile], valueRows = valueTiles[tile]
+            for row in 0..<rows {
+                keyRows[row].withUnsafeBytes { source in
+                    memcpy(keyPointer + row * width, source.baseAddress!, width * 4)
+                }
+                valueRows[row].withUnsafeBytes { source in
+                    memcpy(valuePointer + row * width, source.baseAddress!, width * 4)
+                }
+            }
+        }
+        func contiguous(_ tile: Int) {
+            flatKeyTiles[tile].withUnsafeBytes { source in
+                memcpy(keyPointer, source.baseAddress!, bytes)
+            }
+            flatValueTiles[tile].withUnsafeBytes { source in
+                memcpy(valuePointer, source.baseAddress!, bytes)
+            }
+        }
+
+        let warmVDSP = best("per row, vDSP move, warm", tileCount: 1, rounds: 30, vdsp)
+        let warmMemcpy = best("per row, memcpy, warm", tileCount: 1, rounds: 30, rowMemcpy)
+        let warmContiguous = best("one contiguous move, warm", tileCount: 1, rounds: 30, contiguous)
+        let coldVDSP = best("per row, vDSP move, cold", tileCount: tiles, rounds: 5, vdsp)
+        let coldMemcpy = best("per row, memcpy, cold", tileCount: tiles, rounds: 5, rowMemcpy)
+        let coldContiguous = best("one contiguous move, cold", tileCount: tiles, rounds: 5, contiguous)
+
+        print(
+            "\u{1F4CA} [inkling2 row stage] per row costs "
+                + String(format: "%.1fx", coldVDSP / warmVDSP) + " more when cold; "
+                + "memcpy per row is " + String(format: "%.2fx", coldVDSP / coldMemcpy)
+                + " the shipped call, one contiguous move "
+                + String(format: "%.2fx", coldVDSP / coldContiguous)
+        )
+    }
+
     /// Whether holding four output rows per warp pays for the activation loads
     /// it saves, priced at the published slot shape on the same eight-expert
     /// mixture the forward pass encodes.

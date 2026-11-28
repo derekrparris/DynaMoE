@@ -78,6 +78,44 @@ nonisolated public enum Inkling2VisitStage: String, Sendable, CaseIterable {
     }
 }
 
+/// The pieces a HOST-ONLY stage is made of.
+///
+/// `attentionState` is one bucket holding four different jobs -- four GPU
+/// read-backs, an append into the sequence state, two host projections, three
+/// small stagings and the staging copy of every KV row the position attends
+/// over -- and the four-way split cannot say which of them is the 1.93 ms. They
+/// are different fixes: a read-back wants fewer bytes, a projection wants a
+/// kernel, and the row copy wants the cache on the device, so a resident row
+/// copy is not improved by any of the others.
+///
+/// A detail is billed only when a profile is passed, so `nil` leaves every call
+/// site a branch that is never taken.
+nonisolated public enum Inkling2VisitDetail: String, Sendable, CaseIterable {
+    /// The four `readBack` copies the GPU's K/V work is read back through.
+    case kvReadBack
+    /// `state.append`, which moves the position's K/V into the sequence state.
+    case kvAppend
+    /// The host matrix lookups `relativeStates` needs (`attnWrDu`, the L2 clip
+    /// scale): a dequantized weight read on the host.
+    case relativeLookup
+    /// `wr @ input`, the per-head clip and the full-layer log scale.
+    case relativeMath
+    /// `sinkLogits`, lookup and projection together: it is one head per row.
+    case sinkLogits
+    /// Staging the relative states, the sink logits and the relative bank.
+    case stateStaging
+    /// `workspace.stage(state)`: the copy of every KV row this position
+    /// attends over. This is the piece that grows with the context.
+    case rowStaging
+    /// Obtaining `state.keys`/`state.values`, which for an FP32 state is two
+    /// array references and for an INT8 state is a dequantize of every row.
+    case rowStagingRows
+    /// The key rows copied, and then the value rows, so a copy that is slow for
+    /// one region cannot hide inside the other.
+    case rowStagingKeys
+    case rowStagingValues
+}
+
 // MARK: - What one buffer reports about itself
 
 /// The clocks one committed command buffer reports about itself.
@@ -178,6 +216,10 @@ nonisolated public struct Inkling2StageTiming: Sendable, Equatable {
 /// other mutable state carries.
 nonisolated public final class Inkling2VisitProfile: @unchecked Sendable {
     public private(set) var stages: [Inkling2VisitStage: Inkling2StageTiming] = [:]
+    /// The sub-stage pieces, for the stages a four-way split cannot explain.
+    public private(set) var details: [Inkling2VisitDetail: UInt64] = [:]
+    /// The last staged row shape, so a copy's rate can be read off its time.
+    public private(set) var stagedShape: String = ""
     /// Visits closed, which is what a per-visit figure divides by.
     public private(set) var visits: Int = 0
     /// The visits' own wall time, from `runVisit`'s first statement to its
@@ -203,6 +245,8 @@ nonisolated public final class Inkling2VisitProfile: @unchecked Sendable {
 
     public func reset() {
         stages.removeAll(keepingCapacity: true)
+        details.removeAll(keepingCapacity: true)
+        stagedShape = ""
         visits = 0
         wallNanoseconds = 0
         experts = 0
@@ -230,6 +274,17 @@ nonisolated public final class Inkling2VisitProfile: @unchecked Sendable {
         total.commits += buffers.commits
         total.emptyWindows += buffers.emptyWindows
         stages[stage] = total
+    }
+
+    /// Bills one piece of a host-only stage. Called only from a profile-armed
+    /// path, so an unarmed visit never pays for the stamps.
+    public func recordDetail(_ detail: Inkling2VisitDetail, nanoseconds: UInt64) {
+        details[detail, default: 0] += nanoseconds
+    }
+
+    /// Records the shape the last staging copy moved.
+    public func recordStagedShape(rows: Int, width: Int, storage: String) {
+        stagedShape = "\(rows) x \(width) \(storage)"
     }
 
     /// Closes one visit.
@@ -336,5 +391,29 @@ nonisolated public final class Inkling2VisitProfile: @unchecked Sendable {
         }
         return "inkling2 profile timing [\(label)] per visit, ms: "
             + parts.joined(separator: " | ")
+    }
+
+    /// The host-only stages cut into their pieces, per visit. One line, in the
+    /// order the pieces run, and only the pieces that were billed.
+    public func describeDetails(label: String = "turn") -> String {
+        func milli(_ nanoseconds: UInt64) -> String {
+            guard visits > 0 else { return "0.00" }
+            return String(format: "%.2f", Double(nanoseconds) / Double(visits) / 1_000_000)
+        }
+        var parts: [String] = []
+        for detail in Inkling2VisitDetail.allCases {
+            guard let time = details[detail] else { continue }
+            parts.append("\(detail.rawValue) \(milli(time))")
+        }
+        let state = (details[.kvReadBack] ?? 0) + (details[.kvAppend] ?? 0)
+            + (details[.relativeLookup] ?? 0) + (details[.relativeMath] ?? 0)
+            + (details[.sinkLogits] ?? 0) + (details[.stateStaging] ?? 0)
+            + (details[.rowStaging] ?? 0)
+        var line = "inkling2 profile detail [\(label)] per visit, ms: "
+        line += parts.joined(separator: " | ")
+        line += "; attentionState pieces \(milli(state)) against its wall "
+        line += milli(timing(.attentionState).wallNanoseconds)
+        if !stagedShape.isEmpty { line += ", last staged \(stagedShape)" }
+        return line
     }
 }

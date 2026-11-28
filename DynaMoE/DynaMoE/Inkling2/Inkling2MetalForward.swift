@@ -427,7 +427,9 @@ nonisolated public final class Inkling2DeviceWorkspace {
     /// the staging is a memcpy of both. Decoding on the host instead would cost
     /// a multiply per element per position AND the 4x staging buffer that the
     /// quantized cache exists to avoid.
-    public func stage(_ state: Inkling2VisitState) throws -> Int {
+    public func stage(
+        _ state: Inkling2VisitState, profile: Inkling2VisitProfile? = nil
+    ) throws -> Int {
         guard state.storage == stagedStorage else {
             throw Inkling2ForwardError.unsupported(
                 "this workspace stages \(stagedStorage.rawValue) KV rows but the visit holds "
@@ -437,16 +439,23 @@ nonisolated public final class Inkling2DeviceWorkspace {
         let rows = state.rowCount
         let width = state.rowWidth
         guard rows > 0, width > 0, rows <= stagedCapacity else { return 0 }
+        profile?.recordStagedShape(rows: rows, width: width, storage: stagedStorage.rawValue)
+        var stamp = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         switch stagedStorage {
         case .float32:
             // Row-major copy: the host keeps [[Float]], the kernel wants one block.
             let keyRows = state.keys
             let valueRows = state.values
+            if let profile, stamp != 0 {
+                profile.recordDetail(
+                    .rowStagingRows, nanoseconds: DispatchTime.now().uptimeNanoseconds - stamp
+                )
+                stamp = DispatchTime.now().uptimeNanoseconds
+            }
             let keyPointer = stagedKeys.contents().bindMemory(to: Float.self, capacity: rows * width)
             let valuePointer = stagedValues.contents().bindMemory(to: Float.self, capacity: rows * width)
             for row in 0..<rows {
                 let keyRow = keyRows[row]
-                let valueRow = valueRows[row]
                 let count = min(width, keyRow.count)
                 keyRow.withUnsafeBufferPointer { source in
                     vDSP_mmov(
@@ -454,13 +463,28 @@ nonisolated public final class Inkling2DeviceWorkspace {
                         vDSP_Length(count), 1, vDSP_Length(count), vDSP_Length(count)
                     )
                 }
+            }
+            if let profile, stamp != 0 {
+                profile.recordDetail(
+                    .rowStagingKeys, nanoseconds: DispatchTime.now().uptimeNanoseconds - stamp
+                )
+                stamp = DispatchTime.now().uptimeNanoseconds
+            }
+            for row in 0..<rows {
+                let valueRow = valueRows[row]
+                let count = min(width, valueRow.count)
                 valueRow.withUnsafeBufferPointer { source in
                     vDSP_mmov(
                         source.baseAddress!, valuePointer + row * width,
-                        vDSP_Length(min(count, valueRow.count)), 1,
-                        vDSP_Length(min(count, valueRow.count)), vDSP_Length(min(count, valueRow.count))
+                        vDSP_Length(count), 1,
+                        vDSP_Length(count), vDSP_Length(count)
                     )
                 }
+            }
+            if let profile, stamp != 0 {
+                profile.recordDetail(
+                    .rowStagingValues, nanoseconds: DispatchTime.now().uptimeNanoseconds - stamp
+                )
             }
         case .int8:
             // The kernel indexes a scale by (row, KV head), so the cache's own
@@ -1164,10 +1188,20 @@ nonisolated public final class Inkling2MetalForward {
     /// The relative states: `wr @ input`, per head scaled by the learned scale,
     /// L2-clipped, and (on a full layer) log-scaled. Host arithmetic, because it
     /// is two small vectors and the kernel consumes only the result.
-    func relativeStates(layer: Int, queryInput: [Float], position: Int, isFull: Bool) throws -> [Float] {
+    func relativeStates(
+        layer: Int, queryInput: [Float], position: Int, isFull: Bool,
+        profile: Inkling2VisitProfile? = nil
+    ) throws -> [Float] {
         let heads = isFull ? config.numAttentionHeads : config.swaNumAttentionHeads
+        var stamp = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         let wr = try hostMatrix(.attnWrDu, layer: layer)
         let rScale = try hostMatrix(.attnRelL2ClipScale, layer: layer)
+        if let profile, stamp != 0 {
+            profile.recordDetail(
+                .relativeLookup, nanoseconds: DispatchTime.now().uptimeNanoseconds - stamp
+            )
+            stamp = DispatchTime.now().uptimeNanoseconds
+        }
         var relative = try host.linear(wr, queryInput, rows: heads * config.dRel)
         let tau = isFull
             ? Inkling2Math.logScale(position: position, alpha: config.logScalingAlpha, floor: config.logScalingNFloor)
@@ -1179,14 +1213,28 @@ nonisolated public final class Inkling2MetalForward {
             if isFull { slice = slice.map { $0 * tau } }
             for dimension in 0..<config.dRel { relative[head * config.dRel + dimension] = slice[dimension] }
         }
+        if let profile, stamp != 0 {
+            profile.recordDetail(
+                .relativeMath, nanoseconds: DispatchTime.now().uptimeNanoseconds - stamp
+            )
+        }
         return relative
     }
 
     /// The sink logits: `sinkProj @ input`, one per head.
-    func sinkLogits(layer: Int, queryInput: [Float]) throws -> [Float] {
+    func sinkLogits(
+        layer: Int, queryInput: [Float], profile: Inkling2VisitProfile? = nil
+    ) throws -> [Float] {
         let heads = !config.isLocalLayer(layer) ? config.numAttentionHeads : config.swaNumAttentionHeads
+        let stamp = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         let projection = try hostMatrix(.attnSinkProj, layer: layer)
-        return try host.linear(projection, queryInput, rows: heads)
+        let logits = try host.linear(projection, queryInput, rows: heads)
+        if let profile, stamp != 0 {
+            profile.recordDetail(
+                .sinkLogits, nanoseconds: DispatchTime.now().uptimeNanoseconds - stamp
+            )
+        }
+        return logits
     }
 
     /// The short convolution on device, static or dynamic, for one of a visit's
@@ -1449,26 +1497,52 @@ nonisolated public final class Inkling2MetalForward {
         // K/V joins the cache before the attention is encoded -- the host's
         // `attention` appends at exactly this point, and a row staged before the
         // write would be the previous position's.
-        state.pushConvolution(0, value: readBack(workspace.key, count: kvHeads * headDim))
-        state.pushConvolution(1, value: readBack(workspace.value, count: kvHeads * headDim))
-        _ = state.append(
-            key: readBack(workspace.convolvedKey, count: kvHeads * headDim),
-            value: readBack(workspace.convolvedValue, count: kvHeads * headDim)
-        )
+        // This stage is host-only and is the largest bucket a kernel change
+        // cannot touch, so its pieces are billed one at a time when a profile is
+        // armed: four read-backs, the append, two host projections, three small
+        // stagings and the KV row copy that grows with the context.
+        var stateStamp = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
+        func bill(_ detail: Inkling2VisitDetail) {
+            guard let profile, stateStamp != 0 else { return }
+            let now = DispatchTime.now().uptimeNanoseconds
+            profile.recordDetail(detail, nanoseconds: now - stateStamp)
+            stateStamp = now
+        }
+        // The pieces below bill themselves, so this only advances the stamp.
+        func skip() {
+            if stateStamp != 0 { stateStamp = DispatchTime.now().uptimeNanoseconds }
+        }
+
+        let keyValues = readBack(workspace.key, count: kvHeads * headDim)
+        let valueValues = readBack(workspace.value, count: kvHeads * headDim)
+        let convolvedKey = readBack(workspace.convolvedKey, count: kvHeads * headDim)
+        let convolvedValue = readBack(workspace.convolvedValue, count: kvHeads * headDim)
+        bill(.kvReadBack)
+        state.pushConvolution(0, value: keyValues)
+        state.pushConvolution(1, value: valueValues)
+        _ = state.append(key: convolvedKey, value: convolvedValue)
+        bill(.kvAppend)
 
         // The relative states and the sink logits are small host-side
         // projections; the kernel only needs their results, and computing them
         // on the host keeps this stage's device part to what it is for.
-        let relative = try relativeStates(layer: layer, queryInput: queryInput, position: position, isFull: isFull)
-        let sink = try sinkLogits(layer: layer, queryInput: queryInput)
+        let relative = try relativeStates(
+            layer: layer, queryInput: queryInput, position: position, isFull: isFull,
+            profile: profile
+        )
+        skip()
+        let sink = try sinkLogits(layer: layer, queryInput: queryInput, profile: profile)
+        skip()
         let relativeBuffer = try staging(workspace.relativeStates, relative)
         let sinkBuffer = try staging(workspace.sinkLogits, sink)
         let bankValues = try hostMatrix(.attnRelLogitsProj, layer: layer)
         let bankBuffer = try staging(workspace.bank, bankValues)
+        bill(.stateStaging)
 
         // The KV rows this position attends over, staged: the second command
         // buffer, because the attention reads the row the first one wrote.
-        let rows = try workspace.stage(state)
+        let rows = try workspace.stage(state, profile: profile)
+        bill(.rowStaging)
         let tailStart = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         if let profile {
             profile.record(
