@@ -22,6 +22,15 @@
 //  DynaMoE's existing KV contract, and it reuses the same addressing rule (a
 //  ring read is chronological either way).
 //
+//  An FP32 visit keeps its rows in ONE flat ring rather than one array per row,
+//  because the device attention reads a copy of the whole window every visit and
+//  that copy is the stage's entire cost: 8.4 MB per visit at the published
+//  1,032-row context, measured at 1.28-1.54 ms of host time a visit (slice 38).
+//  A flat ring leaves in at most two contiguous moves instead of one call per
+//  row, which the isolation probe priced at 1.6x (slice 38's 57.3 against
+//  34.5 GB/s). `copyKeyRows`/`copyValueRows` are that path; `keys`/`values`
+//  remain the row-at-a-time reader's form and are what the host reference uses.
+//
 
 import Foundation
 
@@ -113,31 +122,76 @@ nonisolated public final class Inkling2VisitState {
     public let storage: Inkling2KVStorage
     /// The stored rows in `storage`'s own form: one row per retained position,
     /// chronologically, exactly as `keys`/`values` were handed in.
+    ///
+    /// Only `int8` uses these: an FP32 visit keeps its rows in the flat ring
+    /// below instead.
     private var storedKeys: [[Int8]] = []
     private var storedValues: [[Int8]] = []
     /// Per (row, KV head) FP16 scales, K and V separately. Empty in FP32.
     private var keyScales: [[UInt16]] = []
     private var valueScales: [[UInt16]] = []
-    /// The FP32 rows, in `float32` storage. Empty in `int8`: a decoded copy kept
-    /// beside the stored bytes is no memory saved at all, which is the whole
-    /// reason INT8 exists, so the decoded form is produced per read instead.
-    private var decodedKeys: [[Float]] = []
-    private var decodedValues: [[Float]] = []
+    /// The FP32 rows, in `float32` storage, as ONE flat ring: `ringCapacity`
+    /// rows of `ringWidth` floats, row 0 of the window at `ringHead`, row `i`
+    /// at `(ringHead + i) % ringCapacity`.
+    ///
+    /// A flat ring rather than `[[Float]]` because the device attention reads a
+    /// copy of the whole window and the copy is what this stage costs: at the
+    /// published 1,032-row context one visit stages 1,024 rows x 1,024 floats
+    /// x 2 regions = 8.4 MB, and a host-row-at-a-time copy of it was measured at
+    /// 1.28-1.54 ms of a 1.28-1.90 ms stage (slice 38). Out of a flat ring the
+    /// same bytes leave in at most TWO contiguous moves (a wrapped ring is two
+    /// spans), which the isolation probe priced at 1.6x the per-row form
+    /// (57.3 vs 34.5 GB/s).
+    ///
+    /// `int8` keeps its `[[Int8]]` rows: its staging is a quarter of the bytes
+    /// and the kernel reads a scale per (row, head), so there is nothing here
+    /// for a flat copy to win.
+    private var ringKeys: [Float] = []
+    private var ringValues: [Float] = []
+    /// Floats per row in the ring. Zero until the first append.
+    private var ringWidth = 0
+    /// Rows the ring has room for. The ring is reserved, not compacted: a
+    /// windowed visit reserves its window on the first append and never grows,
+    /// a full visit doubles as its positions arrive. `residentBytes` reports
+    /// the rows HELD, which is the number a KV budget prices.
+    private var ringCapacity = 0
+    /// Ring slot holding the oldest retained row.
+    private var ringHead = 0
+    /// Rows currently held.
+    private var ringCount = 0
 
     /// Keys and values as FP32, one row per retained position, chronologically.
     ///
-    /// In `float32` storage these are the stored rows themselves. In `int8` the
-    /// row is dequantized as it is asked for (`stored * scale`, per head): that
-    /// costs a multiply per element per read, and it is the price of the cache
-    /// actually being a quarter of the size. A caller that reads a row many
-    /// times should hold the result itself rather than ask twice.
+    /// A row-at-a-time reader's form, not the staging form: in `float32` each
+    /// row is copied out of the flat ring, so this allocates a row per call,
+    /// and a caller that wants the whole window moved should use
+    /// `copyKeyRows(into:)` (one or two contiguous moves) rather than ask for
+    /// this and copy again. In `int8` the row is dequantized as it is asked for
+    /// (`stored * scale`, per head): that costs a multiply per element per
+    /// read, and it is the price of the cache actually being a quarter of the
+    /// size.
     public var keys: [[Float]] {
-        storage == .float32 ? decodedKeys
+        storage == .float32 ? ringRows(ringKeys)
             : zip(storedKeys, keyScales).map { Self.dequantize($0, $1, headWidth: headWidth) }
     }
     public var values: [[Float]] {
-        storage == .float32 ? decodedValues
+        storage == .float32 ? ringRows(ringValues)
             : zip(storedValues, valueScales).map { Self.dequantize($0, $1, headWidth: headWidth) }
+    }
+
+    /// Moves every retained key row into `destination`, in position order, and
+    /// returns the row count. The staging form: at most two `memcpy` spans
+    /// (a wrapped ring is contiguous from the head to the end, then from the
+    /// start to the head again), where a row-at-a-time copy is one call per
+    /// row. Zero rows in `int8`, whose staging walks stored bytes per row.
+    @discardableResult
+    public func copyKeyRows(into destination: UnsafeMutablePointer<Float>) -> Int {
+        copyRingRows(ringKeys, into: destination)
+    }
+
+    @discardableResult
+    public func copyValueRows(into destination: UnsafeMutablePointer<Float>) -> Int {
+        copyRingRows(ringValues, into: destination)
     }
 
     /// The stored bytes of a row and its per-head scales, for a reader that
@@ -153,14 +207,15 @@ nonisolated public final class Inkling2VisitState {
         return (storedValues[row], valueScales[row])
     }
 
-    /// Bytes the cache is actually holding, which is the number an INT8 setting
-    /// exists to move: the stored rows plus their FP16 scales.
+    /// Bytes the rows this cache HOLDS occupy, which is the number an INT8
+    /// setting exists to move: the stored rows plus their FP16 scales.
+    ///
+    /// Held rows, not reserved: the FP32 flat ring reserves up to twice the
+    /// rows it holds while a full-attention visit is growing, but a KV budget
+    /// prices the positions it can answer for, not the allocator's slack.
     public var residentBytes: Int {
         if storage == .float32 {
-            let rows = decodedKeys.count
-            let keyWidth = decodedKeys.first?.count ?? 0
-            let valueWidth = decodedValues.first?.count ?? 0
-            return rows * (keyWidth + valueWidth) * MemoryLayout<Float>.stride
+            return ringCount * ringWidth * 2 * MemoryLayout<Float>.stride
         }
         let rows = storedKeys.count
         let keyWidth = storedKeys.first?.count ?? 0
@@ -205,8 +260,16 @@ nonisolated public final class Inkling2VisitState {
     public func append(key: [Float], value: [Float]) -> Range<Int> {
         switch storage {
         case .float32:
-            decodedKeys.append(key)
-            decodedValues.append(value)
+            if key.count != ringWidth { resizeRing(toWidth: key.count) }
+            guard ringWidth > 0 else {
+                // A zero-width row is not a position: without this the row
+                // count would advance while nothing became addressable.
+                return windowStart..<(windowStart + rowCount)
+            }
+            ensureRingCapacity(ringCount + 1)
+            writeRingRow(key, into: &ringKeys, at: ringCount)
+            writeRingRow(value, into: &ringValues, at: ringCount)
+            ringCount += 1
         case .int8:
             // Per KV head, both directions, as the device kernel does it: one
             // scale per (token, head), the row read back as stored * scale.
@@ -248,13 +311,13 @@ nonisolated public final class Inkling2VisitState {
 
     /// Rows the cache holds, in either storage.
     public var rowCount: Int {
-        storage == .int8 ? storedKeys.count : decodedKeys.count
+        storage == .int8 ? storedKeys.count : ringCount
     }
 
     /// The width of one row (K and V have the same width here: both are
     /// `kvHeads * headDim`), without dequantizing anything.
     public var rowWidth: Int {
-        storage == .int8 ? (storedKeys.first?.count ?? 0) : (decodedKeys.first?.count ?? 0)
+        storage == .int8 ? (storedKeys.first?.count ?? 0) : ringWidth
     }
 
     /// KV heads, so a scale is per head and not per row.
@@ -268,8 +331,7 @@ nonisolated public final class Inkling2VisitState {
     /// values, so a host scale that covered a different span would be a
     /// different contract with the same name.
     public var headWidth: Int {
-        let width = storage == .int8
-            ? (storedKeys.first?.count ?? 0) : (decodedKeys.first?.count ?? 0)
+        let width = rowWidth
         guard width > 0 else { return 1 }
         return max(1, width / max(1, heads))
     }
@@ -281,8 +343,10 @@ nonisolated public final class Inkling2VisitState {
             keyScales.removeFirst(count)
             valueScales.removeFirst(count)
         } else {
-            decodedKeys.removeFirst(count)
-            decodedValues.removeFirst(count)
+            let drop = min(count, ringCount)
+            guard drop > 0 else { return }
+            ringHead = (ringHead + drop) % max(1, ringCapacity)
+            ringCount -= drop
         }
     }
 
@@ -309,9 +373,7 @@ nonisolated public final class Inkling2VisitState {
                 keyScales.removeLast(min(drop, keyScales.count))
                 valueScales.removeLast(min(drop, valueScales.count))
             } else {
-                let drop = min(removed, decodedKeys.count)
-                decodedKeys.removeLast(drop)
-                decodedValues.removeLast(drop)
+                ringCount -= min(removed, ringCount)
             }
         }
         return removed
@@ -338,8 +400,12 @@ nonisolated public final class Inkling2VisitState {
     }
 
     public func reset() {
-        decodedKeys.removeAll()
-        decodedValues.removeAll()
+        ringKeys.removeAll()
+        ringValues.removeAll()
+        ringWidth = 0
+        ringCapacity = 0
+        ringHead = 0
+        ringCount = 0
         storedKeys.removeAll()
         storedValues.removeAll()
         keyScales.removeAll()
@@ -347,6 +413,117 @@ nonisolated public final class Inkling2VisitState {
         committedPositions = 0
         windowStart = 0
         convolutionHistory = convolutionHistory.map { _ in [] }
+    }
+
+    // MARK: - The flat FP32 ring
+
+    /// One row as `[[Float]]`, chronologically: the reader's form.
+    private func ringRows(_ storage: [Float]) -> [[Float]] {
+        guard ringWidth > 0, ringCount > 0, ringCapacity > 0 else { return [] }
+        var rows = [[Float]]()
+        rows.reserveCapacity(ringCount)
+        storage.withUnsafeBufferPointer { source in
+            let base = source.baseAddress!
+            for row in 0..<ringCount {
+                let start = ((ringHead + row) % ringCapacity) * ringWidth
+                rows.append(Array(UnsafeBufferPointer(start: base + start, count: ringWidth)))
+            }
+        }
+        return rows
+    }
+
+    /// Every retained row into `destination`, in position order: one `memcpy`
+    /// from the head to the end of the ring, then one more for the rows that
+    /// wrapped to its start. Returns the row count.
+    private func copyRingRows(_ storage: [Float], into destination: UnsafeMutablePointer<Float>) -> Int {
+        guard ringWidth > 0, ringCount > 0, ringCapacity > 0 else { return 0 }
+        let rowBytes = ringWidth * MemoryLayout<Float>.stride
+        let leading = min(ringCount, ringCapacity - ringHead)
+        storage.withUnsafeBufferPointer { source in
+            let base = source.baseAddress!
+            if leading > 0 {
+                memcpy(destination, base + ringHead * ringWidth, leading * rowBytes)
+            }
+            let wrapped = ringCount - leading
+            if wrapped > 0 {
+                memcpy(destination + leading * ringWidth, base, wrapped * rowBytes)
+            }
+        }
+        return ringCount
+    }
+
+    /// Writes one row at ring position `row` (0 is the oldest held row).
+    /// A short row is copied as far as it goes, which is what the row-at-a-time
+    /// staging copy did: a ragged row is a caller's bug, not a fault.
+    private func writeRingRow(_ row: [Float], into storage: inout [Float], at index: Int) {
+        guard ringWidth > 0, ringCapacity > 0 else { return }
+        let start = ((ringHead + index) % ringCapacity) * ringWidth
+        let count = min(ringWidth, row.count)
+        _ = storage.withUnsafeMutableBufferPointer { destination in
+            row.withUnsafeBufferPointer { source in
+                memcpy(destination.baseAddress! + start, source.baseAddress!, count * MemoryLayout<Float>.stride)
+            }
+        }
+    }
+
+    /// Grows the ring so it can hold `needed` rows.
+    ///
+    /// Geometric growth (1.5x) rather than a reserve of the whole window: a
+    /// reserve would cost every visit 8 MB the moment it took its first row,
+    /// and the growth copies are amortised to a few KB per position. It also
+    /// keeps a half-full ring's slack bounded, which is what `residentBytes`
+    /// reports against.
+    private func ensureRingCapacity(_ needed: Int) {
+        guard needed > ringCapacity else { return }
+        relayoutRing(to: max(needed, ringCapacity + max(ringCapacity / 2, 16)))
+    }
+
+    /// Re-lays the ring out chronologically into a new buffer of `capacity`
+    /// rows. Rare: once per growth of a full-attention visit's cache.
+    private func relayoutRing(to capacity: Int) {
+        guard ringWidth > 0 else { return }
+        resizeRing(toWidth: ringWidth, capacity: capacity, rows: ringCount)
+    }
+
+    /// Rebuilds the ring with a new row width and/or capacity, keeping the
+    /// held rows in position order from slot 0.
+    private func resizeRing(toWidth width: Int, capacity: Int? = nil, rows: Int? = nil) {
+        guard width > 0 else { return }
+        let held = rows ?? ringCount
+        let target = capacity ?? max(held, 16)
+        var keys = [Float](repeating: 0, count: target * width)
+        var values = [Float](repeating: 0, count: target * width)
+        if ringWidth > 0, ringCapacity > 0, held > 0 {
+            let copyWidth = min(ringWidth, width)
+            ringKeys.withUnsafeBufferPointer { source in
+                keys.withUnsafeMutableBufferPointer { destination in
+                    for row in 0..<held {
+                        let from = ((ringHead + row) % ringCapacity) * ringWidth
+                        memcpy(
+                            destination.baseAddress! + row * width, source.baseAddress! + from,
+                            copyWidth * MemoryLayout<Float>.stride
+                        )
+                    }
+                }
+            }
+            ringValues.withUnsafeBufferPointer { source in
+                values.withUnsafeMutableBufferPointer { destination in
+                    for row in 0..<held {
+                        let from = ((ringHead + row) % ringCapacity) * ringWidth
+                        memcpy(
+                            destination.baseAddress! + row * width, source.baseAddress! + from,
+                            copyWidth * MemoryLayout<Float>.stride
+                        )
+                    }
+                }
+            }
+        }
+        ringKeys = keys
+        ringValues = values
+        ringWidth = width
+        ringCapacity = target
+        ringHead = 0
+        ringCount = held
     }
 }
 

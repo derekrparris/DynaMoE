@@ -514,6 +514,63 @@ final class Inkling2KVStorageTests: XCTestCase {
         }
     }
 
+    /// The flat ring hands a whole window to the staging buffer in position
+    /// order, including after it has wrapped: the copy is at most two `memcpy`
+    /// spans, so a wrapped ring is exactly where an off-by-one would show up.
+    func testTheFlatRingCopiesAWholeWindowInPositionOrder() {
+        let state = visit(storage: .float32, window: 3, full: false, width: 5)
+        // Nine appends over a three-row window: the ring wraps three times and
+        // keeps rows 6, 7 and 8.
+        for index in 0..<9 {
+            let row = (0..<5).map { Float(index * 10 + $0) }
+            _ = state.append(key: row, value: row.map { -$0 })
+        }
+        XCTAssertEqual(state.rowCount, 3)
+        XCTAssertEqual(state.rowWidth, 5)
+        XCTAssertEqual(state.windowStart, 6)
+        var keys = [Float](repeating: 0, count: 3 * 5)
+        var values = [Float](repeating: 0, count: 3 * 5)
+        let copied = keys.withUnsafeMutableBufferPointer { state.copyKeyRows(into: $0.baseAddress!) }
+        _ = values.withUnsafeMutableBufferPointer { state.copyValueRows(into: $0.baseAddress!) }
+        XCTAssertEqual(copied, 3)
+        let expected = (0..<3).flatMap { row in (0..<5).map { Float((row + 6) * 10 + $0) } }
+        XCTAssertEqual(keys, expected)
+        XCTAssertEqual(keys, state.keys.flatMap { $0 }, "the copy and the reader must agree")
+        XCTAssertEqual(values, keys.map { -$0 })
+
+        // An empty visit copies nothing rather than stamping a row of nothing.
+        let empty = visit(storage: .float32)
+        var scratch = [Float](repeating: 7, count: 4)
+        let none = scratch.withUnsafeMutableBufferPointer { empty.copyKeyRows(into: $0.baseAddress!) }
+        XCTAssertEqual(none, 0)
+        XCTAssertEqual(scratch, [7, 7, 7, 7])
+    }
+
+    /// A row that arrives at a new width re-lays the ring out instead of mixing
+    /// strides: the rows already held keep their values, padded to the new
+    /// width. Nothing in the forward pass does this, which is why it must not
+    /// silently corrupt the cache if it ever does.
+    func testAWiderRowReLaysTheRingOutWithoutLosingRows() {
+        let state = visit(storage: .float32, window: 4, full: false, width: 2)
+        _ = state.append(key: [1, 2], value: [3, 4])
+        _ = state.append(key: [5, 6, 7], value: [8, 9, 10])
+        XCTAssertEqual(state.rowWidth, 3)
+        XCTAssertEqual(state.keys, [[1, 2, 0], [5, 6, 7]])
+        XCTAssertEqual(state.values, [[3, 4, 0], [8, 9, 10]])
+    }
+
+    /// A full-attention visit's cache grows by re-laying its ring out, and the
+    /// rows survive every growth in position order.
+    func testAFullVisitKeepsItsRowsAcrossRingGrowth() {
+        let state = visit(storage: .float32, window: 4, full: true, width: 2)
+        for index in 0..<40 {
+            _ = state.append(key: [Float(index), Float(index) + 0.5], value: [0, 0])
+        }
+        XCTAssertEqual(state.rowCount, 40)
+        XCTAssertEqual(state.keys.map { $0[0] }, (0..<40).map(Float.init))
+        XCTAssertEqual(state.keys.map { $0[1] }, (0..<40).map { Float($0) + 0.5 })
+    }
+
     /// The scale is per KV HEAD: one head's large values must not coarsen
     /// another head's small ones.
     func testEachHeadGetsItsOwnScale() {

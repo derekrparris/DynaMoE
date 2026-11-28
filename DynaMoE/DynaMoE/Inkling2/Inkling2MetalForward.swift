@@ -22,7 +22,6 @@
 //  serves every layer and shape.
 //
 
-import Accelerate
 import Foundation
 import Metal
 
@@ -416,11 +415,13 @@ nonisolated public final class Inkling2DeviceWorkspace {
     /// Returns the row count; the caller passes it to the attention kernel with
     /// the visit's `windowStart`.
     ///
-    /// One `vDSP_mmov` per row instead of a scalar element loop: the copy is
-    /// row-major and contiguous on both sides, so it is the same bytes in the
-    /// same order (bit-identical, it is a copy) and measured 4.4-5.1x faster at
-    /// the published row width -- 0.25 ms -> 0.06 ms for a full 1,024-row
-    /// window, and this stage grows with the context.
+    /// In `.float32` this is one or two `memcpy` spans per region, straight out
+    /// of the visit's flat ring, where it used to be one `vDSP_mmov` per row.
+    /// The bytes and their order are identical -- it is a copy -- and the
+    /// isolation probe priced the per-row form at 34.5 GB/s against 57.3 for a
+    /// contiguous move (slice 38). In place the stage went 1.54/1.28 ->
+    /// 0.79/0.65 ms a visit (slice 39), which is where the 8.4 MB this moves at
+    /// the published window is the stage's entire cost.
     ///
     /// In `.int8` storage there is nothing to decode: the cache's rows are
     /// already one signed byte per element plus one FP16 scale per KV head, so
@@ -443,44 +444,16 @@ nonisolated public final class Inkling2DeviceWorkspace {
         var stamp = profile == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         switch stagedStorage {
         case .float32:
-            // Row-major copy: the host keeps [[Float]], the kernel wants one block.
-            let keyRows = state.keys
-            let valueRows = state.values
-            if let profile, stamp != 0 {
-                profile.recordDetail(
-                    .rowStagingRows, nanoseconds: DispatchTime.now().uptimeNanoseconds - stamp
-                )
-                stamp = DispatchTime.now().uptimeNanoseconds
-            }
             let keyPointer = stagedKeys.contents().bindMemory(to: Float.self, capacity: rows * width)
             let valuePointer = stagedValues.contents().bindMemory(to: Float.self, capacity: rows * width)
-            for row in 0..<rows {
-                let keyRow = keyRows[row]
-                let count = min(width, keyRow.count)
-                keyRow.withUnsafeBufferPointer { source in
-                    vDSP_mmov(
-                        source.baseAddress!, keyPointer + row * width,
-                        vDSP_Length(count), 1, vDSP_Length(count), vDSP_Length(count)
-                    )
-                }
-            }
+            _ = state.copyKeyRows(into: keyPointer)
             if let profile, stamp != 0 {
                 profile.recordDetail(
                     .rowStagingKeys, nanoseconds: DispatchTime.now().uptimeNanoseconds - stamp
                 )
                 stamp = DispatchTime.now().uptimeNanoseconds
             }
-            for row in 0..<rows {
-                let valueRow = valueRows[row]
-                let count = min(width, valueRow.count)
-                valueRow.withUnsafeBufferPointer { source in
-                    vDSP_mmov(
-                        source.baseAddress!, valuePointer + row * width,
-                        vDSP_Length(count), 1,
-                        vDSP_Length(count), vDSP_Length(count)
-                    )
-                }
-            }
+            _ = state.copyValueRows(into: valuePointer)
             if let profile, stamp != 0 {
                 profile.recordDetail(
                     .rowStagingValues, nanoseconds: DispatchTime.now().uptimeNanoseconds - stamp

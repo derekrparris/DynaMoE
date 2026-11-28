@@ -107,8 +107,10 @@ nonisolated public enum Inkling2VisitDetail: String, Sendable, CaseIterable {
     /// `workspace.stage(state)`: the copy of every KV row this position
     /// attends over. This is the piece that grows with the context.
     case rowStaging
-    /// Obtaining `state.keys`/`state.values`, which for an FP32 state is two
-    /// array references and for an INT8 state is a dequantize of every row.
+    /// Obtaining the rows the copy reads. It was two array references in FP32
+    /// and is a dequantize of every row in INT8; slice 39 removed it from the
+    /// FP32 path entirely, where the copy now reads the visit's flat ring
+    /// directly, so a zero here is the improvement and not a missing bill.
     case rowStagingRows
     /// The key rows copied, and then the value rows, so a copy that is slow for
     /// one region cannot hide inside the other.
