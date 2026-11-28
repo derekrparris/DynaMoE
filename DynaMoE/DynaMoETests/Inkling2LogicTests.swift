@@ -4642,6 +4642,505 @@ final class Inkling2ExpertFillShapeTests: XCTestCase {
     }
 }
 
+// MARK: - What the fill's read depth delivers
+
+/// Prices the SHAPE of the reads one REAL visit's fill issues, through the
+/// shipped arena and the shipped reader.
+///
+/// Slice 34 priced the fan-out across EXPERTS and shipped it: a visit knows all
+/// of its routing before it reads any of it, so the eight experts go to the
+/// arena in one batch instead of eight calls. This machine's counters say what
+/// that leaves in place: 126,066 misses over 49,536 visits is 2.5 experts per
+/// visit, ten ranges, 12 MB -- and those ten ranges run at 4.8 GB/s where the
+/// same bytes with thirty-two in flight ran at 8.2. So the depth lever is one
+/// level below the expert: a visit cannot route more experts, but it can hold
+/// more READS of the bytes it does want.
+///
+/// The two cases here are the two halves of that: one model-free check that a
+/// chunked read writes exactly the bytes a wide read writes (a cheaper arm that
+/// moved different bytes would be a wrong answer, not an improvement), and one
+/// opt-in probe that prices chunk sizes at the real expert count.
+final class Inkling2FillDepthTests: XCTestCase {
+
+    /// The published slot's four ranges, in the arena's own order.
+    private static let rangeLengths = [2_654_208, 331_776, 1_327_104, 165_888]
+    private static let slotBytes = 4_478_976
+
+    private func write(_ path: String, bytes: Int, chunk: Int) -> Int32 {
+        let descriptor = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0o600)
+        guard descriptor >= 0 else { return -1 }
+        _ = fcntl(descriptor, F_GLOBAL_NOCACHE, 1)
+        let buffer = UnsafeMutableRawPointer.allocate(byteCount: chunk, alignment: 16_384)
+        defer { buffer.deallocate() }
+        var written = 0
+        while written < bytes {
+            let length = min(chunk, bytes - written)
+            memset(buffer, Int32((written / chunk) % 251), length)
+            var sent = 0
+            while sent < length {
+                let got = pwrite(descriptor, buffer.advanced(by: sent), length - sent, off_t(written + sent))
+                if got <= 0 { close(descriptor); return -1 }
+                sent += got
+            }
+            written += length
+        }
+        fsync(descriptor)
+        return descriptor
+    }
+
+    private func geometry() throws -> Inkling2ExpertSlotGeometry {
+        let geometry = try XCTUnwrap(
+            Inkling2ExpertSlotGeometry.make(
+                gateUpRows: 2_304, gateUpRowStride: 1_152, gateUpScaleRowStride: 144,
+                downRows: 2_304, downRowStride: 576, downScaleRowStride: 72
+            )
+        )
+        XCTAssertEqual(geometry.slotBytes, Self.slotBytes)
+        return geometry
+    }
+
+    private func request(layer: Int, expert: Int, base: Int) -> Inkling2ExpertArena.FillRequest {
+        var offset = base
+        var offsets: [UInt64] = []
+        for length in Self.rangeLengths {
+            offsets.append(UInt64(offset))
+            offset += length
+        }
+        return Inkling2ExpertArena.FillRequest(
+            layer: layer, expert: expert,
+            gateUpSourceOffset: offsets[0], gateUpScaleSourceOffset: offsets[1],
+            downSourceOffset: offsets[2], downScaleSourceOffset: offsets[3]
+        )
+    }
+
+    private func ranges(
+        _ request: Inkling2ExpertArena.FillRequest,
+        geometry: Inkling2ExpertSlotGeometry,
+        base: UnsafeMutableRawPointer
+    ) -> [Inkling2ArenaShardReader.Range] {
+        [
+            Inkling2ArenaShardReader.Range(
+                fileOffset: Int(request.gateUpSourceOffset),
+                destination: base.advanced(by: geometry.gateUpWeightOffset),
+                length: geometry.gateUpWeightBytes
+            ),
+            Inkling2ArenaShardReader.Range(
+                fileOffset: Int(request.gateUpScaleSourceOffset),
+                destination: base.advanced(by: geometry.gateUpScaleOffset),
+                length: geometry.gateUpScaleBytes
+            ),
+            Inkling2ArenaShardReader.Range(
+                fileOffset: Int(request.downSourceOffset),
+                destination: base.advanced(by: geometry.downWeightOffset),
+                length: geometry.downWeightBytes
+            ),
+            Inkling2ArenaShardReader.Range(
+                fileOffset: Int(request.downScaleSourceOffset),
+                destination: base.advanced(by: geometry.downScaleOffset),
+                length: geometry.downScaleBytes
+            ),
+        ]
+    }
+
+    /// A chunked read must be the SAME read: every byte at the same destination
+    /// offset, the whole range covered, and nothing written past it. The chunk
+    /// size here (48 KB) divides neither the range lengths nor their gcd, so the
+    /// last piece of every range is a short one -- which is where an off-by-one
+    /// would hide a row of an expert.
+    func testAChunkedReadWritesTheSameBytesAsOneWideRead() throws {
+        let geometry = try geometry()
+        let fileBytes = 16 * 1_048_576
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("inkling2-filldepth-bytes-\(UUID().uuidString).bin")
+        let written = write(url.path, bytes: fileBytes, chunk: 256 * 1_024)
+        XCTAssertGreaterThanOrEqual(written, 0)
+        defer {
+            close(written)
+            try? FileManager.default.removeItem(at: url)
+        }
+        let wide = try Inkling2ArenaShardReader(url: url, chunkBytes: 0)
+        let chunked = try Inkling2ArenaShardReader(url: url, chunkBytes: 48 * 1_024)
+        defer {
+            wide.closeNow()
+            chunked.closeNow()
+        }
+        XCTAssertEqual(wide.chunkBytes, 0)
+        XCTAssertEqual(chunked.chunkBytes, 48 * 1_024)
+
+        let experts = 2
+        let slotsBytes = experts * Self.slotBytes
+        for base in [0, 4 * 1_048_576] {
+            let requests = (0..<experts).map {
+                request(layer: 0, expert: $0, base: base + $0 * Self.slotBytes)
+            }
+            // The two destinations start out DIFFERENT, so a read that wrote
+            // nothing cannot pass the comparison by leaving both untouched.
+            let reference = UnsafeMutableRawPointer.allocate(
+                byteCount: slotsBytes, alignment: 16_384
+            )
+            let destination = UnsafeMutableRawPointer.allocate(
+                byteCount: slotsBytes, alignment: 16_384
+            )
+            defer {
+                reference.deallocate()
+                destination.deallocate()
+            }
+            memset(reference, 0x55, slotsBytes)
+            memset(destination, 0xAA, slotsBytes)
+            var wideBytes = 0
+            var chunkedBytes = 0
+            for (index, item) in requests.enumerated() {
+                wideBytes += try wide.read(
+                    ranges(item, geometry: geometry, base: reference.advanced(by: index * Self.slotBytes))
+                )
+                chunkedBytes += try chunked.read(
+                    ranges(item, geometry: geometry, base: destination.advanced(by: index * Self.slotBytes))
+                )
+            }
+            XCTAssertEqual(wideBytes, slotsBytes)
+            XCTAssertEqual(chunkedBytes, slotsBytes)
+            XCTAssertEqual(
+                memcmp(destination, reference, slotsBytes), 0,
+                "a chunked read moved different bytes at base \(base)"
+            )
+        }
+    }
+
+    /// The same reads the fill issues, priced on the REAL shard file instead of a
+    /// temporary one.
+    ///
+    /// The walk's own arena line says 3.9-4.5 GB/s for the bytes the probe above
+    /// moves at 7.4-10.6, on the same machine and the same read shape, and slice
+    /// 39 recorded that in-place-versus-isolated gap as an open question. This
+    /// case answers it: the temporary file the other probe writes is not the same
+    /// measurement. On the real shard, cold, the same twelve ranges run at
+    /// 4.71-6.34 GB/s (three runs) and one CONTIGUOUS 13.4 MB pread at 5.49-5.69,
+    /// so the fill is inside about 15-30% of what the drive itself delivers and
+    /// the scatter costs almost nothing. The rates that look better than that are
+    /// the unified buffer cache: with the flag off, the identical reads run at
+    /// 18.6-25.3 GB/s, which is memory and not the device.
+    ///
+    /// The APFS-clone arm is the one flag change that could have shipped -- a
+    /// clone is a separate vnode sharing extents copy-on-write, so `F_NOCACHE`
+    /// could be set on it without touching the file the engine MMAPs (the flag is
+    /// global to the file, which is why the reader does not set it on the shard).
+    /// It measured 4.74-5.57, i.e. no better than the plain descriptor, so
+    /// nothing here ships: the fill's cost is the drive's, not the reader's.
+    ///
+    /// Every arm reads a sub-slab of its own, and the arms are interleaved within
+    /// a round: a shared sub-slab let the first arm pull the others' placements
+    /// into the cache, which read as 37 GB/s for a `NOCACHE` read of pages that
+    /// were already resident.
+    func testWhatARealShardDeliversColdOnItsOwnOpenFlags() throws {
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_shardread"),
+            "opt-in: touch /tmp/dynamoe_inkling2_shardread"
+        )
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice(), "no Metal device")
+        let geometry = try geometry()
+        let directory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(Inkling2PublishedTensorTests.snapshotRelativePath)
+        guard FileManager.default.fileExists(atPath: directory.path) else {
+            throw XCTSkip("Inkling 2 snapshot is not downloaded at \(directory.path)")
+        }
+        let shard = try XCTUnwrap(
+            try FileManager.default
+                .contentsOfDirectory(at: directory, includingPropertiesForKeys: [.fileSizeKey])
+                .filter { $0.pathExtension == "safetensors" && $0.lastPathComponent.hasPrefix("model-") }
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+                .first
+        )
+        // The snapshot entry is a symlink into the blob store, and
+        // `resourceValues` reports the LINK's size, so the bytes come from the
+        // file it points at.
+        let shardBytes = Int(try XCTUnwrap(
+            shard.resolvingSymlinksInPath().resourceValues(forKeys: [.fileSizeKey]).fileSize
+        ))
+
+        let experts = 3
+        let visitBytes = experts * Self.slotBytes
+        let rounds = 16
+        let gibibyte = 1_073_741_824
+        // Every arm gets a sub-slab of its own, inside a slab deep in the shard:
+        // at +0 an arm measured 37 GB/s, which is the unified buffer cache
+        // answering and not the device, and a shared sub-slab let the FIRST arm
+        // pull the others' placements into the cache (37 GB/s for a `NOCACHE`
+        // read of pages that were already resident). Distinct sub-slabs are what
+        // make each rate a first touch of these bytes.
+        let slab = 13 * gibibyte
+        let subSlabBytes = 256 * 1_048_576
+        let armCount = 4
+        XCTAssertGreaterThan(
+            shardBytes, slab + armCount * subSlabBytes, "the shard is too small for the slab"
+        )
+
+        let destination = try XCTUnwrap(
+            device.makeBuffer(length: visitBytes, options: .storageModeShared)
+        )
+        let base = destination.contents()
+
+        // The twelve placements are the same for every arm, and are spread over
+        // the whole slab: the real fill's two and a half experts sit at unrelated
+        // offsets, so a probe that laid them end to end would be pricing a
+        // locality the walk does not have. Seeded once, reused, so an arm cannot
+        // be reading a friendlier region than the one before it.
+        var generator = SystemRandomNumberGenerator()
+        let alignment = 2 * 1_048_576
+        let slots = (subSlabBytes - visitBytes) / alignment
+        var placements: [[[Int]]] = []
+        for arm in 0..<armCount {
+            var byRound: [[Int]] = []
+            for _ in 0..<rounds {
+                byRound.append((0..<(experts * 4)).map { _ in
+                    slab + arm * subSlabBytes
+                        + Int.random(in: 0..<slots, using: &generator) * alignment
+                })
+            }
+            placements.append(byRound)
+        }
+        let regionOffsets = [
+            geometry.gateUpWeightOffset, geometry.gateUpScaleOffset,
+            geometry.downWeightOffset, geometry.downScaleOffset,
+        ]
+        let regionLengths = [
+            geometry.gateUpWeightBytes, geometry.gateUpScaleBytes,
+            geometry.downWeightBytes, geometry.downScaleBytes,
+        ]
+        func ranges(
+            arm: Int, round: Int
+        ) -> [(fileOffset: Int, destination: UnsafeMutableRawPointer, length: Int)] {
+            placements[arm][round].enumerated().map { index, placement in
+                (
+                    placement,
+                    base.advanced(by: (index / 4) * Self.slotBytes + regionOffsets[index % 4]),
+                    regionLengths[index % 4]
+                )
+            }
+        }
+
+        /// One arm's descriptor, kept open for the interleaved pass below.
+        func openArm(url: URL, flags: Int32?) throws -> Int32 {
+            let descriptor = open(url.path, O_RDONLY | O_CLOEXEC)
+            XCTAssertGreaterThanOrEqual(descriptor, 0, url.lastPathComponent)
+            if let flags { _ = fcntl(descriptor, flags, 1) }
+            return descriptor
+        }
+
+        @discardableResult
+        func readArm(
+            _ descriptor: Int32, arm: Int, round: Int
+        ) -> UInt64 {
+            let pieces = ranges(arm: arm, round: round)
+            let started = DispatchTime.now().uptimeNanoseconds
+            DispatchQueue.concurrentPerform(iterations: pieces.count) { index in
+                let piece = pieces[index]
+                var total = 0
+                while total < piece.length {
+                    let got = pread(
+                        descriptor, piece.destination.advanced(by: total),
+                        piece.length - total, off_t(piece.fileOffset + total)
+                    )
+                    if got <= 0 { return }
+                    total += got
+                }
+            }
+            return DispatchTime.now().uptimeNanoseconds - started
+        }
+
+        // A clone is the only way to ask for a NOCACHE read of THIS file's bytes
+        // without turning the flag on for the vnode the engine MMAPs: `F_NOCACHE`
+        // is global to the file, so setting it on the shard itself would stop the
+        // GPU's dense reads from ever being cached. APFS clones share extents
+        // copy-on-write, so the copy costs a directory entry, not 19.5 GB.
+        let cloneURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("inkling2-shardread-clone-\(UUID().uuidString).bin")
+        var clone: URL? = nil
+        if clonefile(shard.path, cloneURL.path, 0) == 0 {
+            clone = cloneURL
+        } else {
+            print("\u{1F50E} [inkling2 shardread] no clone arm: clonefile errno \(errno)")
+        }
+        defer { try? FileManager.default.removeItem(at: cloneURL) }
+
+        // Four arms, interleaved within a round so a clock ramp cannot favour
+        // whoever ran first, each over its own sub-slab:
+        //  0 the shard as the arena opens it (cacheable),
+        //  1 the shard with `F_GLOBAL_NOCACHE`,
+        //  2 an APFS clone with `F_GLOBAL_NOCACHE`,
+        //  3 the shard with `F_GLOBAL_NOCACHE` as ONE contiguous read.
+        let descriptors = [
+            try openArm(url: shard, flags: nil),
+            try openArm(url: shard, flags: F_GLOBAL_NOCACHE),
+            try clone.map { try openArm(url: $0, flags: F_GLOBAL_NOCACHE) } ?? -1,
+            try openArm(url: shard, flags: F_GLOBAL_NOCACHE),
+        ]
+        defer { descriptors.forEach { close($0) } }
+        var best = Array(repeating: UInt64.max, count: armCount)
+        for round in 0..<rounds {
+            for arm in 0..<armCount where descriptors[arm] >= 0 {
+                let order = (arm + round) % armCount
+                guard descriptors[order] >= 0 else { continue }
+                if order == 3 {
+                    // The control: the same 13.4 MB as one contiguous read, so the
+                    // scatter's own cost is separable from what the drive sustains.
+                    let pieces = ranges(arm: order, round: round)
+                    let first = pieces.map(\.fileOffset).min() ?? slab
+                    let started = DispatchTime.now().uptimeNanoseconds
+                    var total = 0
+                    while total < visitBytes {
+                        let got = pread(
+                            descriptors[order], base.advanced(by: total), visitBytes - total,
+                            off_t(first + total)
+                        )
+                        if got <= 0 { break }
+                        total += got
+                    }
+                    XCTAssertEqual(total, visitBytes)
+                    best[order] = min(
+                        best[order], DispatchTime.now().uptimeNanoseconds - started
+                    )
+                    continue
+                }
+                best[order] = min(
+                    best[order], readArm(descriptors[order], arm: order, round: round)
+                )
+            }
+        }
+        let cacheBest = best[0]
+        let nocacheBest = best[1]
+        let cloneBest = best[2]
+        let sequentialBest = best[3]
+
+        let arms: [(label: String, best: UInt64)] = [
+            ("pread, default flags (the cache answers)", cacheBest),
+            ("pread, F_GLOBAL_NOCACHE on the shard", nocacheBest),
+            ("pread, F_GLOBAL_NOCACHE on an APFS clone", cloneBest),
+            ("one contiguous pread, F_GLOBAL_NOCACHE (control)", sequentialBest),
+        ]
+        var lines: [String] = []
+        for (label, best) in arms {
+            guard best != UInt64.max else {
+                lines.append("\(label): not measured")
+                continue
+            }
+            let seconds = Double(best) / 1e9
+            lines.append(String(
+                format: "%@: %.2f ms per visit's reads = %.2f GB/s",
+                label, seconds * 1_000, Double(visitBytes) / seconds / 1e9
+            ))
+        }
+        print("\u{1F50E} [inkling2 shardread] " + lines.joined(separator: "\n\u{1F50E} [inkling2 shardread] "))
+        XCTAssertGreaterThan(sequentialBest, 0)
+    }
+
+    /// The probe: at the expert count a visit ACTUALLY misses, how fast is the
+    /// shipped one-read-per-range shape, and does splitting each range into
+    /// chunks buy anything on this SSD?
+    ///
+    /// Arms are interleaved within a round and rotated, over the same bases, so a
+    /// clock ramp or a warm region cannot favour whoever ran first. `F_GLOBAL_NOCACHE`
+    /// keeps every arm a device read.
+    func testWhatTheRealVisitShapeDeliversAndWhatChunkingBuys() throws {
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: "/tmp/dynamoe_inkling2_filldepth"),
+            "opt-in: touch /tmp/dynamoe_inkling2_filldepth"
+        )
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice(), "no Metal device")
+        let geometry = try geometry()
+        let fileBytes = 1_024 * 1_048_576
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("inkling2-filldepth-\(UUID().uuidString).bin")
+        let nocache = write(url.path, bytes: fileBytes, chunk: 16 * 1_048_576)
+        XCTAssertGreaterThanOrEqual(nocache, 0)
+        defer {
+            close(nocache)
+            try? FileManager.default.removeItem(at: url)
+        }
+        let arms: [(label: String, chunk: Int)] = [
+            ("one read per range", 0),
+            ("4 MB chunks", 4 * 1_048_576),
+            ("2 MB chunks", 2 * 1_048_576),
+            ("1 MB chunks", 1_048_576),
+            ("512 KB chunks", 512 * 1_024),
+            ("256 KB chunks", 256 * 1_024),
+        ]
+        let readers = try arms.map {
+            try Inkling2ArenaShardReader(url: url, chunkBytes: $0.chunk)
+        }
+        defer { readers.forEach { $0.closeNow() } }
+
+        let expertCounts = [2, 3, 8]
+        var arenas: [[Inkling2ExpertArena]] = []
+        for count in expertCounts {
+            var row: [Inkling2ExpertArena] = []
+            for _ in arms {
+                let buffer = try XCTUnwrap(
+                    device.makeBuffer(
+                        length: count * Self.slotBytes, options: .storageModeShared
+                    )
+                )
+                let arena = Inkling2ExpertArena(capacity: count, geometry: geometry)
+                arena.attachSlotBuffer(buffer)
+                row.append(arena)
+            }
+            arenas.append(row)
+        }
+
+        let rounds = 16
+        let slotsInFile = fileBytes / Self.slotBytes
+        var generator = SystemRandomNumberGenerator()
+        var best = Array(
+            repeating: Array(repeating: UInt64.max, count: arms.count),
+            count: expertCounts.count
+        )
+        for round in 0..<rounds {
+            var basesByCount: [[Int]] = []
+            for count in expertCounts {
+                var bases: [Int] = []
+                while bases.count < count {
+                    let candidate = Int.random(in: 0..<slotsInFile, using: &generator) * Self.slotBytes
+                    if !bases.contains(candidate) { bases.append(candidate) }
+                }
+                basesByCount.append(bases)
+            }
+            for (countIndex, count) in expertCounts.enumerated() {
+                let requests = (0..<count).map { expert in
+                    request(
+                        layer: round * 64 + countIndex * 16 + expert, expert: expert,
+                        base: basesByCount[countIndex][expert]
+                    )
+                }
+                for step in 0..<arms.count {
+                    // Rotated so no arm is systematically first.
+                    let armIndex = (step + round) % arms.count
+                    let started = DispatchTime.now().uptimeNanoseconds
+                    _ = try arenas[countIndex][armIndex].fill(
+                        requests, reader: readers[armIndex]
+                    )
+                    let elapsed = DispatchTime.now().uptimeNanoseconds - started
+                    best[countIndex][armIndex] = min(best[countIndex][armIndex], elapsed)
+                }
+            }
+        }
+
+        var lines: [String] = []
+        for (countIndex, count) in expertCounts.enumerated() {
+            let moved = Double(count * Self.slotBytes)
+            for (armIndex, arm) in arms.enumerated() {
+                let seconds = Double(best[countIndex][armIndex]) / 1e9
+                lines.append(
+                    String(
+                        format: "%d expert(s), %@: %.2f ms per fill = %.2f GB/s",
+                        count, arm.label, seconds * 1_000, moved / seconds / 1e9
+                    )
+                )
+            }
+        }
+        print("\u{1F50E} [inkling2 filldepth] " + lines.joined(separator: "\n\u{1F50E} [inkling2 filldepth] "))
+        XCTAssertGreaterThan(best[0][0], 0)
+    }
+}
+
 // MARK: - The arena's eviction policy
 
 /// Which expert stays resident, priced on the routing the model actually

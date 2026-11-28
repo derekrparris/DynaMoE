@@ -247,6 +247,18 @@ nonisolated public enum Inkling2ArenaError: Error, Equatable, CustomStringConver
 /// a round trip into throughput. Every range writes a disjoint destination, so
 /// the fan-out needs no coordination. Deliberately no `F_NOCACHE`: the DSV4.1
 /// journal measured that as a 2.2x LOSS through Metal's shared memory.
+///
+/// `chunkBytes` is that depth lever at the level BELOW the expert: a visit only
+/// misses about two and a half experts, which is ten ranges, so splitting a wide
+/// range into pieces asks the SSD for more reads in flight without moving a
+/// different byte. Slice 40 PRICED that and shipped it OFF: on a temporary file
+/// the pieces bought 0 to 1.4 GB/s at two and three experts and nothing at eight
+/// (7.4-10.6 GB/s against 7.4-9.2 with one read per range, every arm inside the
+/// run-to-run noise), and on the REAL shard the whole shape measures 4.71-6.34
+/// GB/s cold against 5.49-5.69 for one contiguous read of the same bytes -- so
+/// the scatter is nearly free and the depth is not what limits the fill. The
+/// drive is. `shippedChunkBytes` is therefore zero and the seam stays as the way
+/// a future machine's answer would be taken.
 nonisolated public final class Inkling2ArenaShardReader: @unchecked Sendable {
     public struct Range {
         public let fileOffset: Int
@@ -259,13 +271,21 @@ nonisolated public final class Inkling2ArenaShardReader: @unchecked Sendable {
         }
     }
 
+    /// The largest contiguous `pread` the shipped reader issues: zero, one read
+    /// per range. Slice 40 priced splitting a range into pieces and measured no
+    /// gain, so the shipped shape is the unsplit one; see the class comment.
+    nonisolated public static let shippedChunkBytes = 0
+
     public let path: String
     public let fileSize: Int
+    /// Zero reads one range per `pread`; anything else caps a piece at that many
+    /// bytes. A piece is never wider than the range it came from.
+    public let chunkBytes: Int
     private let descriptor: Int32
     private let lock = NSLock()
     private var isClosed = false
 
-    public init(url: URL) throws {
+    public init(url: URL, chunkBytes: Int = Inkling2ArenaShardReader.shippedChunkBytes) throws {
         let fd = open(url.path, O_RDONLY | O_CLOEXEC)
         guard fd >= 0 else {
             throw Inkling2ArenaError.cannotOpen("\(url.lastPathComponent): errno \(errno)")
@@ -277,6 +297,7 @@ nonisolated public final class Inkling2ArenaShardReader: @unchecked Sendable {
             throw Inkling2ArenaError.cannotOpen("\(url.lastPathComponent): fstat failed, errno \(code)")
         }
         self.descriptor = fd
+        self.chunkBytes = chunkBytes
         self.path = url.lastPathComponent
         self.fileSize = Int(status.st_size)
     }
@@ -312,40 +333,82 @@ nonisolated public final class Inkling2ArenaShardReader: @unchecked Sendable {
         }
         let fd = descriptor
         let path = self.path
+        // A range wider than `chunkBytes` becomes several reads at the SAME
+        // destination offset the range would have written, so the bytes are
+        // identical to the unsplit read by construction.
+        var pieces: [Inkling2ReadPiece] = []
+        pieces.reserveCapacity(ranges.count * 2)
+        for range in ranges {
+            guard chunkBytes > 0, range.length > chunkBytes else {
+                pieces.append(Inkling2ReadPiece(
+                    fileOffset: range.fileOffset,
+                    destination: range.destination,
+                    length: range.length
+                ))
+                continue
+            }
+            var done = 0
+            while done < range.length {
+                let length = min(chunkBytes, range.length - done)
+                pieces.append(Inkling2ReadPiece(
+                    fileOffset: range.fileOffset + done,
+                    destination: range.destination.advanced(by: done),
+                    length: length
+                ))
+                done += length
+            }
+        }
         let failure = Inkling2ReadFailure()
         let readOne: @Sendable (Int) -> Void = { index in
-            let range = ranges[index]
+            let piece = pieces[index]
             var total = 0
-            while total < range.length {
+            while total < piece.length {
                 let got = pread(
-                    fd, range.destination.advanced(by: total),
-                    range.length - total, off_t(range.fileOffset + total)
+                    fd, piece.destination.advanced(by: total),
+                    piece.length - total, off_t(piece.fileOffset + total)
                 )
                 if got < 0 {
                     if errno == EINTR { continue }
                     failure.record(.shortRead(
-                        path: path, offset: range.fileOffset + total,
-                        wanted: range.length - total, got: Int(got)
+                        path: path, offset: piece.fileOffset + total,
+                        wanted: piece.length - total, got: Int(got)
                     ))
                     return
                 }
                 if got == 0 {
                     failure.record(.shortRead(
-                        path: path, offset: range.fileOffset + total,
-                        wanted: range.length - total, got: 0
+                        path: path, offset: piece.fileOffset + total,
+                        wanted: piece.length - total, got: 0
                     ))
                     return
                 }
                 total += got
             }
         }
-        if ranges.count >= 2 {
-            DispatchQueue.concurrentPerform(iterations: ranges.count, execute: readOne)
-        } else {
-            for index in ranges.indices { readOne(index) }
+        if pieces.count >= 2 {
+            DispatchQueue.concurrentPerform(iterations: pieces.count, execute: readOne)
+        } else if !pieces.isEmpty {
+            readOne(0)
         }
         if let first = failure.first { throw first }
         return ranges.reduce(0) { $0 + $1.length }
+    }
+}
+
+/// One contiguous `pread` the reader will issue, after chunking.
+///
+/// `@unchecked` because the destination is a raw pointer into a caller-owned
+/// buffer: every piece writes a disjoint span, which is the property the fan-out
+/// needs and the caller's reason for passing raw memory at all.
+nonisolated private struct Inkling2ReadPiece: @unchecked Sendable {
+    let fileOffset: Int
+    let destination: UnsafeMutableRawPointer
+    let length: Int
+
+    init(fileOffset: Int, destination: UnsafeMutableRawPointer, length: Int) {
+        self.fileOffset = fileOffset
+        self.destination = destination
+        self.length = length
     }
 }
 
